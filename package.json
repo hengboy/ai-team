@@ -1,0 +1,48 @@
+{
+  "name": "@ai-team/cli",
+  "version": "1.0.0",
+  "description": "Local workflow and agent orchestration for AI coding teams",
+  "type": "module",
+  "bin": {
+    "ai-team": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "pretest": "npm run build",
+    "test": "node --import tsx --test 'test/**/*.test.ts'",
+    "verify": "npm run typecheck && npm run lint && npm test && npm run build",
+    "prepack": "npm run verify"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "better-sqlite3": "^13.0.3",
+    "commander": "^15.0.0",
+    "proper-lockfile": "^4.1.2",
+    "semver": "^7.7.2",
+    "ulid": "^3.0.2",
+    "umzug": "^3.8.3",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.36.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.5.2",
+    "@types/proper-lockfile": "^4.1.4",
+    "@types/semver": "^7.7.1",
+    "eslint": "^9.36.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.44.1"
+  },
+  "license": "MIT"
+}
