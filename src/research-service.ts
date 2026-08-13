@@ -4,6 +4,7 @@ import { ValidationError } from "./errors.js";
 import { validateResearchConclusions, type ResearchConclusion } from "./research.js";
 import { StateStore } from "./state.js";
 import { sha256, toPosix } from "./utils.js";
+import { canonicalizeInside } from "./security.js";
 
 const renderReport = (topic: string, conclusions: ResearchConclusion[]): string => {
   const sections = conclusions.map((item) => [
@@ -36,7 +37,10 @@ export class ResearchService {
     } else {
       path = join(this.store.paths.artifacts, runId, "research", `${slug}.md`);
     }
-    await mkdir(join(path, ".."), { recursive: true });
+    const directory = join(path, "..");
+    await mkdir(directory, { recursive: true });
+    if (run.profile === "planning") await canonicalizeInside(project, directory);
+    else await canonicalizeInside(this.store.paths.artifacts, directory);
     const report = renderReport(topic, conclusions);
     await writeFile(path, report, { mode: 0o600 });
     const digest = sha256(report);

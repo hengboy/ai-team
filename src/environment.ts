@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import semver from "semver";
 import lockfile from "proper-lockfile";
@@ -333,11 +333,26 @@ export class EnvironmentService {
 
   async restore(path: string, dryRun = false): Promise<{ source: string; destination: string }> {
     const absolute = resolve(path);
-    if (!absolute.startsWith(resolve(this.paths.backups))) throw new ValidationError("restore source must be inside ai-team backups");
+    const backupRoot = resolve(this.paths.backups);
+    const backupRel = relative(backupRoot, absolute);
+    if (backupRel === ".." || backupRel.startsWith(`..${sep}`) || backupRel === "") throw new ValidationError("restore source must be inside ai-team backups");
+    const canonicalBackupRoot = await realpath(backupRoot);
+    const canonicalSource = await realpath(absolute);
+    const sourceRel = relative(canonicalBackupRoot, canonicalSource);
+    if (sourceRel === ".." || sourceRel.startsWith(`..${sep}`)) throw new ValidationError("restore source escapes backups through symlink");
     const indexed = await this.findBackupDestination(absolute);
     const backupRelative = absolute.slice(resolve(this.paths.backups).length + 1).split("/");
     const legacyRelative = backupRelative.length > 2 ? backupRelative.slice(1).join("/") : undefined;
     const destination = indexed ?? (legacyRelative ? join(this.userHome, legacyRelative) : join(this.userHome, basename(absolute)));
+    const destinationParent = dirname(destination);
+    let existingParent = destinationParent;
+    while (true) {
+      try { await stat(existingParent); break; } catch { const next = dirname(existingParent); if (next === existingParent) break; existingParent = next; }
+    }
+    const canonicalHome = await realpath(this.userHome);
+    const canonicalParent = await realpath(existingParent);
+    const parentRel = relative(canonicalHome, canonicalParent);
+    if (parentRel === ".." || parentRel.startsWith(`..${sep}`)) throw new ValidationError("restore destination escapes user home through symlink");
     try { await stat(destination); throw new ValidationError(`restore destination exists: ${destination}`); } catch (error) { if (error instanceof ValidationError) throw error; }
     if (!dryRun) { await mkdir(dirname(destination), { recursive: true }); await cp(absolute, destination); }
     return { source: absolute, destination };

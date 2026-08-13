@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import YAML from "yaml";
 import { PLAN_STATES } from "./constants.js";
@@ -64,23 +64,30 @@ export const writeRevision = async (project: string, planId: string, revision: s
   assertSections(docs.spec, SPEC_SECTIONS, "spec.md");
   assertSections(docs.plan, PLAN_SECTIONS, "plan.md");
   assertCoverage(docs.spec, [docs.plan, docs.tasks ?? "", ...Object.values(docs.taskFiles ?? {})]);
-  await mkdir(join(revisionPath, "research"), { recursive: true });
-  const frontmatter = YAML.stringify({ plan_id: planId, revision, target_branch: targetBranch, supersedes: supersedes ?? null });
-  const wrap = (body: string): string => `---\n${frontmatter}---\n\n${body.trim()}\n`;
-  await writeFile(join(revisionPath, "spec.md"), wrap(docs.spec));
-  await writeFile(join(revisionPath, "plan.md"), wrap(docs.plan));
-  if (docs.tasks) await writeFile(join(revisionPath, "tasks.md"), wrap(docs.tasks));
-  if (docs.taskFiles) {
-    await mkdir(join(revisionPath, "tasks"));
-    for (const [taskId, content] of Object.entries(docs.taskFiles)) {
-      if (!/^TASK-\d{3}$/.test(taskId)) throw new ValidationError(`invalid task id: ${taskId}`);
-      await writeFile(join(revisionPath, "tasks", `${taskId}.md`), wrap(content));
-    }
-  }
-  const digest = sha256([docs.spec, docs.plan, docs.tasks ?? "", ...Object.values(docs.taskFiles ?? {})].join("\n"));
   const planRoot = join(project, ".ai-team", "plans", planId);
-  try { await readFile(join(planRoot, "plan.yaml")); } catch { await writeFile(join(planRoot, "plan.yaml"), YAML.stringify({ plan_id: planId, active_revision: revision })); }
-  return { path: revisionPath, digest };
+  let createdPlanMetadata = false;
+  try {
+    await mkdir(join(revisionPath, "research"), { recursive: true });
+    const frontmatter = YAML.stringify({ plan_id: planId, revision, target_branch: targetBranch, supersedes: supersedes ?? null });
+    const wrap = (body: string): string => `---\n${frontmatter}---\n\n${body.trim()}\n`;
+    await writeFile(join(revisionPath, "spec.md"), wrap(docs.spec));
+    await writeFile(join(revisionPath, "plan.md"), wrap(docs.plan));
+    if (docs.tasks) await writeFile(join(revisionPath, "tasks.md"), wrap(docs.tasks));
+    if (docs.taskFiles) {
+      await mkdir(join(revisionPath, "tasks"));
+      for (const [taskId, content] of Object.entries(docs.taskFiles)) {
+        if (!/^TASK-\d{3}$/.test(taskId)) throw new ValidationError(`invalid task id: ${taskId}`);
+        await writeFile(join(revisionPath, "tasks", `${taskId}.md`), wrap(content));
+      }
+    }
+    const digest = sha256([docs.spec, docs.plan, docs.tasks ?? "", ...Object.values(docs.taskFiles ?? {})].join("\n"));
+    try { await readFile(join(planRoot, "plan.yaml")); } catch { await writeFile(join(planRoot, "plan.yaml"), YAML.stringify({ plan_id: planId, active_revision: revision })); createdPlanMetadata = true; }
+    return { path: revisionPath, digest };
+  } catch (error) {
+    await rm(revisionPath, { recursive: true, force: true });
+    if (createdPlanMetadata) await rm(join(planRoot, "plan.yaml"), { force: true });
+    throw error;
+  }
 };
 
 export const triage = (input: { planId?: string; actual?: string; expected?: string; evidence?: string; singleGoal?: boolean; closedAcceptance?: boolean; exhaustiveScope?: boolean; singleModule?: boolean; sensitive?: boolean }): "planned" | "bug" | "feature" | "planning" => {

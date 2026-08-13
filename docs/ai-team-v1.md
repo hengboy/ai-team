@@ -253,6 +253,7 @@ ai-team uninstall [--dry-run]
 ### 9.2 子 Agent 命令
 
 ```text
+ai-team dispatch create --run-id <id> --role <role> --actor-role <role> --packet-file <file>
 ai-team dispatch claim --run-id <id> --dispatch-id <id> --role <role>
 ai-team dispatch prompt --run-id <id> --dispatch-id <id> --role <role>
 ai-team dispatch schema --run-id <id> --dispatch-id <id> --role <role>

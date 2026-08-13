@@ -116,6 +116,17 @@ test("only File Explorer may receive broad read paths including ./**", async () 
   });
 });
 
+test("dispatch creation enforces actor command and delegation authorization", async () => {
+  await withStore((store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    assert.throws(() => dispatches.create(runId, "backend-developer", dispatchPacket(), "test"), /test cannot act for coding run/);
+    assert.throws(() => dispatches.create(runId, "file-explorer", dispatchPacket(), "planning"), /planning cannot act for coding run/);
+    assert.throws(() => dispatches.create(runId, "environment-operator", dispatchPacket(), "coding"), /coding cannot delegate to environment-operator/);
+    assert.doesNotThrow(() => dispatches.create(runId, "backend-developer", dispatchPacket(), "coding"));
+  });
+});
+
 test("failed and retryable results require failure metadata and never advance the run", async () => {
   await withStore(async (store, home) => {
     for (const status of ["failed", "retryable_failure"] as const) {

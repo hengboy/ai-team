@@ -20,7 +20,7 @@ export class WorkflowService {
       allowed_write_paths: [],
       acceptance_criteria: ["Repository facts are supported by file paths", "Unknowns are explicit"],
       context: { request },
-    });
+    }, "planning");
     return { run_id: runId, dispatch_id: dispatchId };
   }
 
@@ -50,7 +50,7 @@ export class WorkflowService {
       allowed_write_paths: [],
       acceptance_criteria: ["Scope is exhaustive", "Current HEAD and test entry points are reported"],
       context: { mode: input.mode, plan_id: input.planId ?? null, revision: selectedRevision ?? null, request: input.request ?? null, implementation_base_commit: head },
-    });
+    }, "coding");
     return { run_id: runId, dispatch_id: dispatchId };
   }
 

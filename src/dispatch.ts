@@ -18,8 +18,15 @@ export interface DispatchPacket {
 export class DispatchService {
   constructor(readonly store: StateStore) {}
 
-  create(runId: string, role: Role, packet: DispatchPacket): string {
-    this.store.getRun(runId);
+  create(runId: string, role: Role, packet: DispatchPacket, actorRole?: Role): string {
+    const run = this.store.getRun(runId) as { profile: Role };
+    const actor = actorRole ?? run.profile;
+    if (actorRole && actorRole !== run.profile) throw new ValidationError(`${actorRole} cannot act for ${run.profile} run`);
+    this.assertCommandAllowed(actor, "dispatch create");
+    const definition = ROLE_MANIFEST[actor];
+    if (role !== actor && !definition.delegates.includes(role)) {
+      throw new ValidationError(`${actor} cannot delegate to ${role}`);
+    }
     if (!packet.objective.trim() || !packet.acceptance_criteria.length) throw new ValidationError("dispatch packet requires objective and acceptance criteria");
     const broad = packet.allowed_read_paths.filter((path) => path === "**" || path.endsWith("/**"));
     if (role !== "file-explorer" && (broad.length || packet.allowed_read_paths.includes("."))) throw new ValidationError(`${role} requires exact allowed_read_paths`);
@@ -110,7 +117,7 @@ export class DispatchService {
       acceptance_criteria: ["Return structured evidence", "Request support for unknown paths"],
       context: { stage: next },
     };
-    const dispatchId = this.create(runId, next as Role, packet);
+    const dispatchId = this.create(runId, next as Role, packet, run.profile as Role);
     this.store.db.prepare("UPDATE runs SET stage=?,updated_at=? WHERE run_id=?").run(next, new Date().toISOString(), runId);
     this.store.event(runId, "run.stage_changed", { stage: next, dispatchId });
   }

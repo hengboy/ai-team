@@ -62,6 +62,7 @@ export class StateStore {
   static async open(home?: string): Promise<StateStore> {
     const paths = getHomePaths(home);
     await Promise.all([paths.state, paths.backups, paths.artifacts, paths.environments, paths.schemas, paths.templates].map((path) => mkdir(path, { recursive: true })));
+    const releaseLock = lockfile.lockSync(paths.state, { realpath: false, stale: 30_000 });
     let existing = false;
     try { existing = (await stat(paths.database)).size > 0; } catch { /* new database */ }
     const backup = join(paths.backups, `state-${Date.now()}.sqlite`);
@@ -71,7 +72,6 @@ export class StateStore {
         try { await copyFile(configFile, `${backup}-${configFile.endsWith(".yaml") ? "config.yaml" : "manifest.json"}`); } catch { /* optional before first install */ }
       }
     }
-    const releaseLock = lockfile.lockSync(paths.state, { realpath: false, stale: 30_000 });
     const db = new Database(paths.database);
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");

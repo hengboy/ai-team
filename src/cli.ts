@@ -113,9 +113,9 @@ export const buildProgram = (): Command => {
   run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readFile(options.noteFile, "utf8") : undefined; store.decide(options.runId, options.decisionId, options.choice, note); output({ status: "resolved" }); }));
 
   const dispatch = program.command("dispatch");
-  dispatch.command("create").requiredOption("--run-id <id>").addOption(roleOption()).requiredOption("--packet-file <file>").action(async (options) => output(await withStore(async (store) => {
+  dispatch.command("create").requiredOption("--run-id <id>").addOption(roleOption()).requiredOption("--packet-file <file>").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).action(async (options) => output(await withStore(async (store) => {
     const packet = JSON.parse(await readFile(options.packetFile, "utf8"));
-    return { dispatch_id: new DispatchService(store).create(options.runId, options.role, packet) };
+    return { dispatch_id: new DispatchService(store).create(options.runId, options.role, packet, options.actorRole) };
   })));
   const dispatchCommand = (name: string): Command => dispatch.command(name).requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").addOption(roleOption()).hook("preAction", (_command, action) => validateCommand("dispatch.identity", { runId: action.opts().runId, dispatchId: action.opts().dispatchId, role: action.opts().role }));
   dispatchCommand("claim").action(async (options) => output(await withStore((store) => new DispatchService(store).claim(options.runId, options.dispatchId, options.role))));
