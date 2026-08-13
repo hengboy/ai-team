@@ -129,7 +129,7 @@ test("planning dispatch can be claimed, inspected, submitted, resumed, and decid
 
   const missingRequest = await cli(sandbox, ["planning", "start", "--project", sandbox.repo]);
   assert.equal(missingRequest.status, 2);
-  assert.match(missingRequest.stderr, /provide exactly one of --request-file or --request-stdin/);
+  assert.match(missingRequest.stderr, /requires exactly one of requestFile, requestStdin|provide exactly one/);
 
   const started = json<{ run_id: string; dispatch_id: string }>(
     await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]),
@@ -185,7 +185,7 @@ test("planning dispatch can be claimed, inspected, submitted, resumed, and decid
   }>(await cli(sandbox, ["run", "show", started.run_id]));
   assert.equal(shown.run.profile, "planning");
   assert.ok(shown.events.some(({ type }) => type === "dispatch.completed"));
-  assert.deepEqual(shown.dispatches.map(({ state }) => state), ["completed"]);
+  assert.deepEqual(shown.dispatches.map(({ state }) => state), ["completed", "pending"]);
 
   const decisionFile = join(sandbox.root, "decision.json");
   await writeFile(decisionFile, JSON.stringify({
@@ -202,10 +202,14 @@ test("planning dispatch can be claimed, inspected, submitted, resumed, and decid
   const resumed = json<{
     pending_dispatches: unknown[];
     pending_decision: { decision_id: string; status: string };
+    pending_operations: unknown[];
+    last_event: { type: string };
   }>(await cli(sandbox, ["run", "resume", started.run_id]));
-  assert.deepEqual(resumed.pending_dispatches, []);
+  assert.equal(resumed.pending_dispatches.length, 1);
   assert.equal(resumed.pending_decision.decision_id, decision.decision_id);
   assert.equal(resumed.pending_decision.status, "pending");
+  assert.deepEqual(resumed.pending_operations, []);
+  assert.equal(resumed.last_event.type, "run.stage_changed");
 
   const noteFile = join(sandbox.root, "note.txt");
   await writeFile(noteFile, "Keep the change narrowly scoped.\n");

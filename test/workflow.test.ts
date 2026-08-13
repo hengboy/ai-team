@@ -82,9 +82,9 @@ test("blocked review resolution maps every P0 and P1 finding exactly", async () 
     const runId = createRun(store);
     const barrier = reviews.create(runId, "c".repeat(40), false);
     const findings: ReviewResult["findings"] = [
-      { finding_id: "FIND-SEC-001", severity: "P0", title: "P0", source: "spec", evidence: "e0" },
-      { finding_id: "FIND-CODE-002", severity: "P1", title: "P1", source: "code", evidence: "e1" },
-      { finding_id: "FIND-TEST-003", severity: "P2", title: "P2", source: "test", evidence: "e2" },
+      { finding_id: "FIND-SEC-001", severity: "P0", title: "P0", source: "spec", source_file: "spec.md", source_line: 1, evidence: "e0", impact: "security", recommendation: "fix" },
+      { finding_id: "FIND-CODE-002", severity: "P1", title: "P1", source: "code", source_file: "src/a.ts", source_line: 2, evidence: "e1", impact: "bug", recommendation: "fix" },
+      { finding_id: "FIND-TEST-003", severity: "P2", title: "P2", source: "test", source_file: "test/a.ts", source_line: 3, evidence: "e2", impact: "coverage", recommendation: "test" },
     ];
     assert.equal(reviews.submit(runId, barrier.barrier_id, result("standards", findings)).state, "blocked");
 
@@ -128,7 +128,7 @@ test("review gate requires both a completed test dispatch and a passed review", 
 
     const testDispatch = new WorkflowService(store).dispatches.create(runId, "test", {
       objective: "independent verification",
-      allowed_read_paths: ["**"],
+      allowed_read_paths: ["src/a.ts"],
       allowed_write_paths: ["test/**"],
       acceptance_criteria: ["tests pass"],
       context: {},
@@ -139,7 +139,7 @@ test("review gate requires both a completed test dispatch and a passed review", 
     const unreviewedRun = createRun(store);
     const unreviewedDispatch = new WorkflowService(store).dispatches.create(unreviewedRun, "test", {
       objective: "independent verification",
-      allowed_read_paths: ["**"],
+      allowed_read_paths: ["test/a.ts"],
       allowed_write_paths: [],
       acceptance_criteria: ["tests pass"],
       context: {},

@@ -3,7 +3,7 @@ import { StateStore } from "./state.js";
 import { sha256, stableJson } from "./utils.js";
 
 export type Severity = "P0" | "P1" | "P2" | "P3";
-export interface ReviewFinding { finding_id: string; severity: Severity; title: string; source: string; evidence: string; }
+export interface ReviewFinding { finding_id: string; severity: Severity; title: string; source: string; source_file: string; source_line: number; evidence: string; impact: string; recommendation: string; }
 export interface ReviewResult { axis: "spec" | "standards"; summary: string; findings: ReviewFinding[]; }
 export interface FindingResolution { finding_id: string; change_evidence: string; verification_evidence: string; }
 
@@ -13,7 +13,7 @@ const validateFindings = (result: ReviewResult): void => {
   for (const finding of result.findings) {
     if (!/^FIND-[A-Z]+-\d{3}$/.test(finding.finding_id)) throw new ValidationError(`invalid finding id: ${finding.finding_id}`);
     if (!(["P0", "P1", "P2", "P3"] as string[]).includes(finding.severity)) throw new ValidationError(`invalid finding severity: ${finding.severity}`);
-    if (!finding.title || !finding.source || !finding.evidence) throw new ValidationError(`finding lacks source or evidence: ${finding.finding_id}`);
+    if (!finding.title || !finding.source || !finding.source_file || !Number.isInteger(finding.source_line) || finding.source_line < 1 || !finding.evidence || !finding.impact || !finding.recommendation) throw new ValidationError(`finding lacks source, location, impact, or recommendation: ${finding.finding_id}`);
     if (ids.has(finding.finding_id)) throw new ValidationError(`duplicate finding id: ${finding.finding_id}`);
     ids.add(finding.finding_id);
   }

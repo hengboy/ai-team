@@ -2,6 +2,7 @@
 import { readFile } from "node:fs/promises";
 import { Command, Option } from "commander";
 import { CONTRACT_DIGEST } from "./contracts.js";
+import { validateCommand } from "./command-contract.js";
 import { EXIT, PACKAGE_VERSION, ROLES } from "./constants.js";
 import { DispatchService } from "./dispatch.js";
 import { EnvironmentService, PLATFORMS, type Platform } from "./environment.js";
@@ -9,9 +10,12 @@ import { AiTeamError, ValidationError } from "./errors.js";
 import { commitPlanningRevision, repositoryIdentity, worktreeStatus } from "./git.js";
 import { GitOrchestrator } from "./git-orchestrator.js";
 import { ScopeGate } from "./gates.js";
+import { runnableTaskBatches, type TaskDefinition } from "./tasks.js";
 import { writeRevision, nextPlanState, type RevisionDocuments } from "./planning.js";
 import { initializeProject } from "./project.js";
 import { ReviewService, type FindingResolution, type ReviewResult } from "./review.js";
+import { ResearchService } from "./research-service.js";
+import type { ResearchConclusion } from "./research.js";
 import { ROLE_MANIFEST_DIGEST } from "./roles.js";
 import { StateStore } from "./state.js";
 import { WorkflowService } from "./workflow.js";
@@ -43,6 +47,7 @@ export const buildProgram = (): Command => {
 
   const planning = program.command("planning");
   requestOptions(planning.command("start").requiredOption("--project <path>")).action(async (options) => {
+    validateCommand("planning.start", { project: options.project, requestFile: options.requestFile, requestStdin: options.requestStdin });
     const request = await WorkflowService.requestFrom(options.requestFile, options.requestStdin);
     output(await withStore((store) => new WorkflowService(store).planningStart(options.project, request)));
   });
@@ -79,10 +84,16 @@ export const buildProgram = (): Command => {
       return { state: "ready", plan_commit: commit };
     }));
   });
+  const tasks = planning.command("tasks");
+  tasks.command("validate").requiredOption("--file <json>").action(async ({ file }) => {
+    const definitions = JSON.parse(await readFile(file, "utf8")) as TaskDefinition[];
+    output({ valid: true, batches: runnableTaskBatches(definitions) });
+  });
 
   const coding = program.command("coding");
   requestOptions(coding.command("start").requiredOption("--project <path>").addOption(new Option("--mode <mode>").choices(["planned", "bug", "feature"]).makeOptionMandatory()).option("--plan-id <id>").option("--revision <nnn>"))
     .action(async (options) => {
+      validateCommand("coding.start", { project: options.project, mode: options.mode, planId: options.planId, revision: options.revision, requestFile: options.requestFile, requestStdin: options.requestStdin });
       const direct = options.mode !== "planned";
       if (direct && !options.requestFile && !options.requestStdin || !direct && (options.requestFile || options.requestStdin)) throw new ValidationError("planned forbids request input; bug/feature require exactly one request input");
       if (direct && (options.planId || options.revision)) throw new ValidationError("bug/feature forbids plan-id and revision");
@@ -92,7 +103,13 @@ export const buildProgram = (): Command => {
 
   const run = program.command("run");
   run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId), decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId), dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId) }))));
-  run.command("resume").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), pending_dispatches: store.db.prepare("SELECT dispatch_id,role,state FROM dispatches WHERE run_id=? AND state!='completed'").all(runId), pending_decision: store.db.prepare("SELECT * FROM decisions WHERE run_id=? AND status='pending'").get(runId) ?? null }))));
+  run.command("resume").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({
+    run: store.getRun(runId),
+    pending_dispatches: store.db.prepare("SELECT dispatch_id,role,state FROM dispatches WHERE run_id=? AND state!='completed'").all(runId),
+    pending_decision: store.db.prepare("SELECT * FROM decisions WHERE run_id=? AND status='pending'").get(runId) ?? null,
+    pending_operations: store.db.prepare("SELECT operation_id,kind,state FROM operations WHERE run_id=? AND state='pending'").all(runId),
+    last_event: store.db.prepare("SELECT type,payload_json,created_at FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT 1").get(runId) ?? null,
+  }))));
   run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readFile(options.noteFile, "utf8") : undefined; store.decide(options.runId, options.decisionId, options.choice, note); output({ status: "resolved" }); }));
 
   const dispatch = program.command("dispatch");
@@ -100,7 +117,7 @@ export const buildProgram = (): Command => {
     const packet = JSON.parse(await readFile(options.packetFile, "utf8"));
     return { dispatch_id: new DispatchService(store).create(options.runId, options.role, packet) };
   })));
-  const dispatchCommand = (name: string): Command => dispatch.command(name).requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").addOption(roleOption());
+  const dispatchCommand = (name: string): Command => dispatch.command(name).requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").addOption(roleOption()).hook("preAction", (_command, action) => validateCommand("dispatch.identity", { runId: action.opts().runId, dispatchId: action.opts().dispatchId, role: action.opts().role }));
   dispatchCommand("claim").action(async (options) => output(await withStore((store) => new DispatchService(store).claim(options.runId, options.dispatchId, options.role))));
   dispatchCommand("prompt").action(async (options) => { process.stdout.write(`${await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role))}\n`); });
   dispatchCommand("schema").action(async (options) => output(await withStore((store) => new DispatchService(store).schema(options.runId, options.dispatchId, options.role))));
@@ -109,11 +126,19 @@ export const buildProgram = (): Command => {
 
   const gitCommand = program.command("git");
   gitCommand.command("status").requiredOption("--run-id <id>").action(async ({ runId }) => output(await withStore(async (store) => { const run = store.getRun(runId); const repo = store.db.prepare("SELECT * FROM repositories WHERE repo_id=?").get(run.repo_id); return { run_id: runId, repository: repo, worktree: await worktreeStatus((repo as any).project_path) }; })));
-  gitCommand.command("prepare").requiredOption("--run-id <id>").option("--task-id <id>", "task id or implementation", "implementation").option("--integration").option("--base-commit <sha>").action(async (options) => output(await withStore((store) => options.integration ? new GitOrchestrator(store).prepareIntegration(options.runId) : new GitOrchestrator(store).prepareTask(options.runId, options.taskId, options.baseCommit))));
+  gitCommand.command("prepare").requiredOption("--run-id <id>").option("--task-id <id>", "task id or implementation", "implementation").option("--integration").option("--base-commit <sha>").option("--depends-on <worktree-id>").action(async (options) => output(await withStore((store) => options.integration ? new GitOrchestrator(store).prepareIntegration(options.runId) : new GitOrchestrator(store).prepareTask(options.runId, options.taskId, options.baseCommit, options.dependsOn))));
   gitCommand.command("commit").requiredOption("--run-id <id>").requiredOption("--worktree-id <id>").requiredOption("--message <message>").requiredOption("--scope <paths>", "comma-separated repository-relative scopes").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).commit(options.runId, options.worktreeId, options.message, options.scope.split(",")))));
   gitCommand.command("merge-task").requiredOption("--run-id <id>").requiredOption("--integration-id <id>").requiredOption("--task-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).mergeTask(options.runId, options.integrationId, options.taskId)) }));
+  gitCommand.command("continue-conflict").requiredOption("--run-id <id>").requiredOption("--integration-id <id>").requiredOption("--scope <paths>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).continueConflict(options.runId, options.integrationId, options.scope.split(","))) }));
   gitCommand.command("integrate").requiredOption("--run-id <id>").requiredOption("--integration-id <id>").action(async (options) => output({ commit: await withStore(async (store) => { new ReviewService(store).assertGate(options.runId); return new GitOrchestrator(store).integrateTarget(options.runId, options.integrationId); }) }));
-  gitCommand.command("reconcile").requiredOption("--run-id <id>").action(async ({ runId }) => output(await withStore((store) => new GitOrchestrator(store).reconcile(runId))));
+  gitCommand.command("reconcile").requiredOption("--run-id <id>").option("--operation-id <id>").option("--state <state>").option("--evidence-file <file>").action(async (options) => output(await withStore(async (store) => {
+    if (options.operationId) {
+      if (!options.state || !options.evidenceFile) throw new ValidationError("reconcile mutation requires --state and --evidence-file");
+      const evidence = JSON.parse(await readFile(options.evidenceFile, "utf8"));
+      store.reconcileOperation(options.operationId, options.state, evidence);
+    }
+    return new GitOrchestrator(store).reconcile(options.runId);
+  })));
   gitCommand.command("cleanup").requiredOption("--run-id <id>").action(async ({ runId }) => output({ removed: await withStore((store) => new GitOrchestrator(store).cleanup(runId)) }));
 
   const scope = program.command("scope");
@@ -125,13 +150,19 @@ export const buildProgram = (): Command => {
     return { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation) };
   })));
 
+  const research = program.command("research");
+  research.command("archive").requiredOption("--run-id <id>").requiredOption("--project <path>").requiredOption("--topic <topic>").requiredOption("--report-file <file>").action(async (options) => output(await withStore(async (store) => {
+    const conclusions = JSON.parse(await readFile(options.reportFile, "utf8")) as ResearchConclusion[];
+    return new ResearchService(store).archive(options.runId, options.project, options.topic, conclusions);
+  })));
+
   const review = program.command("review");
-  review.command("create").requiredOption("--run-id <id>").requiredOption("--revision-sha <sha>").option("--formal").action(async (options) => output(await withStore((store) => new ReviewService(store).create(options.runId, options.revisionSha, options.formal))));
+  review.command("create").requiredOption("--run-id <id>").requiredOption("--revision-sha <sha>").option("--formal").action(async (options) => { validateCommand("review.create", { runId: options.runId, revisionSha: options.revisionSha, formal: options.formal }); output(await withStore((store) => new ReviewService(store).create(options.runId, options.revisionSha, options.formal))); });
   review.command("submit").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").requiredOption("--result-file <file>").action(async (options) => output(await withStore(async (store) => new ReviewService(store).submit(options.runId, options.barrierId, JSON.parse(await readFile(options.resultFile, "utf8")) as ReviewResult))));
   review.command("resolve").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").requiredOption("--resolution-file <file>").action(async (options) => output(await withStore(async (store) => new ReviewService(store).resolve(options.runId, options.barrierId, JSON.parse(await readFile(options.resolutionFile, "utf8")) as FindingResolution[]))));
   review.command("status").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").action(async (options) => output(await withStore((store) => new ReviewService(store).status(options.runId, options.barrierId))));
 
-  program.command("install").option("--platform <list>", "comma-separated platforms", platformList).option("--dry-run").action(async (options) => { const service = new EnvironmentService(); output(await service.generate(await service.active(), options.platform, options.dryRun)); });
+  program.command("install").option("--platform <list>", "comma-separated platforms", platformList).option("--dry-run").action(async (options) => { const service = new EnvironmentService(); const environment = await service.load(await service.active()); const platforms = options.platform ?? environment.platforms; const versions = await service.validateClientVersions(platforms); output({ versions, plan: await service.generate(environment.name, platforms, options.dryRun) }); });
   const env = program.command("env");
   env.command("list").action(async () => output(await new EnvironmentService().list()));
   env.command("show").argument("<name>").option("--resolved").action(async (name, options) => { const service = new EnvironmentService(); const value = await service.load(name); output(options.resolved ? { environment: value, resolved: (await import("./environment.js")).resolveEnvironment(value) } : value); });

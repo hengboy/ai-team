@@ -16,7 +16,7 @@ export class WorkflowService {
     const runId = this.store.createRun({ repoId: repo.repoId, profile: "planning", mode: "planned", targetBranch: branch, request });
     const dispatchId = this.dispatches.create(runId, "file-explorer", {
       objective: "Explore the repository for the planning request and return entry points, constraints, risks, and test locations.",
-      allowed_read_paths: ["**"],
+      allowed_read_paths: ["."],
       allowed_write_paths: [],
       acceptance_criteria: ["Repository facts are supported by file paths", "Unknowns are explicit"],
       context: { request },
@@ -46,7 +46,7 @@ export class WorkflowService {
     const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}) });
     const dispatchId = this.dispatches.create(runId, "file-explorer", {
       objective: "Re-explore the repository at the implementation base and return exact implementation and test scope.",
-      allowed_read_paths: ["**"],
+      allowed_read_paths: ["."],
       allowed_write_paths: [],
       acceptance_criteria: ["Scope is exhaustive", "Current HEAD and test entry points are reported"],
       context: { mode: input.mode, plan_id: input.planId ?? null, revision: selectedRevision ?? null, request: input.request ?? null, implementation_base_commit: head },

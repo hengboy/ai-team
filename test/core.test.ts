@@ -25,8 +25,10 @@ const withStore = async (callback: (store: StateStore, home: string) => Promise<
   }
 };
 
-const createRun = (store: StateStore): string =>
-  store.createRun({ repoId: "repo-1", profile: "coding", mode: "feature", request: "test request" });
+const createRun = (store: StateStore): string => {
+  store.registerRepository("repo-1", "/tmp/repo-1/.git", "/tmp/repo-1");
+  return store.createRun({ repoId: "repo-1", profile: "coding", mode: "feature", request: "test request" });
+};
 
 const validResult = (runId = RUN_ID, dispatchId = DISPATCH_ID) => ({
   ...createResultTemplate(runId, dispatchId, "backend-developer"),
@@ -100,7 +102,7 @@ test("state migration is recorded once and survives reopening", async () => {
   try {
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }],
     );
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
@@ -111,7 +113,7 @@ test("state migration is recorded once and survives reopening", async () => {
     store = await StateStore.open(home);
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }],
     );
   } finally {
     store.close();
@@ -187,7 +189,7 @@ test("dispatch claim is idempotent and enforces run and role identity", async ()
     const dispatches = new DispatchService(store);
     const packet: DispatchPacket = {
       objective: "Implement the core",
-      allowed_read_paths: ["src/**"],
+      allowed_read_paths: ["src/a.ts"],
       allowed_write_paths: ["src/core.ts"],
       acceptance_criteria: ["Tests pass"],
       context: { task: "TASK-001" },

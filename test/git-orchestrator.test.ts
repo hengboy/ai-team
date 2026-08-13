@@ -154,6 +154,19 @@ test("integration uses no-ff merges and cleanup removes owned worktrees", async 
   }
 });
 
+test("conflict continuation refuses ordinary staged changes without MERGE_HEAD", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun();
+    const integration = await fixture.orchestrator.prepareIntegration(runId);
+    await writeFile(join(integration.path, "README.md"), "ordinary change\n");
+    await assert.rejects(
+      fixture.orchestrator.continueConflict(runId, integration.worktree_id, ["README.md"]),
+      /no merge conflict in progress/,
+    );
+  } finally { await fixture.dispose(); }
+});
+
 test("commit rejects sensitive files and symlinks escaping the worktree", async (context) => {
   await context.test("sensitive path", async () => {
     const fixture = await createFixture();

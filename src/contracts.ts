@@ -110,9 +110,20 @@ export const COMMAND_CONTRACT = {
     public: ["init", "install", "status", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"],
     agent: ["planning revision create", "planning revision transition", "planning revision commit", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch validate", "dispatch submit", "decision create", "scope check", "git status", "git prepare", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "review create", "review submit", "review resolve", "review status"],
   },
+  command_specs: {
+    "planning.start": { required: ["project"], optional: ["requestFile", "requestStdin"] },
+    "coding.start": { required: ["project", "mode"], optional: ["planId", "revision", "requestFile", "requestStdin"] },
+    "dispatch.identity": { required: ["runId", "dispatchId", "role"], optional: [] },
+    "review.create": { required: ["runId", "revisionSha"], optional: ["formal"] },
+  },
 };
 
 export const CONTRACT_DIGEST = sha256(stableJson(COMMAND_CONTRACT));
+
+export const resultSchemaForRole = (role: Role): Record<string, unknown> => ({
+  ...resultEnvelopeSchema,
+  properties: { ...resultEnvelopeSchema.properties, payload: ROLE_PAYLOAD_SCHEMAS[role] },
+});
 
 export const createResultTemplate = (runId: string, dispatchId: string, role: Role): ResultEnvelope => ({
   schema_version: SCHEMA_VERSION,

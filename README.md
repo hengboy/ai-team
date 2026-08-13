@@ -73,6 +73,11 @@ restore, and uninstall occur only after an explicit user command. Managed files
 are staged and validated before replacement; changed files block destructive
 removal, and backups require an explicit `backup restore` command.
 
+`install` requires client versions recorded by an earlier explicit probe.
+Versions below the configured minimum block installation; versions above the
+verified range produce a warning. Unsupported hard platform capabilities block
+rendering instead of being silently downgraded.
+
 ## Agent Commands
 
 Generated main agents use `dispatch`, `decision`, `planning revision`, `git`,
@@ -84,6 +89,12 @@ Formal plans require one Spec and one Standards review for each frozen revision.
 Direct bug and feature runs require one Standards review. P0 and P1 findings
 must all have change and verification evidence before integration. Reviews are
 not rerun after repair.
+
+Dispatch submission advances the persisted run stage and creates its successor
+exactly once. File Explorer may receive the repository root; downstream packets
+contain the exact paths returned by File Explorer. Planning Task graphs are
+validated for IDs, dependencies, cycles, coverage fields, and overlapping write
+scopes before safe execution batches are produced.
 
 Run `ai-team <command> --help` for exact parameters. `ai-team contract` prints
 the contract and role-manifest digests used to detect drift.

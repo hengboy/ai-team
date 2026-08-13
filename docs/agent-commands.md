@@ -12,6 +12,12 @@ The generated `planning` and `coding` agents use this sequence:
 8. Coding resolves every P0/P1 with change and verification evidence.
 9. Git Operator performs the final no-fast-forward target merge and safe cleanup.
 
+The CLI automatically advances persisted stages after successful dispatches.
+Planning validates Task dependency graphs before worktree creation. On merge
+conflict, the assigned developer resolves only allowed paths, Git Operator
+continues the merge as a new commit, and Test runs the complete final gate
+without opening a second review barrier.
+
 Commands that create or mutate state are internal Agent commands even though
 they are visible in CLI help. Platform renderers include only commands allowed
 by the role manifest. Ordinary leaf agents cannot create dispatches or invoke

@@ -59,10 +59,16 @@ export const environmentSchema = {
 } as const;
 const validateEnvironmentSchema = new Ajv({ allErrors: true, strict: false }).compile(environmentSchema);
 
-export const CLIENT_VERSIONS: Record<Platform, { command: string; minimum: string; verified: string }> = {
+export const CLIENT_VERSIONS: Record<Platform, { command: string; minimum: string; verified: string; detected_version?: string }> = {
   codex: { command: "codex", minimum: "0.145.0", verified: "0.145.0" },
   claude: { command: "claude", minimum: "2.1.229", verified: "2.1.229" },
   opencode: { command: "opencode", minimum: "1.18.18", verified: "1.18.18" },
+};
+
+export const PLATFORM_CAPABILITIES: Record<Platform, Record<string, "mechanical" | "instruction" | "unsupported">> = {
+  codex: { model: "mechanical", reasoning: "mechanical", command_scope: "instruction", read_scope: "instruction", write_scope: "instruction" },
+  claude: { model: "mechanical", reasoning: "mechanical", command_scope: "instruction", read_scope: "instruction", write_scope: "instruction" },
+  opencode: { model: "mechanical", reasoning: "mechanical", command_scope: "instruction", read_scope: "instruction", write_scope: "instruction" },
 };
 
 export const DEFAULT_ENVIRONMENTS: EnvironmentFile[] = [
@@ -117,6 +123,8 @@ export const renderAgents = (environment: EnvironmentFile): Map<string, string> 
   const files = new Map<string, string>();
   for (const role of ROLES) {
     for (const platform of environment.platforms) {
+      const unsupported = Object.entries(PLATFORM_CAPABILITIES[platform]).filter(([, level]) => level === "unsupported").map(([capability]) => capability);
+      if (unsupported.length) throw new ValidationError(`${platform} has unsupported hard capabilities`, unsupported);
       const ext = platform === "codex" ? "toml" : "md";
       files.set(`${platform}/agents/${role}.${ext}`, renderBody(role, platform, resolved[role][platform], environment.name));
     }
@@ -144,7 +152,7 @@ const replaceManagedBlock = (source: string, block: string | null): string => {
 };
 
 interface ManifestFile { path: string; digest: string; kind: "agent" | "instructions"; }
-interface EnvironmentManifest { environment: string; files: ManifestFile[]; }
+interface EnvironmentManifest { environment: string; files: ManifestFile[]; changes?: Array<{ type: "deleted" | "renamed"; from: string; to?: string }>; }
 export interface GenerationPlan { writes: Array<{ path: string; content: string; kind: "agent" | "instructions" }>; backups: Array<{ source: string; destination: string }>; removals: string[]; blocked: string[]; }
 
 export class EnvironmentService {
@@ -177,6 +185,20 @@ export class EnvironmentService {
   async validate(name: string): Promise<{ name: string; roles: number; platforms: number; digest: string }> {
     const environment = await this.load(name);
     return { name, roles: ROLES.length, platforms: environment.platforms.length, digest: sha256(stableJson(resolveEnvironment(environment))) };
+  }
+
+  async validateClientVersions(platforms: Platform[]): Promise<Array<{ platform: Platform; status: string; version?: string }>> {
+    await this.bootstrap();
+    const config = YAML.parse(await readFile(join(this.paths.root, "config.yaml"), "utf8")) as { client_versions: Record<Platform, { minimum: string; verified: string; detected_version?: string }> };
+    const selected = platforms.map((platform) => {
+      const value = config.client_versions[platform]; const version = value.detected_version;
+      if (!version) return { platform, status: "missing" };
+      if (semver.lt(version, value.minimum)) return { platform, status: "blocked", version };
+      return { platform, status: semver.gt(version, value.verified) ? "warning-unverified" : "supported", version };
+    });
+    const blocked = selected.filter((item) => item.status === "blocked" || item.status === "missing" || item.status === "unknown-version");
+    if (blocked.length) throw new ValidationError("client version gate blocked generation", blocked);
+    return selected;
   }
 
   async plan(name: string, selected?: Platform[]): Promise<GenerationPlan> {
@@ -264,7 +286,11 @@ export class EnvironmentService {
       const config = YAML.parse(await readFile(configPath, "utf8")); config.active_environment = name;
       const stagedManifest = join(stage, "manifest");
       const stagedConfig = join(stage, "config");
-      await writeFile(stagedManifest, `${JSON.stringify({ environment: name, files: plan.writes.map((item) => ({ path: item.path, digest: sha256(item.content), kind: item.kind })) }, null, 2)}\n`, { mode: 0o600 });
+      const previousManifest = controlBackups.get(manifestPath) ? JSON.parse(controlBackups.get(manifestPath)!) as EnvironmentManifest : undefined;
+      const previousPaths = new Set(previousManifest?.files.map((file) => file.path) ?? []);
+      const nextPaths = new Set(plan.writes.map((item) => item.path));
+      const changes = [...previousPaths].filter((path) => !nextPaths.has(path)).map((path) => ({ type: "deleted" as const, from: path }));
+      await writeFile(stagedManifest, `${JSON.stringify({ environment: name, files: plan.writes.map((item) => ({ path: item.path, digest: sha256(item.content), kind: item.kind })), changes }, null, 2)}\n`, { mode: 0o600 });
       await writeFile(stagedConfig, YAML.stringify(config), { mode: 0o600 });
       await rename(stagedManifest, manifestPath);
       await rename(stagedConfig, configPath);
@@ -326,7 +352,7 @@ export class EnvironmentService {
 
   async doctor(probe = false): Promise<Array<{ platform: Platform; status: string; version?: string }>> {
     if (!probe) return PLATFORMS.map((platform) => ({ platform, status: "not-probed" }));
-    return Promise.all(PLATFORMS.map(async (platform) => {
+    const results = await Promise.all(PLATFORMS.map(async (platform) => {
       try {
         const { stdout } = await execFileAsync(CLIENT_VERSIONS[platform].command, ["--version"]);
         const version = stdout.match(/\d+\.\d+\.\d+/)?.[0];
@@ -335,5 +361,10 @@ export class EnvironmentService {
         return { platform, status: semver.gt(version, CLIENT_VERSIONS[platform].verified) ? "warning-unverified" : "supported", version };
       } catch { return { platform, status: "missing" }; }
     }));
+    const configPath = join(this.paths.root, "config.yaml");
+    const config = YAML.parse(await readFile(configPath, "utf8"));
+    for (const result of results) if (result.version) config.client_versions[result.platform].detected_version = result.version;
+    await writeFile(configPath, YAML.stringify(config), { mode: 0o600 });
+    return results;
   }
 }

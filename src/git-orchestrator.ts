@@ -6,6 +6,7 @@ import { assertWritablePath, canonicalizeInside, pathMatchesScope } from "./secu
 import { StateStore } from "./state.js";
 import { sha256, toPosix } from "./utils.js";
 import { ScopeGate } from "./gates.js";
+import { DispatchService } from "./dispatch.js";
 
 export interface PreparedWorktree { worktree_id: string; branch: string; path: string; base_commit: string; reused: boolean; }
 
@@ -24,14 +25,19 @@ export class GitOrchestrator {
     return { root: repository.project_path, run };
   }
 
-  async prepareTask(runId: string, taskId = "implementation", baseCommit?: string): Promise<PreparedWorktree> {
+  async prepareTask(runId: string, taskId = "implementation", baseCommit?: string, dependsOn?: string): Promise<PreparedWorktree> {
     const { root, run } = this.repositoryForRun(runId);
     if ((["bug", "feature"] as string[]).includes(run.mode)) new ScopeGate(this.store).assertPassed(runId, "pre_write");
     const plan = safeSegment(run.plan_id ?? `direct-${runId.slice(-8).toLowerCase()}`);
     const task = safeSegment(taskId.toLowerCase());
     const branch = `task/${plan}/${task}`;
     const path = join(root, ".worktree", "tasks", plan, task);
-    const base = baseCommit ?? run.base_commit;
+    let base = baseCommit ?? run.base_commit;
+    if (dependsOn) {
+      const dependency = this.worktree(runId, dependsOn);
+      if (dependency.state !== "active") throw new ValidationError("dependent Task worktree is not active");
+      base = await currentHead(dependency.path);
+    }
     if (!/^[a-f0-9]{40}$/.test(base)) throw new ValidationError("worktree base must be a 40-character commit SHA");
     const key = `worktree:create:${runId}:${branch}:${base}`;
     const operation = this.store.beginOperation("git.worktree.create", key, { branch, path, base }, runId);
@@ -144,6 +150,34 @@ export class GitOrchestrator {
     const commit = await mergeNoFastForward(root, integration.branch, `Integrate AI Team run ${runId}`);
     this.store.finishOperation(operation.operationId, { commit });
     this.store.db.prepare("UPDATE runs SET state='completed',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+    return commit;
+  }
+
+  async continueConflict(runId: string, integrationId: string, allowedScopes: string[]): Promise<string> {
+    const integration = this.worktree(runId, integrationId);
+    try { await git(integration.path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]); }
+    catch { throw new ValidationError("worktree has no merge conflict in progress"); }
+    const unresolved = (await git(integration.path, ["diff", "--name-only", "--diff-filter=U"])).stdout.split("\n").filter(Boolean);
+    if (unresolved.length) throw new ValidationError("merge still has unresolved paths", unresolved);
+    const changed = (await git(integration.path, ["status", "--porcelain=v1", "-z"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3));
+    if (!changed.length) throw new ValidationError("no conflict resolution changes are present");
+    for (const path of changed) if (!pathMatchesScope(path, allowedScopes)) throw new ValidationError(`conflict resolution changed path outside allowed scope: ${path}`);
+    const operation = this.store.beginOperation("git.merge.continue", `merge-continue:${runId}:${integrationId}:${sha256(changed.sort().join("\n"))}`, { changed }, runId);
+    if (operation.reused) {
+      if (operation.state !== "completed") throw new ValidationError("merge continuation side effect is unknown; reconcile required");
+      return currentHead(integration.path);
+    }
+    await git(integration.path, ["add", "--", ...changed]);
+    await git(integration.path, ["commit", "--no-edit"]);
+    const commit = await currentHead(integration.path);
+    this.store.finishOperation(operation.operationId, { commit, changed });
+    new DispatchService(this.store).create(runId, "test", {
+      objective: "Run the complete final verification after conflict resolution.",
+      allowed_read_paths: ["package.json", "test"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["All final checks pass", "No review is restarted"],
+      context: { conflict_resolution_commit: commit },
+    });
     return commit;
   }
 

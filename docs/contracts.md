@@ -45,3 +45,8 @@ side effects can only proceed through reconciliation.
 The frozen dispatch prompt is a generated task prompt, not a saved user/model
 conversation or chain of thought. It is retained with the packet, schema,
 template, and result artifact for run recovery and audit.
+
+Every dispatch schema replaces the generic payload with the selected role's
+strict payload schema. Every review finding includes a source, file, line,
+evidence, impact, and recommendation. Successful dispatch submission advances
+the durable run stage once; failure statuses do not create a successor.
