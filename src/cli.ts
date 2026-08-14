@@ -15,6 +15,7 @@ import { ScopeGate } from "./gates.js";
 import { runnableTaskBatches, validateTaskPreview, type TaskDefinition } from "./tasks.js";
 import { writeRevision, nextPlanState, type RevisionDocuments } from "./planning.js";
 import { initializeProject } from "./project.js";
+import { updateProjectContext, validateProjectContext } from "./context.js";
 import { ReviewService, type FindingResolution, type ReviewResult } from "./review.js";
 import { ResearchService } from "./research-service.js";
 import type { ResearchConclusion } from "./research.js";
@@ -63,7 +64,20 @@ export const buildProgram = (): Command => {
   const program = new Command().name("ai-team").description("Local AI coding team workflow orchestration").version(PACKAGE_VERSION).option("--human", "render human-readable output");
   program.configureOutput({ outputError: (text) => process.stderr.write(text) });
 
-  program.command("init").argument("<project>").option("--yes", "confirm a patch to a dirty .gitignore").action(async (project, options) => output(await initializeProject(project, options.yes)));
+  program.command("init").argument("<project>").option("--yes", "confirm patches to dirty project files").action(async (project, options) => output(await initializeProject(project, options.yes)));
+  const context = program.command("context");
+  context.command("update").requiredOption("--project <path>").requiredOption("--context-file <json>").action(async (options) => {
+    validateCommand("context.update", { project: options.project, contextFile: options.contextFile });
+    const source = JSON.parse(await readSafeFile(options.contextFile)) as Record<string, unknown>;
+    const value = source.payload && typeof source.payload === "object" && !Array.isArray(source.payload)
+      ? (source.payload as Record<string, unknown>).project_context ?? source
+      : source;
+    output(await updateProjectContext(options.project, value));
+  });
+  context.command("validate").requiredOption("--project <path>").action(async (options) => {
+    validateCommand("context.validate", { project: options.project });
+    output(await validateProjectContext(options.project));
+  });
   program.command("status").option("--project <path>", "project path", process.cwd()).action(async ({ project }) => {
     const repo = await repositoryIdentity(project); const status = await worktreeStatus(repo.root);
     output({ repository: repo, worktree: status, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST });

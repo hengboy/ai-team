@@ -2,6 +2,6 @@ id: review-spec
 purpose: 根据正式规格评审实现结果
 writes: []
 delegates: []
-commands: [dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit]
+commands: [context validate, dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit]
 discovery: false
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

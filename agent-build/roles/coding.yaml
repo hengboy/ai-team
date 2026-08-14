@@ -4,6 +4,7 @@ writes: []
 delegates: [file-explorer, frontend-developer, backend-developer, test, git-operator, code-reviewer, researcher]
 commands:
   - coding start
+  - context validate
   - dispatch create
   - dispatch claim
   - dispatch prompt

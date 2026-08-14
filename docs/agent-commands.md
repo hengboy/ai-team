@@ -27,3 +27,9 @@ Repository discovery is exclusive to File Explorer. Other agents use packet
 paths and request support when they discover an unknown dependency. Researcher
 receives project context from File Explorer and writes cited conclusions as
 `fact`, `inference`, or `recommendation`; it does not search the target repo.
+
+File Explorer also returns `payload.project_context`, including the project
+shape, four managed MEMORY entry groups, module boundaries, navigation entries,
+and maintenance status. Developers update the target project's `MEMORY.md` and
+`.ai-work-flow/index/feature-navigation.md` with `context update`; Test and
+review roles validate them before completion.

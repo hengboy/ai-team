@@ -3,6 +3,7 @@ import type { ErrorObject } from "ajv";
 import { RESULT_STATUSES, ROLES, SCHEMA_VERSION, type ResultStatus, type Role } from "./constants.js";
 import { COMMAND_CONTRACT_BASE } from "./command-contract.js";
 import { sha256, stableJson } from "./utils.js";
+import { isSensitivePath } from "./security.js";
 
 export interface ResultEnvelope {
   schema_version: number;
@@ -21,6 +22,23 @@ export interface ResultEnvelope {
   payload: Record<string, unknown>;
   failure_class?: string;
   side_effect_state?: "none" | "completed" | "unknown";
+}
+
+export interface ProjectContext {
+  project_shape: string;
+  memory: {
+    domain_terms: string[];
+    repository_constraints: string[];
+    responsibilities: string[];
+    module_boundaries: string[];
+  };
+  navigation: Array<{
+    feature: string;
+    keywords: string[];
+    entry_paths: string[];
+    module_boundary: string;
+  }>;
+  maintenance: { status: string; paths: string[] };
 }
 
 export const resultEnvelopeSchema = {
@@ -62,6 +80,8 @@ const ajv = new Ajv({ allErrors: true, strict: false });
 const validateResult = ajv.compile<ResultEnvelope>(resultEnvelopeSchema);
 
 const stringArray = { type: "array", items: { type: "string" } } as const;
+const contextText = { type: "string", minLength: 1, pattern: "^(?!\\s*$)[^\\r\\n]+$" } as const;
+const contextStringArray = { type: "array", items: contextText } as const;
 const evidenceArray = { type: "array", minItems: 1, items: { type: "object", additionalProperties: false, required: ["command", "outcome"], properties: { command: { type: "string" }, outcome: { type: "string" } } } } as const;
 const decisionSchema = {
   type: ["object", "null"],
@@ -86,10 +106,50 @@ const decisionSchema = {
     recommendation: { type: "string", minLength: 1 },
   },
 } as const;
+export const projectContextSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["project_shape", "memory", "navigation", "maintenance"],
+  properties: {
+    project_shape: contextText,
+    memory: {
+      type: "object",
+      additionalProperties: false,
+      required: ["domain_terms", "repository_constraints", "responsibilities", "module_boundaries"],
+      properties: {
+        domain_terms: contextStringArray,
+        repository_constraints: contextStringArray,
+        responsibilities: contextStringArray,
+        module_boundaries: contextStringArray,
+      },
+    },
+    navigation: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["feature", "keywords", "entry_paths", "module_boundary"],
+        properties: {
+          feature: contextText,
+          keywords: { ...contextStringArray, minItems: 1 },
+          entry_paths: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", minLength: 1, pattern: "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$" } },
+          module_boundary: contextText,
+        },
+      },
+    },
+    maintenance: {
+      type: "object",
+      additionalProperties: false,
+      required: ["status", "paths"],
+      properties: { status: contextText, paths: { type: "array", uniqueItems: true, items: { type: "string", minLength: 1, pattern: "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$" } } },
+    },
+  },
+} as const;
+const validateProjectContextInput = ajv.compile<ProjectContext>(projectContextSchema);
 export const ROLE_PAYLOAD_SCHEMAS: Record<Role, object> = {
   planning: { type: "object", additionalProperties: false, required: ["actions", "stage", "pending_questions", "decision"], properties: { actions: stringArray, stage: { enum: ["requirements", "requirements_confirmed", "spec_ready", "plan_ready", "tasks_preview", "ready"] }, pending_questions: { type: "array", maxItems: 1, items: { type: "string", minLength: 1 } }, decision: decisionSchema } },
   coding: { type: "object", additionalProperties: false, required: ["actions"], properties: { actions: stringArray, triage: { enum: ["planned", "bug", "feature", "planning"] } } },
-  "file-explorer": { type: "object", additionalProperties: false, required: ["allowed_read_paths", "entry_points", "test_commands"], properties: { allowed_read_paths: stringArray, entry_points: stringArray, test_commands: stringArray } },
+  "file-explorer": { type: "object", additionalProperties: false, required: ["allowed_read_paths", "entry_points", "test_commands", "project_context"], properties: { allowed_read_paths: stringArray, entry_points: stringArray, test_commands: stringArray, project_context: projectContextSchema } },
   "frontend-developer": { type: "object", additionalProperties: false, required: ["modified_paths", "self_tests"], properties: { modified_paths: stringArray, self_tests: evidenceArray } },
   "backend-developer": { type: "object", additionalProperties: false, required: ["modified_paths", "self_tests"], properties: { modified_paths: stringArray, self_tests: evidenceArray } },
   test: { type: "object", additionalProperties: false, required: ["checks"], properties: { checks: evidenceArray } },
@@ -101,6 +161,16 @@ export const ROLE_PAYLOAD_SCHEMAS: Record<Role, object> = {
   researcher: { type: "object", additionalProperties: false, required: ["report_path", "conclusion_count"], properties: { report_path: { type: "string" }, conclusion_count: { type: "integer", minimum: 1 } } },
 };
 const validateRolePayload = Object.fromEntries(ROLES.map((role) => [role, ajv.compile(ROLE_PAYLOAD_SCHEMAS[role])])) as Record<Role, ReturnType<Ajv["compile"]>>;
+
+export const checkProjectContext = (value: unknown): { valid: true; value: ProjectContext } | { valid: false; errors: Array<{ path: string; message: string }> } => {
+  if (!validateProjectContextInput(value)) return { valid: false, errors: formatSchemaErrors(validateProjectContextInput.errors) };
+  const sensitive = [
+    ...value.navigation.flatMap((entry) => entry.entry_paths),
+    ...value.maintenance.paths,
+  ].filter((path) => isSensitivePath(path));
+  if (sensitive.length) return { valid: false, errors: sensitive.map((path) => ({ path: "/navigation", message: `sensitive project context path is forbidden: ${path}` })) };
+  return { valid: true, value };
+};
 
 export const formatSchemaErrors = (errors: ErrorObject[] | null | undefined): Array<{ path: string; message: string }> =>
   (errors ?? []).map((error) => ({ path: error.instancePath || "/", message: error.message ?? "invalid value" }));
@@ -114,6 +184,16 @@ export const checkResultEnvelope = (value: unknown): { valid: true; value: Resul
   const payloadValidator = validateRolePayload[envelope.role];
   if (envelope.status === "completed" && !payloadValidator(envelope.payload)) {
     return { valid: false, errors: formatSchemaErrors(payloadValidator.errors).map((error) => ({ ...error, path: `/payload${error.path === "/" ? "" : error.path}` })) };
+  }
+  if (envelope.status === "completed" && envelope.role === "file-explorer") {
+    const payload = envelope.payload as { allowed_read_paths: string[]; project_context: ProjectContext };
+    const authorized = new Set(payload.allowed_read_paths);
+    const requiredContextPaths = ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md"];
+    const missingContextPaths = requiredContextPaths.filter((path) => !authorized.has(path));
+    const missingEntryPaths = payload.project_context.navigation.flatMap((entry) => entry.entry_paths.filter((path) => !authorized.has(path)));
+    if (missingContextPaths.length || missingEntryPaths.length) {
+      return { valid: false, errors: [{ path: "/payload/allowed_read_paths", message: `project context paths are not authorized: ${[...missingContextPaths, ...missingEntryPaths].join(", ")}` }] };
+    }
   }
   if (envelope.status === "completed" && envelope.role === "planning") {
     const payload = envelope.payload as { pending_questions: string[]; decision: { question: string } | null };

@@ -16,6 +16,7 @@
 2. 让 **File Explorer** 返回精确入口、调用链、影响范围、路径授权来源和测试命令。
 3. 让 **开发角色** 在隔离 `worktree` 内实现；**Coding** 只调度、协调和收集结果，禁止直接写产品代码。
 4. 让 **Test** 独立验证；修复或冲突后必须取得晚于修复提交的测试、构建和静态检查证据。
+   入口、职责或模块边界变化时，协调开发角色同步目标项目 `MEMORY.md` 与 `.ai-work-flow/index/feature-navigation.md`，并在评审前运行 `ai-team context validate`。
 5. 正式方案执行一次冻结的 **Spec**/**Standards** `review barrier`，`direct` 仅执行 **Standards**；收集并处理 `P0/P1` 一次。
 6. 让 **Git Operator** 按授权范围提交、按依赖从最新 `integration commit` 派生、无 `--ff` 合并和清理；冲突内容由对应 **开发代理** 解决后由 **Git Operator** 继续 `merge`。
 7. 所有阶段均要求结果通过 `frozen schema`，并记录平台、基线、`digest`、变更路径和可重放证据。

@@ -134,6 +134,10 @@ completed | retryable_failure | needs_decision | failed
 ## 5. 规划文档和项目目录
 
 ```text
+.ai-work-flow/
+└── index/
+    └── feature-navigation.md
+MEMORY.md
 .ai-team/
 ├── project.yaml
 ├── standards/
@@ -162,7 +166,9 @@ completed | retryable_failure | needs_decision | failed
 /.ai-team/runtime/
 ```
 
-不修改项目已有 `AGENTS.md` 或 `CLAUDE.md`。如果 `.gitignore` 存在未提交修改，显示补丁并要求用户确认后再改；不覆盖规划目录冲突文件。
+同时幂等创建根 `MEMORY.md` 与 `.ai-work-flow/index/feature-navigation.md`。已有 `AGENTS.md` 或 `CLAUDE.md` 时追加一条上下文维护规则，但不创建不存在的指令文件。任何将被修改的上下文、指令或 `.gitignore` 文件存在未提交内容时，显示诊断并要求用户以 `--yes` 确认；不覆盖用户内容或规划目录冲突文件。
+
+File Explorer 在代码搜索前读取已有 MEMORY 和导航索引，并返回严格的 `payload.project_context`。开发角色只通过 `ai-team context update` 合并领域术语、仓库约束、职责、模块边界和真实入口路径；结构重复、绝对/越界/敏感/不存在路径会阻断写入。入口、职责或模块边界变化时必须同轮更新并运行 `ai-team context validate`。
 
 ## 6. Researcher
 
@@ -224,6 +230,8 @@ P3  非阻断提醒
 ai-team init <project>
 ai-team install [--platform codex,claude,opencode] [--dry-run]
 ai-team status [--project <path>]
+ai-team context update --project <path> --context-file <json>
+ai-team context validate --project <path>
 
 ai-team planning start --project <path> (--request-file <file> | --request-stdin)
 
@@ -372,7 +380,7 @@ opencode:
 
 ## 13. 安装、初始化和卸载
 
-`ai-team init` 必须在 Git 仓库内运行，幂等创建 `.ai-team` 和 `.gitignore` 条目。不修改项目已有 `AGENTS.md/CLAUDE.md`；`.gitignore` 有未提交修改时展示补丁并要求确认。目标项目文档由用户决定何时提交。
+`ai-team init` 必须在 Git 仓库内运行，幂等创建 `.ai-team`、`.gitignore` 条目和目标项目上下文骨架；只向已有 `AGENTS.md/CLAUDE.md` 追加维护规则。将被修改的上下文、指令或 `.gitignore` 文件有未提交内容时展示诊断并要求确认。目标项目上下文属于源码，由用户决定何时提交。
 
 `ai-team install` 修改/创建全局指令文件；文件存在时按路径创建最新版备份，使用 managed marker 保留用户内容。安装不修改项目代码、不创建 Git 提交、不修改用户 shell profile。已运行的客户端会话继续使用旧 Agent，新会话加载新版本。
 
@@ -397,13 +405,14 @@ opencode:
 3. Umzug migration、迁移备份恢复、幂等提交、状态迁移和并发锁。
 4. Planning 逐问、需求清单确认、spec/plan 生成、Task 预览循环和 revision 不可变。
 5. Coding planned/bug/feature 分诊、脏工作区、分支迁移、最新 HEAD 基线和范围三次门禁。
-6. File Explorer 独占发现、Researcher 报告及其 Planning/Coding 委派边界。
-7. Git worktree、依赖 Task integration、冲突解决、目标分支漂移、非快进 merge 和清理。
-8. 一次 Spec/Standard 评审、一次性 P0/P1 修复、无复审和最终验证门禁。
-9. Codex TOML、Claude Markdown、OpenCode Markdown/AGENTS.md 的生成、回读和 drift 检查。
-10. managed 文件备份、角色删除/重命名、卸载和 restore 冲突。
-11. 路径 canonicalize、符号链接逃逸、敏感输出脱敏和未知副作用 reconcile。
-12. 临时 Git 仓库中的端到端 Planning、拆分/不拆分 Coding、直接 Bug、小功能、Researcher 和环境切换回滚。
+6. File Explorer 独占发现、严格 `project_context`、Researcher 报告及其 Planning/Coding 委派边界。
+7. 上下文初始化、幂等合并、重复章节拒绝、真实路径校验、指令规则和原子失败恢复。
+8. Git worktree、依赖 Task integration、冲突解决、目标分支漂移、非快进 merge 和清理。
+9. 一次 Spec/Standard 评审、一次性 P0/P1 修复、无复审和最终验证门禁。
+10. Codex TOML、Claude Markdown、OpenCode Markdown/AGENTS.md 的生成、回读和 drift 检查。
+11. managed 文件备份、角色删除/重命名、卸载和 restore 冲突。
+12. 路径 canonicalize、符号链接逃逸、敏感输出脱敏和未知副作用 reconcile。
+13. 临时 Git 仓库中的端到端 Planning、拆分/不拆分 Coding、直接 Bug、小功能、Researcher 和环境切换回滚。
 
 验收标准：启用平台全部 `in-sync`；12 个角色、委派图、模型配置和 contract digest 一致；所有 schema 严格通过；临时 Git 仓库可完成完整生命周期；SQLite 可从空库和上一版本迁移；不执行真实模型调用的测试全部通过；真实客户端探测仅由 `env doctor --probe` 触发。
 

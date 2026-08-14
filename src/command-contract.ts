@@ -48,6 +48,8 @@ export const COMMAND_PARAMETER_TYPES = Object.freeze({
 /** Exact command spellings. This is the only syntax table used by renderers. */
 export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Object.freeze({
   "planning start": ["ai-team planning start --project <path> (--request-file <file> | --request-stdin)"],
+  "context update": ["ai-team context update --project <path> --context-file <json>"],
+  "context validate": ["ai-team context validate --project <path>"],
   "planning revision create": ["ai-team planning revision create --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> --documents-file <file> [--supersedes <revision>] [--run-id <run-id>]"],
   "planning revision transition": ["ai-team planning revision transition --project <path> --plan-id <plan-id> --revision <revision> --to <state> [--plan-commit <commit>]"],
   "planning tasks validate": ["ai-team planning tasks validate --file <json> [--preview]"],
@@ -93,11 +95,13 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   uninstall: ["ai-team uninstall [--dry-run]"],
 });
 
-const PUBLIC_COMMANDS = ["init", "install", "status", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
-const AGENT_COMMANDS = ["planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "scope check", "git status", "git prepare", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "review create", "review submit", "review resolve", "review status"] as const;
+const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
+const AGENT_COMMANDS = ["context update", "context validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "scope check", "git status", "git prepare", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "review create", "review submit", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */
 export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.freeze({
+  "context.update": { required: ["project", "contextFile"], optional: [], ...((COMMAND_SYNTAX["context update"]) ? { syntax: COMMAND_SYNTAX["context update"] } : {}) },
+  "context.validate": { required: ["project"], optional: [], ...((COMMAND_SYNTAX["context validate"]) ? { syntax: COMMAND_SYNTAX["context validate"] } : {}) },
   "planning.start": { required: ["project"], optional: ["requestFile", "requestStdin"], exclusive: [["requestFile", "requestStdin"]], ...((COMMAND_SYNTAX["planning start"]) ? { syntax: COMMAND_SYNTAX["planning start"] } : {}) },
   "coding.start": { required: ["project"], optional: ["mode", "planId", "revision", "requestFile", "requestStdin"], patterns: { planId: IDS.planId, revision: IDS.revision }, ...((COMMAND_SYNTAX["coding start"]) ? { syntax: COMMAND_SYNTAX["coding start"] } : {}) },
   "dispatch.identity": { required: ["runId", "dispatchId", "role"], optional: [], patterns: { runId: IDS.runId, dispatchId: IDS.dispatchId }, syntax: ["ai-team dispatch <claim|prompt|schema|template|validate|submit> --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"] },

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { validateCommand } from "../src/command-contract.js";
-import { checkResultEnvelope, createResultTemplate, resultSchemaForRole, ROLE_PAYLOAD_SCHEMAS } from "../src/contracts.js";
+import { checkProjectContext, checkResultEnvelope, createResultTemplate, resultSchemaForRole, ROLE_PAYLOAD_SCHEMAS } from "../src/contracts.js";
 import { DispatchService, type DispatchPacket } from "../src/dispatch.js";
 import { ResearchService } from "../src/research-service.js";
 import type { ResearchConclusion } from "../src/research.js";
@@ -64,10 +64,23 @@ const completedResult = (
   payload,
 });
 
+const projectContext = (entryPaths: string[] = ["src/dispatch.ts"]) => ({
+  project_shape: "TypeScript CLI",
+  memory: {
+    domain_terms: ["dispatch"],
+    repository_constraints: ["Node.js 22+"],
+    responsibilities: ["src/dispatch.ts coordinates role dispatches"],
+    module_boundaries: ["src contains runtime services"],
+  },
+  navigation: [{ feature: "Dispatch", keywords: ["dispatch"], entry_paths: entryPaths, module_boundary: "runtime" }],
+  maintenance: { status: "current", paths: ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md"] },
+});
+
 const fileExplorerResult = (runId: string, dispatchId: string) => completedResult(runId, dispatchId, "file-explorer", {
-  allowed_read_paths: ["src/dispatch.ts", "test/review-fixes.test.ts"],
+  allowed_read_paths: ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md", "src/dispatch.ts", "test/review-fixes.test.ts"],
   entry_points: ["src/dispatch.ts"],
   test_commands: ["npm test"],
+  project_context: projectContext(),
 });
 
 test("an exact File Explorer result creates one planning or coding dispatch and duplicate submit reuses it", async () => {
@@ -89,6 +102,8 @@ test("an exact File Explorer result creates one planning or coding dispatch and 
       assert.equal(generated.length, 1);
       assert.equal(generated[0]?.state, "pending");
       assert.deepEqual(JSON.parse(generated[0]?.packet_json ?? "{}").allowed_read_paths, [
+        "MEMORY.md",
+        ".ai-work-flow/index/feature-navigation.md",
         "src/dispatch.ts",
         "test/review-fixes.test.ts",
       ]);
@@ -171,7 +186,7 @@ test("completed results enforce the payload schema selected for every role", () 
   const payloads = {
     planning: { actions: ["confirm requirements"], stage: "requirements", pending_questions: [], decision: null },
     coding: { actions: ["dispatch backend task"], triage: "feature" },
-    "file-explorer": { allowed_read_paths: ["src/a.ts"], entry_points: ["src/a.ts"], test_commands: ["npm test"] },
+    "file-explorer": { allowed_read_paths: ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md", "src/a.ts"], entry_points: ["src/a.ts"], test_commands: ["npm test"], project_context: projectContext(["src/a.ts"]) },
     "frontend-developer": { modified_paths: ["src/ui.ts"], self_tests: [{ command: "npm test", outcome: "passed" }] },
     "backend-developer": { modified_paths: ["src/api.ts"], self_tests: [{ command: "npm test", outcome: "passed" }] },
     test: { checks: [{ command: "npm test", outcome: "passed" }] },
@@ -209,6 +224,22 @@ test("completed results enforce the payload schema selected for every role", () 
     checkResultEnvelope({ ...codingWithPlanningPayload, payload: payloads["file-explorer"] }).valid,
     false,
   );
+});
+
+test("project context and context command contracts reject unsafe paths and identities", () => {
+  const valid = {
+    project_shape: "CLI",
+    memory: { domain_terms: [], repository_constraints: [], responsibilities: [], module_boundaries: [] },
+    navigation: [{ feature: "Readme", keywords: ["readme"], entry_paths: ["README.md"], module_boundary: "root" }],
+    maintenance: { status: "current", paths: ["MEMORY.md"] },
+  };
+  assert.equal(checkProjectContext(valid).valid, true);
+  for (const path of ["/etc/passwd", "../README.md", ".env/token", "src\\main.ts"]) {
+    assert.equal(checkProjectContext({ ...valid, navigation: [{ ...valid.navigation[0], entry_paths: [path] }] }).valid, false, path);
+  }
+  assert.doesNotThrow(() => validateCommand("context.update", { project: "/tmp/project", contextFile: "/tmp/context.json" }));
+  assert.throws(() => validateCommand("context.update", { project: "/tmp/project", contextFile: undefined }), /missing required/);
+  assert.doesNotThrow(() => validateCommand("context.validate", { project: "/tmp/project" }));
 });
 
 test("review findings without a concrete location or impact are rejected", async () => {

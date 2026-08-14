@@ -50,3 +50,8 @@ Every dispatch schema replaces the generic payload with the selected role's
 strict payload schema. Every review finding includes a source, file, line,
 evidence, impact, and recommendation. Successful dispatch submission advances
 the durable run stage once; failure statuses do not create a successor.
+
+The File Explorer payload includes strict `project_context` data. Navigation
+entries contain `feature`, `keywords`, repository-relative `entry_paths`, and
+`module_boundary`; the CLI rejects missing, sensitive, absolute, escaping, and
+symbolic-link paths before updating project context files.

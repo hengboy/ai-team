@@ -112,7 +112,7 @@ test("CLI entrypoint executes through a symlinked path", async (t) => {
   assert.match(contract.contract_digest, /^[a-f0-9]{64}$/);
 });
 
-test("init creates project metadata and applies the documented ignore entries", async (t) => {
+test("init creates project metadata, context skeletons, and documented ignore entries", async (t) => {
   const sandbox = await makeSandbox(t);
 
   const initialized = json<{
@@ -130,6 +130,39 @@ test("init creates project metadata and applies the documented ignore entries", 
   const project = await readFile(join(sandbox.repo, ".ai-team", "project.yaml"), "utf8");
   assert.match(project, /schema_version: 1/);
   assert.match(project, /repo_id:/);
+  assert.match(await readFile(join(sandbox.repo, "MEMORY.md"), "utf8"), /## 项目上下文/);
+  assert.match(await readFile(join(sandbox.repo, ".ai-work-flow", "index", "feature-navigation.md"), "utf8"), /# Feature Navigation/);
+});
+
+test("context update accepts File Explorer output and validate reports maintenance state", async (t) => {
+  const sandbox = await makeSandbox(t);
+  await cli(sandbox, ["init", sandbox.repo]);
+  const explorerResult = join(sandbox.root, "explorer-result.json");
+  await writeFile(explorerResult, JSON.stringify({
+    payload: {
+      project_context: {
+        project_shape: "Node.js CLI",
+        memory: {
+          domain_terms: ["dispatch"],
+          repository_constraints: ["Node.js 22+"],
+          responsibilities: ["README documents the fixture"],
+          module_boundaries: ["root documentation"],
+        },
+        navigation: [{ feature: "Fixture", keywords: ["readme"], entry_paths: ["README.md"], module_boundary: "root" }],
+        maintenance: { status: "current", paths: ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md"] },
+      },
+    },
+  }));
+  const updated = json<{ updated_paths: string[] }>(await cli(sandbox, [
+    "context", "update", "--project", sandbox.repo, "--context-file", explorerResult,
+  ]));
+  assert.deepEqual(updated.updated_paths, ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md"]);
+  const validation = json<{ valid: boolean; navigation: { entries: number }; maintenance: { status: string; paths: string[] } }>(
+    await cli(sandbox, ["context", "validate", "--project", sandbox.repo]),
+  );
+  assert.equal(validation.valid, true);
+  assert.equal(validation.navigation.entries, 1);
+  assert.deepEqual(validation.maintenance, { status: "current", paths: [] });
 });
 
 test("planning dispatch can be claimed, inspected, submitted, resumed, and decided", async (t) => {
@@ -178,7 +211,17 @@ test("planning dispatch can be claimed, inspected, submitted, resumed, and decid
   const result = JSON.parse(row.template_json) as Record<string, unknown>;
   result.summary = "Repository entry points and tests were identified.";
   result.verification = [{ command: "git status --short", outcome: "passed" }];
-  result.payload = { allowed_read_paths: ["README.md"], entry_points: ["README.md"], test_commands: ["npm test"] };
+  result.payload = {
+    allowed_read_paths: ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md", "README.md"],
+    entry_points: ["README.md"],
+    test_commands: ["npm test"],
+    project_context: {
+      project_shape: "documentation fixture",
+      memory: { domain_terms: [], repository_constraints: [], responsibilities: [], module_boundaries: [] },
+      navigation: [{ feature: "Fixture", keywords: ["fixture"], entry_paths: ["README.md"], module_boundary: "root" }],
+      maintenance: { status: "current", paths: ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md"] },
+    },
+  };
   const resultFile = join(sandbox.root, "result.json");
   await writeFile(resultFile, `${JSON.stringify(result, null, 2)}\n`);
 

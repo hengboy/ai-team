@@ -4,7 +4,7 @@ import { SecurityError } from "./errors.js";
 import { assertRelativePosixPath } from "./utils.js";
 
 const SENSITIVE_PATTERNS = [
-  /(^|\/)\.env(?:\.|$)/,
+  /(^|\/)\.env(?:[./]|$)/,
   /(^|\/)\.ssh(?:\/|$)/,
   /(^|\/)(?:credentials?|secrets?|keys?)(?:\/|$)/i,
   /^\.ai-team\/runtime(?:\/|$)/,

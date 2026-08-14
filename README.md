@@ -21,10 +21,17 @@ ai-team install --dry-run
 ai-team install
 ```
 
-`ai-team init` creates `.ai-team/project.yaml`, planning directories, and the
-required `.gitignore` entries. It never edits project `AGENTS.md` or
-`CLAUDE.md`. If `.gitignore` is already modified, inspect the JSON patch and
-repeat with `--yes`.
+`ai-team init` creates `.ai-team/project.yaml`, planning directories, the
+required `.gitignore` entries, and the target project's `MEMORY.md` plus
+`.ai-work-flow/index/feature-navigation.md`. It appends the maintenance rule
+to an existing `AGENTS.md` or `CLAUDE.md` without creating either file. If any
+existing target context or instruction file is modified, inspect the JSON
+diagnostic and repeat with `--yes`.
+
+Use `ai-team context update --project <path> --context-file <json>` for the
+structured File Explorer result, and `ai-team context validate --project <path>`
+to inspect sections, real navigation paths, instruction rules, and pending
+maintenance.
 
 ## Workflow
 

@@ -204,7 +204,7 @@ test("research conclusions require every provenance field", () => {
   }
 });
 
-test("project init is Git-only, idempotent, and never changes AGENTS.md", async () => {
+test("project init is Git-only, idempotent, and appends the context rule once", async () => {
   const nonRepository = await temporaryDirectory();
   const repository = await createRepository();
   try {
@@ -213,17 +213,22 @@ test("project init is Git-only, idempotent, and never changes AGENTS.md", async 
 
     const agentsPath = path.join(repository.directory, "AGENTS.md");
     await writeFile(agentsPath, "# Existing instructions\n");
-    const first = await initializeProject(repository.directory);
+    await assert.rejects(() => initializeProject(repository.directory), /confirmation required/);
+    const first = await initializeProject(repository.directory, true);
     const second = await initializeProject(repository.directory);
     assert.deepEqual(first.additions, ["/.worktree/", "/.ai-team/runtime/"]);
     assert.deepEqual(second.additions, []);
-    assert.equal(await readFile(agentsPath, "utf8"), "# Existing instructions\n");
+    const agents = await readFile(agentsPath, "utf8");
+    assert.match(agents, /入口、职责或模块边界变化时/);
+    assert.equal(agents.match(/入口、职责或模块边界变化时/g)?.length, 1);
     const ignore = await readFile(path.join(repository.directory, ".gitignore"), "utf8");
     assert.equal(ignore.match(/^\/\.worktree\/$/gm)?.length, 1);
     assert.equal(ignore.match(/^\/\.ai-team\/runtime\/$/gm)?.length, 1);
     await stat(path.join(repository.directory, ".ai-team", "project.yaml"));
     await stat(path.join(repository.directory, ".ai-team", "standards"));
     await stat(path.join(repository.directory, ".ai-team", "plans"));
+    await stat(path.join(repository.directory, "MEMORY.md"));
+    await stat(path.join(repository.directory, ".ai-work-flow", "index", "feature-navigation.md"));
   } finally {
     await rm(nonRepository, { recursive: true, force: true });
     await rm(repository.directory, { recursive: true, force: true });

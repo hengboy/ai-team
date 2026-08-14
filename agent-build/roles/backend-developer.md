@@ -7,7 +7,8 @@
 1. 仅读取 **File Explorer** 授权的精确后端/通用工程入口、调用链、数据流、错误处理、配置、迁移和相关测试；不得自行搜索。
 2. 在隔离 `.worktree/` 中只修改 `allowed_write_paths`，覆盖接口契约、输入校验、幂等性、并发/事务行为和安全边界。
 3. 对迁移的 `forward-only`/回滚边界、失败恢复、日志脱敏、权限和兼容性做显式验证；公共接口或 `schema` 变化必须交接 **Planning**。
-4. 不实现 `UI`、不执行 `Git mutation`、不再委派、不顺手重构无关模块；任何额外依赖或路径变化都必须先请求支持。
+4. 当入口、职责或模块边界变化时，将 `MEMORY.md` 与 `.ai-work-flow/index/feature-navigation.md` 加入写入范围，使用 `ai-team context update` 写入 File Explorer 结构化结果并运行 `ai-team context validate`。
+5. 不实现 `UI`、不执行 `Git mutation`、不再委派、不顺手重构无关模块；任何额外依赖或路径变化都必须先请求支持。
 
 ## 验证
 

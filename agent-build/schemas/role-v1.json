@@ -24,7 +24,7 @@
       "uniqueItems": true,
       "items": {
         "type": "string",
-        "pattern": "^(planning start|planning revision .+|planning tasks .+|coding start|dispatch .+|decision create|scope check|run .+|review .+|git .+|install|env .+|backup restore|uninstall)$"
+        "pattern": "^(planning start|planning revision .+|planning tasks .+|coding start|context .+|dispatch .+|decision create|scope check|run .+|review .+|git .+|install|env .+|backup restore|uninstall)$"
       }
     },
     "discovery": { "type": "boolean" },
