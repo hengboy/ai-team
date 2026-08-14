@@ -28,9 +28,11 @@ Node.js 22+ TypeScript ESM CLI package with Commander, SQLite workflow state, im
 - src/planning.ts validates complete revision documents and revision/run stage consistency.
 - src/contracts.ts owns result envelope and role payload schemas.
 - src/command-contract.ts owns exact public and agent command syntax.
+- skills/init-ai-team owns the reusable Codex workflow for initializing and validating AI Team in a target Git project.
 
 ### 模块边界
 - src/git-orchestrator.ts and src/git.ts own Git orchestration.
 - src/environment.ts and agent-build/roles own managed role generation and capabilities.
+- skills/init-ai-team wraps public init and context validation commands without changing CLI behavior.
 - test/*.test.ts contains unit, CLI end-to-end, lock, contract, and workflow regressions.
 <!-- ai-team:project-context:end -->
