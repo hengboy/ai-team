@@ -31,15 +31,15 @@ export class ResearchService {
     const run = this.store.getRun(runId) as { profile: string; plan_id?: string; revision?: string };
     const slug = safeTopic(topic);
     let path: string;
-    if (run.profile === "planning") {
-      if (!run.plan_id || !run.revision) throw new ValidationError("planning research requires the run to bind plan_id and revision");
+    if (run.profile === "planning" || run.plan_id || run.revision) {
+      if (!run.plan_id || !run.revision) throw new ValidationError("planned research requires the run to bind plan_id and revision");
       path = join(project, ".ai-team", "plans", run.plan_id, "revisions", run.revision, "research", `${slug}.md`);
     } else {
       path = join(this.store.paths.artifacts, runId, "research", `${slug}.md`);
     }
     const directory = join(path, "..");
     await mkdir(directory, { recursive: true });
-    if (run.profile === "planning") await canonicalizeInside(project, directory);
+    if (run.plan_id && run.revision) await canonicalizeInside(project, directory);
     else await canonicalizeInside(this.store.paths.artifacts, directory);
     const report = renderReport(topic, conclusions);
     await writeFile(path, report, { mode: 0o600 });

@@ -176,7 +176,7 @@ Planning 调研报告写入：
 .ai-team/plans/<plan-id>/revisions/<revision>/research/<topic>.md
 ```
 
-并与同一 revision 的 spec/plan/tasks 一起由 Git Operator 提交。Coding 实施期间产生的新报告保存为 run artifact，不修改冻结 plan；若外部事实使方案失效，停止并转 Planning 新 revision。
+并与同一 revision 的 spec/plan/tasks 一起由 Git Operator 提交。有 `plan_id`/`revision` 绑定的 Coding 实施期间产生的新报告同样归档到该 revision 的 `research/` 目录；无规划绑定的 bug/feature 调研才保存为 run artifact，不修改冻结 plan。若外部事实使方案失效，停止并转 Planning 新 revision。
 
 ## 7. Git、分支和 Worktree
 

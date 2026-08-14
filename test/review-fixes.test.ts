@@ -317,7 +317,7 @@ test("reconcileOperation persists completed and not-applied states while rejecti
   });
 });
 
-test("planning research is archived with its revision while coding research stays in run artifacts", async () => {
+test("planned research is archived with its revision while direct coding research stays in run artifacts", async () => {
   await withStore(async (store, home) => {
     const project = join(home, "project");
     const conclusion: ResearchConclusion = {
@@ -333,7 +333,7 @@ test("planning research is archived with its revision while coding research stay
     const unboundPlanning = createRun(store, "planning");
     await assert.rejects(
       research.archive(unboundPlanning, project, "API support", [conclusion]),
-      /planning research requires the run to bind plan_id and revision/,
+      /planned research requires the run to bind plan_id and revision/,
     );
 
     const planningRun = createRun(store, "planning", { planId: "20260813-api-abcd", revision: "001" });
@@ -352,8 +352,8 @@ test("planning research is archived with its revision while coding research stay
 
     const codingRun = createRun(store, "coding", { planId: "20260813-api-abcd", revision: "001" });
     const coding = await research.archive(codingRun, project, "API support", [conclusion]);
-    assert.equal(coding.path, join(store.paths.artifacts, codingRun, "research", "api-support.md"));
-    assert.equal(coding.path.startsWith(join(project, ".ai-team", "plans")), false);
+    assert.equal(coding.path, join(project, ".ai-team", "plans", "20260813-api-abcd", "revisions", "001", "research", "api-support.md"));
+    assert.equal(coding.path.startsWith(join(project, ".ai-team", "plans")), true);
     assert.match(await readFile(coding.path, "utf8"), /# Research: API support/);
   });
 });
