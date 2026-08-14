@@ -1,1 +1,100 @@
-{"type":"object","required":["name","platforms","defaults"]}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-team.local/schemas/agent-build/environment-v1.json",
+  "title": "AI Team agent-build environment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "platforms", "defaults", "overrides"],
+  "properties": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "platforms": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/platform" }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["codex", "claude", "opencode"],
+      "properties": {
+        "codex": { "$ref": "#/$defs/codexModel" },
+        "claude": { "$ref": "#/$defs/claudeModel" },
+        "opencode": { "$ref": "#/$defs/opencodeModel" }
+      }
+    },
+    "overrides": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "planning",
+        "coding",
+        "file-explorer",
+        "frontend-developer",
+        "backend-developer",
+        "test",
+        "git-operator",
+        "code-reviewer",
+        "review-spec",
+        "review-standards",
+        "environment-operator",
+        "researcher"
+      ],
+      "properties": {
+        "planning": { "$ref": "#/$defs/roleOverrides" },
+        "coding": { "$ref": "#/$defs/roleOverrides" },
+        "file-explorer": { "$ref": "#/$defs/roleOverrides" },
+        "frontend-developer": { "$ref": "#/$defs/roleOverrides" },
+        "backend-developer": { "$ref": "#/$defs/roleOverrides" },
+        "test": { "$ref": "#/$defs/roleOverrides" },
+        "git-operator": { "$ref": "#/$defs/roleOverrides" },
+        "code-reviewer": { "$ref": "#/$defs/roleOverrides" },
+        "review-spec": { "$ref": "#/$defs/roleOverrides" },
+        "review-standards": { "$ref": "#/$defs/roleOverrides" },
+        "environment-operator": { "$ref": "#/$defs/roleOverrides" },
+        "researcher": { "$ref": "#/$defs/roleOverrides" }
+      }
+    }
+  },
+  "$defs": {
+    "platform": { "enum": ["codex", "claude", "opencode"] },
+    "codexModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "reasoning"],
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "reasoning": { "enum": ["low", "medium", "high", "xhigh"] }
+      }
+    },
+    "claudeModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "effort"],
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "effort": { "enum": ["low", "medium", "high"] }
+      }
+    },
+    "opencodeModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "variant", "options"],
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "variant": { "enum": ["low", "medium", "high"] },
+        "options": { "type": "object" }
+      }
+    },
+    "roleOverrides": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "codex": { "$ref": "#/$defs/codexModel" },
+        "claude": { "$ref": "#/$defs/claudeModel" },
+        "opencode": { "$ref": "#/$defs/opencodeModel" }
+      }
+    }
+  }
+}

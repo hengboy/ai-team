@@ -1,1 +1,61 @@
-{"type":"object","required":["schema_version","template_version","roles","platforms","instructions","role_directory","environment_directory","template_directory"]}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-team.local/schemas/agent-build/manifest-v1.json",
+  "title": "AI Team agent-build manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "template_version",
+    "roles",
+    "platforms",
+    "instructions",
+    "role_directory",
+    "environment_directory",
+    "template_directory"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "template_version": { "type": "integer", "minimum": 1 },
+    "roles": {
+      "type": "array",
+      "minItems": 12,
+      "maxItems": 12,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "planning",
+          "coding",
+          "file-explorer",
+          "frontend-developer",
+          "backend-developer",
+          "test",
+          "git-operator",
+          "code-reviewer",
+          "review-spec",
+          "review-standards",
+          "environment-operator",
+          "researcher"
+        ]
+      }
+    },
+    "platforms": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "enum": ["codex", "claude", "opencode"] }
+    },
+    "instructions": { "$ref": "#/$defs/relativePath" },
+    "role_directory": { "$ref": "#/$defs/relativePath" },
+    "environment_directory": { "$ref": "#/$defs/relativePath" },
+    "template_directory": { "$ref": "#/$defs/relativePath" }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).+$"
+    }
+  }
+}

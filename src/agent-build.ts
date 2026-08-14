@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
 import YAML from "yaml";
 import { ROLES, type Role } from "./constants.js";
 import { ValidationError } from "./errors.js";
@@ -21,6 +22,13 @@ const variantValues = new Set(["low", "medium", "high"]);
 const supportedCommandPrefixes = ["planning start", "planning revision ", "planning tasks ", "coding start", "dispatch ", "decision create", "scope check", "run ", "review ", "git ", "install", "env ", "backup restore", "uninstall"];
 const allowedVariables = new Set(["role", "purpose", "allowed_commands", "delegates", "discovery", "stop_conditions", "platform", "environment", "contract_digest", "role_manifest_digest", "template_version", "spec_template", "plan_template", "task_template"]);
 const packageRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
+const expectedSchemas = ["manifest-v1.json", "role-v1.json", "environment-v1.json"] as const;
+
+interface AgentBuildValidators {
+  manifest: ValidateFunction;
+  role: ValidateFunction;
+  environment: ValidateFunction;
+}
 
 const fail = (message: string, details?: unknown): never => { throw new ValidationError(message, details); };
 const assertSafe = (root: string, value: string): string => {
@@ -35,6 +43,39 @@ const readText = (root: string, path: string): string => {
   const canonicalRoot = realpathSync(root); const canonical = realpathSync(target); const rel = relative(canonicalRoot, canonical);
   if (rel === ".." || rel.startsWith(`..${sep}`)) fail(`agent-build resource escapes root: ${path}`);
   return readFileSync(target, "utf8").replaceAll("\r\n", "\n");
+};
+const compileSchema = (root: string, file: (typeof expectedSchemas)[number]): ValidateFunction => {
+  const path = join("schemas", file);
+  let schema: unknown;
+  try {
+    schema = JSON.parse(readText(root, path));
+  } catch (error) {
+    return fail(`invalid agent-build schema JSON: ${file}`, error instanceof Error ? error.message : error);
+  }
+  try {
+    return new Ajv2020({ allErrors: true, strict: false }).compile(schema as Record<string, unknown>);
+  } catch (error) {
+    return fail(`invalid agent-build schema: ${file}`, error instanceof Error ? error.message : error);
+  }
+};
+const loadValidators = (root: string): AgentBuildValidators => {
+  const schemaDir = join(root, "schemas");
+  if (!existsSync(schemaDir) || !lstatSync(schemaDir).isDirectory()) fail("agent-build schema directory is missing");
+  const expected = new Set<string>(expectedSchemas);
+  for (const file of readdirSync(schemaDir)) if (!expected.has(file)) fail(`unexpected schema resource: ${file}`);
+  for (const file of expectedSchemas) if (!existsSync(join(schemaDir, file))) fail(`agent-build schema is missing: ${file}`);
+  return {
+    manifest: compileSchema(root, "manifest-v1.json"),
+    role: compileSchema(root, "role-v1.json"),
+    environment: compileSchema(root, "environment-v1.json"),
+  };
+};
+const assertSchema = (validate: ValidateFunction, value: unknown, source: string): void => {
+  if (validate(value)) return;
+  fail(`${source} schema is invalid`, validate.errors?.map((error) => ({
+    path: error.instancePath || "/",
+    message: error.message,
+  })));
 };
 const validateTemplateVariables = (body: string, source: string): void => {
   for (const match of body.matchAll(/{{\s*([^{}]+?)\s*}}/g)) if (!allowedVariables.has(match[1]!)) fail(`unknown template variable in ${source}: ${match[1]}`);
@@ -82,7 +123,9 @@ function parseAndValidate(root: string): AgentBuild {
   if (!existsSync(root) || !lstatSync(root).isDirectory()) fail(`agent-build directory does not exist: ${root}`);
   const rootEntries = new Set(["manifest.yaml", "instructions.md", "roles", "environments", "schemas", "templates"]);
   for (const entry of readdirSync(root)) if (!rootEntries.has(entry)) fail(`unexpected agent-build resource: ${entry}`);
+  const validators = loadValidators(root);
   const manifest = YAML.parse(readText(root, "manifest.yaml")) as AgentBuildManifest;
+  assertSchema(validators.manifest, manifest, "agent-build manifest");
   if (!manifest || manifest.schema_version !== 1 || !Number.isInteger(manifest.template_version) || manifest.template_version < 1) fail("invalid agent-build manifest version");
   if (!Array.isArray(manifest.roles) || manifest.roles.length !== ROLES.length || [...manifest.roles].sort().join("\0") !== [...ROLES].sort().join("\0")) fail("agent-build role set does not match runtime roles");
   if (!Array.isArray(manifest.platforms) || manifest.platforms.length !== supportedPlatforms.length || [...manifest.platforms].sort().join("\0") !== [...supportedPlatforms].sort().join("\0")) fail("agent-build platform set does not match supported platforms");
@@ -96,6 +139,7 @@ function parseAndValidate(root: string): AgentBuild {
   for (const role of ROLES) {
     const yamlPath = join(manifest.role_directory, `${role}.yaml`); const mdPath = join(manifest.role_directory, `${role}.md`);
     const value = YAML.parse(readText(root, yamlPath)) as AgentBuildRole;
+    assertSchema(validators.role, value, yamlPath);
     if (!value || value.id !== role || typeof value.purpose !== "string" || !Array.isArray(value.writes) || !Array.isArray(value.delegates) || !Array.isArray(value.commands) || typeof value.discovery !== "boolean" || !value.enforcement) fail(`invalid role configuration: ${role}`);
     if (value.delegates.some((item) => !ROLES.includes(item as Role))) fail(`unknown delegate in role: ${role}`);
     if (value.commands.some((item) => typeof item !== "string" || !item.trim() || !supportedCommandPrefixes.some((prefix) => item === prefix || item.startsWith(prefix)))) fail(`unknown command in role: ${role}`);
@@ -109,6 +153,7 @@ function parseAndValidate(root: string): AgentBuild {
   for (const file of readdirSync(envDir).sort()) {
     if (!file.endsWith(".yaml")) fail(`unexpected agent-build environment resource: ${file}`);
     const value = parseEnvironment(root, join(manifest.environment_directory, file));
+    assertSchema(validators.environment, value, join(manifest.environment_directory, file));
     if (!value?.name || value.name !== file.slice(0, -5) || !Array.isArray(value.platforms) || value.platforms.some((p) => !supportedPlatforms.includes(p as AgentBuildPlatform))) fail(`invalid environment configuration: ${file}`);
     if (!value.defaults || Object.keys(value.defaults).sort().join("\0") !== supportedPlatforms.slice().sort().join("\0")) fail(`environment defaults must cover all platforms: ${file}`);
     for (const platform of supportedPlatforms) {
@@ -134,11 +179,7 @@ function parseAndValidate(root: string): AgentBuild {
   for (const role of ROLES) { declaredFiles.add(join(manifest.role_directory, `${role}.yaml`)); declaredFiles.add(join(manifest.role_directory, `${role}.md`)); }
   for (const file of readdirSync(envDir)) declaredFiles.add(join(manifest.environment_directory, file));
   for (const file of expectedTemplates) declaredFiles.add(join(manifest.template_directory, file));
-  const schemaDir = join(root, "schemas");
-  if (!existsSync(schemaDir) || !lstatSync(schemaDir).isDirectory()) fail("agent-build schema directory is missing");
-  const expectedSchemas = new Set(["manifest-v1.json", "role-v1.json", "environment-v1.json"]);
-  for (const file of readdirSync(schemaDir)) { if (!expectedSchemas.has(file)) fail(`unexpected schema resource: ${file}`); readText(root, join("schemas", file)); declaredFiles.add(join("schemas", file)); }
-  for (const file of expectedSchemas) if (!existsSync(join(schemaDir, file))) fail(`agent-build schema is missing: ${file}`);
+  for (const file of expectedSchemas) declaredFiles.add(join("schemas", file));
   const digestParts = [...declaredFiles].sort().map((path) => `${path}\n${readText(root, path)}`);
   return Object.freeze({ root, manifest, roles: roles as Record<Role, AgentBuildRole>, environments, templates, instructions, digest: sha256(digestParts.join("\n")), templateVersion: manifest.template_version });
 }
