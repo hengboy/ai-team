@@ -1,5 +1,6 @@
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import { ROLES, type Role } from "./constants.js";
 import { ValidationError } from "./errors.js";
@@ -19,7 +20,7 @@ const effortValues = new Set(["low", "medium", "high"]);
 const variantValues = new Set(["low", "medium", "high"]);
 const supportedCommandPrefixes = ["planning start", "planning revision ", "coding start", "dispatch ", "decision create", "scope check", "run ", "review ", "git ", "install", "env ", "backup restore", "uninstall"];
 const allowedVariables = new Set(["role", "purpose", "allowed_commands", "delegates", "discovery", "stop_conditions", "platform", "environment", "contract_digest", "role_manifest_digest", "template_version", "spec_template", "plan_template", "task_template"]);
-const packageRoot = resolve(new URL("../", import.meta.url).pathname);
+const packageRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 
 const fail = (message: string, details?: unknown): never => { throw new ValidationError(message, details); };
 const assertSafe = (root: string, value: string): string => {

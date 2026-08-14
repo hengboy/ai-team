@@ -59,6 +59,7 @@ export interface RevisionDocuments {
 export const writeRevision = async (project: string, planId: string, revision: string, targetBranch: string, docs: RevisionDocuments, supersedes?: string): Promise<{ path: string; digest: string }> => {
   if (!/^\d{8}-[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{4}$/.test(planId)) throw new ValidationError("invalid plan id");
   if (!/^\d{3}$/.test(revision)) throw new ValidationError("invalid revision");
+  if (supersedes && !/^\d{3}$/.test(supersedes)) throw new ValidationError("invalid superseded revision");
   const revisionPath = join(project, ".ai-team", "plans", planId, "revisions", revision);
   try { await stat(revisionPath); throw new ValidationError("planning revisions are immutable; create a new revision"); } catch (error) { if (error instanceof ValidationError) throw error; }
   assertSections(docs.spec, SPEC_SECTIONS, "spec.md");
@@ -95,4 +96,19 @@ export const triage = (input: { planId?: string; actual?: string; expected?: str
   if (input.actual && input.expected && input.evidence) return "bug";
   if (input.singleGoal && input.closedAcceptance && input.exhaustiveScope && input.singleModule && !input.sensitive) return "feature";
   return "planning";
+};
+
+export const triageRequest = (request: string, hasReadyRevision = false): "planned" | "bug" | "feature" | "planning" => {
+  if (hasReadyRevision) return "planned";
+  const fields = new Set([...request.matchAll(/^\s*(actual|expected|evidence|goal|acceptance|scope|module|sensitive)\s*:\s*(.+)$/gim)].map((match) => match[1]!.toLowerCase()));
+  return triage({
+    ...(fields.has("actual") ? { actual: "provided" } : {}),
+    ...(fields.has("expected") ? { expected: "provided" } : {}),
+    ...(fields.has("evidence") ? { evidence: "provided" } : {}),
+    singleGoal: fields.has("goal"),
+    closedAcceptance: fields.has("acceptance"),
+    exhaustiveScope: fields.has("scope"),
+    singleModule: fields.has("module"),
+    sensitive: fields.has("sensitive"),
+  });
 };

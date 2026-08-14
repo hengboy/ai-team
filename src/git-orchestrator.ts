@@ -36,13 +36,15 @@ export class GitOrchestrator {
     if (dependsOn) {
       const dependency = this.worktree(runId, dependsOn);
       if (dependency.state !== "active") throw new ValidationError("dependent Task worktree is not active");
-      base = await currentHead(dependency.path);
+      const integration = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1").get(runId) as any;
+      if (!integration) throw new ValidationError("dependent Task requires an active integration worktree");
+      base = await currentHead(integration.path);
     }
     if (!/^[a-f0-9]{40}$/.test(base)) throw new ValidationError("worktree base must be a 40-character commit SHA");
     const key = `worktree:create:${runId}:${branch}:${base}`;
-    const operation = this.store.beginOperation("git.worktree.create", key, { branch, path, base }, runId);
     const existing = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=?").get(runId, branch) as any;
-    if (operation.reused) {
+    if (existing) {
+      const operation = this.store.beginOperation("git.worktree.create", key, { branch, path, base }, runId);
       if (operation.state !== "completed" || !existing) throw new ValidationError("worktree operation has unknown side effect; reconcile required");
       return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: true };
     }
@@ -50,6 +52,8 @@ export class GitOrchestrator {
     if (collision) throw new ValidationError(`branch or worktree belongs to another run: ${collision.run_id}`);
     try { await stat(path); throw new ValidationError(`unowned worktree path already exists: ${path}`); } catch (error) { if (error instanceof ValidationError) throw error; }
     try { await git(root, ["show-ref", "--verify", `refs/heads/${branch}`]); throw new ValidationError(`unowned branch already exists: ${branch}`); } catch (error) { if (error instanceof ValidationError && error.message.startsWith("unowned")) throw error; }
+    const operation = this.store.beginOperation("git.worktree.create", key, { branch, path, base }, runId);
+    if (operation.reused) throw new ValidationError("worktree operation has unknown side effect; reconcile required");
     await mkdir(dirname(path), { recursive: true });
     await createWorktree(root, path, branch, base);
     const worktreeId = `worktree_${sha256(`${runId}:${branch}`).slice(0, 24)}`;
@@ -67,9 +71,18 @@ export class GitOrchestrator {
     const path = join(root, ".worktree", "integration", plan, short);
     const base = run.base_commit;
     const existing = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=?").get(runId, branch) as any;
-    if (existing) return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: true };
-    const operation = this.store.beginOperation("git.integration.create", `integration:create:${runId}:${base}`, { branch, path, base }, runId);
-    if (operation.reused && operation.state !== "completed") throw new ValidationError("integration operation has unknown side effect; reconcile required");
+    const key = `integration:create:${runId}:${base}`;
+    if (existing) {
+      const operation = this.store.beginOperation("git.integration.create", key, { branch, path, base }, runId);
+      if (operation.state !== "completed") throw new ValidationError("integration operation has unknown side effect; reconcile required");
+      return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: true };
+    }
+    const collision = this.store.db.prepare("SELECT run_id FROM worktrees WHERE branch=? OR path=?").get(branch, path) as any;
+    if (collision) throw new ValidationError(`branch or worktree belongs to another run: ${collision.run_id}`);
+    try { await stat(path); throw new ValidationError(`unowned worktree path already exists: ${path}`); } catch (error) { if (error instanceof ValidationError) throw error; }
+    try { await git(root, ["show-ref", "--verify", `refs/heads/${branch}`]); throw new ValidationError(`unowned branch already exists: ${branch}`); } catch (error) { if (error instanceof ValidationError && error.message.startsWith("unowned")) throw error; }
+    const operation = this.store.beginOperation("git.integration.create", key, { branch, path, base }, runId);
+    if (operation.reused) throw new ValidationError("integration operation has unknown side effect; reconcile required");
     await mkdir(dirname(path), { recursive: true });
     await createWorktree(root, path, branch, base);
     const worktreeId = `worktree_${sha256(`${runId}:${branch}`).slice(0, 24)}`;
@@ -134,14 +147,26 @@ export class GitOrchestrator {
       const count = this.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.sync' AND state='completed'").get(runId) as { count: number };
       if (count.count >= 3) throw new ValidationError("target branch drift exceeded 3 synchronization attempts");
       const sync = this.store.beginOperation("git.sync", `sync:${runId}:${integration.branch}:${current}`, { target: current }, runId);
-      try {
-        const synced = await mergeNoFastForward(integration.path, run.target_branch, `Sync ${run.target_branch} into ${integration.branch}`);
-        this.store.finishOperation(sync.operationId, { commit: synced });
-      } catch (error) {
-        throw new ValidationError("target synchronization conflicted; developer resolution required", { cause: String(error) });
+      if (sync.reused) {
+        if (sync.state !== "completed") throw new ValidationError("target synchronization has unknown side effect; reconcile required");
+      } else {
+        try {
+          const synced = await mergeNoFastForward(integration.path, run.target_branch, `Sync ${run.target_branch} into ${integration.branch}`);
+          this.store.finishOperation(sync.operationId, { commit: synced });
+          new DispatchService(this.store).create(runId, "test", {
+            objective: "Run the complete final verification after synchronizing target branch changes.",
+            allowed_read_paths: ["package.json", "test"],
+            allowed_write_paths: [],
+            acceptance_criteria: ["All final checks pass", "No review is restarted"],
+            context: { synchronization_commit: synced, target_commit: current },
+          });
+        } catch (error) {
+          throw new ValidationError("target synchronization conflicted; developer resolution required", { cause: String(error) });
+        }
       }
     }
     const integrationHead = await currentHead(integration.path);
+    new (await import("./review.js")).ReviewService(this.store).assertGate(runId, integrationHead);
     const operation = this.store.beginOperation("git.integrate", `integrate:${runId}:${run.target_branch}:${integrationHead}`, { integration: integration.branch }, runId);
     if (operation.reused) {
       if (operation.state !== "completed") throw new ValidationError("integration side effect is unknown; reconcile required");
@@ -191,8 +216,12 @@ export class GitOrchestrator {
       const canonical = await realpath(row.path);
       const relativePath = toPosix(relative(root, canonical));
       if (!relativePath.startsWith(".worktree/")) throw new ValidationError(`refusing to remove worktree outside managed root: ${canonical}`);
+      const operation = this.store.beginOperation("git.cleanup", `cleanup:${runId}:${row.worktree_id}`, { worktreeId: row.worktree_id, path: canonical, branch: row.branch }, runId);
+      if (operation.reused && operation.state !== "completed") throw new ValidationError("cleanup side effect is unknown; reconcile required");
+      if (operation.reused) { this.store.db.prepare("UPDATE worktrees SET state='removed' WHERE worktree_id=?").run(row.worktree_id); removed.push(canonical); continue; }
       await git(root, ["worktree", "remove", canonical]);
       await git(root, ["branch", "-d", row.branch]);
+      this.store.finishOperation(operation.operationId, { path: canonical, branch: row.branch, removed: true });
       this.store.db.prepare("UPDATE worktrees SET state='removed' WHERE worktree_id=?").run(row.worktree_id);
       removed.push(canonical);
     }
@@ -205,7 +234,12 @@ export class GitOrchestrator {
     const result: Array<{ operation_id: string; state: string; fact: string }> = [];
     for (const operation of pending) {
       const request = JSON.parse(operation.request_json);
-      if (operation.kind.includes("worktree") || operation.kind.includes("integration.create")) {
+      if (operation.kind === "git.cleanup") {
+        const listed = (await git(root, ["worktree", "list", "--porcelain"])).stdout;
+        const branchExists = await git(root, ["show-ref", "--verify", `refs/heads/${request.branch}`]).then(() => true, () => false);
+        const exists = listed.includes(`worktree ${request.path}`) || branchExists;
+        result.push({ operation_id: operation.operation_id, state: exists ? "unknown" : "completed", fact: exists ? "cleanup is partially applied" : "owned worktree and branch are absent" });
+      } else if (operation.kind.includes("worktree") || operation.kind.includes("integration.create")) {
         const listed = (await git(root, ["worktree", "list", "--porcelain"])).stdout;
         const exists = listed.includes(`worktree ${request.path}`) && listed.includes(`branch refs/heads/${request.branch}`);
         result.push({ operation_id: operation.operation_id, state: exists ? "completed" : "not_applied", fact: exists ? "owned worktree exists" : "owned worktree absent" });

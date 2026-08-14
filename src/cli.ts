@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
 import { CONTRACT_DIGEST } from "./contracts.js";
 import { validateCommand } from "./command-contract.js";
@@ -53,7 +55,7 @@ export const buildProgram = (): Command => {
     output(await withStore((store) => new WorkflowService(store).planningStart(options.project, request)));
   });
   const revision = planning.command("revision");
-  revision.command("create").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--target-branch <branch>").requiredOption("--documents-file <file>").option("--supersedes <nnn>").action(async (options) => {
+  revision.command("create").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--target-branch <branch>").requiredOption("--documents-file <file>").option("--supersedes <nnn>").option("--run-id <id>").action(async (options) => {
     const docs = JSON.parse(await readFile(options.documentsFile, "utf8")) as RevisionDocuments;
     const result = await writeRevision(options.project, options.planId, options.revision, options.targetBranch, docs, options.supersedes);
     const repo = await repositoryIdentity(options.project);
@@ -61,6 +63,7 @@ export const buildProgram = (): Command => {
       store.registerRepository(repo.repoId, repo.commonDir, repo.root);
       store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,supersedes,created_at) VALUES (?,?,?,'draft',?,?,?,?)")
         .run(options.planId, options.revision, repo.repoId, options.targetBranch, result.digest, options.supersedes ?? null, new Date().toISOString());
+      if (options.runId) store.bindPlanningRevision(options.runId, repo.repoId, options.planId, options.revision);
     });
     output(result);
   });
@@ -71,13 +74,31 @@ export const buildProgram = (): Command => {
       if (!row) throw new ValidationError("planning revision not found");
       if (options.to === "ready") throw new ValidationError("ready state requires planning revision commit");
       const state = nextPlanState(row.state, options.to);
-      store.db.prepare("UPDATE revisions SET state=?,plan_commit=COALESCE(?,plan_commit) WHERE repo_id=? AND plan_id=? AND revision=?").run(state, options.planCommit ?? null, repo.repoId, options.planId, options.revision);
-      return { state };
+      let dispatchId: string | undefined;
+      const transition = store.db.transaction(() => {
+        store.db.prepare("UPDATE revisions SET state=?,plan_commit=COALESCE(?,plan_commit) WHERE repo_id=? AND plan_id=? AND revision=?").run(state, options.planCommit ?? null, repo.repoId, options.planId, options.revision);
+        if (state === "plan_ready") {
+          const runs = store.db.prepare("SELECT run_id FROM runs WHERE repo_id=? AND profile='planning' AND plan_id=? AND revision=? AND state='active'").all(repo.repoId, options.planId, options.revision) as Array<{ run_id: string }>;
+          if (runs.length !== 1) throw new ValidationError("plan_ready transition requires exactly one bound active planning run");
+          dispatchId = new DispatchService(store).createPlanningCommit(runs[0]!.run_id, {
+            objective: `Commit immutable planning revision ${options.planId}/${options.revision}.`,
+            allowed_read_paths: [`.ai-team/plans/${options.planId}/plan.yaml`, `.ai-team/plans/${options.planId}/revisions/${options.revision}`],
+            allowed_write_paths: [],
+            acceptance_criteria: ["Commit only plan.yaml, this revision, and its archived research", "Record the planning trailers and resulting commit"],
+            context: { plan_id: options.planId, revision: options.revision },
+          });
+        }
+      });
+      transition();
+      return { state, ...(dispatchId ? { dispatch_id: dispatchId } : {}) };
     }));
   });
-  revision.command("commit").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").action(async (options) => {
+  revision.command("commit").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").action(async (options) => {
     const repo = await repositoryIdentity(options.project);
     output(await withStore(async (store) => {
+      new DispatchService(store).assertClaimed(options.runId, options.dispatchId, "git-operator");
+      const run = store.getRun(options.runId) as { repo_id: string; profile: string };
+      if (run.repo_id !== repo.repoId || run.profile !== "planning") throw new ValidationError("planning commit dispatch does not belong to this revision repository");
       const row = store.db.prepare("SELECT * FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?").get(repo.repoId, options.planId, options.revision) as any;
       if (!row || !["plan_ready", "tasks_preview"].includes(row.state) || !row.digest) throw new ValidationError("planning revision is not ready to commit");
       const commit = await commitPlanningRevision(repo.root, options.planId, options.revision, row.digest);
@@ -92,9 +113,15 @@ export const buildProgram = (): Command => {
   });
 
   const coding = program.command("coding");
-  requestOptions(coding.command("start").requiredOption("--project <path>").addOption(new Option("--mode <mode>").choices(["planned", "bug", "feature"]).makeOptionMandatory()).option("--plan-id <id>").option("--revision <nnn>"))
+  requestOptions(coding.command("start").requiredOption("--project <path>").addOption(new Option("--mode <mode>").choices(["planned", "bug", "feature"])).option("--plan-id <id>").option("--revision <nnn>"))
     .action(async (options) => {
       validateCommand("coding.start", { project: options.project, mode: options.mode, planId: options.planId, revision: options.revision, requestFile: options.requestFile, requestStdin: options.requestStdin });
+      if (!options.mode) {
+        const hasRequest = Boolean(options.requestFile || options.requestStdin);
+        const request = hasRequest ? await WorkflowService.requestFrom(options.requestFile, options.requestStdin) : undefined;
+        output(await withStore((store) => new WorkflowService(store).codingStartAuto(options.project, request, options.planId, options.revision)));
+        return;
+      }
       const direct = options.mode !== "planned";
       if (direct && !options.requestFile && !options.requestStdin || !direct && (options.requestFile || options.requestStdin)) throw new ValidationError("planned forbids request input; bug/feature require exactly one request input");
       if (direct && (options.planId || options.revision)) throw new ValidationError("bug/feature forbids plan-id and revision");
@@ -111,7 +138,7 @@ export const buildProgram = (): Command => {
     pending_operations: store.db.prepare("SELECT operation_id,kind,state FROM operations WHERE run_id=? AND state='pending'").all(runId),
     last_event: store.db.prepare("SELECT type,payload_json,created_at FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT 1").get(runId) ?? null,
   }))));
-  run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readFile(options.noteFile, "utf8") : undefined; store.decide(options.runId, options.decisionId, options.choice, note); output({ status: "resolved" }); }));
+  run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readFile(options.noteFile, "utf8") : undefined; store.decide(options.runId, options.decisionId, options.choice, note); const run = store.getRun(options.runId) as { profile: string }; const dispatchId = run.profile === "planning" ? new DispatchService(store).continuePlanning(options.runId) : undefined; output({ status: "resolved", ...(dispatchId ? { dispatch_id: dispatchId } : {}) }); }));
 
   const dispatch = program.command("dispatch");
   dispatch.command("create").requiredOption("--run-id <id>").addOption(roleOption()).requiredOption("--packet-file <file>").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).action(async (options) => output(await withStore(async (store) => {
@@ -131,7 +158,7 @@ export const buildProgram = (): Command => {
   gitCommand.command("commit").requiredOption("--run-id <id>").requiredOption("--worktree-id <id>").requiredOption("--message <message>").requiredOption("--scope <paths>", "comma-separated repository-relative scopes").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).commit(options.runId, options.worktreeId, options.message, options.scope.split(",")))));
   gitCommand.command("merge-task").requiredOption("--run-id <id>").requiredOption("--integration-id <id>").requiredOption("--task-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).mergeTask(options.runId, options.integrationId, options.taskId)) }));
   gitCommand.command("continue-conflict").requiredOption("--run-id <id>").requiredOption("--integration-id <id>").requiredOption("--scope <paths>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).continueConflict(options.runId, options.integrationId, options.scope.split(","))) }));
-  gitCommand.command("integrate").requiredOption("--run-id <id>").requiredOption("--integration-id <id>").action(async (options) => output({ commit: await withStore(async (store) => { new ReviewService(store).assertGate(options.runId); return new GitOrchestrator(store).integrateTarget(options.runId, options.integrationId); }) }));
+  gitCommand.command("integrate").requiredOption("--run-id <id>").requiredOption("--integration-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).integrateTarget(options.runId, options.integrationId)) }));
   gitCommand.command("reconcile").requiredOption("--run-id <id>").option("--operation-id <id>").option("--state <state>").option("--evidence-file <file>").action(async (options) => output(await withStore(async (store) => {
     if (options.operationId) {
       if (!options.state || !options.evidenceFile) throw new ValidationError("reconcile mutation requires --state and --evidence-file");
@@ -192,4 +219,4 @@ export const main = async (argv = process.argv): Promise<void> => {
   }
 };
 
-if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) await main();
+if (process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])) await main();

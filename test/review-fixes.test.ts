@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,8 @@ import { ReviewService, type ReviewResult } from "../src/review.js";
 import { StateStore } from "../src/state.js";
 
 const temporaryDirectory = async (): Promise<string> => mkdtemp(join(tmpdir(), "ai-team-review-fixes-"));
+const REVIEW_HEAD = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const REVIEW_COMMON_DIR = execFileSync("git", ["rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
 
 const withStore = async (callback: (store: StateStore, home: string) => Promise<void> | void): Promise<void> => {
   const home = await temporaryDirectory();
@@ -30,8 +33,8 @@ const createRun = (
   profile: "planning" | "coding" = "coding",
   extra: { planId?: string; revision?: string } = {},
 ): string => {
-  const repoId = `repo-${profile}-${Math.random()}`;
-  store.registerRepository(repoId, `/tmp/${repoId}/.git`, `/tmp/${repoId}`);
+  const repoId = "repo-review-fixture";
+  store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
   return store.createRun({
     repoId,
     profile,
@@ -166,8 +169,8 @@ test("failed and retryable results require failure metadata and never advance th
 
 test("completed results enforce the payload schema selected for every role", () => {
   const payloads = {
-    planning: { actions: ["confirm requirements"] },
-    coding: { actions: ["dispatch backend task"] },
+    planning: { actions: ["confirm requirements"], stage: "requirements", pending_questions: [], decision: null },
+    coding: { actions: ["dispatch backend task"], triage: "feature" },
     "file-explorer": { allowed_read_paths: ["src/a.ts"], entry_points: ["src/a.ts"], test_commands: ["npm test"] },
     "frontend-developer": { modified_paths: ["src/ui.ts"], self_tests: [{ command: "npm test", outcome: "passed" }] },
     "backend-developer": { modified_paths: ["src/api.ts"], self_tests: [{ command: "npm test", outcome: "passed" }] },
@@ -201,7 +204,7 @@ test("completed results enforce the payload schema selected for every role", () 
   }
 
   const codingWithPlanningPayload = completedResult(runId, dispatchId, "coding", payloads.planning);
-  assert.equal(checkResultEnvelope(codingWithPlanningPayload).valid, true);
+  assert.equal(checkResultEnvelope(codingWithPlanningPayload).valid, false);
   assert.equal(
     checkResultEnvelope({ ...codingWithPlanningPayload, payload: payloads["file-explorer"] }).valid,
     false,
@@ -211,8 +214,12 @@ test("completed results enforce the payload schema selected for every role", () 
 test("review findings without a concrete location or impact are rejected", async () => {
   await withStore((store) => {
     const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const testId = dispatches.create(runId, "test", dispatchPacket());
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(completedResult(runId, testId, "test", { checks: [{ command: "npm test", outcome: "passed" }] })), new Date().toISOString(), testId);
     const reviews = new ReviewService(store);
-    const barrier = reviews.create(runId, "a".repeat(40), false);
+    const barrier = reviews.create(runId, REVIEW_HEAD, false);
     const validFinding: ReviewResult["findings"][number] = {
       finding_id: "FIND-CODE-001",
       severity: "P1",
@@ -238,6 +245,9 @@ test("review findings without a concrete location or impact are rejected", async
         /lacks source, location, impact, or recommendation/,
       );
     }
+    const leaf = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='review-standards'").get(runId) as { dispatch_id: string };
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify({ ...completedResult(runId, leaf.dispatch_id, "review-standards", { finding_ids: [validFinding.finding_id] }), summary: "reviewed", findings: [validFinding] }), new Date().toISOString(), leaf.dispatch_id);
     assert.equal(reviews.submit(runId, barrier.barrier_id, {
       axis: "standards",
       summary: "reviewed",
@@ -345,6 +355,76 @@ test("planning research is archived with its revision while coding research stay
     assert.equal(coding.path, join(store.paths.artifacts, codingRun, "research", "api-support.md"));
     assert.equal(coding.path.startsWith(join(project, ".ai-team", "plans")), false);
     assert.match(await readFile(coding.path, "utf8"), /# Research: API support/);
+  });
+});
+
+test("planning revision binding and Git Operator dispatch enforce run ownership", async () => {
+  await withStore((store) => {
+    const runId = createRun(store, "planning");
+    assert.throws(
+      () => store.bindPlanningRevision(runId, "another-repository", "20260814-plan-abcd", "001"),
+      /does not belong/,
+    );
+    store.bindPlanningRevision(runId, "repo-review-fixture", "20260814-plan-abcd", "001");
+    assert.equal(store.getRun(runId).plan_id, "20260814-plan-abcd");
+    store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
+      .run("20260814-plan-abcd", "001", "repo-review-fixture", "plan_ready", "main", new Date().toISOString());
+    const dispatches = new DispatchService(store);
+    const packet = {
+      objective: "Commit the immutable planning revision",
+      allowed_read_paths: [".ai-team/plans/20260814-plan-abcd/revisions/001"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Only planning files are committed"],
+      context: { plan_id: "20260814-plan-abcd", revision: "001" },
+    };
+    const dispatchId = dispatches.createPlanningCommit(runId, packet);
+    assert.equal(dispatches.createPlanningCommit(runId, packet), dispatchId);
+    assert.throws(() => dispatches.assertClaimed(runId, dispatchId, "git-operator"), /must be claimed/);
+    dispatches.claim(runId, dispatchId, "git-operator");
+    assert.doesNotThrow(() => dispatches.assertClaimed(runId, dispatchId, "git-operator"));
+  });
+});
+
+test("planning results advance one stage and create at most one matching decision", async () => {
+  await withStore(async (store, home) => {
+    const runId = createRun(store, "planning");
+    store.db.prepare("UPDATE runs SET stage='planning' WHERE run_id=?").run(runId);
+    const dispatches = new DispatchService(store);
+    const planningId = dispatches.create(runId, "planning", dispatchPacket(), "planning");
+    dispatches.claim(runId, planningId, "planning");
+    const question = "Which compatibility target should the complete requirements use?";
+    const resultPath = join(home, "planning-stage.json");
+    await writeFile(resultPath, JSON.stringify(completedResult(runId, planningId, "planning", {
+      actions: ["clarify compatibility"],
+      stage: "requirements",
+      pending_questions: [question],
+      decision: {
+        question,
+        choices: [
+          { id: "current", label: "Current", impact: "No migration" },
+          { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
+        ],
+        recommendation: "current",
+      },
+    })));
+    await dispatches.submit(runId, planningId, "planning", resultPath);
+    assert.equal(store.getRun(runId).stage, "requirements");
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { count: number }).count, 1);
+
+    const invalidRun = createRun(store, "planning");
+    store.db.prepare("UPDATE runs SET stage='planning' WHERE run_id=?").run(invalidRun);
+    const invalidId = dispatches.create(invalidRun, "planning", dispatchPacket(), "planning");
+    dispatches.claim(invalidRun, invalidId, "planning");
+    const invalidPath = join(home, "planning-skip.json");
+    await writeFile(invalidPath, JSON.stringify(completedResult(invalidRun, invalidId, "planning", {
+      actions: ["skip confirmation"], stage: "ready", pending_questions: [], decision: null,
+    })));
+    await assert.rejects(dispatches.submit(invalidRun, invalidId, "planning", invalidPath), /invalid planning stage transition/);
+    assert.equal(
+      (store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(invalidId) as { state: string }).state,
+      "claimed",
+    );
+    assert.equal(store.getRun(invalidRun).stage, "planning");
   });
 });
 

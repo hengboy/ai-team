@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -102,7 +103,7 @@ test("state migration is recorded once and survives reopening", async () => {
   try {
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }],
     );
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
@@ -113,8 +114,48 @@ test("state migration is recorded once and survives reopening", async () => {
     store = await StateStore.open(home);
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }],
     );
+  } finally {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("migration 004 preserves legacy revisions and scopes identical revisions by repository", async () => {
+  const home = await temporaryHome();
+  let store = await StateStore.open(home);
+  try {
+    store.registerRepository("repo-a", "/tmp/repo-a.git", "/tmp/repo-a");
+    store.registerRepository("repo-b", "/tmp/repo-b.git", "/tmp/repo-b");
+    store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
+      .run("20260814-shared-abcd", "001", "repo-a", "ready", "main", "2026-08-14T00:00:00.000Z");
+    store.close();
+
+    const database = new Database(join(home, "state", "state.sqlite"));
+    database.pragma("foreign_keys = OFF");
+    database.exec(`
+      ALTER TABLE revisions RENAME TO revisions_v4;
+      CREATE TABLE revisions (
+        plan_id TEXT NOT NULL, revision TEXT NOT NULL, repo_id TEXT NOT NULL REFERENCES repositories(repo_id),
+        state TEXT NOT NULL, target_branch TEXT NOT NULL, digest TEXT, plan_commit TEXT, supersedes TEXT,
+        created_at TEXT NOT NULL, PRIMARY KEY(plan_id, revision)
+      );
+      INSERT INTO revisions SELECT plan_id,revision,repo_id,state,target_branch,digest,plan_commit,supersedes,created_at FROM revisions_v4;
+      DROP TABLE revisions_v4;
+      DELETE FROM schema_migrations WHERE name='004-repository-scoped-revisions';
+    `);
+    database.close();
+
+    store = await StateStore.open(home);
+    store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
+      .run("20260814-shared-abcd", "001", "repo-b", "draft", "develop", "2026-08-14T00:01:00.000Z");
+    const rows = store.db.prepare("SELECT repo_id,state,target_branch FROM revisions WHERE plan_id=? AND revision=? ORDER BY repo_id")
+      .all("20260814-shared-abcd", "001");
+    assert.deepEqual(rows, [
+      { repo_id: "repo-a", state: "ready", target_branch: "main" },
+      { repo_id: "repo-b", state: "draft", target_branch: "develop" },
+    ]);
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });

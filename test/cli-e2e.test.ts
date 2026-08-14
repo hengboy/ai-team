@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -100,6 +100,16 @@ test("CLI help and contract expose the installed command contract", async (t) =>
   assert.match(contract.role_manifest_digest, /^[a-f0-9]{64}$/);
   assert.ok(contract.roles.includes("file-explorer"));
   assert.ok(contract.roles.includes("test"));
+});
+
+test("CLI entrypoint executes through a symlinked path", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const linkedCli = join(sandbox.root, "linked cli.js");
+  await symlink(CLI, linkedCli);
+  const contract = json<{ contract_digest: string }>(
+    await execute(process.execPath, [linkedCli, "contract"], { cwd: sandbox.repo, env: sandbox.env }),
+  );
+  assert.match(contract.contract_digest, /^[a-f0-9]{64}$/);
 });
 
 test("init creates project metadata and applies the documented ignore entries", async (t) => {
@@ -213,16 +223,15 @@ test("planning dispatch can be claimed, inspected, submitted, resumed, and decid
 
   const noteFile = join(sandbox.root, "note.txt");
   await writeFile(noteFile, "Keep the change narrowly scoped.\n");
-  assert.deepEqual(
-    json(await cli(sandbox, [
+  const resolved = json<{ status: string; dispatch_id: string }>(await cli(sandbox, [
       "run", "decide",
       "--run-id", started.run_id,
       "--decision-id", decision.decision_id,
       "--choice", "minimal",
       "--note-file", noteFile,
-    ])),
-    { status: "resolved" },
-  );
+    ]));
+  assert.equal(resolved.status, "resolved");
+  assert.match(resolved.dispatch_id, /^dispatch_[0-9A-HJKMNP-TV-Z]{26}$/);
   const finalState = json<{ decisions: Array<{ status: string; choice: string; note: string }> }>(
     await cli(sandbox, ["run", "show", started.run_id]),
   );

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +13,8 @@ import {
   type Platform,
 } from "../src/environment.js";
 import { ROLES } from "../src/constants.js";
+import { ROLE_MANIFEST } from "../src/roles.js";
+import YAML from "yaml";
 
 const makeHomes = async (t: test.TestContext): Promise<{ aiTeamHome: string; userHome: string }> => {
   const root = await mkdtemp(join(tmpdir(), "ai-team-environment-test-"));
@@ -30,6 +32,14 @@ const balancedEnvironment = (): EnvironmentFile => {
   const environment = DEFAULT_ENVIRONMENTS.find(({ name }) => name === "balanced");
   assert.ok(environment);
   return structuredClone(environment);
+};
+
+const recordSupportedVersions = async (service: EnvironmentService, platforms: Platform[] = PLATFORMS): Promise<void> => {
+  await service.bootstrap();
+  const configPath = join(service.paths.root, "config.yaml");
+  const config = YAML.parse(await readFile(configPath, "utf8"));
+  for (const platform of platforms) config.client_versions[platform].detected_version = config.client_versions[platform].minimum;
+  await writeFile(configPath, YAML.stringify(config));
 };
 
 test("resolveEnvironment applies platform defaults and role overrides", () => {
@@ -66,6 +76,16 @@ test("environment overrides configure each role independently", () => {
   assert.deepEqual(resolved.test.codex, { model: "gpt-5.2", reasoning: "medium" });
 });
 
+test("environment validation rejects unknown override roles and unsafe names", async (t) => {
+  const environment = balancedEnvironment() as EnvironmentFile & { overrides: Record<string, unknown> };
+  environment.overrides = { unknown: { codex: { model: "gpt", reasoning: "high" } } };
+  assert.throws(() => resolveEnvironment(environment), /environment schema is invalid/);
+
+  const { aiTeamHome, userHome } = await makeHomes(t);
+  const service = new EnvironmentService(aiTeamHome, userHome);
+  await assert.rejects(service.load("../balanced"), /invalid environment name/);
+});
+
 test("renderAgents renders all twelve roles for all three platforms", () => {
   const files = renderAgents(balancedEnvironment());
 
@@ -76,6 +96,14 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
       const content = files.get(`${platform}/agents/${role}.${extension}`);
       assert.ok(content, `missing ${platform} output for ${role}`);
       assert.match(content, new RegExp(`Role: ${role}`));
+      assert.match(content, /CLI 命令契约/);
+      for (const command of ROLE_MANIFEST[role].commands) assert.ok(content.includes(`\`${command}\``), `missing command ${command} for ${role}`);
+      const metadata = platform === "codex"
+        ? JSON.parse(JSON.parse(content.match(/^metadata = (.+)$/m)?.[1] ?? "null"))
+        : YAML.parse(content.slice(content.indexOf("---") + 4, content.indexOf("---", content.indexOf("---") + 3))).ai_team;
+      assert.deepEqual(metadata.command_contract.allowed_commands, ROLE_MANIFEST[role].commands);
+      assert.ok(metadata.command_contract.syntax.length > 0);
+      assert.ok(Object.keys(metadata.command_contract.parameter_types).length > 0);
       if (platform === "codex") {
         assert.ok(content.includes(`\\"platform\\":\\"${platform}\\"`));
         assert.match(content, /model_reasoning_effort = "medium"/);
@@ -109,6 +137,7 @@ test("generate records status and drift blocks uninstall", async (t) => {
   const { aiTeamHome, userHome } = await makeHomes(t);
   const service = new EnvironmentService(aiTeamHome, userHome);
   const driftedPath = join(userHome, ".codex", "agents", "planning.toml");
+  await recordSupportedVersions(service);
 
   const plan = await service.generate("balanced");
   assert.equal(plan.writes.length, ROLES.length * PLATFORMS.length + PLATFORMS.length);
@@ -123,6 +152,7 @@ test("generate records status and drift blocks uninstall", async (t) => {
     path: driftedPath,
     state: "drifted",
   });
+  await assert.rejects(service.generate("balanced"), /blocked by drift/);
 
   const preview = await service.uninstall(true);
   assert.deepEqual(preview.blocked, [driftedPath]);
@@ -130,6 +160,15 @@ test("generate records status and drift blocks uninstall", async (t) => {
   await assert.rejects(service.uninstall(), /managed files drifted; uninstall blocked/);
   assert.equal(await readFile(driftedPath, "utf8"), "locally edited\n");
   await stat(join(aiTeamHome, "manifest.json"));
+});
+
+test("generation rejects managed targets that escape user home through symlinks", async (t) => {
+  const { aiTeamHome, userHome } = await makeHomes(t);
+  const outside = await mkdtemp(join(tmpdir(), "ai-team-environment-outside-"));
+  t.after(async () => { const { rm } = await import("node:fs/promises"); await rm(outside, { recursive: true, force: true }); });
+  await symlink(outside, join(userHome, ".codex"));
+  const service = new EnvironmentService(aiTeamHome, userHome);
+  await assert.rejects(service.generate("balanced", ["codex"], true), /escapes user home through symlink/);
 });
 
 test("restore refuses to overwrite an existing destination", async (t) => {
@@ -152,6 +191,7 @@ test("uninstall removes only managed blocks and preserves user instructions", as
   const instructions = join(fixture.userHome, ".codex", "AGENTS.md");
   await mkdir(join(fixture.userHome, ".codex"), { recursive: true });
   await writeFile(instructions, "# User instructions\n\nKeep this content.\n");
+  await recordSupportedVersions(service, ["codex"]);
   await service.generate("balanced", ["codex"]);
   assert.match(await readFile(instructions, "utf8"), /Keep this content/);
   await service.uninstall();
@@ -188,4 +228,14 @@ test("doctor without probe does not invoke platform clients", async (t) => {
     if (originalProbeLog === undefined) delete process.env.AI_TEAM_PROBE_LOG;
     else process.env.AI_TEAM_PROBE_LOG = originalProbeLog;
   }
+});
+
+test("doctor probe bootstraps a fresh installation before persisting versions", async (t) => {
+  const { aiTeamHome, userHome } = await makeHomes(t);
+  const service = new EnvironmentService(aiTeamHome, userHome);
+  const results = await service.doctor(true);
+  assert.equal(results.length, PLATFORMS.length);
+  const config = YAML.parse(await readFile(join(aiTeamHome, "config.yaml"), "utf8"));
+  assert.equal(config.active_environment, "balanced");
+  assert.ok(config.client_versions.codex);
 });

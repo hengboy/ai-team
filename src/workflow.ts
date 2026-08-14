@@ -3,6 +3,7 @@ import { currentBranch, currentHead, repositoryIdentity, worktreeStatus } from "
 import { StateStore } from "./state.js";
 import { DispatchService } from "./dispatch.js";
 import { ValidationError } from "./errors.js";
+import { triageRequest } from "./planning.js";
 
 export class WorkflowService {
   readonly dispatches: DispatchService;
@@ -22,6 +23,11 @@ export class WorkflowService {
       context: { request },
     }, "planning");
     return { run_id: runId, dispatch_id: dispatchId };
+  }
+
+  async bindPlanningRevision(runId: string, project: string, planId: string, revision: string): Promise<void> {
+    const repo = await repositoryIdentity(project);
+    this.store.bindPlanningRevision(runId, repo.repoId, planId, revision);
   }
 
   async codingStart(input: { project: string; mode: "planned" | "bug" | "feature"; planId?: string; revision?: string; request?: string }): Promise<{ run_id: string; dispatch_id: string }> {
@@ -52,6 +58,27 @@ export class WorkflowService {
       context: { mode: input.mode, plan_id: input.planId ?? null, revision: selectedRevision ?? null, request: input.request ?? null, implementation_base_commit: head },
     }, "coding");
     return { run_id: runId, dispatch_id: dispatchId };
+  }
+
+  async codingStartAuto(project: string, request?: string, planId?: string, revision?: string): Promise<{ triage: "planned" | "bug" | "feature" | "planning"; run_id?: string; dispatch_id?: string }> {
+    const repo = await repositoryIdentity(project);
+    this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
+    if (revision && !planId) throw new ValidationError("automatic planned triage requires plan-id with revision");
+    if (planId) {
+      const started = await this.codingStart({ project, mode: "planned", planId, ...(revision ? { revision } : {}) });
+      return { triage: "planned", ...started };
+    }
+    const ready = this.store.db.prepare("SELECT plan_id,revision FROM revisions WHERE repo_id=? AND state='ready' ORDER BY created_at DESC").all(repo.repoId) as Array<{ plan_id: string; revision: string }>;
+    if (ready.length === 1) {
+      const started = await this.codingStart({ project, mode: "planned", planId: ready[0]!.plan_id, revision: ready[0]!.revision });
+      return { triage: "planned", ...started };
+    }
+    if (ready.length > 1) throw new ValidationError("multiple ready revisions; specify a plan");
+    if (!request?.trim()) throw new ValidationError("automatic coding triage requires a request");
+    const mode = triageRequest(request);
+    if (mode === "planning") return { triage: mode };
+    const started = await this.codingStart({ project, mode, request });
+    return { triage: mode, ...started };
   }
 
   static async requestFrom(file?: string, stdin = false): Promise<string> {

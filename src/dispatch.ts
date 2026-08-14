@@ -4,8 +4,9 @@ import type { Role } from "./constants.js";
 import { checkResultEnvelope, createResultTemplate, resultSchemaForRole, type ResultEnvelope } from "./contracts.js";
 import { ValidationError } from "./errors.js";
 import { ROLE_MANIFEST } from "./roles.js";
+import { assertWritablePath } from "./security.js";
 import { StateStore } from "./state.js";
-import { makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
+import { assertRelativePosixPath, makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
 
 export interface DispatchPacket {
   objective: string;
@@ -15,21 +16,59 @@ export interface DispatchPacket {
   context: Record<string, unknown>;
 }
 
+const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
+  if (!packet || typeof packet !== "object" || Array.isArray(packet)) throw new ValidationError("dispatch packet must be an object");
+  const value = packet as Record<string, unknown>;
+  const allowed = new Set(["objective", "allowed_read_paths", "allowed_write_paths", "acceptance_criteria", "context"]);
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unknown.length) throw new ValidationError("dispatch packet has unknown fields", unknown.map((key) => `/${key}`));
+  if (typeof value.objective !== "string" || !value.objective.trim()) throw new ValidationError("dispatch packet objective must be a non-empty string", ["/objective"]);
+  for (const key of ["allowed_read_paths", "allowed_write_paths", "acceptance_criteria"] as const) {
+    if (!Array.isArray(value[key]) || value[key].some((item) => typeof item !== "string" || !item.trim())) {
+      throw new ValidationError(`dispatch packet ${key} must contain non-empty strings`, [`/${key}`]);
+    }
+  }
+  if (!(value.context && typeof value.context === "object" && !Array.isArray(value.context))) throw new ValidationError("dispatch packet context must be an object", ["/context"]);
+  if (!(value.acceptance_criteria as string[]).length) throw new ValidationError("dispatch packet requires acceptance criteria", ["/acceptance_criteria"]);
+  const reads = value.allowed_read_paths as string[];
+  const writes = value.allowed_write_paths as string[];
+  for (const path of [...reads, ...writes]) {
+    if (path !== "." && path !== "**") assertRelativePosixPath(path);
+  }
+  for (const path of writes) assertWritablePath(path);
+  const broad = reads.filter((path) => path === "**" || path === "." || path.endsWith("/**"));
+  if (role !== "file-explorer" && broad.length) throw new ValidationError(`${role} requires exact allowed_read_paths`);
+  return value as unknown as DispatchPacket;
+};
+
 export class DispatchService {
   constructor(readonly store: StateStore) {}
 
   create(runId: string, role: Role, packet: DispatchPacket, actorRole?: Role): string {
     const run = this.store.getRun(runId) as { profile: Role };
     const actor = actorRole ?? run.profile;
-    if (actorRole && actorRole !== run.profile) throw new ValidationError(`${actorRole} cannot act for ${run.profile} run`);
+    const reviewerLeaf = run.profile === "coding" && actor === "code-reviewer" && (role === "review-spec" || role === "review-standards");
+    if (actorRole && actorRole !== run.profile && !reviewerLeaf) throw new ValidationError(`${actorRole} cannot act for ${run.profile} run`);
     this.assertCommandAllowed(actor, "dispatch create");
     const definition = ROLE_MANIFEST[actor];
     if (role !== actor && !definition.delegates.includes(role)) {
       throw new ValidationError(`${actor} cannot delegate to ${role}`);
     }
-    if (!packet.objective.trim() || !packet.acceptance_criteria.length) throw new ValidationError("dispatch packet requires objective and acceptance criteria");
-    const broad = packet.allowed_read_paths.filter((path) => path === "**" || path.endsWith("/**"));
-    if (role !== "file-explorer" && (broad.length || packet.allowed_read_paths.includes("."))) throw new ValidationError(`${role} requires exact allowed_read_paths`);
+    return this.insert(runId, role, validatePacket(packet, role));
+  }
+
+  createPlanningCommit(runId: string, packet: DispatchPacket): string {
+    const run = this.store.getRun(runId) as { profile: string; repo_id: string; plan_id?: string; revision?: string };
+    if (run.profile !== "planning" || !run.plan_id || !run.revision) throw new ValidationError("planning commit requires a bound planning revision");
+    const revision = this.store.db.prepare("SELECT state FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+      .get(run.repo_id, run.plan_id, run.revision) as { state: string } | undefined;
+    if (revision?.state !== "plan_ready") throw new ValidationError("planning commit dispatch requires a plan_ready revision");
+    const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator' AND state!='failed'").get(runId) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
+    return this.insert(runId, "git-operator", validatePacket(packet, "git-operator"));
+  }
+
+  private insert(runId: string, role: Role, packet: DispatchPacket): string {
     const dispatchId = makeId("dispatch");
     const prompt = [
       `Role: ${role}`,
@@ -37,6 +76,9 @@ export class DispatchService {
       `目标：${packet.objective}`,
       `允许读取：${packet.allowed_read_paths.join(", ") || "无"}`,
       `允许写入：${packet.allowed_write_paths.join(", ") || "无"}`,
+      `验收条件：${packet.acceptance_criteria.join("；")}`,
+      `上下文：${stableJson(packet.context)}`,
+      "返回字段：schema_version, run_id, dispatch_id, role, status, summary, findings, changes, verification, risks, decisions_needed, requested_support, handoff, payload。",
       "只能返回符合冻结 schema 的结果。遇到数据包之外的工作时请求支持。",
     ].join("\n");
     const template = createResultTemplate(runId, dispatchId, role);
@@ -63,6 +105,11 @@ export class DispatchService {
   prompt(runId: string, dispatchId: string, role: Role): string { return this.get(runId, dispatchId, role).prompt as string; }
   schema(runId: string, dispatchId: string, role: Role): unknown { return JSON.parse(this.get(runId, dispatchId, role).schema_json); }
   template(runId: string, dispatchId: string, role: Role): ResultEnvelope { return JSON.parse(this.get(runId, dispatchId, role).template_json) as ResultEnvelope; }
+
+  assertClaimed(runId: string, dispatchId: string, role: Role): void {
+    const row = this.get(runId, dispatchId, role);
+    if (row.state !== "claimed") throw new ValidationError(`${role} dispatch must be claimed before this operation`);
+  }
 
   async validateFile(runId: string, dispatchId: string, role: Role, path: string): Promise<ResultEnvelope> {
     this.get(runId, dispatchId, role);
@@ -97,10 +144,15 @@ export class DispatchService {
       this.store.db.prepare("INSERT OR IGNORE INTO artifacts(artifact_id,run_id,dispatch_id,kind,path,sha256,redacted,created_at) VALUES (?,?,?,'result',?,?,1,?)")
         .run(artifactId, runId, dispatchId, artifact, digest, new Date().toISOString());
       this.store.event(runId, "dispatch.completed", { dispatchId, status: result.status, artifactId, digest });
+      if (result.status === "completed") {
+        if (role === "planning") this.advancePlanning(runId, result);
+        else this.advanceRun(runId, role, result);
+      } else {
+        this.store.db.prepare("UPDATE runs SET state=?,updated_at=? WHERE run_id=?")
+          .run(result.status === "retryable_failure" ? "retryable_failure" : result.status === "needs_decision" ? "needs_decision" : "failed", new Date().toISOString(), runId);
+      }
     });
     transaction();
-    if (result.status === "completed") this.advanceRun(runId, role, result);
-    else this.store.db.prepare("UPDATE runs SET state=?,updated_at=? WHERE run_id=?").run(result.status === "retryable_failure" ? "retryable_failure" : result.status === "needs_decision" ? "needs_decision" : "failed", new Date().toISOString(), runId);
     return { reused: false, artifact };
   }
 
@@ -120,6 +172,42 @@ export class DispatchService {
     const dispatchId = this.create(runId, next as Role, packet, run.profile as Role);
     this.store.db.prepare("UPDATE runs SET stage=?,updated_at=? WHERE run_id=?").run(next, new Date().toISOString(), runId);
     this.store.event(runId, "run.stage_changed", { stage: next, dispatchId });
+  }
+
+  private advancePlanning(runId: string, result: ResultEnvelope): void {
+    const payload = result.payload as { stage: string; pending_questions: string[]; decision: { question: string; choices: Array<{ id: string; label: string; impact: string }>; recommendation: string } | null };
+    const run = this.store.getRun(runId) as { stage: string };
+    const transitions: Record<string, string[]> = {
+      planning: ["requirements"],
+      requirements: ["requirements", "requirements_confirmed"],
+      requirements_confirmed: ["spec_ready"],
+      spec_ready: ["plan_ready"],
+      plan_ready: ["tasks_preview", "ready"],
+      tasks_preview: ["tasks_preview", "ready"],
+      ready: [],
+    };
+    if (!transitions[run.stage]?.includes(payload.stage)) throw new ValidationError(`invalid planning stage transition: ${run.stage} -> ${payload.stage}`);
+    if (payload.pending_questions.length && payload.stage !== "requirements" && payload.stage !== "tasks_preview") {
+      throw new ValidationError(`planning stage ${payload.stage} cannot have pending questions`);
+    }
+    this.store.db.prepare("UPDATE runs SET stage=?,updated_at=? WHERE run_id=?").run(payload.stage, new Date().toISOString(), runId);
+    this.store.event(runId, "planning.stage_changed", { stage: payload.stage });
+    if (payload.pending_questions.length === 1) {
+      if (!payload.decision) throw new ValidationError("planning pending question requires one matching decision");
+      this.store.createDecision(runId, payload.decision.question, payload.decision.choices, payload.decision.recommendation);
+    }
+  }
+
+  continuePlanning(runId: string): string {
+    const run = this.store.getRun(runId) as { profile: string; stage: string };
+    if (run.profile !== "planning") throw new ValidationError("only planning runs can continue planning");
+    const pending = this.store.db.prepare("SELECT 1 FROM decisions WHERE run_id=? AND status='pending'").get(runId);
+    if (pending) throw new ValidationError("planning cannot continue with a pending decision");
+    return this.create(runId, "planning", {
+      objective: "Continue the planning workflow from the resolved user decision, asking at most one highest-priority question.",
+      allowed_read_paths: ["package.json"], allowed_write_paths: [".ai-team/plans/**"],
+      acceptance_criteria: ["Return the next planning stage", "Return at most one pending question"], context: { stage: run.stage },
+    }, "planning");
   }
 
   private artifactPath(runId: string, dispatchId: string): string { return join(this.store.paths.artifacts, runId, dispatchId, "result.json"); }

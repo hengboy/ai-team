@@ -62,9 +62,32 @@ const validateResult = ajv.compile<ResultEnvelope>(resultEnvelopeSchema);
 
 const stringArray = { type: "array", items: { type: "string" } } as const;
 const evidenceArray = { type: "array", minItems: 1, items: { type: "object", additionalProperties: false, required: ["command", "outcome"], properties: { command: { type: "string" }, outcome: { type: "string" } } } } as const;
+const decisionSchema = {
+  type: ["object", "null"],
+  additionalProperties: false,
+  required: ["question", "choices", "recommendation"],
+  properties: {
+    question: { type: "string", minLength: 1 },
+    choices: {
+      type: "array",
+      minItems: 2,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "label", "impact"],
+        properties: {
+          id: { type: "string", minLength: 1 },
+          label: { type: "string", minLength: 1 },
+          impact: { type: "string", minLength: 1 },
+        },
+      },
+    },
+    recommendation: { type: "string", minLength: 1 },
+  },
+} as const;
 export const ROLE_PAYLOAD_SCHEMAS: Record<Role, object> = {
-  planning: { type: "object", additionalProperties: false, required: ["actions"], properties: { actions: stringArray } },
-  coding: { type: "object", additionalProperties: false, required: ["actions"], properties: { actions: stringArray } },
+  planning: { type: "object", additionalProperties: false, required: ["actions", "stage", "pending_questions", "decision"], properties: { actions: stringArray, stage: { enum: ["requirements", "requirements_confirmed", "spec_ready", "plan_ready", "tasks_preview", "ready"] }, pending_questions: { type: "array", maxItems: 1, items: { type: "string", minLength: 1 } }, decision: decisionSchema } },
+  coding: { type: "object", additionalProperties: false, required: ["actions"], properties: { actions: stringArray, triage: { enum: ["planned", "bug", "feature", "planning"] } } },
   "file-explorer": { type: "object", additionalProperties: false, required: ["allowed_read_paths", "entry_points", "test_commands"], properties: { allowed_read_paths: stringArray, entry_points: stringArray, test_commands: stringArray } },
   "frontend-developer": { type: "object", additionalProperties: false, required: ["modified_paths", "self_tests"], properties: { modified_paths: stringArray, self_tests: evidenceArray } },
   "backend-developer": { type: "object", additionalProperties: false, required: ["modified_paths", "self_tests"], properties: { modified_paths: stringArray, self_tests: evidenceArray } },
@@ -91,6 +114,15 @@ export const checkResultEnvelope = (value: unknown): { valid: true; value: Resul
   if (envelope.status === "completed" && !payloadValidator(envelope.payload)) {
     return { valid: false, errors: formatSchemaErrors(payloadValidator.errors).map((error) => ({ ...error, path: `/payload${error.path === "/" ? "" : error.path}` })) };
   }
+  if (envelope.status === "completed" && envelope.role === "planning") {
+    const payload = envelope.payload as { pending_questions: string[]; decision: { question: string } | null };
+    if (payload.pending_questions.length === 1 && payload.decision?.question !== payload.pending_questions[0]) {
+      return { valid: false, errors: [{ path: "/payload/decision", message: "must match the single pending question" }] };
+    }
+    if (payload.pending_questions.length === 0 && payload.decision !== null) {
+      return { valid: false, errors: [{ path: "/payload/decision", message: "must be null without a pending question" }] };
+    }
+  }
   return { valid: true, value: envelope };
 };
 
@@ -112,7 +144,7 @@ export const COMMAND_CONTRACT = {
   },
   command_specs: {
     "planning.start": { required: ["project"], optional: ["requestFile", "requestStdin"] },
-    "coding.start": { required: ["project", "mode"], optional: ["planId", "revision", "requestFile", "requestStdin"] },
+    "coding.start": { required: ["project"], optional: ["mode", "planId", "revision", "requestFile", "requestStdin"] },
     "dispatch.identity": { required: ["runId", "dispatchId", "role"], optional: [] },
     "review.create": { required: ["runId", "revisionSha"], optional: ["formal"] },
   },

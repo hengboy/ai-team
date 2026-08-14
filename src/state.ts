@@ -48,6 +48,30 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "004-repository-scoped-revisions",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      db.exec(`
+        ALTER TABLE revisions RENAME TO revisions_legacy;
+        CREATE TABLE revisions (
+          plan_id TEXT NOT NULL,
+          revision TEXT NOT NULL,
+          repo_id TEXT NOT NULL REFERENCES repositories(repo_id),
+          state TEXT NOT NULL,
+          target_branch TEXT NOT NULL,
+          digest TEXT,
+          plan_commit TEXT,
+          supersedes TEXT,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(repo_id, plan_id, revision)
+        );
+        INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,plan_commit,supersedes,created_at)
+          SELECT plan_id,revision,repo_id,state,target_branch,digest,plan_commit,supersedes,created_at FROM revisions_legacy;
+        DROP TABLE revisions_legacy;
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
@@ -118,6 +142,14 @@ export class StateStore {
       VALUES (?, ?, ?, ?, 'active', 'file-explorer', ?, ?, ?, ?, ?, ?, ?)`).run(runId, input.repoId, input.profile, input.mode, input.planId ?? null, input.revision ?? null, input.baseCommit ?? null, input.targetBranch ?? null, input.request ?? null, now, now);
     this.event(runId, "run.created", input);
     return runId;
+  }
+
+  bindPlanningRevision(runId: string, repoId: string, planId: string, revision: string): void {
+    const run = this.getRun(runId) as { repo_id: string; profile: string };
+    if (run.profile !== "planning" || run.repo_id !== repoId) throw new ValidationError("planning revision does not belong to this run repository");
+    this.db.prepare("UPDATE runs SET plan_id=?,revision=?,updated_at=? WHERE run_id=?")
+      .run(planId, revision, new Date().toISOString(), runId);
+    this.event(runId, "planning.revision_bound", { planId, revision });
   }
 
   getRun(runId: string): Record<string, unknown> {

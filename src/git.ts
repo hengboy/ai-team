@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { ValidationError } from "./errors.js";
 import { sha256 } from "./utils.js";
@@ -74,9 +74,11 @@ export const commitPaths = async (project: string, paths: string[], message: str
 };
 
 export const commitPlanningRevision = async (project: string, planId: string, revision: string, digest: string): Promise<string> => {
-  const path = `.ai-team/plans/${planId}/revisions/${revision}`;
+  const paths = [`.ai-team/plans/${planId}/plan.yaml`, `.ai-team/plans/${planId}/revisions/${revision}`];
   const message = `Plan ${planId} revision ${revision}\n\nAI-Team-Plan: ${planId}\nAI-Team-Revision: ${revision}\nAI-Team-Digest: ${digest}`;
-  return commitPaths(project, [path], message);
+  const existing: string[] = [];
+  for (const path of paths) { try { await stat(`${project}/${path}`); existing.push(path); } catch { /* optional plan metadata */ } }
+  return commitPaths(project, existing, message);
 };
 
 export const mergeNoFastForward = async (project: string, branch: string, message: string): Promise<string> => {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 
 import { ValidationError } from "../src/errors.js";
+import { createResultTemplate } from "../src/contracts.js";
 import { repositoryIdentity } from "../src/git.js";
 import { assertCoverage, validateCoverage, writeRevision } from "../src/planning.js";
 import { initializeProject, planProjectInit } from "../src/project.js";
@@ -40,9 +41,11 @@ const openStore = async (): Promise<{ store: StateStore; home: string }> => {
   return { store: await StateStore.open(home), home };
 };
 
-const createRun = (store: StateStore): string => {
-  store.registerRepository("repo", "/tmp/repo/.git", "/tmp/repo");
-  return store.createRun({ repoId: "repo", profile: "coding", mode: "feature" });
+const REVIEW_HEAD = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const REVIEW_COMMON_DIR = execFileSync("git", ["rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
+const createRun = (store: StateStore, mode = "feature"): string => {
+  store.registerRepository("repo", path.resolve(REVIEW_COMMON_DIR), process.cwd());
+  return store.createRun({ repoId: "repo", profile: "coding", mode });
 };
 
 const result = (axis: "spec" | "standards", findings: ReviewResult["findings"] = []): ReviewResult => ({
@@ -51,24 +54,57 @@ const result = (axis: "spec" | "standards", findings: ReviewResult["findings"] =
   findings,
 });
 
+const completeTest = (store: StateStore, runId: string): void => {
+  const dispatchId = new WorkflowService(store).dispatches.create(runId, "test", {
+    objective: "independent verification", allowed_read_paths: ["package.json"], allowed_write_paths: [], acceptance_criteria: ["tests pass"], context: {},
+  });
+  store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+    .run(JSON.stringify({ ...createResultTemplate(runId, dispatchId, "test"), summary: "tests passed", verification: [{ command: "npm test", outcome: "passed" }], payload: { checks: [{ command: "npm test", outcome: "passed" }] } }), new Date().toISOString(), dispatchId);
+};
+
+const completeReviewLeaf = (store: StateStore, runId: string, review: ReviewResult): void => {
+  const role = review.axis === "spec" ? "review-spec" : "review-standards";
+  const row = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role=? ORDER BY created_at DESC LIMIT 1").get(runId, role) as { dispatch_id: string };
+  store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+    .run(JSON.stringify({ ...createResultTemplate(runId, row.dispatch_id, role), summary: review.summary, findings: review.findings, verification: [{ command: "review", outcome: "completed" }], payload: { finding_ids: review.findings.map(({ finding_id }) => finding_id) } }), new Date().toISOString(), row.dispatch_id);
+};
+
+const submitReview = (reviews: ReviewService, store: StateStore, runId: string, barrierId: string, review: ReviewResult) => {
+  completeReviewLeaf(store, runId, review);
+  return reviews.submit(runId, barrierId, review);
+};
+
 test("direct and formal reviews require the correct axes and run once per frozen revision", async () => {
   const { store, home } = await openStore();
   try {
     const reviews = new ReviewService(store);
     const directRun = createRun(store);
-    const direct = reviews.create(directRun, "a".repeat(40), false);
+    completeTest(store, directRun);
+    assert.throws(() => reviews.create(directRun, REVIEW_HEAD, true), /require direct review axes/);
+    assert.throws(() => reviews.create(directRun, "0".repeat(40), false), /commit does not exist/);
+    const direct = reviews.create(directRun, REVIEW_HEAD, false);
     assert.deepEqual(direct.axes, ["standards"]);
+    assert.deepEqual(
+      (store.db.prepare("SELECT role FROM dispatches WHERE run_id=? AND role LIKE 'review-%' ORDER BY role").all(directRun) as Array<{ role: string }>).map(({ role }) => role),
+      ["review-standards"],
+    );
     assert.throws(() => reviews.submit(directRun, direct.barrier_id, result("spec")), /not required/);
-    assert.equal(reviews.submit(directRun, direct.barrier_id, result("standards")).state, "passed");
+    assert.equal(submitReview(reviews, store, directRun, direct.barrier_id, result("standards")).state, "passed");
     assert.throws(() => reviews.submit(directRun, direct.barrier_id, result("standards")), /already complete/);
-    assert.throws(() => reviews.create(directRun, "a".repeat(40), false), /reviews run once/);
+    assert.throws(() => reviews.create(directRun, REVIEW_HEAD, false), /reviews run once/);
 
-    const formalRun = createRun(store);
-    const formal = reviews.create(formalRun, "b".repeat(40), true);
+    const formalRun = createRun(store, "planned");
+    completeTest(store, formalRun);
+    assert.throws(() => reviews.create(formalRun, REVIEW_HEAD, false), /require formal review axes/);
+    const formal = reviews.create(formalRun, REVIEW_HEAD, true);
     assert.deepEqual(formal.axes, ["spec", "standards"]);
-    assert.equal(reviews.submit(formalRun, formal.barrier_id, result("spec")).state, "pending");
+    assert.deepEqual(
+      (store.db.prepare("SELECT role FROM dispatches WHERE run_id=? AND role LIKE 'review-%' ORDER BY role").all(formalRun) as Array<{ role: string }>).map(({ role }) => role),
+      ["review-spec", "review-standards"],
+    );
+    assert.equal(submitReview(reviews, store, formalRun, formal.barrier_id, result("spec")).state, "pending");
     assert.throws(() => reviews.submit(formalRun, formal.barrier_id, result("spec")), /already submitted/);
-    assert.equal(reviews.submit(formalRun, formal.barrier_id, result("standards")).state, "passed");
+    assert.equal(submitReview(reviews, store, formalRun, formal.barrier_id, result("standards")).state, "passed");
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });
@@ -80,13 +116,14 @@ test("blocked review resolution maps every P0 and P1 finding exactly", async () 
   try {
     const reviews = new ReviewService(store);
     const runId = createRun(store);
-    const barrier = reviews.create(runId, "c".repeat(40), false);
+    completeTest(store, runId);
+    const barrier = reviews.create(runId, REVIEW_HEAD, false);
     const findings: ReviewResult["findings"] = [
       { finding_id: "FIND-SEC-001", severity: "P0", title: "P0", source: "spec", source_file: "spec.md", source_line: 1, evidence: "e0", impact: "security", recommendation: "fix" },
       { finding_id: "FIND-CODE-002", severity: "P1", title: "P1", source: "code", source_file: "src/a.ts", source_line: 2, evidence: "e1", impact: "bug", recommendation: "fix" },
       { finding_id: "FIND-TEST-003", severity: "P2", title: "P2", source: "test", source_file: "test/a.ts", source_line: 3, evidence: "e2", impact: "coverage", recommendation: "test" },
     ];
-    assert.equal(reviews.submit(runId, barrier.barrier_id, result("standards", findings)).state, "blocked");
+    assert.equal(submitReview(reviews, store, runId, barrier.barrier_id, result("standards", findings)).state, "blocked");
 
     assert.throws(
       () => reviews.resolve(runId, barrier.barrier_id, [
@@ -122,29 +159,15 @@ test("review gate requires both a completed test dispatch and a passed review", 
   try {
     const reviews = new ReviewService(store);
     const runId = createRun(store);
-    const barrier = reviews.create(runId, "d".repeat(40), false);
-    reviews.submit(runId, barrier.barrier_id, result("standards"));
-    assert.throws(() => reviews.assertGate(runId), /test dispatch has not completed/);
-
-    const testDispatch = new WorkflowService(store).dispatches.create(runId, "test", {
-      objective: "independent verification",
-      allowed_read_paths: ["src/a.ts"],
-      allowed_write_paths: ["test/**"],
-      acceptance_criteria: ["tests pass"],
-      context: {},
-    });
-    store.db.prepare("UPDATE dispatches SET state='completed' WHERE dispatch_id=?").run(testDispatch);
+    assert.throws(() => reviews.create(runId, REVIEW_HEAD, false), /requires a completed independent test/);
+    completeTest(store, runId);
+    const barrier = reviews.create(runId, REVIEW_HEAD, false);
+    assert.throws(() => reviews.submit(runId, barrier.barrier_id, result("standards")), /leaf dispatch has not completed/);
+    submitReview(reviews, store, runId, barrier.barrier_id, result("standards"));
     assert.doesNotThrow(() => reviews.assertGate(runId));
 
     const unreviewedRun = createRun(store);
-    const unreviewedDispatch = new WorkflowService(store).dispatches.create(unreviewedRun, "test", {
-      objective: "independent verification",
-      allowed_read_paths: ["test/a.ts"],
-      allowed_write_paths: [],
-      acceptance_criteria: ["tests pass"],
-      context: {},
-    });
-    store.db.prepare("UPDATE dispatches SET state='completed' WHERE dispatch_id=?").run(unreviewedDispatch);
+    completeTest(store, unreviewedRun);
     assert.throws(() => reviews.assertGate(unreviewedRun), /review gate has not passed/);
   } finally {
     store.close();
@@ -358,6 +381,42 @@ test("bug and feature coding modes require a request and capture their Git basel
       assert.equal(run.target_branch, "main");
       assert.equal(run.base_commit, repository.head);
     }
+  } finally {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+    await rm(repository.directory, { recursive: true, force: true });
+  }
+});
+
+test("automatic coding triage prioritizes one ready revision and otherwise classifies evidence", async () => {
+  const repository = await createRepository();
+  const { store, home } = await openStore();
+  try {
+    const workflow = new WorkflowService(store);
+    const identity = await repositoryIdentity(repository.directory);
+    store.registerRepository(identity.repoId, identity.commonDir, identity.root);
+    store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
+      .run("20260814-auto-abcd", "001", identity.repoId, "ready", "main", new Date().toISOString());
+    const planned = await workflow.codingStartAuto(repository.directory, "actual: broken\nexpected: works\nevidence: failing test");
+    assert.equal(planned.triage, "planned");
+    assert.equal(store.getRun(planned.run_id!).plan_id, "20260814-auto-abcd");
+
+    store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
+      .run("20260814-explicit-abcd", "001", identity.repoId, "ready", "main", new Date(Date.now() + 1).toISOString());
+    await assert.rejects(
+      workflow.codingStartAuto(repository.directory, "actual: broken\nexpected: works\nevidence: failing test"),
+      /multiple ready revisions; specify a plan/,
+    );
+    const explicit = await workflow.codingStartAuto(repository.directory, undefined, "20260814-explicit-abcd", "001");
+    assert.equal(explicit.triage, "planned");
+    assert.equal(store.getRun(explicit.run_id!).plan_id, "20260814-explicit-abcd");
+
+    store.db.prepare("UPDATE revisions SET state='implemented' WHERE repo_id=?").run(identity.repoId);
+    const bug = await workflow.codingStartAuto(repository.directory, "actual: broken\nexpected: works\nevidence: failing test");
+    assert.equal(bug.triage, "bug");
+    const feature = await workflow.codingStartAuto(repository.directory, "goal: add command\nacceptance: exits zero\nscope: src/cli.ts\nmodule: cli");
+    assert.equal(feature.triage, "feature");
+    assert.deepEqual(await workflow.codingStartAuto(repository.directory, "Please redesign several modules."), { triage: "planning" });
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });

@@ -13,7 +13,7 @@ const IDS = {
 
 export const COMMAND_SPECS: Record<string, CommandSpec> = {
   "planning.start": { required: ["project"], optional: ["requestFile", "requestStdin"], exclusive: [["requestFile", "requestStdin"]] },
-  "coding.start": { required: ["project", "mode"], optional: ["planId", "revision", "requestFile", "requestStdin"], patterns: { planId: IDS.planId, revision: IDS.revision } },
+  "coding.start": { required: ["project"], optional: ["mode", "planId", "revision", "requestFile", "requestStdin"], patterns: { planId: IDS.planId, revision: IDS.revision } },
   "dispatch.identity": { required: ["runId", "dispatchId", "role"], optional: [], patterns: { runId: IDS.runId, dispatchId: IDS.dispatchId } },
   "run.identity": { required: ["runId"], optional: [], patterns: { runId: IDS.runId } },
   "review.create": { required: ["runId", "revisionSha"], optional: ["formal"], patterns: { runId: IDS.runId, revisionSha: IDS.commit } },

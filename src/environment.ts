@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -51,11 +51,12 @@ export const environmentSchema = {
       claude: { type: "object", additionalProperties: false, required: ["model", "effort"], properties: { model: { type: "string", minLength: 1 }, effort: { enum: EFFORT } } },
       opencode: { type: "object", additionalProperties: false, required: ["model", "variant", "options"], properties: { model: { type: "string", minLength: 1 }, variant: { enum: VARIANTS }, options: { type: "object" } } },
     } },
-    overrides: { type: "object", additionalProperties: { type: "object", additionalProperties: false, properties: {
+    overrides: { type: "object", additionalProperties: false, properties: Object.fromEntries(ROLES.map((role) => [role, { type: "object", additionalProperties: false, properties: {
       codex: { type: "object", additionalProperties: false, required: ["model", "reasoning"], properties: { model: { type: "string", minLength: 1 }, reasoning: { enum: REASONING } } },
       claude: { type: "object", additionalProperties: false, required: ["model", "effort"], properties: { model: { type: "string", minLength: 1 }, effort: { enum: EFFORT } } },
       opencode: { type: "object", additionalProperties: false, required: ["model", "variant", "options"], properties: { model: { type: "string", minLength: 1 }, variant: { enum: VARIANTS }, options: { type: "object" } } },
-    } } },
+    } }])),
+    },
   },
 } as const;
 const validateEnvironmentSchema = new Ajv({ allErrors: true, strict: false }).compile(environmentSchema);
@@ -77,6 +78,38 @@ export const DEFAULT_ENVIRONMENTS: EnvironmentFile[] = Object.values(AGENT_BUILD
 const MANAGED_START = "<!-- ai-team:managed:start -->";
 const MANAGED_END = "<!-- ai-team:managed:end -->";
 const FILE_MARKER = "由 ai-team 生成。此文件受管理；本地编辑将阻止替换。";
+const ENVIRONMENT_NAME = /^[a-z][a-z0-9-]*$/;
+
+const assertEnvironmentName = (name: string): string => {
+  if (!ENVIRONMENT_NAME.test(name)) throw new ValidationError(`invalid environment name: ${name}`);
+  return name;
+};
+
+const assertManagedTarget = async (userHome: string, target: string): Promise<void> => {
+  const canonicalHome = await realpath(userHome);
+  const targetRelative = relative(resolve(userHome), resolve(target));
+  if (targetRelative === ".." || targetRelative.startsWith(`..${sep}`) || targetRelative === "") throw new ValidationError(`managed target escapes user home: ${target}`);
+  let ancestor = target;
+  while (true) {
+    try {
+      const info = await lstat(ancestor);
+      if (info.isSymbolicLink()) {
+        const canonical = await realpath(ancestor);
+        const rel = relative(canonicalHome, canonical);
+        if (rel === ".." || rel.startsWith(`..${sep}`)) throw new ValidationError(`managed target escapes user home through symlink: ${target}`);
+      }
+      break;
+    } catch (error) {
+      if (error instanceof ValidationError) throw error;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) throw error;
+      ancestor = parent;
+    }
+  }
+  const canonicalAncestor = await realpath(ancestor);
+  const rel = relative(canonicalHome, canonicalAncestor);
+  if (rel === ".." || rel.startsWith(`..${sep}`)) throw new ValidationError(`managed target escapes user home through symlink: ${target}`);
+};
 
 export const resolveEnvironment = (environment: EnvironmentFile): Record<Role, Record<Platform, ModelConfig>> => {
   if (!validateEnvironmentSchema(environment)) throw new ValidationError("environment schema is invalid", validateEnvironmentSchema.errors?.map((error) => ({ path: error.instancePath || "/", message: error.message })));
@@ -97,10 +130,90 @@ export const resolveEnvironment = (environment: EnvironmentFile): Record<Role, R
 };
 
 export interface AgentRenderInput { role: Role; model: ModelConfig; environment: string; }
+const COMMAND_PARAMETER_TYPES = Object.freeze({
+  path: "string; canonical local filesystem path",
+  file: "string; readable file path",
+  json: "string; readable JSON file path",
+  name: "string; lowercase environment name matching ^[a-z][a-z0-9-]*$",
+  role: "enum; one of the 12 manifest role IDs",
+  mode: "enum; planned, bug, or feature",
+  "platform-list": "comma-separated enum; codex, claude, or opencode",
+  "plan-id": "string; eight decimal digits, lowercase slug, and four lowercase hex digits",
+  revision: "string; exactly three decimal digits",
+  "task-id": "string; TASK- followed by three decimal digits",
+  "run-id": "string; run_ followed by a 26-character Crockford ULID",
+  "dispatch-id": "string; dispatch_ followed by a 26-character Crockford ULID",
+  commit: "string; exactly 40 lowercase hexadecimal characters",
+  "opaque-id": "string; CLI-issued identifier",
+  branch: "string; Git branch name",
+  state: "enum; planning state draft|requirements_confirmed|spec_ready|plan_ready|tasks_preview|ready|implemented|superseded|abandoned, or reconciliation state completed|not_applied|unknown",
+  stage: "enum; triage, pre_write, or pre_commit",
+  paths: "comma-separated repository-relative POSIX paths",
+  boolean: "boolean; presence of the flag means true",
+  text: "non-empty string",
+});
+
+const COMMAND_SYNTAX: Record<string, string[]> = {
+  "planning start": ["ai-team planning start --project <path> (--request-file <file> | --request-stdin)"],
+  "planning revision create": ["ai-team planning revision create --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> --documents-file <file> [--supersedes <revision>] [--run-id <run-id>]"],
+  "planning revision transition": ["ai-team planning revision transition --project <path> --plan-id <plan-id> --revision <revision> --to <state> [--plan-commit <commit>]"],
+  "coding start": [
+    "ai-team coding start --project <path> --mode planned --plan-id <plan-id> [--revision <revision>]",
+    "ai-team coding start --project <path> --mode bug (--request-file <file> | --request-stdin)",
+    "ai-team coding start --project <path> --mode feature (--request-file <file> | --request-stdin)",
+  ],
+  "dispatch create": ["ai-team dispatch create --run-id <run-id> --role <role> --actor-role <role> --packet-file <json>"],
+  "dispatch claim": ["ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
+  "dispatch prompt": ["ai-team dispatch prompt --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
+  "dispatch schema": ["ai-team dispatch schema --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
+  "dispatch validate": ["ai-team dispatch validate --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --result-file <json>"],
+  "dispatch submit": ["ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --result-file <json>"],
+  "decision create": ["ai-team decision create --run-id <run-id> --file <json>"],
+  "run show": ["ai-team run show <run-id>"],
+  "run resume": ["ai-team run resume <run-id>"],
+  "run decide": ["ai-team run decide --run-id <run-id> --decision-id <opaque-id> --choice <text> [--note-file <file>]"],
+  "scope check": ["ai-team scope check --run-id <run-id> --stage <stage> --paths <paths>"],
+  "review create": ["ai-team review create --run-id <run-id> --revision-sha <commit> [--formal]"],
+  "review submit": ["ai-team review submit --run-id <run-id> --barrier-id <opaque-id> --result-file <json>"],
+  "review resolve": ["ai-team review resolve --run-id <run-id> --barrier-id <opaque-id> --resolution-file <json>"],
+  "review status": ["ai-team review status --run-id <run-id> --barrier-id <opaque-id>"],
+  "git status": ["ai-team git status --run-id <run-id>"],
+  "git prepare": ["ai-team git prepare --run-id <run-id> [--task-id <task-id>] [--integration] [--base-commit <commit>] [--depends-on <opaque-id>]"],
+  "git commit": ["ai-team git commit --run-id <run-id> --worktree-id <opaque-id> --message <text> --scope <paths>"],
+  "git merge-task": ["ai-team git merge-task --run-id <run-id> --integration-id <opaque-id> --task-id <task-id>"],
+  "git continue-conflict": ["ai-team git continue-conflict --run-id <run-id> --integration-id <opaque-id> --scope <paths>"],
+  "git integrate": ["ai-team git integrate --run-id <run-id> --integration-id <opaque-id>"],
+  "git reconcile": ["ai-team git reconcile --run-id <run-id> [--operation-id <opaque-id> --state <state> --evidence-file <json>]"],
+  "git cleanup": ["ai-team git cleanup --run-id <run-id>"],
+  "install": ["ai-team install [--platform <platform-list>] [--dry-run]"],
+  "env list": ["ai-team env list"],
+  "env show": ["ai-team env show <name> [--resolved]"],
+  "env validate": ["ai-team env validate <name>"],
+  "env edit": ["ai-team env edit <name>"],
+  "env generate": ["ai-team env generate [--platform <platform-list>] [--dry-run]"],
+  "env switch": ["ai-team env switch <name> [--dry-run]"],
+  "env status": ["ai-team env status"],
+  "env doctor": ["ai-team env doctor [--probe]"],
+  "backup restore": ["ai-team backup restore <path> [--dry-run]"],
+  "uninstall": ["ai-team uninstall [--dry-run]"],
+};
+
+const commandContractFor = (commands: string[]): { allowed_commands: string[]; syntax: string[]; parameter_types: typeof COMMAND_PARAMETER_TYPES } => ({
+  allowed_commands: commands,
+  syntax: [...new Set(commands.flatMap((command) => {
+    if (command === "review *") return ["review create", "review submit", "review resolve", "review status"].flatMap((item) => COMMAND_SYNTAX[item] ?? []);
+    if (command === "git *") return ["git status", "git prepare", "git commit", "git merge-task", "git continue-conflict", "git integrate", "git reconcile", "git cleanup"].flatMap((item) => COMMAND_SYNTAX[item] ?? []);
+    if (command === "env *") return ["env list", "env show", "env validate", "env edit", "env generate", "env switch", "env status", "env doctor"].flatMap((item) => COMMAND_SYNTAX[item] ?? []);
+    return COMMAND_SYNTAX[command] ?? [];
+  }))],
+  parameter_types: COMMAND_PARAMETER_TYPES,
+});
 const renderBody = (role: Role, platform: Platform, model: ModelConfig, environment: string): string => {
   const definition = ROLE_MANIFEST[role];
-  const metadata = { role, platform, environment, model, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, agent_build_digest: AGENT_BUILD.digest, template_version: AGENT_BUILD.templateVersion };
-  const instructions = `Role: ${role}\n\n${renderRoleBody(AGENT_BUILD, role, { role, purpose: definition.purpose, allowed_commands: definition.commands.join(", "), delegates: definition.delegates.join(", ") || "无", discovery: definition.discovery ? "允许" : "禁止；请请求文件探索代理支持", stop_conditions: "遇到运行数据包之外的工作时返回 requested_support", platform, environment, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, template_version: AGENT_BUILD.templateVersion, spec_template: AGENT_BUILD.templates.spec!, plan_template: AGENT_BUILD.templates.plan!, task_template: AGENT_BUILD.templates.task! })}`;
+  const commandContract = commandContractFor(definition.commands);
+  const metadata = { role, platform, environment, model, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, agent_build_digest: AGENT_BUILD.digest, template_version: AGENT_BUILD.templateVersion, command_contract: commandContract };
+  const body = renderRoleBody(AGENT_BUILD, role, { role, purpose: definition.purpose, allowed_commands: definition.commands.join(", "), delegates: definition.delegates.join(", ") || "无", discovery: definition.discovery ? "允许" : "禁止；请请求文件探索代理支持", stop_conditions: "遇到运行数据包之外的工作时返回 requested_support", platform, environment, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, template_version: AGENT_BUILD.templateVersion, spec_template: AGENT_BUILD.templates.spec!, plan_template: AGENT_BUILD.templates.plan!, task_template: AGENT_BUILD.templates.task! });
+  const instructions = `Role: ${role}\n\n${body}\n\n## CLI 命令契约\n\n允许命令：\n${commandContract.allowed_commands.map((command) => `- \`${command}\``).join("\n")}\n\n精确语法：\n${commandContract.syntax.map((syntax) => `- \`${syntax}\``).join("\n")}\n\n参数类型：\n${Object.entries(commandContract.parameter_types).map(([name, description]) => `- \`<${name}>\`: ${description}`).join("\n")}`;
   if (platform === "codex") {
     return `# ${FILE_MARKER}\nmodel = ${JSON.stringify(model.model)}\nmodel_reasoning_effort = ${JSON.stringify(model.reasoning)}\n\n[ai_team]\nmetadata = ${JSON.stringify(stableJson(metadata))}\ninstructions = ${JSON.stringify(instructions)}\n`;
   }
@@ -175,7 +288,7 @@ export class EnvironmentService {
 
   async load(name: string): Promise<EnvironmentFile> {
     await this.bootstrap();
-    const parsed = YAML.parse(await readFile(join(this.paths.environments, `${name}.yaml`), "utf8")) as EnvironmentFile;
+    const parsed = YAML.parse(await readFile(join(this.paths.environments, `${assertEnvironmentName(name)}.yaml`), "utf8")) as EnvironmentFile;
     resolveEnvironment(parsed);
     return parsed;
   }
@@ -208,28 +321,37 @@ export class EnvironmentService {
     const targets = platformTargets(this.userHome);
     const writes: GenerationPlan["writes"] = [];
     const backups: GenerationPlan["backups"] = [];
+    const blocked: string[] = [];
     let previous: EnvironmentManifest | undefined;
     try { previous = JSON.parse(await readFile(join(this.paths.root, "manifest.json"), "utf8")) as EnvironmentManifest; } catch { /* first generation */ }
     const backupPath = (path: string): string => join(this.paths.backups, "latest", sha256(path).slice(0, 16), basename(path));
     for (const [key, content] of rendered) {
       const [platform, , filename] = key.split("/") as [Platform, string, string];
       const path = join(targets[platform].agents, filename);
+      await assertManagedTarget(this.userHome, path);
       try {
         const current = await readFile(path, "utf8");
-        if (current !== content) backups.push({ source: path, destination: backupPath(path) });
+        const owned = previous?.files.find((file) => file.path === path);
+        if (owned && sha256(current) !== owned.digest) blocked.push(path);
+        else if (current !== content) backups.push({ source: path, destination: backupPath(path) });
       } catch { /* new file */ }
       writes.push({ path, content, kind: "agent" });
     }
     for (const platform of environment.platforms) {
       const path = targets[platform].instructions;
+      await assertManagedTarget(this.userHome, path);
       let current = "";
-      try { current = await readFile(path, "utf8"); backups.push({ source: path, destination: backupPath(path) }); } catch { /* new file */ }
+      try {
+        current = await readFile(path, "utf8");
+        const owned = previous?.files.find((file) => file.path === path);
+        if (owned && sha256(current) !== owned.digest) blocked.push(path);
+        else backups.push({ source: path, destination: backupPath(path) });
+      } catch { /* new file */ }
       writes.push({ path, content: replaceManagedBlock(current, managedBlock(name)), kind: "instructions" });
     }
     const nextPaths = new Set(writes.map((item) => item.path));
     const obsolete = (previous?.files ?? []).filter((file) => !nextPaths.has(file.path));
     const removals: string[] = [];
-    const blocked: string[] = [];
     for (const file of obsolete) {
       try {
         const current = await readFile(file.path, "utf8");
@@ -250,6 +372,8 @@ export class EnvironmentService {
   private async generateLocked(name: string, selected?: Platform[], dryRun = false): Promise<GenerationPlan> {
     const plan = await this.plan(name, selected);
     if (dryRun) return plan;
+    const environment = await this.load(name);
+    await this.validateClientVersions(selected ?? environment.platforms);
     if (plan.blocked.length) throw new ValidationError("managed role deletion or rename is blocked by drift", plan.blocked);
     const stage = await mkdtemp(join(tmpdir(), "ai-team-stage-"));
     const completed: Array<{ path: string; backup?: string }> = [];
@@ -366,6 +490,7 @@ export class EnvironmentService {
   }
 
   async doctor(probe = false): Promise<Array<{ platform: Platform; status: string; version?: string }>> {
+    await this.bootstrap();
     if (!probe) return PLATFORMS.map((platform) => ({ platform, status: "not-probed" }));
     const results = await Promise.all(PLATFORMS.map(async (platform) => {
       try {

@@ -27,10 +27,11 @@ test("client version gates use persisted probe facts and never silently downgrad
   const root = await mkdtemp(join(tmpdir(), "ai-team-version-gate-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const aiTeamHome = join(root, "config"); const userHome = join(root, "user"); const bin = join(root, "bin");
-  await mkdir(bin, { recursive: true });
+  await Promise.all([mkdir(bin, { recursive: true }), mkdir(userHome, { recursive: true })]);
   const service = new EnvironmentService(aiTeamHome, userHome);
   await service.bootstrap();
   await assert.rejects(service.validateClientVersions(["codex"]), /version gate blocked/);
+  await assert.rejects(service.generate("balanced", ["codex"]), /version gate blocked/);
   const originalPath = process.env.PATH; process.env.PATH = bin;
   try {
     await writeFile(join(bin, "codex"), "#!/bin/sh\necho codex-cli 0.100.0\n"); await chmod(join(bin, "codex"), 0o700);

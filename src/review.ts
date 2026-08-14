@@ -1,6 +1,8 @@
+import { execFileSync } from "node:child_process";
+import { DispatchService } from "./dispatch.js";
 import { ValidationError } from "./errors.js";
 import { StateStore } from "./state.js";
-import { sha256, stableJson } from "./utils.js";
+import { redact, sha256, stableJson } from "./utils.js";
 
 export type Severity = "P0" | "P1" | "P2" | "P3";
 export interface ReviewFinding { finding_id: string; severity: Severity; title: string; source: string; source_file: string; source_line: number; evidence: string; impact: string; recommendation: string; }
@@ -23,16 +25,60 @@ export class ReviewService {
   constructor(readonly store: StateStore) {}
 
   create(runId: string, revisionSha: string, formal: boolean): { barrier_id: string; axes: string[] } {
-    this.store.getRun(runId);
+    const run = this.store.getRun(runId) as { mode: string; repo_id: string; plan_id?: string; revision?: string };
+    const requiredFormal = run.mode === "planned";
+    if (formal !== requiredFormal) throw new ValidationError(`${run.mode} runs require ${requiredFormal ? "formal" : "direct"} review axes`);
     if (!/^[a-f0-9]{40}$/.test(revisionSha)) throw new ValidationError("review revision must be a 40-character commit SHA");
+    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
+    if (!repository) throw new ValidationError("review repository is not registered");
+    try { execFileSync("git", ["-C", repository.project_path, "cat-file", "-e", `${revisionSha}^{commit}`], { stdio: "ignore" }); }
+    catch { throw new ValidationError("review revision commit does not exist", { revisionSha }); }
+    const integration = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1").get(runId) as { path: string } | undefined;
+    const frozenPath = integration?.path ?? repository.project_path;
+    const frozenHead = execFileSync("git", ["-C", frozenPath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    if (revisionSha !== frozenHead) throw new ValidationError("review revision is stale for the current integration HEAD", { revisionSha, frozenHead });
+    const test = this.store.db.prepare("SELECT state,result_json,completed_at FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; result_json?: string; completed_at?: string } | undefined;
+    if (test?.state !== "completed") throw new ValidationError("review requires a completed independent test dispatch");
+    const revisionLine = execFileSync("git", ["-C", frozenPath, "rev-list", "--parents", "-n", "1", revisionSha], { encoding: "utf8" }).trim().split(" ");
+    const firstParent = revisionLine[1];
+    const diffArgs = firstParent ? ["diff", firstParent, revisionSha] : ["diff-tree", "--root", "--no-commit-id", "-p", revisionSha];
+    const pathArgs = firstParent ? ["diff", "--name-only", "-z", firstParent, revisionSha] : ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", revisionSha];
+    const changedPaths = [...new Set(execFileSync("git", ["-C", frozenPath, ...pathArgs], { encoding: "utf8" }).split("\0").filter(Boolean))];
+    const committedDiff = redact(execFileSync("git", ["-C", frozenPath, ...diffArgs], { encoding: "utf8", maxBuffer: 5 * 1024 * 1024 }));
+    const planningCandidates = requiredFormal && run.plan_id && run.revision ? [
+      `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/spec.md`,
+      `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/plan.md`,
+      `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/tasks.md`,
+    ] : [];
+    const planningPaths = planningCandidates.filter((path) => {
+      try { execFileSync("git", ["-C", frozenPath, "cat-file", "-e", `${revisionSha}:${path}`], { stdio: "ignore" }); return true; }
+      catch { return false; }
+    });
     const barrierId = `review_${sha256(`${runId}:${revisionSha}`).slice(0, 24)}`;
-    try {
-      this.store.db.prepare("INSERT INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,created_at) VALUES (?,?,?,?, 'pending', ?)")
+    const axes = formal ? ["spec", "standards"] as const : ["standards"] as const;
+    const dispatches = new DispatchService(this.store);
+    const create = this.store.db.transaction(() => {
+      const inserted = this.store.db.prepare("INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,created_at) VALUES (?,?,?,?, 'pending', ?)")
         .run(barrierId, runId, revisionSha, formal ? 1 : 0, new Date().toISOString());
-    } catch {
-      throw new ValidationError("review already exists for this frozen revision; reviews run once");
-    }
-    return { barrier_id: barrierId, axes: formal ? ["spec", "standards"] : ["standards"] };
+      if (!inserted.changes) throw new ValidationError("review already exists for this frozen revision; reviews run once");
+      for (const axis of axes) {
+        dispatches.create(runId, axis === "spec" ? "review-spec" : "review-standards", {
+          objective: `Review frozen commit ${revisionSha} on the ${axis} axis.`,
+          allowed_read_paths: [...new Set([...changedPaths, ...planningPaths])],
+          allowed_write_paths: [],
+          acceptance_criteria: ["Every finding cites a concrete source and evidence", "Return all P0-P3 findings for this axis"],
+          context: {
+            barrier_id: barrierId,
+            revision_sha: revisionSha,
+            axis,
+            committed_diff: committedDiff,
+            test_evidence: test.result_json ? JSON.parse(test.result_json) : { state: test.state, completed_at: test.completed_at ?? null },
+          },
+        }, "code-reviewer");
+      }
+    });
+    create();
+    return { barrier_id: barrierId, axes: [...axes] };
   }
 
   submit(runId: string, barrierId: string, result: ReviewResult): { state: string; blocking: ReviewFinding[] } {
@@ -41,6 +87,15 @@ export class ReviewService {
     if (barrier.state !== "pending") throw new ValidationError("review barrier is already complete");
     const required = barrier.formal ? ["spec", "standards"] : ["standards"];
     if (!required.includes(result.axis)) throw new ValidationError(`${result.axis} review is not required for this run`);
+    const role = result.axis === "spec" ? "review-spec" : "review-standards";
+    const leaf = (this.store.db.prepare("SELECT state,packet_json,result_json FROM dispatches WHERE run_id=? AND role=? ORDER BY created_at DESC").all(runId, role) as Array<{ state: string; packet_json: string; result_json?: string }>)
+      .find((item) => (JSON.parse(item.packet_json) as { context?: { barrier_id?: string } }).context?.barrier_id === barrierId);
+    if (leaf?.state !== "completed" || !leaf.result_json) throw new ValidationError(`${result.axis} review leaf dispatch has not completed`);
+    const envelope = JSON.parse(leaf.result_json) as { summary?: string; findings?: ReviewFinding[]; payload?: { finding_ids?: string[] } };
+    const findingIds = result.findings.map((finding) => finding.finding_id);
+    if (envelope.summary !== result.summary || stableJson(envelope.findings ?? []) !== stableJson(result.findings) || stableJson(envelope.payload?.finding_ids ?? []) !== stableJson(findingIds)) {
+      throw new ValidationError(`${result.axis} review result does not match its completed leaf dispatch`);
+    }
     try { this.store.db.prepare("INSERT INTO review_results(barrier_id,axis,result_json,created_at) VALUES (?,?,?,?)").run(barrierId, result.axis, stableJson(result), new Date().toISOString()); }
     catch { throw new ValidationError(`${result.axis} review was already submitted`); }
     const results = this.results(barrierId);
@@ -74,11 +129,19 @@ export class ReviewService {
     return { ...barrier, results: this.results(barrierId), resolutions: this.store.db.prepare("SELECT * FROM finding_resolutions WHERE barrier_id=? ORDER BY finding_id").all(barrierId) };
   }
 
-  assertGate(runId: string): void {
-    const test = this.store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='test' AND state='completed'").get(runId) as { count: number };
-    const review = this.store.db.prepare("SELECT state FROM review_barriers WHERE run_id=? ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string } | undefined;
-    if (!test.count) throw new ValidationError("independent test dispatch has not completed");
+  assertGate(runId: string, frozenHead?: string): void {
+    const test = this.store.db.prepare("SELECT state FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string } | undefined;
+    const review = this.store.db.prepare("SELECT state,revision_sha FROM review_barriers WHERE run_id=? ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; revision_sha: string } | undefined;
+    if (!test || test.state !== "completed") throw new ValidationError("latest independent test dispatch has not completed");
     if (!review || !["passed", "resolved"].includes(review.state)) throw new ValidationError("review gate has not passed");
+    if (frozenHead && frozenHead !== review.revision_sha) {
+      const operation = this.store.db.prepare("SELECT kind,evidence_json,completed_at FROM operations WHERE run_id=? AND kind IN ('git.sync','git.merge.continue') AND state='completed' ORDER BY completed_at DESC LIMIT 1").get(runId) as { kind: string; evidence_json: string; completed_at: string } | undefined;
+      const evidence = operation ? JSON.parse(operation.evidence_json) as { commit?: string } : undefined;
+      const latestTest = this.store.db.prepare("SELECT state,completed_at FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; completed_at?: string } | undefined;
+      if (!operation || evidence?.commit !== frozenHead || latestTest?.state !== "completed" || !latestTest.completed_at || latestTest.completed_at < operation.completed_at) {
+        throw new ValidationError("review is stale for the current integration HEAD", { reviewed: review.revision_sha, current: frozenHead });
+      }
+    }
   }
 
   private barrier(runId: string, barrierId: string): any {
