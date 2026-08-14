@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
 import { CONTRACT_DIGEST } from "./contracts.js";
 import { validateCommand } from "./command-contract.js";
-import { EXIT, PACKAGE_VERSION, ROLES } from "./constants.js";
+import { EXIT, PACKAGE_VERSION, ROLES, STAGING_KINDS, STAGING_MAX_BYTES, type Role, type StagingKind } from "./constants.js";
 import { DispatchService } from "./dispatch.js";
 import { EnvironmentService, PLATFORMS, type Platform } from "./environment.js";
 import { AiTeamError, ValidationError } from "./errors.js";
@@ -21,7 +21,7 @@ import { ResearchService } from "./research-service.js";
 import type { ResearchConclusion } from "./research.js";
 import { ROLE_MANIFEST_DIGEST } from "./roles.js";
 import { AGENT_BUILD } from "./roles.js";
-import { StateStore } from "./state.js";
+import { StateStore, type StagingBinding, type StagingEntry } from "./state.js";
 import { WorkflowService } from "./workflow.js";
 import { assertReadablePath } from "./security.js";
 
@@ -168,6 +168,71 @@ const readSafeFile = async (path: string): Promise<string> => {
   return value;
 };
 
+const readStdinJson = async (): Promise<Buffer> => {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of process.stdin) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > STAGING_MAX_BYTES) throw new ValidationError("staging JSON exceeds the 2 MiB limit");
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks);
+};
+
+interface JsonInput {
+  file?: string;
+  stagingId?: string;
+  runId?: string;
+  dispatchId?: string | null;
+  role?: Role;
+  kind: StagingKind;
+}
+
+interface LoadedJson {
+  value: unknown;
+  entry?: StagingEntry;
+  binding: StagingBinding;
+  consume: (binding?: StagingBinding) => Promise<void>;
+  validationFailed: (error: unknown, binding?: StagingBinding) => void;
+}
+
+const loadJsonInput = async (store: StateStore, input: JsonInput, retentionHours: number): Promise<LoadedJson> => {
+  if (Boolean(input.file) === Boolean(input.stagingId)) throw new ValidationError("provide exactly one JSON file option or --staging-id");
+  if (input.file) {
+    return {
+      value: JSON.parse(await readSafeFile(input.file)),
+      binding: {},
+      consume: async () => {},
+      validationFailed: () => {},
+    };
+  }
+  if (!input.runId) throw new ValidationError("--run-id is required with --staging-id");
+  const binding: StagingBinding = {
+    runId: input.runId,
+    ...(input.dispatchId !== undefined ? { dispatchId: input.dispatchId } : {}),
+    ...(input.role ? { role: input.role } : {}),
+    kind: input.kind,
+  };
+  const stagingId = input.stagingId!;
+  let loaded;
+  try { loaded = await store.readStagingEntry(stagingId, binding); }
+  catch (error) {
+    try { store.recordStagingValidationFailure(stagingId, binding, error); } catch { /* do not mask the validation error */ }
+    throw error;
+  }
+  return {
+    value: loaded.value,
+    entry: loaded.entry,
+    binding,
+    consume: async (extra = {}) => { await store.consumeStagingEntry(stagingId, { ...binding, ...extra }, new Date(), retentionHours); },
+    validationFailed: (error, extra = {}) => store.recordStagingValidationFailure(stagingId, { ...binding, ...extra }, error),
+  };
+};
+
+const jsonOptions = (command: Command, fileFlag: string): Command => command.option(`${fileFlag} <file>`).option("--staging-id <id>");
+const retentionHours = (): Promise<number> => new EnvironmentService().stagingRetentionHours();
+
 const requestOptions = (command: Command): Command => command.option("--request-file <file>").option("--request-stdin");
 
 export const buildProgram = (): Command => {
@@ -178,13 +243,26 @@ export const buildProgram = (): Command => {
 
   program.command("init").argument("<project>").option("--yes", "confirm patches to dirty project files").action(async (project, options) => output(await initializeProject(project, options.yes)));
   const context = program.command("context");
-  context.command("update").requiredOption("--project <path>").requiredOption("--context-file <json>").action(async (options) => {
-    validateCommand("context.update", { project: options.project, contextFile: options.contextFile });
-    const source = JSON.parse(await readSafeFile(options.contextFile)) as Record<string, unknown>;
-    const value = source.payload && typeof source.payload === "object" && !Array.isArray(source.payload)
-      ? (source.payload as Record<string, unknown>).project_context ?? source
-      : source;
-    output(await updateProjectContext(options.project, value));
+  jsonOptions(context.command("update").requiredOption("--project <path>").option("--run-id <id>"), "--context-file").action(async (options) => {
+    validateCommand("context.update", { project: options.project, contextFile: options.contextFile, stagingId: options.stagingId, runId: options.runId });
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      const input = await loadJsonInput(store, { file: options.contextFile, stagingId: options.stagingId, runId: options.runId, role: "file-explorer", kind: "project-context" }, retention);
+      try {
+        if (options.stagingId) {
+          const repo = await repositoryIdentity(options.project);
+          const run = store.getRun(options.runId) as { repo_id: string };
+          if (run.repo_id !== repo.repoId) throw new ValidationError("project context staging run does not belong to this repository");
+        }
+        const source = input.value as Record<string, unknown>;
+        const value = source.payload && typeof source.payload === "object" && !Array.isArray(source.payload)
+          ? (source.payload as Record<string, unknown>).project_context ?? source
+          : source;
+        const result = await updateProjectContext(options.project, value);
+        await input.consume();
+        return result;
+      } catch (error) { input.validationFailed(error); throw error; }
+    }));
   });
   context.command("validate").requiredOption("--project <path>").action(async (options) => {
     validateCommand("context.validate", { project: options.project });
@@ -202,21 +280,26 @@ export const buildProgram = (): Command => {
     output(await withStore((store) => new WorkflowService(store).planningStart(options.project, request)));
   });
   const revision = planning.command("revision");
-  revision.command("create").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--target-branch <branch>").requiredOption("--documents-file <file>").option("--supersedes <nnn>").option("--run-id <id>").action(async (options) => {
-    const docs = JSON.parse(await readSafeFile(options.documentsFile)) as RevisionDocuments;
+  jsonOptions(revision.command("create").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--target-branch <branch>").option("--supersedes <nnn>").option("--run-id <id>"), "--documents-file").action(async (options) => {
     const repo = await repositoryIdentity(options.project);
+    const retention = await retentionHours();
     output(await withStore(async (store) => {
+      const input = await loadJsonInput(store, { file: options.documentsFile, stagingId: options.stagingId, runId: options.runId, role: "planning", kind: "planning-documents" }, retention);
+      try {
       if (options.runId) {
         const run = store.getRun(options.runId) as { profile: string; repo_id: string; stage: string };
         if (run.profile !== "planning" || run.repo_id !== repo.repoId) throw new ValidationError("planning revision does not belong to this run repository");
         assertRevisionRunStage("draft", run.stage);
       }
+      const docs = input.value as RevisionDocuments;
       const result = await writeRevision(options.project, options.planId, options.revision, options.targetBranch, docs, options.supersedes);
       store.registerRepository(repo.repoId, repo.commonDir, repo.root);
       store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,supersedes,created_at) VALUES (?,?,?,'draft',?,?,?,?)")
         .run(options.planId, options.revision, repo.repoId, options.targetBranch, result.digest, options.supersedes ?? null, new Date().toISOString());
       if (options.runId) store.bindPlanningRevision(options.runId, repo.repoId, options.planId, options.revision);
+      await input.consume();
       return result;
+      } catch (error) { input.validationFailed(error); throw error; }
     }));
   });
   revision.command("transition").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--to <state>").option("--plan-commit <sha>").action(async (options) => {
@@ -334,10 +417,18 @@ export const buildProgram = (): Command => {
     }));
   });
   const tasks = planning.command("tasks");
-  tasks.command("validate").requiredOption("--file <json>").option("--preview").action(async ({ file, preview }) => {
-    const definitions = JSON.parse(await readSafeFile(file)) as TaskDefinition[];
-    if (preview) validateTaskPreview(definitions);
-    output({ valid: true, batches: runnableTaskBatches(definitions) });
+  jsonOptions(tasks.command("validate").option("--run-id <id>").option("--preview"), "--file").action(async (options) => {
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      const input = await loadJsonInput(store, { file: options.file, stagingId: options.stagingId, runId: options.runId, role: "planning", kind: "planning-tasks" }, retention);
+      try {
+        const definitions = input.value as TaskDefinition[];
+        if (options.preview) validateTaskPreview(definitions);
+        const result = { valid: true, batches: runnableTaskBatches(definitions) };
+        if (!options.preview) await input.consume();
+        return result;
+      } catch (error) { input.validationFailed(error); throw error; }
+    }));
   });
 
   const coding = program.command("coding");
@@ -362,20 +453,103 @@ export const buildProgram = (): Command => {
   run.command("resume").argument("<run-id>").action(async (runId) => output(await withStore((store) => new DispatchService(store).resume(runId))));
   run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined; const run = store.getRun(options.runId) as { profile: string }; const dispatchId = run.profile === "planning" ? new DispatchService(store).resolvePlanningDecision(options.runId, options.decisionId, options.choice, note) : (store.decide(options.runId, options.decisionId, options.choice, note), undefined); output({ status: "resolved", ...(dispatchId ? { dispatch_id: dispatchId } : {}) }); }));
 
-  const dispatch = program.command("dispatch");
-  dispatch.command("create").requiredOption("--run-id <id>").addOption(roleOption()).requiredOption("--packet-file <file>").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).option("--actor-dispatch-id <id>").action(async (options) => output(await withStore(async (store) => {
-    if ((options.actorRole === "coding" || options.actorRole === "code-reviewer") && !options.actorDispatchId) throw new ValidationError(`${options.actorRole} dispatch creation requires --actor-dispatch-id`);
-    const packet = JSON.parse(await readSafeFile(options.packetFile));
-    if (options.actorRole === "coding" && options.role !== "file-explorer" && !packet?.context?.explorer_dispatch_id) throw new ValidationError("downstream dispatch requires --packet-file context.explorer_dispatch_id");
-    return { dispatch_id: new DispatchService(store).create(options.runId, options.role, packet, options.actorRole, options.actorDispatchId) };
+  const staging = program.command("staging");
+  staging.command("create").requiredOption("--run-id <id>").addOption(roleOption()).addOption(new Option("--kind <kind>").choices([...STAGING_KINDS]).makeOptionMandatory()).option("--dispatch-id <id>").action(async (options) => {
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      let initialJson: string | undefined;
+      if (options.kind === "dispatch-result") {
+        if (!options.dispatchId) throw new ValidationError("dispatch-result staging requires --dispatch-id");
+        initialJson = `${JSON.stringify(new DispatchService(store).template(options.runId, options.dispatchId, options.role), null, 2)}\n`;
+      }
+      return store.createStagingEntry({
+        runId: options.runId,
+        ...(options.dispatchId ? { dispatchId: options.dispatchId } : {}),
+        role: options.role,
+        kind: options.kind,
+        ...(initialJson ? { initialJson } : {}),
+        retentionHours: retention,
+      });
+    }));
+  });
+  staging.command("write").requiredOption("--run-id <id>").addOption(roleOption()).requiredOption("--staging-id <id>").requiredOption("--input-stdin").action(async (options) => {
+    const content = await readStdinJson();
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      try { return await store.writeStagingEntry(options.stagingId, content, { runId: options.runId, role: options.role }, undefined, retention); }
+      catch (error) {
+        try { store.recordStagingValidationFailure(options.stagingId, { runId: options.runId, role: options.role }, error); } catch { /* do not mask the write error */ }
+        throw error;
+      }
+    }));
+  });
+  staging.command("show").requiredOption("--run-id <id>").addOption(roleOption()).option("--staging-id <id>").option("--content").action(async (options) => output(await withStore(async (store) => {
+    if (!options.stagingId) {
+      if (options.content) throw new ValidationError("--content requires --staging-id");
+      return { entries: store.listStagingEntries(options.runId, options.role) };
+    }
+    if (!options.content) {
+      const entry = store.getStagingEntry(options.stagingId);
+      if (entry.runId !== options.runId || entry.role !== options.role) throw new ValidationError("staging identity does not match run and role");
+      return { entry };
+    }
+    const result = await store.readStagingEntry(options.stagingId, { runId: options.runId, role: options.role });
+    return { entry: result.entry, content: result.value };
   })));
+  staging.command("cleanup").option("--expired").option("--run-id <id>").option("--staging-id <id>").option("--all").action(async (options) => {
+    const explicit = Boolean(options.runId || options.stagingId);
+    if (Boolean(options.expired) === explicit || explicit && !options.all || options.stagingId && !options.runId) {
+      throw new ValidationError("use --expired, or --run-id [--staging-id] --all");
+    }
+    const retention = await retentionHours();
+    output(await withStore((store) => store.cleanupStagingEntries({
+      ...(options.expired ? { expired: true } : { runId: options.runId, ...(options.stagingId ? { stagingId: options.stagingId } : {}), all: true }),
+      retentionHours: retention,
+    })));
+  });
+
+  const dispatch = program.command("dispatch");
+  jsonOptions(dispatch.command("create").requiredOption("--run-id <id>").addOption(roleOption()).addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).option("--actor-dispatch-id <id>"), "--packet-file").action(async (options) => {
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+    if ((options.actorRole === "coding" || options.actorRole === "code-reviewer") && !options.actorDispatchId) throw new ValidationError(`${options.actorRole} dispatch creation requires --actor-dispatch-id`);
+    const input = await loadJsonInput(store, { file: options.packetFile, stagingId: options.stagingId, runId: options.runId, dispatchId: options.actorDispatchId, role: options.actorRole, kind: "dispatch-packet" }, retention);
+    try {
+      const packet = input.value as any;
+      if (options.actorRole === "coding" && options.role !== "file-explorer" && !packet?.context?.explorer_dispatch_id) throw new ValidationError("downstream dispatch requires packet context.explorer_dispatch_id");
+      const result = { dispatch_id: new DispatchService(store).create(options.runId, options.role, packet, options.actorRole, options.actorDispatchId) };
+      await input.consume();
+      return result;
+    } catch (error) { input.validationFailed(error); throw error; }
+  }));
+  });
   const dispatchCommand = (name: string): Command => dispatch.command(name).requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").addOption(roleOption()).hook("preAction", (_command, action) => validateCommand("dispatch.identity", { runId: action.opts().runId, dispatchId: action.opts().dispatchId, role: action.opts().role }));
   dispatchCommand("claim").action(async (options) => output(await withStore((store) => new DispatchService(store).claim(options.runId, options.dispatchId, options.role))));
   dispatchCommand("prompt").action(async (options) => output(await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role), { readonly: true }), { legacyRaw: true }));
   dispatchCommand("schema").action(async (options) => output(await withStore((store) => new DispatchService(store).schema(options.runId, options.dispatchId, options.role), { readonly: true })));
   dispatchCommand("template").action(async (options) => output(await withStore((store) => new DispatchService(store).template(options.runId, options.dispatchId, options.role), { readonly: true })));
-  dispatchCommand("validate").requiredOption("--result-file <file>").action(async (options) => output({ valid: true, result: await withStore((store) => new DispatchService(store).validateFile(options.runId, options.dispatchId, options.role, options.resultFile), { readonly: true }) }));
-  dispatchCommand("submit").requiredOption("--result-file <file>").action(async (options) => output(await withStore((store) => new DispatchService(store).submit(options.runId, options.dispatchId, options.role, options.resultFile))));
+  jsonOptions(dispatchCommand("validate"), "--result-file").action(async (options) => {
+    if (options.resultFile && options.stagingId) throw new ValidationError("provide exactly one JSON file option or --staging-id");
+    if (options.resultFile) { output({ valid: true, result: await withStore((store) => new DispatchService(store).validateFile(options.runId, options.dispatchId, options.role, options.resultFile), { readonly: true }) }); return; }
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      const input = await loadJsonInput(store, { stagingId: options.stagingId, runId: options.runId, dispatchId: options.dispatchId, role: options.role, kind: "dispatch-result" }, retention);
+      try { return { valid: true, result: new DispatchService(store).validateValue(options.runId, options.dispatchId, options.role, input.value) }; }
+      catch (error) { input.validationFailed(error); throw error; }
+    }));
+  });
+  jsonOptions(dispatchCommand("submit"), "--result-file").action(async (options) => {
+    if (options.resultFile && !options.stagingId) { output(await withStore((store) => new DispatchService(store).submit(options.runId, options.dispatchId, options.role, options.resultFile))); return; }
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      const input = await loadJsonInput(store, { file: options.resultFile, stagingId: options.stagingId, runId: options.runId, dispatchId: options.dispatchId, role: options.role, kind: "dispatch-result" }, retention);
+      try {
+        const result = await new DispatchService(store).submitValue(options.runId, options.dispatchId, options.role, input.value);
+        await input.consume();
+        return result;
+      } catch (error) { input.validationFailed(error); throw error; }
+    }));
+  });
 
   const gitCommand = program.command("git");
   gitCommand.command("status").requiredOption("--run-id <id>").action(async ({ runId }) => output(await withStore(async (store) => { const run = store.getRun(runId); const repo = store.db.prepare("SELECT * FROM repositories WHERE repo_id=?").get(run.repo_id); return { run_id: runId, repository: repo, worktree: await worktreeStatus((repo as any).project_path) }; }, { readonly: true })));
@@ -384,42 +558,93 @@ export const buildProgram = (): Command => {
   gitCommand.command("merge-task").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--task-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).mergeTask(options.runId, options.integrationId, options.taskId, options.dispatchId)) }));
   gitCommand.command("continue-conflict").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--scope <paths>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).continueConflict(options.runId, options.integrationId, options.scope.split(","), options.dispatchId)) }));
   gitCommand.command("integrate").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).integrateTarget(options.runId, options.integrationId, options.dispatchId)) }));
-  gitCommand.command("reconcile").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--operation-id <id>").option("--state <state>").option("--evidence-file <file>").action(async (options) => output(await withStore(async (store) => {
+  jsonOptions(gitCommand.command("reconcile").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--operation-id <id>").option("--state <state>"), "--evidence-file").action(async (options) => {
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
     new DispatchService(store).assertClaimed(options.runId, options.dispatchId, "git-operator");
     if (options.operationId) {
-      if (!options.state || !options.evidenceFile) throw new ValidationError("reconcile mutation requires --state and --evidence-file");
-      const evidence = JSON.parse(await readSafeFile(options.evidenceFile));
+      if (!options.state) throw new ValidationError("reconcile mutation requires --state and JSON evidence");
+      const input = await loadJsonInput(store, { file: options.evidenceFile, stagingId: options.stagingId, runId: options.runId, dispatchId: options.dispatchId, role: "git-operator", kind: "git-reconcile-evidence" }, retention);
+      try {
+      const evidence = input.value;
       const operation = store.db.prepare("SELECT operation_id,run_id,idempotency_key,kind,state,request_json,evidence_json FROM operations WHERE operation_id=?")
         .get(options.operationId) as PlanningCommitOperation | undefined;
       if (operation?.kind === "planning.revision.commit") {
         if (!["completed", "not_applied"].includes(options.state)) throw new ValidationError("planning commit reconciliation state must be completed or not_applied");
-        return reconcilePlanningCommit(store, operation, options.runId, options.dispatchId, options.state, evidence);
+        const result = reconcilePlanningCommit(store, operation, options.runId, options.dispatchId, options.state, evidence);
+        await input.consume();
+        return result;
       }
       store.reconcileOperation(options.operationId, options.state, evidence);
+      await input.consume();
+      } catch (error) { input.validationFailed(error); throw error; }
+    } else if (options.evidenceFile || options.stagingId || options.state) {
+      throw new ValidationError("reconcile evidence requires --operation-id and --state");
     }
     return new GitOrchestrator(store).reconcile(options.runId);
-  })));
+  }));
+  });
   gitCommand.command("cleanup").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").action(async ({ runId, dispatchId }) => output({ removed: await withStore((store) => new GitOrchestrator(store).cleanup(runId, dispatchId)) }));
 
   const scope = program.command("scope");
   scope.command("check").requiredOption("--run-id <id>").addOption(new Option("--stage <stage>").choices(["triage", "pre_write", "pre_commit"]).makeOptionMandatory()).requiredOption("--paths <paths>", "comma-separated repository-relative paths").action(async (options) => output(await withStore((store) => new ScopeGate(store).check(options.runId, options.stage, options.paths.split(",")))));
 
   const decision = program.command("decision");
-  decision.command("create").requiredOption("--run-id <id>").requiredOption("--file <json>").action(async (options) => output(await withStore(async (store) => {
-    const value = JSON.parse(await readSafeFile(options.file));
-    return { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation) };
-  })));
+  jsonOptions(decision.command("create").requiredOption("--run-id <id>"), "--file").action(async (options) => {
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      const run = store.getRun(options.runId) as { profile: Role };
+      const role: Role = run.profile === "planning" ? "planning" : "coding";
+      const input = await loadJsonInput(store, { file: options.file, stagingId: options.stagingId, runId: options.runId, role, kind: "decision" }, retention);
+      try {
+        const value = input.value as any;
+        const result = { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation) };
+        await input.consume();
+        return result;
+      } catch (error) { input.validationFailed(error); throw error; }
+    }));
+  });
 
   const research = program.command("research");
-  research.command("archive").requiredOption("--run-id <id>").requiredOption("--project <path>").requiredOption("--topic <topic>").requiredOption("--report-file <file>").action(async (options) => output(await withStore(async (store) => {
-    const conclusions = JSON.parse(await readSafeFile(options.reportFile)) as ResearchConclusion[];
-    return new ResearchService(store).archive(options.runId, options.project, options.topic, conclusions);
-  })));
+  jsonOptions(research.command("archive").requiredOption("--run-id <id>").requiredOption("--project <path>").requiredOption("--topic <topic>"), "--report-file").action(async (options) => {
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      const input = await loadJsonInput(store, { file: options.reportFile, stagingId: options.stagingId, runId: options.runId, role: "researcher", kind: "research-conclusions" }, retention);
+      try {
+        const result = await new ResearchService(store).archive(options.runId, options.project, options.topic, input.value as ResearchConclusion[]);
+        await input.consume();
+        return result;
+      } catch (error) { input.validationFailed(error); throw error; }
+    }));
+  });
 
   const review = program.command("review");
   review.command("create").requiredOption("--run-id <id>").requiredOption("--revision-sha <sha>").option("--formal").action(async (options) => { validateCommand("review.create", { runId: options.runId, revisionSha: options.revisionSha, formal: options.formal }); output(await withStore((store) => new ReviewService(store).create(options.runId, options.revisionSha, options.formal))); });
-  review.command("submit").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").requiredOption("--result-file <file>").action(async (options) => output(await withStore(async (store) => new ReviewService(store).submit(options.runId, options.barrierId, JSON.parse(await readSafeFile(options.resultFile)) as ReviewResult))));
-  review.command("resolve").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").requiredOption("--resolution-file <file>").action(async (options) => output(await withStore(async (store) => new ReviewService(store).resolve(options.runId, options.barrierId, JSON.parse(await readSafeFile(options.resolutionFile)) as FindingResolution[]))));
+  jsonOptions(review.command("submit").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>"), "--result-file").action(async (options) => {
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      const input = await loadJsonInput(store, { file: options.resultFile, stagingId: options.stagingId, runId: options.runId, kind: "review-result" }, retention);
+      try {
+        const value = input.value as ReviewResult;
+        const role: Role = value.axis === "spec" ? "review-spec" : "review-standards";
+        if (input.entry && input.entry.role !== role) throw new ValidationError("review staging role does not match result axis");
+        const result = new ReviewService(store).submit(options.runId, options.barrierId, value);
+        await input.consume({ role });
+        return result;
+      } catch (error) { input.validationFailed(error); throw error; }
+    }));
+  });
+  jsonOptions(review.command("resolve").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>"), "--resolution-file").action(async (options) => {
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      const input = await loadJsonInput(store, { file: options.resolutionFile, stagingId: options.stagingId, runId: options.runId, role: "coding", kind: "review-resolution" }, retention);
+      try {
+        const result = new ReviewService(store).resolve(options.runId, options.barrierId, input.value as FindingResolution[]);
+        await input.consume();
+        return result;
+      } catch (error) { input.validationFailed(error); throw error; }
+    }));
+  });
   review.command("status").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").action(async (options) => output(await withStore((store) => new ReviewService(store).status(options.runId, options.barrierId), { readonly: true })));
 
   program.command("install").option("--platform <list>", "comma-separated platforms", platformList).option("--dry-run").action(async (options) => { const service = new EnvironmentService(); const environment = await service.load(await service.active()); const platforms = options.platform ?? environment.platforms; const versions = await service.validateClientVersions(platforms); output({ versions, plan: await service.generate(environment.name, platforms, options.dryRun) }); });

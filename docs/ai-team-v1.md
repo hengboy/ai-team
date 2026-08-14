@@ -310,7 +310,11 @@ ai-team run decide --run-id <id> --decision-id <id> --choice <choice-id> [--note
 
 全局状态库默认位于 `~/.config/ai-team/state/state.sqlite`，按 Git common dir 生成 `repo_id` 隔离，并记录规范化项目路径。使用 `better-sqlite3 + Umzug`；只执行向前迁移，迁移前自动备份数据库、解析配置和 active environment，迁移失败恢复备份。
 
-主要表：`repositories`、`runs`、`run_events`、`decisions`、`revisions`、`dispatches`、`artifacts`、`worktrees`、`operations`、`schema_migrations`。
+主要表：`repositories`、`runs`、`run_events`、`decisions`、`revisions`、`dispatches`、`artifacts`、`worktrees`、`operations`、`staging_entries`、`schema_migrations`。
+
+代理 JSON 使用 `${AI_TEAM_HOME}/state/staging/<run-id>/<staging-id>.json` 的受管生命周期。根目录和 run 目录为 `0700`，文件为 `0600`；CLI 校验 UID、regular file、单 hardlink、真实路径、mode 和文件身份，并以同目录临时文件、文件 `fsync`、原子替换和目录同步发布不超过 2 MiB 的合法 JSON。`staging_entries` 只保存绑定、状态、SHA-256、大小和时间，不保存 JSON 原文，也不提升 `STATE_SCHEMA_EPOCH`。
+
+默认 `staging.retention_hours` 为 168。业务失败保留内容；业务持久化后才消费，删除失败标记 `cleanup_pending`。`staging cleanup --expired` 完整清理过期项，指定 run/id 的清理必须显式 `--all`。升级时先发布兼容旧文件参数和 `--staging-id` 的 CLI，再生成或安装新版代理；不扫描、迁移或删除历史 `$TMPDIR/opencode` 文件。
 
 所有副作用先写 operation，再执行，再写完成证据。重复 submit、重复 claim、重复 Git 操作使用幂等键；副作用明确未发生时可重试，明确已完成时复用，状态未知时阻断并 reconcile。网络超时、客户端进程异常和临时资源错误最多重试 2 次；认证、权限、配置、非法 schema 和未知副作用不自动重试、不换模型、不换平台。
 
@@ -329,6 +333,7 @@ ai-team run decide --run-id <id> --decision-id <id> --choice <choice-id> [--note
 │   ├── balanced.yaml
 │   └── economy.yaml
 ├── state/
+│   └── staging/<run-id>/<staging-id>.json
 ├── backups/
 ├── schemas/
 └── templates/

@@ -1,7 +1,8 @@
 id: backend-developer
 purpose: 在分配的范围内实现后端及通用工程工作
 writes: [dispatch.allowed_write_paths]
+staging: { owned_entries: [dispatch-result] }
 delegates: []
-commands: [context update, context validate, dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit]
+commands: [context update, context validate, dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit, staging create, staging write, staging show]
 discovery: false
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

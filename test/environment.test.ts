@@ -86,6 +86,24 @@ test("environment validation rejects unknown override roles and unsafe names", a
   await assert.rejects(service.load("../balanced"), /invalid environment name/);
 });
 
+test("staging retention defaults for new and legacy configs and rejects invalid values", async (t) => {
+  const { aiTeamHome, userHome } = await makeHomes(t);
+  const service = new EnvironmentService(aiTeamHome, userHome);
+  await service.bootstrap();
+  const configPath = join(service.paths.root, "config.yaml");
+  const current = YAML.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(current.staging, { retention_hours: 168 });
+  assert.equal(await service.stagingRetentionHours(), 168);
+
+  delete current.staging;
+  await writeFile(configPath, YAML.stringify(current));
+  assert.equal(await service.stagingRetentionHours(), 168);
+
+  current.staging = { retention_hours: 0 };
+  await writeFile(configPath, YAML.stringify(current));
+  await assert.rejects(service.stagingRetentionHours(), /config schema is invalid/);
+});
+
 test("renderAgents renders all twelve roles for all three platforms", () => {
   const files = renderAgents(balancedEnvironment());
 
@@ -104,6 +122,10 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
       assert.deepEqual(metadata.command_contract.allowed_commands, ROLE_MANIFEST[role].commands);
       assert.ok(metadata.command_contract.syntax.length > 0);
       assert.ok(Object.keys(metadata.command_contract.parameter_types).length > 0);
+      assert.deepEqual(metadata.writes, ROLE_MANIFEST[role].writes);
+      assert.deepEqual(metadata.staging, ROLE_MANIFEST[role].staging);
+      assert.match(content, /staging\.owned_entries/);
+      assert.match(content, /不得直接写入.*\$TMPDIR.*项目目录.*AI_TEAM_HOME/);
       if (platform === "codex") {
         assert.doesNotMatch(content, /^\[ai_team\]$/m);
         assert.match(content, new RegExp(`^name = "${role}"$`, "m"));

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, link, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -104,7 +104,7 @@ test("state migration is recorded once and survives reopening", async () => {
   try {
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }],
     );
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
@@ -115,7 +115,7 @@ test("state migration is recorded once and survives reopening", async () => {
     store = await StateStore.open(home);
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }],
     );
   } finally {
     store.close();
@@ -132,7 +132,7 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
     try {
       assert.equal(
         (reader.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count,
-        4,
+        5,
       );
       assert.throws(() => reader.db.prepare("UPDATE runs SET state='failed'").run(), /readonly|read-only/i);
     } finally {
@@ -143,6 +143,95 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
     writer.close();
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("managed staging persists metadata without JSON content and consumes files", async () => {
+  await withStore(async (store, home) => {
+    const runId = createRun(store);
+    await assert.rejects(
+      store.createStagingEntry({ runId, role: "environment-operator", kind: "decision" }),
+      /does not own staging kind/,
+    );
+    const entry = await store.createStagingEntry({ runId, role: "backend-developer", kind: "dispatch-result" });
+    const directory = join(home, "state", "staging", runId);
+    const path = join(directory, `${entry.stagingId}.json`);
+
+    assert.equal((await stat(join(home, "state", "staging"))).mode & 0o777, 0o700);
+    assert.equal((await stat(directory)).mode & 0o777, 0o700);
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
+    assert.equal(entry.state, "draft");
+
+    const secret = { token: "staging-raw-secret", nested: [1, 2, 3] };
+    const ready = await store.writeStagingEntry(entry.stagingId, JSON.stringify(secret), { runId, role: "backend-developer", kind: "dispatch-result" });
+    assert.equal(ready.state, "ready");
+    assert.deepEqual((await store.readStagingEntry(entry.stagingId, { runId, role: "backend-developer", kind: "dispatch-result" })).value, secret);
+    assert.throws(() => store.getStagingEntry("staging_01ARZ3NDEKTSV4RRFFQ69G5FAV"), /unknown staging entry/);
+    await assert.rejects(store.readStagingEntry(entry.stagingId, { runId, role: "test" }), /role binding/);
+    await assert.rejects(store.readStagingEntry(entry.stagingId, { runId, kind: "decision" }), /kind binding/);
+
+    const persisted = JSON.stringify({
+      entries: store.db.prepare("SELECT * FROM staging_entries").all(),
+      events: store.db.prepare("SELECT type,payload_json FROM run_events WHERE type LIKE 'staging.%'").all(),
+    });
+    assert.doesNotMatch(persisted, /staging-raw-secret/);
+
+    const consumed = await store.consumeStagingEntry(entry.stagingId, { runId, role: "backend-developer", kind: "dispatch-result" });
+    assert.equal(consumed.state, "consumed");
+    await assert.rejects(stat(path), { code: "ENOENT" });
+    await assert.rejects(store.writeStagingEntry(entry.stagingId, "{}", { runId }), /not readable/);
+  });
+});
+
+test("managed staging rejects invalid JSON, oversized writes, links, modes, and path replacement", async () => {
+  await withStore(async (store, home) => {
+    const runId = createRun(store);
+    const entry = await store.createStagingEntry({ runId, role: "test", kind: "dispatch-result" });
+    const path = join(home, "state", "staging", runId, `${entry.stagingId}.json`);
+    await store.writeStagingEntry(entry.stagingId, "{\"valid\":true}", { runId, role: "test" });
+
+    await assert.rejects(store.writeStagingEntry(entry.stagingId, "{", { runId, role: "test" }), /not valid JSON/);
+    assert.deepEqual((await store.readStagingEntry(entry.stagingId, { runId, role: "test" })).value, { valid: true });
+    await assert.rejects(store.writeStagingEntry(entry.stagingId, Buffer.alloc(2 * 1024 * 1024 + 1), { runId, role: "test" }), /exceeds/);
+
+    const hardlink = join(home, "staging-hardlink.json");
+    await link(path, hardlink);
+    await assert.rejects(store.readStagingEntry(entry.stagingId, { runId, role: "test" }), /exactly one hard link/);
+    await unlink(hardlink);
+    await chmod(path, 0o644);
+    await assert.rejects(store.readStagingEntry(entry.stagingId, { runId, role: "test" }), /mode 0600/);
+    await chmod(path, 0o600);
+
+    const outside = join(home, "outside.json");
+    await writeFile(outside, "{\"outside\":true}", { mode: 0o600 });
+    await assert.rejects(store.writeStagingEntry(entry.stagingId, "{\"replacement\":true}", { runId, role: "test" }, async () => {
+      await unlink(path);
+      await symlink(outside, path);
+    }), /regular file|identity changed/);
+    assert.equal(await readFile(outside, "utf8"), "{\"outside\":true}");
+  });
+});
+
+test("managed staging expires and cleans only selected entries", async () => {
+  await withStore(async (store, home) => {
+    const runId = createRun(store);
+    const old = new Date("2026-08-01T00:00:00.000Z");
+    const entry = await store.createStagingEntry({ runId, role: "planning", kind: "planning-tasks", retentionHours: 1, now: old });
+    assert.equal(store.expireStagingEntries(new Date("2026-08-01T02:00:00.000Z")), 1);
+    assert.equal(store.getStagingEntry(entry.stagingId).state, "expired");
+    const path = join(home, "state", "staging", runId, `${entry.stagingId}.json`);
+    await chmod(path, 0o644);
+    const failed = await store.cleanupStagingEntries({ expired: true, now: new Date("2026-08-01T02:00:00.000Z") });
+    assert.deepEqual(failed, { matched: 1, removed: 0, pending: 1 });
+    assert.equal(store.getStagingEntry(entry.stagingId).state, "cleanup_pending");
+
+    store.registerRepository("repo-2", "/tmp/repo-2/.git", "/tmp/repo-2");
+    const otherRun = store.createRun({ repoId: "repo-2", profile: "coding", mode: "feature", request: "other" });
+    assert.deepEqual(await store.cleanupStagingEntries({ runId: otherRun, stagingId: entry.stagingId, all: true }), { matched: 0, removed: 0, pending: 0 });
+    await chmod(path, 0o600);
+    const cleaned = await store.cleanupStagingEntries({ runId, stagingId: entry.stagingId, all: true });
+    assert.deepEqual(cleaned, { matched: 1, removed: 1, pending: 0 });
+    assert.throws(() => store.getStagingEntry(entry.stagingId), /unknown staging entry/);
+  });
 });
 
 test("migration 004 preserves legacy revisions and scopes identical revisions by repository", async () => {

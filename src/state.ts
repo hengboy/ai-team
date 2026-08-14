@@ -7,13 +7,84 @@ import { getHomePaths, type HomePaths } from "./home.js";
 import { ValidationError } from "./errors.js";
 import { makeId, redact, sha256, stableJson } from "./utils.js";
 import { CONTRACT_DIGEST } from "./contracts.js";
-import { AGENT_BUILD, ROLE_MANIFEST_DIGEST } from "./roles.js";
+import { AGENT_BUILD, ROLE_MANIFEST, ROLE_MANIFEST_DIGEST } from "./roles.js";
+import {
+  STAGING_DEFAULT_RETENTION_HOURS,
+  STAGING_KINDS,
+  STAGING_OPPORTUNISTIC_CLEANUP_LIMIT,
+  ROLES,
+  type Role,
+  type StagingKind,
+  type StagingState,
+} from "./constants.js";
+import {
+  ensureManagedDirectory,
+  readManagedJsonFile,
+  removeManagedFile,
+  stagingFilePath,
+  stagingRunDirectory,
+  writeManagedJsonFile,
+  type ManagedFileIdentity,
+} from "./security.js";
 
 /** Increment when persisted state contracts change incompatibly. */
 export const STATE_SCHEMA_EPOCH = 2;
 
 export interface StateStoreOpenOptions {
   readonly?: boolean;
+}
+
+export interface StagingEntry {
+  stagingId: string;
+  runId: string;
+  dispatchId: string | null;
+  role: Role;
+  kind: StagingKind;
+  state: StagingState;
+  contentDigest: string | null;
+  contentBytes: number | null;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  consumedAt: string | null;
+  cleanupAttemptedAt: string | null;
+  cleanupError: string | null;
+}
+
+interface StagingEntryRow {
+  staging_id: string;
+  run_id: string;
+  dispatch_id: string | null;
+  role: Role;
+  kind: StagingKind;
+  state: StagingState;
+  content_sha256: string | null;
+  content_bytes: number | null;
+  file_dev: string | null;
+  file_ino: string | null;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+  consumed_at: string | null;
+  cleanup_attempted_at: string | null;
+  cleanup_error: string | null;
+}
+
+export interface StagingBinding {
+  runId?: string;
+  dispatchId?: string | null;
+  role?: Role;
+  kind?: StagingKind;
+}
+
+export interface StagingCleanupSelector {
+  stagingId?: string;
+  runId?: string;
+  all?: boolean;
+  expired?: boolean;
+  limit?: number;
+  now?: Date;
+  retentionHours?: number;
 }
 
 const migrations = [
@@ -113,6 +184,34 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "005-staging-entries",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      db.exec(`
+        CREATE TABLE staging_entries (
+          staging_id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          dispatch_id TEXT REFERENCES dispatches(dispatch_id) ON DELETE CASCADE,
+          role TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind IN ('project-context','planning-documents','planning-tasks','dispatch-packet','dispatch-result','decision','git-reconcile-evidence','research-conclusions','review-result','review-resolution')),
+          state TEXT NOT NULL CHECK(state IN ('draft','ready','consumed','cleanup_pending','expired')),
+          content_sha256 TEXT,
+          content_bytes INTEGER,
+          file_dev TEXT,
+          file_ino TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          consumed_at TEXT,
+          cleanup_attempted_at TEXT,
+          cleanup_error TEXT
+        );
+        CREATE INDEX staging_entries_expiry ON staging_entries(state, expires_at);
+        CREATE INDEX staging_entries_run ON staging_entries(run_id, created_at);
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
@@ -180,6 +279,7 @@ export class StateStore {
       return new StateStore(paths, db, () => {});
     }
     await Promise.all([paths.state, paths.backups, paths.artifacts, paths.environments, paths.schemas, paths.templates].map((path) => mkdir(path, { recursive: true })));
+    await ensureManagedDirectory(paths.root, paths.staging);
     const releaseLock = await lockfile.lock(paths.state, {
       realpath: false,
       stale: 30_000,
@@ -342,5 +442,260 @@ export class StateStore {
     this.db.prepare("UPDATE decisions SET status='resolved',choice=?,note=?,receipt_json=?,resolved_at=? WHERE decision_id=?")
       .run(choice, note ?? null, stableJson(receipt), resolvedAt, decisionId);
     this.event(runId, "decision.resolved", { decisionId, choice });
+  }
+
+  private stagingRow(stagingId: string): StagingEntryRow {
+    const row = this.db.prepare("SELECT * FROM staging_entries WHERE staging_id=?").get(stagingId) as StagingEntryRow | undefined;
+    if (!row) throw new ValidationError(`unknown staging entry: ${stagingId}`);
+    return row;
+  }
+
+  private stagingMetadata(row: StagingEntryRow): StagingEntry {
+    return {
+      stagingId: row.staging_id,
+      runId: row.run_id,
+      dispatchId: row.dispatch_id,
+      role: row.role,
+      kind: row.kind,
+      state: row.state,
+      contentDigest: row.content_sha256,
+      contentBytes: row.content_bytes,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      expiresAt: row.expires_at,
+      consumedAt: row.consumed_at,
+      cleanupAttemptedAt: row.cleanup_attempted_at,
+      cleanupError: row.cleanup_error,
+    };
+  }
+
+  private stagingIdentity(row: StagingEntryRow): ManagedFileIdentity {
+    if (!row.file_dev || !row.file_ino) throw new ValidationError(`staging entry has no content identity: ${row.staging_id}`);
+    return { dev: row.file_dev, ino: row.file_ino };
+  }
+
+  private stagingPath(row: Pick<StagingEntryRow, "run_id" | "staging_id">): string {
+    return stagingFilePath(this.paths.staging, row.run_id, row.staging_id);
+  }
+
+  private async ensureStagingDirectories(runId?: string): Promise<void> {
+    await ensureManagedDirectory(this.paths.root, this.paths.staging);
+    if (runId) await ensureManagedDirectory(this.paths.staging, stagingRunDirectory(this.paths.staging, runId));
+  }
+
+  private assertStagingBinding(row: StagingEntryRow, binding: StagingBinding): void {
+    if (binding.runId !== undefined && row.run_id !== binding.runId) throw new ValidationError("staging run binding does not match");
+    if (binding.dispatchId !== undefined && row.dispatch_id !== binding.dispatchId) throw new ValidationError("staging dispatch binding does not match");
+    if (binding.role !== undefined && row.role !== binding.role) throw new ValidationError("staging role binding does not match");
+    if (binding.kind !== undefined && row.kind !== binding.kind) throw new ValidationError("staging kind binding does not match");
+  }
+
+  private activeStagingRow(stagingId: string, binding: StagingBinding = {}, now = new Date()): StagingEntryRow {
+    this.expireStagingEntries(now);
+    const row = this.stagingRow(stagingId);
+    this.assertStagingBinding(row, binding);
+    if (row.state === "expired") throw new ValidationError(`staging entry has expired: ${stagingId}`);
+    if (row.state !== "draft" && row.state !== "ready") throw new ValidationError(`staging entry is not readable: ${row.state}`);
+    return row;
+  }
+
+  getStagingEntry(stagingId: string): StagingEntry {
+    return this.stagingMetadata(this.stagingRow(stagingId));
+  }
+
+  listStagingEntries(runId: string, role: Role): StagingEntry[] {
+    this.getRun(runId);
+    return (this.db.prepare("SELECT * FROM staging_entries WHERE run_id=? AND role=? ORDER BY created_at,staging_id")
+      .all(runId, role) as StagingEntryRow[]).map((row) => this.stagingMetadata(row));
+  }
+
+  recordStagingValidationFailure(stagingId: string, binding: StagingBinding, error: unknown): void {
+    const row = this.stagingRow(stagingId);
+    this.assertStagingBinding(row, binding);
+    this.event(row.run_id, "staging.validation_failed", {
+      stagingId,
+      error: redact(error instanceof Error ? error.message : String(error)).slice(0, 1000),
+    });
+  }
+
+  async createStagingEntry(input: {
+    runId: string;
+    dispatchId?: string;
+    role: Role;
+    kind: StagingKind;
+    initialJson?: string | Buffer;
+    retentionHours?: number;
+    now?: Date;
+  }): Promise<StagingEntry> {
+    if (!(ROLES as readonly string[]).includes(input.role)) throw new ValidationError(`unknown staging role: ${input.role}`);
+    if (!(STAGING_KINDS as readonly string[]).includes(input.kind)) throw new ValidationError(`unknown staging kind: ${input.kind}`);
+    if (!ROLE_MANIFEST[input.role].staging.owned_entries.includes(input.kind)) {
+      throw new ValidationError(`${input.role} does not own staging kind ${input.kind}`);
+    }
+    this.getRun(input.runId);
+    if (input.dispatchId) {
+      const dispatch = this.db.prepare("SELECT run_id,role FROM dispatches WHERE dispatch_id=?").get(input.dispatchId) as { run_id: string; role: string } | undefined;
+      if (!dispatch || dispatch.run_id !== input.runId || dispatch.role !== input.role) {
+        throw new ValidationError("staging dispatch binding does not match run and role");
+      }
+    }
+    const retentionHours = input.retentionHours ?? STAGING_DEFAULT_RETENTION_HOURS;
+    if (!Number.isInteger(retentionHours) || retentionHours <= 0) throw new ValidationError("staging retention hours must be a positive integer");
+    const now = input.now ?? new Date();
+    await this.ensureStagingDirectories();
+    await this.cleanupStagingEntries({ expired: true, limit: STAGING_OPPORTUNISTIC_CLEANUP_LIMIT, now });
+    const stagingId = makeId("staging");
+    const runDirectory = stagingRunDirectory(this.paths.staging, input.runId);
+    await ensureManagedDirectory(this.paths.staging, runDirectory);
+    const path = stagingFilePath(this.paths.staging, input.runId, stagingId);
+    const content = await writeManagedJsonFile(this.paths.staging, path, input.initialJson ?? "null");
+    const timestamp = now.toISOString();
+    const expiresAt = new Date(now.getTime() + retentionHours * 60 * 60 * 1000).toISOString();
+    try {
+      this.db.prepare(`INSERT INTO staging_entries(
+        staging_id,run_id,dispatch_id,role,kind,state,content_sha256,content_bytes,file_dev,file_ino,created_at,updated_at,expires_at
+      ) VALUES (?,?,?,?,?,'draft',?,?,?,?,?,?,?)`).run(
+        stagingId, input.runId, input.dispatchId ?? null, input.role, input.kind, content.digest, content.bytes,
+        content.identity.dev, content.identity.ino, timestamp, timestamp, expiresAt,
+      );
+      this.event(input.runId, "staging.created", { stagingId, dispatchId: input.dispatchId ?? null, role: input.role, kind: input.kind });
+    } catch (error) {
+      await removeManagedFile(this.paths.staging, path, content.identity).catch(() => {});
+      throw error;
+    }
+    return this.getStagingEntry(stagingId);
+  }
+
+  async writeStagingEntry(
+    stagingId: string,
+    content: string | Buffer,
+    binding: StagingBinding = {},
+    beforeReplace?: () => Promise<void> | void,
+    retentionHours = STAGING_DEFAULT_RETENTION_HOURS,
+  ): Promise<StagingEntry> {
+    if (!Number.isInteger(retentionHours) || retentionHours <= 0) throw new ValidationError("staging retention hours must be a positive integer");
+    const persisted = this.stagingRow(stagingId);
+    await this.ensureStagingDirectories(persisted.run_id);
+    const row = this.activeStagingRow(stagingId, binding);
+    const written = await writeManagedJsonFile(
+      this.paths.staging,
+      this.stagingPath(row),
+      content,
+      this.stagingIdentity(row),
+      ...(beforeReplace ? [{ beforeReplace }] : []),
+    );
+    const now = new Date();
+    const timestamp = now.toISOString();
+    const expiresAt = new Date(now.getTime() + retentionHours * 60 * 60 * 1000).toISOString();
+    this.db.prepare(`UPDATE staging_entries SET state='ready',content_sha256=?,content_bytes=?,file_dev=?,file_ino=?,updated_at=?,expires_at=?,cleanup_error=NULL
+      WHERE staging_id=? AND state IN ('draft','ready')`).run(
+      written.digest, written.bytes, written.identity.dev, written.identity.ino, timestamp, expiresAt, stagingId,
+    );
+    this.event(row.run_id, "staging.written", { stagingId, digest: written.digest, bytes: written.bytes });
+    return this.getStagingEntry(stagingId);
+  }
+
+  async readStagingEntry(stagingId: string, binding: StagingBinding = {}): Promise<{ entry: StagingEntry; value: unknown }> {
+    const persisted = this.stagingRow(stagingId);
+    await this.ensureStagingDirectories(persisted.run_id);
+    const row = this.activeStagingRow(stagingId, binding);
+    const content = await readManagedJsonFile(
+      this.paths.staging,
+      this.stagingPath(row),
+      this.stagingIdentity(row),
+    );
+    if (content.digest !== row.content_sha256 || content.bytes !== row.content_bytes) {
+      throw new ValidationError("staging content does not match persisted metadata");
+    }
+    return { entry: this.stagingMetadata(row), value: content.value };
+  }
+
+  async consumeStagingEntry(stagingId: string, binding: StagingBinding = {}, now = new Date(), retentionHours = STAGING_DEFAULT_RETENTION_HOURS): Promise<StagingEntry> {
+    if (!Number.isInteger(retentionHours) || retentionHours <= 0) throw new ValidationError("staging retention hours must be a positive integer");
+    const persisted = this.stagingRow(stagingId);
+    await this.ensureStagingDirectories(persisted.run_id);
+    const row = this.activeStagingRow(stagingId, binding, now);
+    const timestamp = now.toISOString();
+    this.db.prepare(`UPDATE staging_entries SET state='cleanup_pending',consumed_at=?,updated_at=?,cleanup_attempted_at=?,cleanup_error=NULL
+      WHERE staging_id=?`).run(timestamp, timestamp, timestamp, stagingId);
+    try {
+      await removeManagedFile(this.paths.staging, this.stagingPath(row), this.stagingIdentity(row));
+      this.db.prepare(`UPDATE staging_entries SET state='consumed',consumed_at=?,updated_at=?,cleanup_attempted_at=?,cleanup_error=NULL
+        WHERE staging_id=?`).run(timestamp, timestamp, timestamp, stagingId);
+      this.event(row.run_id, "staging.consumed", { stagingId, digest: row.content_sha256, bytes: row.content_bytes });
+    } catch (error) {
+      const message = redact(error instanceof Error ? error.message : String(error)).slice(0, 1000);
+      const retryAt = new Date(now.getTime() + retentionHours * 60 * 60 * 1000).toISOString();
+      this.db.prepare(`UPDATE staging_entries SET state='cleanup_pending',updated_at=?,expires_at=?,cleanup_attempted_at=?,cleanup_error=?
+        WHERE staging_id=?`).run(timestamp, retryAt, timestamp, message, stagingId);
+      this.event(row.run_id, "staging.cleanup_pending", { stagingId, digest: row.content_sha256 });
+    }
+    return this.getStagingEntry(stagingId);
+  }
+
+  expireStagingEntries(now = new Date()): number {
+    const timestamp = now.toISOString();
+    const rows = this.db.prepare(`SELECT staging_id,run_id FROM staging_entries
+      WHERE state IN ('draft','ready') AND expires_at<=?`).all(timestamp) as Array<{ staging_id: string; run_id: string }>;
+    const update = this.db.prepare("UPDATE staging_entries SET state='expired',updated_at=? WHERE staging_id=?");
+    for (const row of rows) {
+      update.run(timestamp, row.staging_id);
+      this.event(row.run_id, "staging.expired", { stagingId: row.staging_id });
+    }
+    return rows.length;
+  }
+
+  async cleanupStagingEntries(selector: StagingCleanupSelector = { expired: true }): Promise<{ matched: number; removed: number; pending: number }> {
+    await this.ensureStagingDirectories();
+    const now = selector.now ?? new Date();
+    const timestamp = now.toISOString();
+    this.expireStagingEntries(now);
+    let sql = "SELECT * FROM staging_entries";
+    const parameters: unknown[] = [];
+    if (selector.stagingId) {
+      sql += selector.runId ? " WHERE staging_id=? AND run_id=?" : " WHERE staging_id=?";
+      parameters.push(selector.stagingId);
+      if (selector.runId) parameters.push(selector.runId);
+    } else if (selector.runId) {
+      sql += " WHERE run_id=?";
+      parameters.push(selector.runId);
+    } else if (!selector.all) {
+      sql += " WHERE state='expired' OR (state='cleanup_pending' AND expires_at<=?)";
+      parameters.push(timestamp);
+    }
+    sql += " ORDER BY created_at,staging_id";
+    if (selector.limit !== undefined) {
+      if (!Number.isInteger(selector.limit) || selector.limit <= 0) throw new ValidationError("staging cleanup limit must be a positive integer");
+      sql += " LIMIT ?";
+      parameters.push(selector.limit);
+    }
+    const rows = this.db.prepare(sql).all(...parameters) as StagingEntryRow[];
+    let removed = 0;
+    let pending = 0;
+    for (const row of rows) {
+      try {
+        await this.ensureStagingDirectories(row.run_id);
+        if (row.file_dev && row.file_ino) {
+          await removeManagedFile(
+            this.paths.staging,
+            this.stagingPath(row),
+            { dev: row.file_dev, ino: row.file_ino },
+          );
+        }
+        this.db.prepare("DELETE FROM staging_entries WHERE staging_id=?").run(row.staging_id);
+        this.event(row.run_id, "staging.deleted", { stagingId: row.staging_id, state: row.state, digest: row.content_sha256 });
+        removed += 1;
+      } catch (error) {
+        const message = redact(error instanceof Error ? error.message : String(error)).slice(0, 1000);
+        const retentionHours = selector.retentionHours ?? STAGING_DEFAULT_RETENTION_HOURS;
+        if (!Number.isInteger(retentionHours) || retentionHours <= 0) throw new ValidationError("staging retention hours must be a positive integer");
+        const retryAt = new Date(now.getTime() + retentionHours * 60 * 60 * 1000).toISOString();
+        this.db.prepare(`UPDATE staging_entries SET state='cleanup_pending',updated_at=?,expires_at=?,cleanup_attempted_at=?,cleanup_error=?
+          WHERE staging_id=?`).run(timestamp, retryAt, timestamp, message, row.staging_id);
+        this.event(row.run_id, "staging.cleanup_pending", { stagingId: row.staging_id, digest: row.content_sha256 });
+        pending += 1;
+      }
+    }
+    return { matched: rows.length, removed, pending };
   }
 }

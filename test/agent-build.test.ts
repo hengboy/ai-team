@@ -54,3 +54,14 @@ test("role manifests reserve revision creation for planning and revision commit 
   assert.ok(!build.roles.planning.commands.includes("planning revision commit"));
   assert.ok(build.roles["git-operator"].commands.includes("planning revision commit"));
 });
+
+test("role manifests declare staging ownership separately from project writes", () => {
+  const build = loadAgentBuildSync(sourceRoot);
+  assert.equal(build.templateVersion, 2);
+  assert.deepEqual(build.roles["file-explorer"].staging.owned_entries, ["project-context", "dispatch-result"]);
+  assert.deepEqual(build.roles["environment-operator"].staging.owned_entries, []);
+  assert.ok(build.roles.planning.commands.includes("staging create"));
+  assert.ok(build.roles.coding.commands.includes("staging cleanup"));
+  assert.ok(build.roles.researcher.commands.includes("research archive"));
+  assert.ok(!build.roles["environment-operator"].commands.includes("staging create"));
+});

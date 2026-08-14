@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
-import { dirname, relative, resolve, sep } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { ulid } from "ulid";
 import { ValidationError } from "./errors.js";
 
@@ -22,7 +23,7 @@ export const stableJson = (value: unknown): string => {
   return JSON.stringify(normalize(value));
 };
 
-export const makeId = (kind: "run" | "dispatch"): string => `${kind}_${ulid()}`;
+export const makeId = (kind: "run" | "dispatch" | "staging"): string => `${kind}_${ulid()}`;
 
 export const makePlanId = (slug: string, now = new Date()): string => {
   const normalized = slug
@@ -68,6 +69,38 @@ export const readJson = async <T>(path: string): Promise<T> =>
 
 export const writeJson = async (path: string, value: unknown): Promise<void> => {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+};
+
+export interface AtomicWriteOptions {
+  beforeReplace?: () => Promise<void> | void;
+}
+
+export const atomicWriteFile = async (
+  path: string,
+  content: Buffer,
+  options: AtomicWriteOptions = {},
+): Promise<void> => {
+  const directory = dirname(path);
+  const temporary = join(directory, `.${randomBytes(16).toString("hex")}.tmp`);
+  let handle;
+  try {
+    handle = await open(
+      temporary,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    await handle.writeFile(content);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await options.beforeReplace?.();
+    await rename(temporary, path);
+    const directoryHandle = await open(directory, fsConstants.O_RDONLY);
+    try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+  } finally {
+    await handle?.close().catch(() => {});
+    await rm(temporary, { force: true }).catch(() => {});
+  }
 };
 
 export const toPosix = (path: string): string => path.split(sep).join("/");

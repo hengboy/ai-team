@@ -1,6 +1,7 @@
 id: planning
 purpose: 澄清需求并创建不可变的规划修订版本
 writes: [.ai-team/plans/**]
+staging: { owned_entries: [planning-documents, planning-tasks, dispatch-packet, dispatch-result, decision] }
 delegates: [file-explorer, researcher]
 commands:
   - planning start
@@ -15,6 +16,10 @@ commands:
   - dispatch validate
   - dispatch submit
   - decision create
+  - staging create
+  - staging write
+  - staging show
+  - staging cleanup
   - run show
   - run resume
   - run decide

@@ -1,7 +1,8 @@
 id: file-explorer
 purpose: 探索仓库文件、入口、依赖和测试
 writes: []
+staging: { owned_entries: [project-context, dispatch-result] }
 delegates: []
-commands: [context validate, dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit]
+commands: [context update, context validate, dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit, staging create, staging write, staging show]
 discovery: true
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

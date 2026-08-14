@@ -106,6 +106,34 @@ scopes before safe execution batches are produced.
 Run `ai-team <command> --help` for exact parameters. `ai-team contract` prints
 the contract and role-manifest digests used to detect drift.
 
+### Managed JSON staging
+
+Agent-produced JSON is stored under
+`${AI_TEAM_HOME:-~/.config/ai-team}/state/staging/<run-id>/` and is managed only
+through the CLI:
+
+```sh
+ai-team staging create --run-id <id> --role <role> --kind <kind> [--dispatch-id <id>]
+ai-team staging write --run-id <id> --role <role> --staging-id <id> --input-stdin
+ai-team staging show --run-id <id> --role <role> [--staging-id <id>] [--content]
+ai-team staging cleanup --expired
+ai-team staging cleanup --run-id <id> [--staging-id <id>] --all
+```
+
+The 10 kinds are `project-context`, `planning-documents`, `planning-tasks`,
+`dispatch-packet`, `dispatch-result`, `decision`, `git-reconcile-evidence`,
+`research-conclusions`, `review-result`, and `review-resolution`. Existing JSON
+file options remain supported; each consumer accepts either its file option or
+`--staging-id`, never both. Validation and Task preview do not consume content.
+Successful mutating commands persist their business result before deleting the
+staged file. Failed deletion is recorded as `cleanup_pending` for retry.
+
+Directories are mode `0700`, files are `0600`, and writes are limited to 2 MiB
+of valid JSON with atomic replacement and link/ownership/path checks. The
+default failure retention is 168 hours and can be set with
+`staging.retention_hours` in `config.yaml`. Metadata and audit events contain
+digests and sizes, not raw staging JSON.
+
 ## Safety
 
 AI Team rejects credential paths, `.env*`, `.ai-team/runtime`, and symlink path
@@ -113,6 +141,9 @@ escapes. Git commands are passed as fixed argument arrays. Push, tag, rebase,
 reset, clean, stash, squash, cherry-pick, amend, remote mutation, and release
 operations are not available. Failed or uncertain operations retain worktrees
 and require reconciliation.
+
+Upgrade the compatible CLI before regenerating or installing agents. AI Team
+does not scan, migrate, or remove historical `$TMPDIR/opencode` files.
 
 ## Development
 

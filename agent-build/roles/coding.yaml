@@ -1,6 +1,7 @@
 id: coding
 purpose: 分流并协调实现、验证、评审、修复和集成工作
 writes: []
+staging: { owned_entries: [dispatch-packet, dispatch-result, decision, review-resolution] }
 delegates: [file-explorer, frontend-developer, backend-developer, test, git-operator, code-reviewer, researcher]
 commands:
   - coding start
@@ -13,6 +14,10 @@ commands:
   - dispatch validate
   - dispatch submit
   - decision create
+  - staging create
+  - staging write
+  - staging show
+  - staging cleanup
   - scope check
   - review create
   - review submit

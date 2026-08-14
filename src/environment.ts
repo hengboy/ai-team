@@ -13,7 +13,7 @@ import { IncompatibleError, ValidationError } from "./errors.js";
 import { getHomePaths } from "./home.js";
 import { AGENT_BUILD, ROLE_MANIFEST, ROLE_MANIFEST_DIGEST } from "./roles.js";
 import { renderRoleBody } from "./agent-build.js";
-import { ROLES, type Role } from "./constants.js";
+import { ROLES, STAGING_DEFAULT_RETENTION_HOURS, type Role } from "./constants.js";
 import { sha256, stableJson } from "./utils.js";
 import { commandContractFor } from "./command-contract.js";
 import { assertReadablePath, assertWritablePath } from "./security.js";
@@ -67,7 +67,7 @@ export const environmentConfigSchema = {
   $id: "https://ai-team.local/schemas/config-v1.json",
   type: "object",
   additionalProperties: false,
-  required: ["active_environment", "enabled_platforms", "client_versions", "state_schema_epoch"],
+  required: ["active_environment", "enabled_platforms", "client_versions", "state_schema_epoch", "staging"],
   properties: {
     active_environment: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
     state_schema_epoch: { type: "integer", minimum: 1 },
@@ -78,6 +78,10 @@ export const environmentConfigSchema = {
         type: "object", additionalProperties: false, required: ["command", "minimum", "verified"],
         properties: { command: { type: "string", minLength: 1 }, minimum: { type: "string", minLength: 1 }, verified: { type: "string", minLength: 1 }, detected_version: { type: "string", minLength: 1 } },
       }])),
+    },
+    staging: {
+      type: "object", additionalProperties: false, required: ["retention_hours"],
+      properties: { retention_hours: { type: "integer", minimum: 1 } },
     },
   },
 } as const;
@@ -231,9 +235,9 @@ const legacyRendererNotUsed = (commands: string[]): { allowed_commands: string[]
 const renderBody = (role: Role, platform: Platform, model: ModelConfig, environment: string): string => {
   const definition = ROLE_MANIFEST[role];
   const commandContract = commandContractFor(definition.commands);
-  const metadata = { role, platform, environment, model, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, agent_build_digest: AGENT_BUILD.digest, template_version: AGENT_BUILD.templateVersion, command_contract: commandContract };
+  const metadata = { role, platform, environment, model, writes: definition.writes, staging: definition.staging, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, agent_build_digest: AGENT_BUILD.digest, template_version: AGENT_BUILD.templateVersion, command_contract: commandContract };
   const body = renderRoleBody(AGENT_BUILD, role, { role, purpose: definition.purpose, allowed_commands: definition.commands.join(", "), delegates: definition.delegates.join(", ") || "无", discovery: definition.discovery ? "允许" : "禁止；请请求文件探索代理支持", stop_conditions: "遇到运行数据包之外的工作时返回 requested_support", platform, environment, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, template_version: AGENT_BUILD.templateVersion, spec_template: AGENT_BUILD.templates.spec!, plan_template: AGENT_BUILD.templates.plan!, task_template: AGENT_BUILD.templates.task! });
-  const instructions = `Role: ${role}\n\n${body}\n\n## CLI 命令契约\n\n允许命令：\n${commandContract.allowed_commands.map((command) => `- \`${command}\``).join("\n")}\n\n精确语法：\n${commandContract.syntax.map((syntax) => `- \`${syntax}\``).join("\n")}\n\n参数类型：\n${Object.entries(commandContract.parameter_types).map(([name, description]) => `- \`<${name}>\`: ${description}`).join("\n")}`;
+  const instructions = `Role: ${role}\n\n${body}\n\n## 写入边界\n\n项目 writes：${definition.writes.length ? definition.writes.map((item) => `\`${item}\``).join(", ") : "无"}\n\nstaging.owned_entries：${definition.staging.owned_entries.length ? definition.staging.owned_entries.map((item) => `\`${item}\``).join(", ") : "无"}\n\n代理生成的临时 JSON 只能通过 \`ai-team staging create/write/show\` 管理；不得直接写入 \`$TMPDIR\`、项目目录或任意 \`AI_TEAM_HOME\` 路径。staging 所有权不扩大项目 writes。\n\n## CLI 命令契约\n\n允许命令：\n${commandContract.allowed_commands.map((command) => `- \`${command}\``).join("\n")}\n\n精确语法：\n${commandContract.syntax.map((syntax) => `- \`${syntax}\``).join("\n")}\n\n参数类型：\n${Object.entries(commandContract.parameter_types).map(([name, description]) => `- \`<${name}>\`: ${description}`).join("\n")}`;
   if (platform === "codex") {
     return `# ${FILE_MARKER}\n# ai_team.metadata = ${stableJson(metadata)}\nname = ${JSON.stringify(role)}\ndescription = ${JSON.stringify(definition.purpose)}\nmodel = ${JSON.stringify(model.model)}\nmodel_reasoning_effort = ${JSON.stringify(model.reasoning)}\ndeveloper_instructions = ${JSON.stringify(instructions)}\n`;
   }
@@ -298,7 +302,7 @@ const replaceManagedBlock = (source: string, block: string | null): string => {
 interface ManifestFile { path: string; digest: string; kind: "agent" | "instructions"; }
 interface EnvironmentManifest { environment: string; agent_build_digest?: string; role_manifest_digest?: string; contract_digest?: string; template_version?: number; files: ManifestFile[]; changes?: Array<{ type: "deleted" | "renamed"; from: string; to?: string }>; }
 export interface GenerationPlan { writes: Array<{ path: string; content: string; kind: "agent" | "instructions" }>; backups: Array<{ source: string; destination: string }>; removals: string[]; blocked: string[]; }
-interface EnvironmentConfig { state_schema_epoch: number; active_environment: string; enabled_platforms: Platform[]; client_versions: Record<Platform, { command: string; minimum: string; verified: string; detected_version?: string }>; }
+interface EnvironmentConfig { state_schema_epoch: number; active_environment: string; enabled_platforms: Platform[]; client_versions: Record<Platform, { command: string; minimum: string; verified: string; detected_version?: string }>; staging: { retention_hours: number }; }
 
 export class EnvironmentService {
   readonly paths;
@@ -311,7 +315,7 @@ export class EnvironmentService {
       try { await stat(path); } catch { await writeFile(path, YAML.stringify(environment), { mode: 0o600 }); }
     }
     const config = join(this.paths.root, "config.yaml");
-    try { await stat(config); } catch { await writeFile(config, YAML.stringify({ state_schema_epoch: 2, active_environment: "balanced", enabled_platforms: PLATFORMS, client_versions: CLIENT_VERSIONS }), { mode: 0o600 }); }
+    try { await stat(config); } catch { await writeFile(config, YAML.stringify({ state_schema_epoch: 2, active_environment: "balanced", enabled_platforms: PLATFORMS, client_versions: CLIENT_VERSIONS, staging: { retention_hours: STAGING_DEFAULT_RETENTION_HOURS } }), { mode: 0o600 }); }
     await writeFile(join(this.paths.schemas, "result-envelope-v1.json"), `${JSON.stringify(resultEnvelopeSchema, null, 2)}\n`, { mode: 0o600 });
     await writeFile(join(this.paths.schemas, "environment-v1.json"), `${JSON.stringify(environmentSchema, null, 2)}\n`, { mode: 0o600 });
     await writeFile(join(this.paths.schemas, "config-v1.json"), `${JSON.stringify(environmentConfigSchema, null, 2)}\n`, { mode: 0o600 });
@@ -321,10 +325,13 @@ export class EnvironmentService {
   private async config(): Promise<EnvironmentConfig> {
     await this.bootstrap();
     const value = YAML.parse(await readFile(join(this.paths.root, "config.yaml"), "utf8")) as Partial<EnvironmentConfig>;
+    value.staging ??= { retention_hours: STAGING_DEFAULT_RETENTION_HOURS };
     if (!validateEnvironmentConfig(value)) throw new ValidationError("environment config schema is invalid", validateEnvironmentConfig.errors);
     const normalized = value as EnvironmentConfig;
-    return { state_schema_epoch: normalized.state_schema_epoch, active_environment: normalized.active_environment, enabled_platforms: [...new Set(normalized.enabled_platforms)], client_versions: normalized.client_versions };
+    return { state_schema_epoch: normalized.state_schema_epoch, active_environment: normalized.active_environment, enabled_platforms: [...new Set(normalized.enabled_platforms)], client_versions: normalized.client_versions, staging: { retention_hours: normalized.staging.retention_hours } };
   }
+
+  async stagingRetentionHours(): Promise<number> { return (await this.config()).staging.retention_hours; }
 
   private async enabledPlatforms(): Promise<Platform[]> { return (await this.config()).enabled_platforms; }
 

@@ -259,7 +259,7 @@ test("project context and context command contracts reject unsafe paths and iden
     assert.equal(checkProjectContext({ ...valid, navigation: [{ ...valid.navigation[0], entry_paths: [path] }] }).valid, false, path);
   }
   assert.doesNotThrow(() => validateCommand("context.update", { project: "/tmp/project", contextFile: "/tmp/context.json" }));
-  assert.throws(() => validateCommand("context.update", { project: "/tmp/project", contextFile: undefined }), /missing required/);
+  assert.throws(() => validateCommand("context.update", { project: "/tmp/project", contextFile: undefined }), /requires exactly one/);
   assert.doesNotThrow(() => validateCommand("context.validate", { project: "/tmp/project" }));
 });
 

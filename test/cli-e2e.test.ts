@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,6 +47,17 @@ const execute = async (
 
 const cli = async (sandbox: Sandbox, args: string[]): Promise<CommandResult> =>
   execute(process.execPath, [CLI, ...args], { cwd: sandbox.repo, env: sandbox.env });
+
+const cliWithInput = async (sandbox: Sandbox, args: string[], input: string): Promise<CommandResult> => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, [CLI, ...args], { cwd: sandbox.repo, env: sandbox.env, stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  child.on("error", reject);
+  child.on("close", (code) => resolve({ status: code ?? 1, stdout, stderr }));
+  child.stdin.end(input);
+});
 
 const git = async (sandbox: Sandbox, args: string[]): Promise<CommandResult> =>
   execute("git", args, { cwd: sandbox.repo, env: sandbox.env });
@@ -152,7 +163,7 @@ test("init creates project metadata, context skeletons, and documented ignore en
   assert.match(project, /schema_version: 1/);
   assert.match(project, /repo_id:/);
   assert.match(await readFile(join(sandbox.repo, "MEMORY.md"), "utf8"), /## 项目上下文/);
-  assert.match(await readFile(join(sandbox.repo, ".ai-team", "index", "feature-navigation.md"), "utf8"), /# Feature Navigation/);
+  assert.match(await readFile(join(sandbox.repo, ".ai-team", "index", "feature-navigation.md"), "utf8"), /# 功能导航/);
 });
 
 test("context update accepts File Explorer output and validate reports maintenance state", async (t) => {
@@ -184,6 +195,99 @@ test("context update accepts File Explorer output and validate reports maintenan
   assert.equal(validation.valid, true);
   assert.equal(validation.navigation.entries, 1);
   assert.deepEqual(validation.maintenance, { status: "current", paths: [] });
+});
+
+test("staging CLI initializes frozen dispatch results and consumes only after submit", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const requestFile = join(sandbox.root, "request.md");
+  await writeFile(requestFile, "Exercise managed staging.\n");
+  const started = json<{ run_id: string; dispatch_id: string }>(await cli(sandbox, [
+    "planning", "start", "--project", sandbox.repo, "--request-file", requestFile,
+  ]));
+  const identity = ["--run-id", started.run_id, "--dispatch-id", started.dispatch_id, "--role", "file-explorer"];
+  json(await cli(sandbox, ["dispatch", "claim", ...identity]));
+
+  const created = json<{ stagingId: string; state: string; dispatchId: string }>(await cli(sandbox, [
+    "staging", "create", "--run-id", started.run_id, "--dispatch-id", started.dispatch_id,
+    "--role", "file-explorer", "--kind", "dispatch-result",
+  ]));
+  assert.equal(created.state, "draft");
+  assert.equal(created.dispatchId, started.dispatch_id);
+  const stagingPath = join(sandbox.aiTeamHome, "state", "staging", started.run_id, `${created.stagingId}.json`);
+  assert.equal((await stat(join(sandbox.aiTeamHome, "state", "staging"))).mode & 0o777, 0o700);
+  assert.equal((await stat(join(sandbox.aiTeamHome, "state", "staging", started.run_id))).mode & 0o777, 0o700);
+  assert.equal((await stat(stagingPath)).mode & 0o777, 0o600);
+
+  const shown = json<{ entry: { state: string }; content: Record<string, any> }>(await cli(sandbox, [
+    "staging", "show", "--run-id", started.run_id, "--role", "file-explorer",
+    "--staging-id", created.stagingId, "--content",
+  ]));
+  assert.equal(shown.content.run_id, started.run_id);
+  assert.equal(shown.content.dispatch_id, started.dispatch_id);
+  assert.equal(shown.content.role, "file-explorer");
+  shown.content.summary = "Located the managed staging entry points.";
+  shown.content.verification = [{ command: "staging smoke", outcome: "passed" }];
+  shown.content.payload = {
+    allowed_read_paths: ["README.md", "MEMORY.md", ".ai-team/index/feature-navigation.md"],
+    entry_points: ["README.md"],
+    test_commands: ["npm test"],
+    project_context: {
+      project_shape: "fixture",
+      memory: { domain_terms: [], repository_constraints: [], responsibilities: [], module_boundaries: [] },
+      navigation: [{ feature: "Fixture", keywords: ["fixture"], entry_paths: ["README.md"], module_boundary: "root" }],
+      maintenance: { status: "current", paths: ["MEMORY.md", ".ai-team/index/feature-navigation.md"] },
+    },
+  };
+  const written = json<{ state: string }>(await cliWithInput(sandbox, [
+    "staging", "write", "--run-id", started.run_id, "--role", "file-explorer",
+    "--staging-id", created.stagingId, "--input-stdin",
+  ], JSON.stringify(shown.content)));
+  assert.equal(written.state, "ready");
+
+  const validated = json<{ valid: boolean }>(await cli(sandbox, ["dispatch", "validate", ...identity, "--staging-id", created.stagingId]));
+  assert.equal(validated.valid, true);
+  const afterValidate = json<{ entry: { state: string } }>(await cli(sandbox, [
+    "staging", "show", "--run-id", started.run_id, "--role", "file-explorer", "--staging-id", created.stagingId,
+  ]));
+  assert.equal(afterValidate.entry.state, "ready");
+
+  const resultFile = join(sandbox.root, "result.json");
+  await writeFile(resultFile, JSON.stringify(shown.content));
+  const exclusive = await cli(sandbox, ["dispatch", "validate", ...identity, "--result-file", resultFile, "--staging-id", created.stagingId]);
+  assert.notEqual(exclusive.status, 0);
+  assert.match(exclusive.stderr, /exactly one/);
+
+  const submitted = json<{ reused: boolean; artifact: string }>(await cli(sandbox, ["dispatch", "submit", ...identity, "--staging-id", created.stagingId]));
+  assert.equal(submitted.reused, false);
+  await stat(submitted.artifact);
+  const consumed = json<{ entry: { state: string } }>(await cli(sandbox, [
+    "staging", "show", "--run-id", started.run_id, "--role", "file-explorer", "--staging-id", created.stagingId,
+  ]));
+  assert.equal(consumed.entry.state, "consumed");
+  await assert.rejects(stat(stagingPath), { code: "ENOENT" });
+});
+
+test("all JSON consumer commands advertise staging-id while retaining file options", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const consumers = [
+    ["context", "update"],
+    ["planning", "revision", "create"],
+    ["planning", "tasks", "validate"],
+    ["dispatch", "create"],
+    ["dispatch", "validate"],
+    ["dispatch", "submit"],
+    ["decision", "create"],
+    ["git", "reconcile"],
+    ["research", "archive"],
+    ["review", "submit"],
+    ["review", "resolve"],
+  ];
+  for (const command of consumers) {
+    const help = await cli(sandbox, [...command, "--help"]);
+    assert.equal(help.status, 0, `${command.join(" ")}: ${help.stderr}`);
+    assert.match(help.stdout, /--staging-id <id>/, command.join(" "));
+    assert.match(help.stdout, /--(?:context|documents|result|evidence|report|resolution)?-?file <file>|--packet-file <file>/, command.join(" "));
+  }
 });
 
 test("planning dispatch can be claimed, inspected, submitted, resumed, and decided", async (t) => {

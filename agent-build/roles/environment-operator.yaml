@@ -1,6 +1,7 @@
 id: environment-operator
 purpose: 安装、生成、切换、恢复和卸载受管理的全局文件
 writes: [AI_TEAM_HOME, platform agent directories]
+staging: { owned_entries: [] }
 delegates: []
 commands:
   - install

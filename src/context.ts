@@ -17,7 +17,8 @@ const MEMORY_END = "<!-- ai-team:project-context:end -->";
 const MEMORY_HEADING = "## 项目上下文";
 const NAVIGATION_START = "<!-- ai-team:feature-navigation:start -->";
 const NAVIGATION_END = "<!-- ai-team:feature-navigation:end -->";
-const NAVIGATION_HEADING = "# Feature Navigation";
+const NAVIGATION_HEADING = "# 功能导航";
+const LEGACY_NAVIGATION_HEADING = "# Feature Navigation";
 const NAVIGATION_ENTRY = "<!-- ai-team:feature-navigation-entry ";
 const EMPTY = "_待补充_";
 
@@ -139,7 +140,7 @@ const ensureSingleManagedSection = (source: string | undefined, kind: "memory" |
     : [NAVIGATION_START, NAVIGATION_END, NAVIGATION_HEADING];
   const starts = occurrences(source, start);
   const ends = occurrences(source, end);
-  const headings = occurrences(source, heading);
+  const headings = occurrences(source, heading) + (kind === "navigation" ? occurrences(source, LEGACY_NAVIGATION_HEADING) : 0);
   if (starts === 0 && ends === 0 && headings === 0) return;
   if (starts !== 1 || ends !== 1 || headings !== 1 || source.indexOf(start) > source.indexOf(end)) {
     throw new ValidationError(`${kind === "memory" ? "MEMORY.md" : NAVIGATION_PATH} has duplicate or malformed managed sections`);
@@ -172,7 +173,7 @@ const parseNavigation = (source: string): { entries: ProjectContext["navigation"
   if (start < 0 || endMarker < start) throw new ValidationError(`${NAVIGATION_PATH} managed section is missing`);
   const end = endMarker + NAVIGATION_END.length;
   const managed = source.slice(start, end);
-  if (occurrences(managed, NAVIGATION_HEADING) !== 1) throw new ValidationError(`${NAVIGATION_PATH} must contain exactly one heading`);
+  if (occurrences(managed, NAVIGATION_HEADING) + occurrences(managed, LEGACY_NAVIGATION_HEADING) !== 1) throw new ValidationError(`${NAVIGATION_PATH} must contain exactly one heading`);
   const lines = managed.split("\n");
   const headerIndex = lines.indexOf("| 功能 | 关键词 | 入口路径 | 模块边界 |");
   const separatorIndex = lines.indexOf("| --- | --- | --- | --- |");

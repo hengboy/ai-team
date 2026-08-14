@@ -54,3 +54,24 @@ export const ROLES = [
 
 export type Role = (typeof ROLES)[number];
 export type ResultStatus = (typeof RESULT_STATUSES)[number];
+
+export const STAGING_KINDS = [
+  "project-context",
+  "planning-documents",
+  "planning-tasks",
+  "dispatch-packet",
+  "dispatch-result",
+  "decision",
+  "git-reconcile-evidence",
+  "research-conclusions",
+  "review-result",
+  "review-resolution",
+] as const;
+
+export const STAGING_STATES = ["draft", "ready", "consumed", "cleanup_pending", "expired"] as const;
+export const STAGING_MAX_BYTES = 2 * 1024 * 1024;
+export const STAGING_DEFAULT_RETENTION_HOURS = 168;
+export const STAGING_OPPORTUNISTIC_CLEANUP_LIMIT = 100;
+
+export type StagingKind = (typeof STAGING_KINDS)[number];
+export type StagingState = (typeof STAGING_STATES)[number];

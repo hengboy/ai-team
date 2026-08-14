@@ -10,6 +10,7 @@ export interface HomePaths {
   schemas: string;
   templates: string;
   artifacts: string;
+  staging: string;
 }
 
 export const getHomePaths = (override = process.env.AI_TEAM_HOME): HomePaths => {
@@ -23,5 +24,6 @@ export const getHomePaths = (override = process.env.AI_TEAM_HOME): HomePaths => 
     schemas: join(root, "schemas"),
     templates: join(root, "templates"),
     artifacts: join(root, "state", "artifacts"),
+    staging: join(root, "state", "staging"),
   };
 };

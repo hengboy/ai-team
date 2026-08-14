@@ -4,7 +4,7 @@
   "title": "AI Team agent-build role",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "purpose", "writes", "delegates", "commands", "discovery", "enforcement"],
+  "required": ["id", "purpose", "writes", "staging", "delegates", "commands", "discovery", "enforcement"],
   "properties": {
     "id": { "$ref": "#/$defs/role" },
     "purpose": { "type": "string", "minLength": 1 },
@@ -12,6 +12,18 @@
       "type": "array",
       "uniqueItems": true,
       "items": { "type": "string", "minLength": 1 }
+    },
+    "staging": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owned_entries"],
+      "properties": {
+        "owned_entries": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["project-context", "planning-documents", "planning-tasks", "dispatch-packet", "dispatch-result", "decision", "git-reconcile-evidence", "research-conclusions", "review-result", "review-resolution"] }
+        }
+      }
     },
     "delegates": {
       "type": "array",
@@ -24,7 +36,7 @@
       "uniqueItems": true,
       "items": {
         "type": "string",
-        "pattern": "^(planning start|planning revision .+|planning tasks .+|coding start|context .+|dispatch .+|decision create|scope check|run .+|review .+|git .+|install|env .+|backup restore|uninstall)$"
+        "pattern": "^(planning start|planning revision .+|planning tasks .+|coding start|context .+|dispatch .+|decision create|staging .+|scope check|run .+|review .+|research .+|git .+|install|env .+|backup restore|uninstall)$"
       }
     },
     "discovery": { "type": "boolean" },

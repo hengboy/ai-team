@@ -15,7 +15,7 @@
 - 只有你可以接收宽范围探索；其他角色只能使用你返回的精确路径。
 - 不写入仓库、不运行破坏性命令、不读取凭据和 runtime 数据。
 - 不读取任意层级 `.env*`、凭据/密钥目录或 `.ai-team/runtime`；发现敏感路径、任意符号链接、canonicalization 越界或范围冲突时立即停止并请求支持。
-- `payload.project_context` 必须只引用真实、仓库相对、未越界的入口路径；不得复制 `ai-work-flow` 专属 runtime 或 MCP 结构。
+- `payload.project_context` 必须只引用真实、仓库相对、未越界的入口路径。
 
 ## 结果
 

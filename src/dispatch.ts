@@ -189,6 +189,13 @@ export class DispatchService {
   }
 
   async validateFile(runId: string, dispatchId: string, role: Role, path: string): Promise<ResultEnvelope> {
+    assertReadablePath(path);
+    const info = await stat(path);
+    if (info.size > 2 * 1024 * 1024) throw new ValidationError("result file exceeds the 2 MiB limit");
+    return this.validateValue(runId, dispatchId, role, await readJson(path));
+  }
+
+  validateValue(runId: string, dispatchId: string, role: Role, value: unknown): ResultEnvelope {
     const dispatch = this.get(runId, dispatchId, role) as { state: string };
     if (!["claimed", "completed", "needs_decision"].includes(dispatch.state)) {
       throw new ValidationError("dispatch must be claimed before validate");
@@ -196,10 +203,7 @@ export class DispatchService {
     const run = this.store.getRun(runId) as { state: string };
     const validRunState = dispatch.state === "needs_decision" ? run.state === "needs_decision" : run.state === "active";
     if (!validRunState) throw new ValidationError("run must be active before validate");
-    assertReadablePath(path);
-    const info = await stat(path);
-    if (info.size > 2 * 1024 * 1024) throw new ValidationError("result file exceeds the 2 MiB limit");
-    const result = checkResultEnvelope(await readJson(path));
+    const result = checkResultEnvelope(value);
     if (!result.valid) throw new ValidationError("result envelope is invalid", result.errors);
     if (result.value.run_id !== runId || result.value.dispatch_id !== dispatchId || result.value.role !== role) {
       throw new ValidationError("result envelope identity does not match dispatch");
@@ -208,19 +212,27 @@ export class DispatchService {
   }
 
   async submit(runId: string, dispatchId: string, role: Role, path: string): Promise<{ reused: boolean; artifact: string }> {
+    assertReadablePath(path);
+    const info = await stat(path);
+    if (info.size > 2 * 1024 * 1024) throw new ValidationError("result file exceeds the 2 MiB limit");
+    const source = await readFile(path, "utf8");
+    return this.submitValue(runId, dispatchId, role, JSON.parse(source), source);
+  }
+
+  async submitValue(runId: string, dispatchId: string, role: Role, value: unknown, source?: string): Promise<{ reused: boolean; artifact: string }> {
     const row = this.get(runId, dispatchId, role);
     if (["completed", "needs_decision"].includes(row.state) && row.result_json) {
       const result = JSON.parse(row.result_json) as ResultEnvelope;
-      const incoming = await this.validateFile(runId, dispatchId, role, path);
+      const incoming = this.validateValue(runId, dispatchId, role, value);
       if (stableJson(result) !== stableJson(incoming)) throw new ValidationError("dispatch was already submitted with a different result");
       return { reused: true, artifact: this.artifactPath(runId, dispatchId) };
     }
     if (row.state !== "claimed") throw new ValidationError("dispatch must be claimed before submit");
-    const result = await this.validateFile(runId, dispatchId, role, path);
+    const result = this.validateValue(runId, dispatchId, role, value);
     const artifactDirectory = join(this.store.paths.artifacts, runId, dispatchId);
     await mkdir(artifactDirectory, { recursive: true });
     const artifact = this.artifactPath(runId, dispatchId);
-    const redacted = redact(await readFile(path, "utf8"));
+    const redacted = redact(source ?? `${JSON.stringify(value, null, 2)}\n`);
     await writeFile(artifact, redacted, { mode: 0o600 });
     const digest = sha256(redacted);
     const artifactId = `artifact_${digest.slice(0, 24)}`;

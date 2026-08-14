@@ -3,14 +3,14 @@ import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
 import YAML from "yaml";
-import { ROLES, type Role } from "./constants.js";
+import { ROLES, STAGING_KINDS, type Role, type StagingKind } from "./constants.js";
 import { ValidationError } from "./errors.js";
 import { sha256 } from "./utils.js";
 
 export type AgentBuildPlatform = "codex" | "claude" | "opencode";
 export type Enforcement = "mechanical" | "instruction" | "unsupported";
 export interface AgentBuildManifest { schema_version: number; template_version: number; roles: string[]; platforms: AgentBuildPlatform[]; instructions: string; role_directory: string; environment_directory: string; template_directory: string; }
-export interface AgentBuildRole { id: Role; purpose: string; writes: string[]; delegates: Role[]; commands: string[]; discovery: boolean; enforcement: Record<string, Enforcement>; body: string; }
+export interface AgentBuildRole { id: Role; purpose: string; writes: string[]; staging: { owned_entries: StagingKind[] }; delegates: Role[]; commands: string[]; discovery: boolean; enforcement: Record<string, Enforcement>; body: string; }
 export interface EnvironmentFile { name: string; platforms: AgentBuildPlatform[]; defaults: Record<string, Record<string, unknown>>; overrides?: Record<string, Record<string, Record<string, unknown>>>; }
 export interface AgentBuild { root: string; manifest: AgentBuildManifest; roles: Record<Role, AgentBuildRole>; environments: Record<string, EnvironmentFile>; templates: Record<string, string>; instructions: string; digest: string; templateVersion: number; }
 export interface RenderContext { role: Role; purpose: string; allowed_commands: string; delegates: string; discovery: string; stop_conditions: string; platform: AgentBuildPlatform; environment: string; contract_digest: string; role_manifest_digest: string; template_version: number; spec_template: string; plan_template: string; task_template: string; }
@@ -19,7 +19,7 @@ const supportedPlatforms: AgentBuildPlatform[] = ["codex", "claude", "opencode"]
 const reasoningValues = new Set(["low", "medium", "high", "xhigh"]);
 const effortValues = new Set(["low", "medium", "high"]);
 const variantValues = new Set(["low", "medium", "high"]);
-const supportedCommandPrefixes = ["planning start", "planning revision ", "planning tasks ", "coding start", "context ", "dispatch ", "decision create", "scope check", "run ", "review ", "git ", "install", "env ", "backup restore", "uninstall"];
+const supportedCommandPrefixes = ["planning start", "planning revision ", "planning tasks ", "coding start", "context ", "dispatch ", "decision create", "staging ", "scope check", "run ", "review ", "research ", "git ", "install", "env ", "backup restore", "uninstall"];
 const allowedVariables = new Set(["role", "purpose", "allowed_commands", "delegates", "discovery", "stop_conditions", "platform", "environment", "contract_digest", "role_manifest_digest", "template_version", "spec_template", "plan_template", "task_template"]);
 const packageRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const expectedSchemas = ["manifest-v1.json", "role-v1.json", "environment-v1.json"] as const;
@@ -140,7 +140,8 @@ function parseAndValidate(root: string): AgentBuild {
     const yamlPath = join(manifest.role_directory, `${role}.yaml`); const mdPath = join(manifest.role_directory, `${role}.md`);
     const value = YAML.parse(readText(root, yamlPath)) as AgentBuildRole;
     assertSchema(validators.role, value, yamlPath);
-    if (!value || value.id !== role || typeof value.purpose !== "string" || !Array.isArray(value.writes) || !Array.isArray(value.delegates) || !Array.isArray(value.commands) || typeof value.discovery !== "boolean" || !value.enforcement) fail(`invalid role configuration: ${role}`);
+    if (!value || value.id !== role || typeof value.purpose !== "string" || !Array.isArray(value.writes) || !Array.isArray(value.staging?.owned_entries) || !Array.isArray(value.delegates) || !Array.isArray(value.commands) || typeof value.discovery !== "boolean" || !value.enforcement) fail(`invalid role configuration: ${role}`);
+    if (value.staging.owned_entries.some((item) => !STAGING_KINDS.includes(item))) fail(`unknown staging kind in role: ${role}`);
     if (value.delegates.some((item) => !ROLES.includes(item as Role))) fail(`unknown delegate in role: ${role}`);
     if (value.commands.some((item) => typeof item !== "string" || !item.trim() || !supportedCommandPrefixes.some((prefix) => item === prefix || item.startsWith(prefix)))) fail(`unknown command in role: ${role}`);
     for (const level of Object.values(value.enforcement)) if (!["mechanical", "instruction", "unsupported"].includes(level)) fail(`invalid enforcement in role: ${role}`);

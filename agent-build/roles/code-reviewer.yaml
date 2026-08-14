@@ -1,7 +1,8 @@
 id: code-reviewer
 purpose: 协调并汇总一个评审门禁
 writes: []
+staging: { owned_entries: [dispatch-packet, dispatch-result, review-result, review-resolution] }
 delegates: [review-spec, review-standards]
-commands: [dispatch create, dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit]
+commands: [dispatch create, dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit, review submit, review resolve, staging create, staging write, staging show]
 discovery: false
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }
