@@ -1,4 +1,4 @@
 interface:
-  display_name: "Initialize AI Team"
-  short_description: "Initialize and validate AI Team in a Git project"
-  default_prompt: "Use $init-ai-team to initialize AI Team in my target Git project and validate its context."
+  display_name: "初始化 AI Team"
+  short_description: "在 Git 项目中初始化并验证 AI Team"
+  default_prompt: "使用 $init-ai-team 在我指定的 Git 项目中初始化 AI Team，并验证项目上下文。"
