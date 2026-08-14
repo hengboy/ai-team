@@ -134,6 +134,15 @@ test("generate dry-run returns a plan without writing managed user files", async
   const plan = await service.generate("balanced", undefined, true);
 
   assert.equal(plan.writes.length, ROLES.length * PLATFORMS.length + PLATFORMS.length);
+  const instructionWrites = plan.writes.filter((item) => item.kind === "instructions");
+  assert.equal(instructionWrites.length, PLATFORMS.length);
+  for (const write of instructionWrites) {
+    assert.match(write.content, /\*\*File Explorer\*\*/);
+    assert.match(write.content, /`仓库文件检索`/);
+    assert.match(write.content, /不得自行使用 `rg`、`find`、`glob`/);
+    assert.match(write.content, /ai-team:managed:start/);
+    assert.match(write.content, /ai-team:managed:end/);
+  }
   assert.deepEqual(plan.backups, []);
   assert.deepEqual(plan.removals, []);
   assert.deepEqual(plan.blocked, []);

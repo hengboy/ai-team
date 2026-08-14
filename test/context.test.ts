@@ -45,7 +45,11 @@ test("context initialization is idempotent and preserves existing instructions",
   assert.equal(second.context.memory_status, "unchanged");
   assert.equal(await readFile(join(root, "MEMORY.md"), "utf8"), firstMemory);
   assert.equal(await readFile(join(root, ".ai-work-flow", "index", "feature-navigation.md"), "utf8"), firstNavigation);
-  assert.equal((await readFile(join(root, "AGENTS.md"), "utf8")).split(CONTEXT_RULE).length - 1, 1);
+  const instructions = await readFile(join(root, "AGENTS.md"), "utf8");
+  assert.equal(instructions.split(CONTEXT_RULE).length - 1, 1);
+  assert.match(instructions, /\*\*File Explorer\*\*/);
+  assert.match(instructions, /`仓库文件检索`/);
+  assert.match(instructions, /不得自行使用 `rg`、`find`、`glob`/);
   await assert.rejects(stat(join(root, "CLAUDE.md")));
   assert.equal((await validateProjectContext(root)).valid, true);
 });
