@@ -235,9 +235,16 @@ const renderBody = (role: Role, platform: Platform, model: ModelConfig, environm
   const body = renderRoleBody(AGENT_BUILD, role, { role, purpose: definition.purpose, allowed_commands: definition.commands.join(", "), delegates: definition.delegates.join(", ") || "无", discovery: definition.discovery ? "允许" : "禁止；请请求文件探索代理支持", stop_conditions: "遇到运行数据包之外的工作时返回 requested_support", platform, environment, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, template_version: AGENT_BUILD.templateVersion, spec_template: AGENT_BUILD.templates.spec!, plan_template: AGENT_BUILD.templates.plan!, task_template: AGENT_BUILD.templates.task! });
   const instructions = `Role: ${role}\n\n${body}\n\n## CLI 命令契约\n\n允许命令：\n${commandContract.allowed_commands.map((command) => `- \`${command}\``).join("\n")}\n\n精确语法：\n${commandContract.syntax.map((syntax) => `- \`${syntax}\``).join("\n")}\n\n参数类型：\n${Object.entries(commandContract.parameter_types).map(([name, description]) => `- \`<${name}>\`: ${description}`).join("\n")}`;
   if (platform === "codex") {
-    return `# ${FILE_MARKER}\nmodel = ${JSON.stringify(model.model)}\nmodel_reasoning_effort = ${JSON.stringify(model.reasoning)}\n\n[ai_team]\nmetadata = ${JSON.stringify(stableJson(metadata))}\ninstructions = ${JSON.stringify(instructions)}\n`;
+    return `# ${FILE_MARKER}\n# ai_team.metadata = ${stableJson(metadata)}\nname = ${JSON.stringify(role)}\ndescription = ${JSON.stringify(definition.purpose)}\nmodel = ${JSON.stringify(model.model)}\nmodel_reasoning_effort = ${JSON.stringify(model.reasoning)}\ndeveloper_instructions = ${JSON.stringify(instructions)}\n`;
   }
-  const frontmatter = YAML.stringify({ model: model.model, effort: model.effort, variant: model.variant, options: model.options, ai_team: metadata });
+  const frontmatter = YAML.stringify({
+    ...(platform === "opencode" ? { mode: role === "planning" || role === "coding" ? "primary" : "subagent" } : {}),
+    model: model.model,
+    effort: model.effort,
+    variant: model.variant,
+    options: model.options,
+    ai_team: metadata,
+  });
   return `<!-- ${FILE_MARKER} -->\n---\n${frontmatter}---\n\n# ${role}\n\n${instructions}\n`;
 };
 

@@ -99,19 +99,24 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
       assert.match(content, /CLI 命令契约/);
       for (const command of ROLE_MANIFEST[role].commands) assert.ok(content.includes(`\`${command}\``), `missing command ${command} for ${role}`);
       const metadata = platform === "codex"
-        ? JSON.parse(JSON.parse(content.match(/^metadata = (.+)$/m)?.[1] ?? "null"))
+        ? JSON.parse(content.match(/^# ai_team\.metadata = (.+)$/m)?.[1] ?? "null")
         : YAML.parse(content.slice(content.indexOf("---") + 4, content.indexOf("---", content.indexOf("---") + 3))).ai_team;
       assert.deepEqual(metadata.command_contract.allowed_commands, ROLE_MANIFEST[role].commands);
       assert.ok(metadata.command_contract.syntax.length > 0);
       assert.ok(Object.keys(metadata.command_contract.parameter_types).length > 0);
       if (platform === "codex") {
-        assert.ok(content.includes(`\\"platform\\":\\"${platform}\\"`));
+        assert.doesNotMatch(content, /^\[ai_team\]$/m);
+        assert.match(content, new RegExp(`^name = "${role}"$`, "m"));
+        assert.match(content, /^description = ".+"$/m);
+        assert.match(content, /^developer_instructions = "Role:/m);
+        assert.ok(content.includes(`"platform":"${platform}"`));
         assert.match(content, /model_reasoning_effort = "medium"/);
       } else {
         assert.match(content, new RegExp(`^  platform: ${platform}$`, "m"));
       }
       if (platform === "claude") assert.match(content, /^effort: medium$/m);
       if (platform === "opencode") {
+        assert.match(content, new RegExp(`^mode: ${role === "planning" || role === "coding" ? "primary" : "subagent"}$`, "m"));
         assert.match(content, /^variant: medium$/m);
         assert.match(content, /^options: (?:&\w+ )?\{\}$/m);
       }
