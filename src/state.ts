@@ -7,6 +7,7 @@ import { getHomePaths, type HomePaths } from "./home.js";
 import { ValidationError } from "./errors.js";
 import { makeId, redact, sha256, stableJson } from "./utils.js";
 import { CONTRACT_DIGEST } from "./contracts.js";
+import { checkDecisionInput } from "./contracts.js";
 import { AGENT_BUILD, ROLE_MANIFEST, ROLE_MANIFEST_DIGEST } from "./roles.js";
 import {
   STAGING_DEFAULT_RETENTION_HOURS,
@@ -420,15 +421,14 @@ export class StateStore {
   }
 
   createDecision(runId: string, question: string, choices: Array<{ id: string; label: string; impact: string }>, recommendation?: string, type = "workflow"): string {
-    if (!question.trim() || choices.length < 2 || choices.some((choice) => !choice.id || !choice.label || !choice.impact)) {
-      throw new ValidationError("typed decision requires a question and at least two complete choices");
-    }
     const existing = this.db.prepare("SELECT decision_id FROM decisions WHERE run_id=? AND status='pending'").get(runId);
     if (existing) throw new ValidationError(`run already has a pending decision: ${(existing as any).decision_id}`);
+    const checked = checkDecisionInput({ question, choices, recommendation, type });
+    if (!checked.valid) throw new ValidationError("decision input is invalid", checked.errors);
     const decisionId = `decision_${makeId("dispatch").slice(9)}`;
-    const receipt = { type, question, choices, recommendation: recommendation ?? null };
+    const receipt = { type: checked.value.type ?? "workflow", question, choices, recommendation: recommendation ?? null };
     this.db.prepare("INSERT INTO decisions(decision_id,run_id,question,choices_json,recommendation,decision_type,receipt_json,status,created_at) VALUES (?,?,?,?,?,?,?,'pending',?)")
-      .run(decisionId, runId, question, stableJson(choices), recommendation ?? null, type, stableJson(receipt), new Date().toISOString());
+      .run(decisionId, runId, question, stableJson(choices), recommendation, checked.value.type ?? "workflow", stableJson(receipt), new Date().toISOString());
     return decisionId;
   }
 

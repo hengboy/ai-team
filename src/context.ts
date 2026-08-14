@@ -9,8 +9,9 @@ import { assertRelativePosixPath, stableJson } from "./utils.js";
 
 export const MEMORY_PATH = "MEMORY.md";
 export const NAVIGATION_PATH = ".ai-team/index/feature-navigation.md";
+export const LEGACY_NAVIGATION_PATH = ".ai-work-flow/index/feature-navigation.md";
 export const INSTRUCTION_PATHS = ["AGENTS.md", "CLAUDE.md"] as const;
-export const CONTEXT_RULE = "所有`仓库文件检索`、`目录遍历`、`文件名/全文搜索`、`入口定位`、`调用链`和`未知依赖探索`必须委派给 **File Explorer**；其他代理只能读取 `packet` 明确授权或 **File Explorer** 返回的精确路径，遇到未知路径时请求支持，不得自行使用 `rg`、`find`、`glob` 或`全仓扫描`。入口、职责或模块边界变化时，同轮更新根 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md`；评审以已提交 `MEMORY.md` 为 standards source。";
+export const CONTEXT_RULE = "所有`仓库文件检索`、`目录遍历`、`文件名/全文搜索`、`入口定位`、`调用链`和`未知依赖探索`必须委派给 **File Explorer**；其他代理只能读取 `packet` 明确授权或 **File Explorer** 返回的精确路径，遇到未知路径时请求支持，不得自行使用 `rg`、`find`、`glob` 或`全仓扫描`。入口、职责或模块边界变化时，同轮更新根 `MEMORY.md` 与权威路径 `.ai-team/index/feature-navigation.md`；旧 `.ai-work-flow/index/feature-navigation.md` 仅在初始化时单向迁移，不得双写。评审以已提交 `MEMORY.md` 为 standards source。";
 
 const MEMORY_START = "<!-- ai-team:project-context:start -->";
 const MEMORY_END = "<!-- ai-team:project-context:end -->";
@@ -231,7 +232,8 @@ const prepareInitialization = async (root: string): Promise<{ plan: ContextInitP
   const memoryFile = join(root, MEMORY_PATH);
   const navigationFile = join(root, NAVIGATION_PATH);
   const memory = await readOptional(memoryFile);
-  const navigation = await readOptional(navigationFile);
+  const canonicalNavigation = await readOptional(navigationFile);
+  const navigation = canonicalNavigation ?? await readOptional(join(root, LEGACY_NAVIGATION_PATH));
   ensureSingleManagedSection(memory, "memory");
   ensureSingleManagedSection(navigation, "navigation");
 
@@ -243,7 +245,7 @@ const prepareInitialization = async (root: string): Promise<{ plan: ContextInitP
     : navigation.includes(NAVIGATION_START) ? (parseNavigation(navigation), navigation) : appendSection(navigation, renderNavigationSection([]));
   const writes: PendingWrite[] = [];
   if (memoryContent !== memory) writes.push({ path: memoryFile, content: memoryContent, existed: memory !== undefined });
-  if (navigationContent !== navigation) writes.push({ path: navigationFile, content: navigationContent, existed: navigation !== undefined });
+  if (navigationContent !== canonicalNavigation) writes.push({ path: navigationFile, content: navigationContent, existed: canonicalNavigation !== undefined });
 
   const instructionStatuses: ContextInitPlan["instruction_statuses"] = [];
   for (const relativePath of INSTRUCTION_PATHS) {
@@ -271,7 +273,7 @@ const prepareInitialization = async (root: string): Promise<{ plan: ContextInitP
       memory_path: MEMORY_PATH,
       navigation_path: NAVIGATION_PATH,
       memory_status: memory === undefined ? "created" : memoryContent === memory ? "unchanged" : "updated",
-      navigation_status: navigation === undefined ? "created" : navigationContent === navigation ? "unchanged" : "updated",
+      navigation_status: canonicalNavigation === undefined ? "created" : navigationContent === canonicalNavigation ? "unchanged" : "updated",
       instruction_statuses: instructionStatuses,
       dirty_paths: dirtyPaths,
     },

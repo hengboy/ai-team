@@ -188,6 +188,35 @@ test("integration uses no-ff merges and cleanup removes owned worktrees", async 
   }
 });
 
+test("review may bind the task implementation commit before an equivalent integration merge", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun();
+    const task = await fixture.orchestrator.prepareTask(runId, "direct-review");
+    await mkdir(join(task.path, "src"));
+    await writeFile(join(task.path, "src", "direct-review.ts"), "export const reviewed = true;\n");
+    const implementation = await fixture.orchestrator.commit(runId, task.worktree_id, "Implement direct review", ["src/**"]);
+    const integration = await fixture.orchestrator.prepareIntegration(runId);
+    assert.notEqual(await rawGit(integration.path, ["rev-parse", "HEAD"]), implementation.commit);
+
+    const testDispatch = new DispatchService(fixture.store).create(runId, "test", {
+      objective: "Verify implementation", allowed_read_paths: ["package.json"], allowed_write_paths: [], acceptance_criteria: ["passes"], context: {},
+    });
+    fixture.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), testDispatch);
+    const reviews = new ReviewService(fixture.store);
+    const barrier = reviews.create(runId, implementation.commit, false);
+    const packet = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='review-standards'").get(runId) as { packet_json: string }).packet_json);
+    assert.equal(packet.context.review_strategy, "implementation_commit");
+    completeStandardsReview(fixture.store, runId);
+    reviews.submit(runId, barrier.barrier_id, { axis: "standards", summary: "passed", findings: [] });
+
+    const integrated = await fixture.orchestrator.mergeTask(runId, integration.worktree_id, task.worktree_id);
+    assert.doesNotThrow(() => reviews.assertGate(runId, integrated));
+  } finally {
+    await fixture.dispose();
+  }
+});
+
 test("target drift sync runs once and requires a newer final test before integration", async () => {
   const fixture = await createFixture();
   try {

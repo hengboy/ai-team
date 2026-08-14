@@ -134,6 +134,24 @@ test("CLI JSON output is stable by default and exposes top-level fields only in 
   assert.equal(error.ok, false);
 });
 
+test("decision commands expose a template and return field-level errors for empty JSON", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const schema = json<Record<string, any>>(await cli(sandbox, ["decision", "schema"]));
+  const template = json<Record<string, any>>(await cli(sandbox, ["decision", "template"]));
+  assert.deepEqual(schema.required, ["question", "choices"]);
+  assert.equal(template.choices.length, 2);
+
+  const requestFile = join(sandbox.root, "decision-request.md");
+  await writeFile(requestFile, "Need a decision.\n");
+  const started = json<{ run_id: string }>(await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]));
+  const empty = join(sandbox.root, "empty-decision.json");
+  await writeFile(empty, "{}\n");
+  const failed = await cli(sandbox, ["decision", "create", "--run-id", started.run_id, "--file", empty]);
+  assert.equal(failed.status, 2);
+  const error = JSON.parse(failed.stderr.trim().split("\n").at(-1) ?? "null") as { details: Array<{ path: string }> };
+  assert.deepEqual(error.details.map((item) => item.path).sort(), ["/choices", "/question"]);
+});
+
 test("CLI entrypoint executes through a symlinked path", async (t) => {
   const sandbox = await makeSandbox(t);
   const linkedCli = join(sandbox.root, "linked cli.js");

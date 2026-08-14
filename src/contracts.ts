@@ -83,10 +83,18 @@ const stringArray = { type: "array", items: { type: "string" } } as const;
 const contextText = { type: "string", minLength: 1, pattern: "^(?!\\s*$)[^\\r\\n]+$" } as const;
 const contextStringArray = { type: "array", items: contextText } as const;
 const evidenceArray = { type: "array", minItems: 1, items: { type: "object", additionalProperties: false, required: ["command", "outcome"], properties: { command: { type: "string" }, outcome: { type: "string" } } } } as const;
-const decisionSchema = {
-  type: ["object", "null"],
+export interface TypedDecisionInput {
+  question: string;
+  choices: Array<{ id: string; label: string; impact: string }>;
+  recommendation?: string;
+  type?: string;
+}
+
+export const DECISION_INPUT_SCHEMA = {
+  $id: "https://ai-team.local/schemas/decision-input-v1.json",
+  type: "object",
   additionalProperties: false,
-  required: ["question", "choices", "recommendation"],
+  required: ["question", "choices"],
   properties: {
     question: { type: "string", minLength: 1 },
     choices: {
@@ -104,8 +112,10 @@ const decisionSchema = {
       },
     },
     recommendation: { type: "string", minLength: 1 },
+    type: { type: "string", minLength: 1 },
   },
 } as const;
+const decisionSchema = { anyOf: [DECISION_INPUT_SCHEMA, { type: "null" }] } as const;
 export const projectContextSchema = {
   type: "object",
   additionalProperties: false,
@@ -146,6 +156,7 @@ export const projectContextSchema = {
   },
 } as const;
 const validateProjectContextInput = ajv.compile<ProjectContext>(projectContextSchema);
+const validateDecisionInput = ajv.compile<TypedDecisionInput>(DECISION_INPUT_SCHEMA);
 export const ROLE_PAYLOAD_SCHEMAS: Record<Role, object> = {
   planning: { type: "object", additionalProperties: false, required: ["actions", "stage", "pending_questions", "decision"], properties: { actions: stringArray, stage: { enum: ["requirements", "requirements_confirmed", "spec_ready", "plan_ready", "tasks_preview", "ready"] }, pending_questions: { type: "array", maxItems: 1, items: { type: "string", minLength: 1 } }, decision: decisionSchema } },
   coding: { type: "object", additionalProperties: false, required: ["actions"], properties: { actions: stringArray, triage: { enum: ["planned", "bug", "feature", "planning"] } } },
@@ -173,11 +184,39 @@ export const checkProjectContext = (value: unknown): { valid: true; value: Proje
 };
 
 export const formatSchemaErrors = (errors: ErrorObject[] | null | undefined): Array<{ path: string; message: string }> =>
-  (errors ?? []).map((error) => ({ path: error.instancePath || "/", message: error.message ?? "invalid value" }));
+  (errors ?? []).map((error) => {
+    const missing = error.keyword === "required" ? (error.params as { missingProperty?: string }).missingProperty : undefined;
+    const path = missing ? `${error.instancePath}/${missing}` : error.instancePath || "/";
+    return { path, message: error.message ?? "invalid value" };
+  });
+
+export const checkDecisionInput = (value: unknown): { valid: true; value: TypedDecisionInput } | { valid: false; errors: Array<{ path: string; message: string }> } => {
+  if (!validateDecisionInput(value)) return { valid: false, errors: formatSchemaErrors(validateDecisionInput.errors) };
+  const ids = value.choices.map((choice) => choice.id);
+  if (new Set(ids).size !== ids.length) return { valid: false, errors: [{ path: "/choices", message: "choice ids must be unique" }] };
+  return { valid: true, value };
+};
+
+export const DECISION_INPUT_TEMPLATE: TypedDecisionInput = {
+  question: "",
+  choices: [
+    { id: "option-a", label: "", impact: "" },
+    { id: "option-b", label: "", impact: "" },
+  ],
+  recommendation: "",
+  type: "workflow",
+};
 
 export const checkResultEnvelope = (value: unknown): { valid: true; value: ResultEnvelope } | { valid: false; errors: Array<{ path: string; message: string }> } => {
   if (!validateResult(value)) return { valid: false, errors: formatSchemaErrors(validateResult.errors) };
   const envelope = value as ResultEnvelope;
+  if (envelope.status === "needs_decision" && envelope.role !== "planning") {
+    if (envelope.decisions_needed.length !== 1) {
+      return { valid: false, errors: [{ path: "/decisions_needed", message: "needs_decision requires exactly one typed decision" }] };
+    }
+    const decision = checkDecisionInput(envelope.decisions_needed[0]);
+    if (!decision.valid) return { valid: false, errors: decision.errors.map((error) => ({ ...error, path: `/decisions_needed/0${error.path === "/" ? "" : error.path}` })) };
+  }
   if (envelope.status === "completed" && envelope.verification.length === 0) {
     return { valid: false, errors: [{ path: "/verification", message: "completed results require verification evidence" }] };
   }

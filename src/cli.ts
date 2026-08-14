@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
-import { CONTRACT_DIGEST } from "./contracts.js";
+import { checkDecisionInput, CONTRACT_DIGEST, DECISION_INPUT_SCHEMA, DECISION_INPUT_TEMPLATE } from "./contracts.js";
 import { validateCommand } from "./command-contract.js";
 import { EXIT, PACKAGE_VERSION, ROLES, STAGING_KINDS, STAGING_MAX_BYTES, type Role, type StagingKind } from "./constants.js";
 import { DispatchService } from "./dispatch.js";
@@ -451,7 +451,7 @@ export const buildProgram = (): Command => {
   const run = program.command("run");
   run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId), decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId), dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId) }), { readonly: true })));
   run.command("resume").argument("<run-id>").action(async (runId) => output(await withStore((store) => new DispatchService(store).resume(runId))));
-  run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined; const run = store.getRun(options.runId) as { profile: string }; const dispatchId = run.profile === "planning" ? new DispatchService(store).resolvePlanningDecision(options.runId, options.decisionId, options.choice, note) : (store.decide(options.runId, options.decisionId, options.choice, note), undefined); output({ status: "resolved", ...(dispatchId ? { dispatch_id: dispatchId } : {}) }); }));
+  run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined; const dispatchId = new DispatchService(store).resolveDecision(options.runId, options.decisionId, options.choice, note); output({ status: "resolved", dispatch_id: dispatchId }); }));
 
   const staging = program.command("staging");
   staging.command("create").requiredOption("--run-id <id>").addOption(roleOption()).addOption(new Option("--kind <kind>").choices([...STAGING_KINDS]).makeOptionMandatory()).option("--dispatch-id <id>").action(async (options) => {
@@ -590,6 +590,8 @@ export const buildProgram = (): Command => {
   scope.command("check").requiredOption("--run-id <id>").addOption(new Option("--stage <stage>").choices(["triage", "pre_write", "pre_commit"]).makeOptionMandatory()).requiredOption("--paths <paths>", "comma-separated repository-relative paths").action(async (options) => output(await withStore((store) => new ScopeGate(store).check(options.runId, options.stage, options.paths.split(",")))));
 
   const decision = program.command("decision");
+  decision.command("schema").action(() => output(DECISION_INPUT_SCHEMA));
+  decision.command("template").action(() => output(DECISION_INPUT_TEMPLATE));
   jsonOptions(decision.command("create").requiredOption("--run-id <id>"), "--file").action(async (options) => {
     const retention = await retentionHours();
     output(await withStore(async (store) => {
@@ -597,8 +599,10 @@ export const buildProgram = (): Command => {
       const role: Role = run.profile === "planning" ? "planning" : "coding";
       const input = await loadJsonInput(store, { file: options.file, stagingId: options.stagingId, runId: options.runId, role, kind: "decision" }, retention);
       try {
-        const value = input.value as any;
-        const result = { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation) };
+        const checked = checkDecisionInput(input.value);
+        if (!checked.valid) throw new ValidationError("decision input is invalid", checked.errors);
+        const value = checked.value;
+        const result = { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation, value.type ?? "workflow") };
         await input.consume();
         return result;
       } catch (error) { input.validationFailed(error); throw error; }

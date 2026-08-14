@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { validateCommand } from "../src/command-contract.js";
-import { checkProjectContext, checkResultEnvelope, createResultTemplate, resultSchemaForRole, ROLE_PAYLOAD_SCHEMAS } from "../src/contracts.js";
+import { checkDecisionInput, checkProjectContext, checkResultEnvelope, createResultTemplate, resultSchemaForRole, ROLE_PAYLOAD_SCHEMAS } from "../src/contracts.js";
 import { DispatchService, type DispatchPacket } from "../src/dispatch.js";
 import { ResearchService } from "../src/research-service.js";
 import type { ResearchConclusion } from "../src/research.js";
@@ -141,7 +141,7 @@ test("dispatch creation enforces actor command and delegation authorization", as
     assert.throws(() => dispatches.create(runId, "backend-developer", dispatchPacket(), "test"), /test cannot act for coding run/);
     assert.throws(() => dispatches.create(runId, "file-explorer", dispatchPacket(), "planning"), /planning cannot act for coding run/);
     assert.throws(() => dispatches.create(runId, "environment-operator", dispatchPacket(), "coding"), /coding cannot delegate to environment-operator/);
-    assert.doesNotThrow(() => dispatches.create(runId, "backend-developer", dispatchPacket(), "coding"));
+    assert.throws(() => dispatches.create(runId, "backend-developer", dispatchPacket(), "coding"), /worktree_id/);
   });
 });
 
@@ -683,7 +683,7 @@ test("run resume repairs a stale planning retryable failure without crossing blo
     assert.equal((second.run as { state: string }).state, "active");
     assert.equal(first.pending_dispatches.length, 1);
     assert.deepEqual(second.pending_dispatches, first.pending_dispatches);
-    assert.equal(first.pending_dispatches[0]?.role, "planning");
+    assert.equal(first.pending_dispatches[0]?.role, "file-explorer");
     assert.equal(
       (store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(recoverable.explorerId) as { state: string }).state,
       "completed",
@@ -706,8 +706,9 @@ test("run resume repairs a stale planning retryable failure without crossing blo
 
     const coding = await makeRetryable("coding");
     const codingResult = dispatches.resume(coding.runId);
-    assert.equal((codingResult.run as { state: string }).state, "retryable_failure");
-    assert.equal(codingResult.pending_dispatches.length, 0);
+    assert.equal((codingResult.run as { state: string }).state, "active");
+    assert.equal(codingResult.pending_dispatches.length, 1);
+    assert.equal(codingResult.pending_dispatches[0]?.role, "file-explorer");
 
     for (const sideEffectState of ["completed", "unknown"] as const) {
       const blocked = await makeRetryable("planning", sideEffectState);
@@ -755,4 +756,93 @@ test("validateCommand rejects malformed, unknown, and non-exclusive inputs", () 
     project: "/tmp/project",
     requestFile: "request.md",
   }));
+});
+
+test("coding decisions are created from results and resolution atomically resumes the blocked dispatch", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const reviewerId = dispatches.create(runId, "code-reviewer", dispatchPacket());
+    dispatches.claim(runId, reviewerId, "code-reviewer");
+    const decision = {
+      question: "Which review baseline should be used?",
+      choices: [
+        { id: "implementation", label: "Implementation commit", impact: "Review the submitted task commit" },
+        { id: "integration", label: "Integration HEAD", impact: "Prepare integration before review" },
+      ],
+      recommendation: "implementation",
+      type: "review_baseline",
+    };
+    await dispatches.submitValue(runId, reviewerId, "code-reviewer", {
+      ...createResultTemplate(runId, reviewerId, "code-reviewer"),
+      status: "needs_decision",
+      summary: "Review baseline is ambiguous",
+      verification: [],
+      decisions_needed: [decision],
+      payload: {},
+    });
+
+    const pending = store.db.prepare("SELECT decision_id FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string };
+    assert.equal(store.getRun(runId).state, "needs_decision");
+    const continuationId = dispatches.resolveDecision(runId, pending.decision_id, "implementation");
+    const resumed = dispatches.resume(runId);
+    assert.equal((resumed.run as { state: string }).state, "active");
+    assert.equal(resumed.pending_decision, null);
+    assert.deepEqual(resumed.pending_dispatches, [{ dispatch_id: continuationId, role: "code-reviewer", state: "pending" }]);
+    assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(reviewerId) as { state: string }).state, "completed");
+  });
+});
+
+test("implementation dependencies and commit gate test creation and freeze the complete review packet", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const codingId = dispatches.create(runId, "coding", dispatchPacket());
+    dispatches.claim(runId, codingId, "coding");
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_defect_regression", runId, "task/regression", process.cwd(), REVIEW_HEAD, new Date().toISOString());
+    const changedPaths = ["src/dispatch.ts", "src/state.ts", "src/contracts.ts", "src/cli.ts", "src/review.ts", "test/review-fixes.test.ts"];
+    const developerId = dispatches.create(runId, "backend-developer", {
+      ...dispatchPacket(changedPaths), context: { worktree_id: "worktree_defect_regression" },
+    }, "coding", codingId);
+    const gitId = dispatches.create(runId, "git-operator", dispatchPacket(changedPaths), "coding", codingId);
+
+    await dispatches.submitValue(runId, codingId, "coding", completedResult(runId, codingId, "coding", { actions: ["dispatch implementation"] }));
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='test'").get(runId) as { count: number }).count, 0);
+    dispatches.claim(runId, developerId, "backend-developer");
+    await dispatches.submitValue(runId, developerId, "backend-developer", completedResult(runId, developerId, "backend-developer", {
+      modified_paths: changedPaths, self_tests: [{ command: "npm test", outcome: "passed" }],
+    }));
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='test'").get(runId) as { count: number }).count, 0);
+
+    const commit = store.beginOperation("git.commit", `commit:${runId}:regression`, { paths: changedPaths }, runId);
+    store.finishOperation(commit.operationId, { commit: REVIEW_HEAD, paths: changedPaths });
+    dispatches.claim(runId, gitId, "git-operator");
+    await dispatches.submitValue(runId, gitId, "git-operator", completedResult(runId, gitId, "git-operator", {
+      operations: [{ command: "git commit", outcome: REVIEW_HEAD }],
+    }));
+    const testRow = store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='test'").get(runId) as { dispatch_id: string; packet_json: string };
+    assert.equal(JSON.parse(testRow.packet_json).context.implementation_commit, REVIEW_HEAD);
+
+    dispatches.claim(runId, testRow.dispatch_id, "test");
+    await dispatches.submitValue(runId, testRow.dispatch_id, "test", completedResult(runId, testRow.dispatch_id, "test", {
+      checks: [{ command: "npm test", outcome: "passed" }],
+    }));
+    const review = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='code-reviewer'").get(runId) as { packet_json: string };
+    const packet = JSON.parse(review.packet_json);
+    assert.equal(packet.context.implementation_commit, REVIEW_HEAD);
+    assert.deepEqual(packet.context.changed_paths, changedPaths);
+    assert.match(packet.context.diff_digest, /^[a-f0-9]{64}$/);
+    assert.match(packet.context.test_evidence_digest, /^[a-f0-9]{64}$/);
+    assert.match(packet.context.revision_digest, /^[a-f0-9]{64}$/);
+    assert.deepEqual(new Set(packet.context.artifacts.map((artifact: { role: string }) => artifact.role)), new Set(["coding", "backend-developer", "git-operator", "test"]));
+    assert.ok(packet.context.artifacts.every((artifact: { artifact_id: string; sha256: string }) => /^artifact_/.test(artifact.artifact_id) && /^[a-f0-9]{64}$/.test(artifact.sha256)));
+    assert.deepEqual(packet.allowed_read_paths, changedPaths);
+  });
+});
+
+test("decision validation reports missing fields by JSON path", () => {
+  const checked = checkDecisionInput({});
+  assert.equal(checked.valid, false);
+  if (!checked.valid) assert.deepEqual(checked.errors.map((error) => error.path).sort(), ["/choices", "/question"]);
 });

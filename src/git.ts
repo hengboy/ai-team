@@ -65,6 +65,7 @@ export const worktreeStatus = async (project: string): Promise<WorktreeStatus> =
   for (const entry of output.split("\0").filter(Boolean)) {
     const code = entry.slice(0, 2);
     const path = entry.slice(3);
+    if (path === ".worktree/" || path.startsWith(".worktree/")) continue;
     if (code === "??") untracked.push(path);
     else {
       if (code[0] !== " ") staged.push(path);

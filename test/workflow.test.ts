@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -254,6 +254,39 @@ test("project init requires confirmation before appending to a dirty .gitignore"
       await readFile(path.join(repository.directory, ".gitignore"), "utf8"),
       "dist/\ncoverage/\n/.worktree/\n/.ai-team/runtime/\n",
     );
+  } finally {
+    await rm(repository.directory, { recursive: true, force: true });
+  }
+});
+
+test("project init migrates the legacy navigation path once and keeps .ai-team authoritative", async () => {
+  const repository = await createRepository();
+  try {
+    const legacyDirectory = path.join(repository.directory, ".ai-work-flow", "index");
+    await mkdir(legacyDirectory, { recursive: true });
+    const legacyPath = path.join(legacyDirectory, "feature-navigation.md");
+    const legacy = [
+      "<!-- ai-team:feature-navigation:start -->",
+      "# 功能导航",
+      "",
+      "| 功能 | 关键词 | 入口路径 | 模块边界 |",
+      "| --- | --- | --- | --- |",
+      "| Legacy | readme | `README.md` | root |",
+      "",
+      '<!-- ai-team:feature-navigation-entry {"entry_paths":["README.md"],"feature":"Legacy","keywords":["readme"],"module_boundary":"root"} -->',
+      "<!-- ai-team:feature-navigation:end -->",
+      "",
+    ].join("\n");
+    await writeFile(legacyPath, legacy);
+    await writeFile(path.join(repository.directory, "AGENTS.md"), "# Instructions\n");
+
+    await initializeProject(repository.directory, true);
+    const canonical = await readFile(path.join(repository.directory, ".ai-team", "index", "feature-navigation.md"), "utf8");
+    assert.equal(canonical, legacy);
+    assert.equal(await readFile(legacyPath, "utf8"), legacy);
+    const agents = await readFile(path.join(repository.directory, "AGENTS.md"), "utf8");
+    assert.match(agents, /权威路径.*\.ai-team\/index\/feature-navigation\.md/);
+    assert.match(agents, /仅在初始化时单向迁移，不得双写/);
   } finally {
     await rm(repository.directory, { recursive: true, force: true });
   }

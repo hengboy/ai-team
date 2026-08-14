@@ -36,15 +36,22 @@ export class ReviewService {
     const integration = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1").get(runId) as { path: string } | undefined;
     const frozenPath = integration?.path ?? repository.project_path;
     const frozenHead = execFileSync("git", ["-C", frozenPath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-    if (revisionSha !== frozenHead) throw new ValidationError("review revision is stale for the current integration HEAD", { revisionSha, frozenHead });
+    const implementationOperations = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind IN ('git.merge.task','git.commit') AND state='completed' ORDER BY completed_at DESC").all(runId) as Array<{ evidence_json?: string }>;
+    const implementationCommit = implementationOperations.map((item) => {
+      try { return (JSON.parse(item.evidence_json ?? "{}") as { commit?: string }).commit; } catch { return undefined; }
+    }).find((commit) => /^[a-f0-9]{40}$/.test(commit ?? ""));
+    if (revisionSha !== frozenHead && revisionSha !== implementationCommit) {
+      throw new ValidationError("review revision is stale for the current integration HEAD and the latest implementation commit", { revisionSha, frozenHead, implementationCommit: implementationCommit ?? null });
+    }
+    const reviewPath = repository.project_path;
     const test = this.store.db.prepare("SELECT state,result_json,completed_at FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; result_json?: string; completed_at?: string } | undefined;
     if (test?.state !== "completed") throw new ValidationError("review requires a completed independent test dispatch");
-    const revisionLine = execFileSync("git", ["-C", frozenPath, "rev-list", "--parents", "-n", "1", revisionSha], { encoding: "utf8" }).trim().split(" ");
+    const revisionLine = execFileSync("git", ["-C", reviewPath, "rev-list", "--parents", "-n", "1", revisionSha], { encoding: "utf8" }).trim().split(" ");
     const firstParent = revisionLine[1];
     const diffArgs = firstParent ? ["diff", firstParent, revisionSha] : ["diff-tree", "--root", "--no-commit-id", "-p", revisionSha];
     const pathArgs = firstParent ? ["diff", "--name-only", "-z", firstParent, revisionSha] : ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", revisionSha];
-    const changedPaths = [...new Set(execFileSync("git", ["-C", frozenPath, ...pathArgs], { encoding: "utf8" }).split("\0").filter(Boolean))];
-    const committedDiff = redact(execFileSync("git", ["-C", frozenPath, ...diffArgs], { encoding: "utf8", maxBuffer: 5 * 1024 * 1024 }));
+    const changedPaths = [...new Set(execFileSync("git", ["-C", reviewPath, ...pathArgs], { encoding: "utf8" }).split("\0").filter(Boolean))];
+    const committedDiff = redact(execFileSync("git", ["-C", reviewPath, ...diffArgs], { encoding: "utf8", maxBuffer: 5 * 1024 * 1024 }));
     const diffDigest = sha256(committedDiff);
     const planningCandidates = requiredFormal && run.plan_id && run.revision ? [
       `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/spec.md`,
@@ -52,11 +59,11 @@ export class ReviewService {
       `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/tasks.md`,
     ] : [];
     const planningPaths = planningCandidates.filter((path) => {
-      try { execFileSync("git", ["-C", frozenPath, "cat-file", "-e", `${revisionSha}:${path}`], { stdio: "ignore" }); return true; }
+      try { execFileSync("git", ["-C", reviewPath, "cat-file", "-e", `${revisionSha}:${path}`], { stdio: "ignore" }); return true; }
       catch { return false; }
     });
     const documentDigest = sha256(planningPaths.map((path) => {
-      try { return `${path}\0${execFileSync("git", ["-C", frozenPath, "show", `${revisionSha}:${path}`], { encoding: "utf8", maxBuffer: 2 * 1024 * 1024 })}`; }
+      try { return `${path}\0${execFileSync("git", ["-C", reviewPath, "show", `${revisionSha}:${path}`], { encoding: "utf8", maxBuffer: 2 * 1024 * 1024 })}`; }
       catch { return `${path}\0`; }
     }).join("\n"));
     const testEvidence = test.result_json ? JSON.parse(test.result_json) : { state: test.state, completed_at: test.completed_at ?? null };
@@ -95,6 +102,7 @@ export class ReviewService {
             document_digest: documentDigest,
             diff_digest: diffDigest,
             test_evidence_digest: testEvidenceDigest,
+            review_strategy: revisionSha === frozenHead ? "integration_head" : "implementation_commit",
             committed_diff: committedDiff,
             test_evidence: testEvidence,
           },
@@ -166,7 +174,14 @@ export class ReviewService {
       const operation = this.store.db.prepare("SELECT kind,evidence_json,completed_at FROM operations WHERE run_id=? AND kind IN ('git.sync','git.merge.continue') AND state='completed' ORDER BY completed_at DESC LIMIT 1").get(runId) as { kind: string; evidence_json: string; completed_at: string } | undefined;
       const evidence = operation ? JSON.parse(operation.evidence_json) as { commit?: string } : undefined;
       const latestTest = this.store.db.prepare("SELECT state,completed_at FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; completed_at?: string } | undefined;
-      if (!operation || evidence?.commit !== frozenHead || latestTest?.state !== "completed" || !latestTest.completed_at || latestTest.completed_at < operation.completed_at) {
+      let equivalentIntegratedTree = false;
+      try {
+        const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=(SELECT repo_id FROM runs WHERE run_id=?)").get(runId) as { project_path: string };
+        execFileSync("git", ["-C", repository.project_path, "merge-base", "--is-ancestor", review.revision_sha, frozenHead], { stdio: "ignore" });
+        execFileSync("git", ["-C", repository.project_path, "diff", "--quiet", review.revision_sha, frozenHead], { stdio: "ignore" });
+        equivalentIntegratedTree = true;
+      } catch { /* a changed tree requires a new review */ }
+      if (!equivalentIntegratedTree && (!operation || evidence?.commit !== frozenHead || latestTest?.state !== "completed" || !latestTest.completed_at || latestTest.completed_at < operation.completed_at)) {
         throw new ValidationError("review is stale for the current integration HEAD", { reviewed: review.revision_sha, current: frozenHead });
       }
     }
