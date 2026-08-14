@@ -17,6 +17,7 @@ import { ReviewService, type FindingResolution, type ReviewResult } from "./revi
 import { ResearchService } from "./research-service.js";
 import type { ResearchConclusion } from "./research.js";
 import { ROLE_MANIFEST_DIGEST } from "./roles.js";
+import { AGENT_BUILD } from "./roles.js";
 import { StateStore } from "./state.js";
 import { WorkflowService } from "./workflow.js";
 
@@ -177,7 +178,7 @@ export const buildProgram = (): Command => {
   backup.command("restore").argument("<path>").option("--dry-run").action(async (path, options) => output(await new EnvironmentService().restore(path, options.dryRun)));
   program.command("uninstall").option("--dry-run").action(async ({ dryRun }) => output(await new EnvironmentService().uninstall(dryRun)));
 
-  program.command("contract").description("Print the installed contract metadata").action(() => output({ contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, roles: ROLES }));
+  program.command("contract").description("Print the installed contract metadata").action(() => output({ contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, agent_build_digest: AGENT_BUILD.digest, template_version: AGENT_BUILD.templateVersion, roles: ROLES }));
   return program;
 };
 

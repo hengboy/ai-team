@@ -1,0 +1,20 @@
+schema_version: 1
+template_version: 1
+roles:
+  - planning
+  - coding
+  - file-explorer
+  - frontend-developer
+  - backend-developer
+  - test
+  - git-operator
+  - code-reviewer
+  - review-spec
+  - review-standards
+  - environment-operator
+  - researcher
+platforms: [codex, claude, opencode]
+instructions: instructions.md
+role_directory: roles
+environment_directory: environments
+template_directory: templates

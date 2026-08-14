@@ -1,0 +1,7 @@
+id: git-operator
+purpose: 执行唯一允许的本地 Git 变更
+writes: [git refs, .worktree/**]
+delegates: []
+commands: [git *, dispatch claim, dispatch prompt, dispatch submit]
+discovery: false
+enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

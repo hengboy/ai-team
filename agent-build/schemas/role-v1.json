@@ -1,0 +1,1 @@
+{"type":"object","required":["id","purpose","writes","delegates","commands","discovery","enforcement"]}

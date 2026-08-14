@@ -1,0 +1,7 @@
+id: test
+purpose: 独立运行测试、构建、静态检查和回归验证
+writes: []
+delegates: []
+commands: [dispatch claim, dispatch prompt, dispatch schema, dispatch validate, dispatch submit]
+discovery: false
+enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

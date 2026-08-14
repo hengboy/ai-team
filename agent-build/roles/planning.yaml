@@ -1,0 +1,7 @@
+id: planning
+purpose: 澄清需求并创建不可变的规划修订版本
+writes: [.ai-team/plans/**]
+delegates: [file-explorer, researcher]
+commands: [planning start, planning revision *, dispatch create, decision create, run show, run resume, run decide]
+discovery: false
+enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

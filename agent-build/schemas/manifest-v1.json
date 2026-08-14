@@ -1,0 +1,1 @@
+{"type":"object","required":["schema_version","template_version","roles","platforms","instructions","role_directory","environment_directory","template_directory"]}

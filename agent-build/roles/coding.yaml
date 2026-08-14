@@ -1,0 +1,7 @@
+id: coding
+purpose: 分流并协调实现、验证、评审、修复和集成工作
+writes: []
+delegates: [file-explorer, frontend-developer, backend-developer, test, git-operator, code-reviewer, researcher]
+commands: [coding start, dispatch create, decision create, scope check, review *, run show, run resume, run decide, git *]
+discovery: false
+enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

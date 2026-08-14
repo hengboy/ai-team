@@ -34,10 +34,10 @@ export class DispatchService {
     const prompt = [
       `Role: ${role}`,
       `Dispatch: ${dispatchId}`,
-      `Objective: ${packet.objective}`,
-      `Allowed reads: ${packet.allowed_read_paths.join(", ") || "none"}`,
-      `Allowed writes: ${packet.allowed_write_paths.join(", ") || "none"}`,
-      `Return only a result matching the frozen schema. Request support for work outside this packet.`,
+      `目标：${packet.objective}`,
+      `允许读取：${packet.allowed_read_paths.join(", ") || "无"}`,
+      `允许写入：${packet.allowed_write_paths.join(", ") || "无"}`,
+      "只能返回符合冻结 schema 的结果。遇到数据包之外的工作时请求支持。",
     ].join("\n");
     const template = createResultTemplate(runId, dispatchId, role);
     this.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,created_at)

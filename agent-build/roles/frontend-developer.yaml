@@ -1,0 +1,7 @@
+id: frontend-developer
+purpose: 在分配的工作树范围内实现前端行为
+writes: [dispatch.allowed_write_paths]
+delegates: []
+commands: [dispatch claim, dispatch prompt, dispatch schema, dispatch validate, dispatch submit]
+discovery: false
+enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

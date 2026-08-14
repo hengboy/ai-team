@@ -8,6 +8,7 @@
   },
   "files": [
     "dist",
+    "agent-build",
     "README.md",
     "LICENSE"
   ],

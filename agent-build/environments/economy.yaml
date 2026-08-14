@@ -1,0 +1,55 @@
+name: economy
+platforms: [codex, claude, opencode]
+defaults:
+  codex: { model: gpt-5.2, reasoning: low }
+  claude: { model: claude-haiku-4-5, effort: low }
+  opencode: { model: openai/gpt-5.2, variant: low, options: {} }
+overrides:
+  planning:
+    codex: { model: gpt-5.2, reasoning: medium }
+    claude: { model: claude-haiku-4-5, effort: medium }
+    opencode: { model: openai/gpt-5.2, variant: medium, options: {} }
+  coding:
+    codex: { model: gpt-5.2, reasoning: medium }
+    claude: { model: claude-haiku-4-5, effort: medium }
+    opencode: { model: openai/gpt-5.2, variant: medium, options: {} }
+  file-explorer:
+    codex: { model: gpt-5.2, reasoning: low }
+    claude: { model: claude-haiku-4-5, effort: low }
+    opencode: { model: openai/gpt-5.2, variant: low, options: {} }
+  frontend-developer:
+    codex: { model: gpt-5.2, reasoning: medium }
+    claude: { model: claude-haiku-4-5, effort: medium }
+    opencode: { model: openai/gpt-5.2, variant: medium, options: {} }
+  backend-developer:
+    codex: { model: gpt-5.2, reasoning: medium }
+    claude: { model: claude-haiku-4-5, effort: medium }
+    opencode: { model: openai/gpt-5.2, variant: medium, options: {} }
+  test:
+    codex: { model: gpt-5.2, reasoning: medium }
+    claude: { model: claude-haiku-4-5, effort: medium }
+    opencode: { model: openai/gpt-5.2, variant: medium, options: {} }
+  git-operator:
+    codex: { model: gpt-5.2, reasoning: low }
+    claude: { model: claude-haiku-4-5, effort: low }
+    opencode: { model: openai/gpt-5.2, variant: low, options: {} }
+  code-reviewer:
+    codex: { model: gpt-5.2, reasoning: medium }
+    claude: { model: claude-haiku-4-5, effort: medium }
+    opencode: { model: openai/gpt-5.2, variant: medium, options: {} }
+  review-spec:
+    codex: { model: gpt-5.2, reasoning: medium }
+    claude: { model: claude-haiku-4-5, effort: medium }
+    opencode: { model: openai/gpt-5.2, variant: medium, options: {} }
+  review-standards:
+    codex: { model: gpt-5.2, reasoning: medium }
+    claude: { model: claude-haiku-4-5, effort: medium }
+    opencode: { model: openai/gpt-5.2, variant: medium, options: {} }
+  environment-operator:
+    codex: { model: gpt-5.2, reasoning: low }
+    claude: { model: claude-haiku-4-5, effort: low }
+    opencode: { model: openai/gpt-5.2, variant: low, options: {} }
+  researcher:
+    codex: { model: gpt-5.2, reasoning: low }
+    claude: { model: claude-haiku-4-5, effort: low }
+    opencode: { model: openai/gpt-5.2, variant: low, options: {} }

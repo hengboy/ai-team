@@ -1,0 +1,7 @@
+id: review-standards
+purpose: 根据工程标准评审实现结果
+writes: []
+delegates: []
+commands: [dispatch claim, dispatch prompt, dispatch schema, dispatch validate, dispatch submit]
+discovery: false
+enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

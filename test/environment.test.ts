@@ -54,6 +54,18 @@ test("resolveEnvironment applies platform defaults and role overrides", () => {
   assert.equal(Object.keys(resolved).length, ROLES.length);
 });
 
+test("environment overrides configure each role independently", () => {
+  const environment = balancedEnvironment();
+  environment.overrides = {
+    planning: { codex: { model: "gpt-planning", reasoning: "high" } },
+    coding: { codex: { model: "gpt-coding", reasoning: "xhigh" } },
+  };
+  const resolved = resolveEnvironment(environment);
+  assert.deepEqual(resolved.planning.codex, { model: "gpt-planning", reasoning: "high" });
+  assert.deepEqual(resolved.coding.codex, { model: "gpt-coding", reasoning: "xhigh" });
+  assert.deepEqual(resolved.test.codex, { model: "gpt-5.2", reasoning: "medium" });
+});
+
 test("renderAgents renders all twelve roles for all three platforms", () => {
   const files = renderAgents(balancedEnvironment());
 
