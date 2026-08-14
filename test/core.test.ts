@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { checkResultEnvelope, createResultTemplate } from "../src/contracts.js";
+import { COMMAND_SYNTAX, commandContractFor } from "../src/command-contract.js";
 import { DispatchService, type DispatchPacket } from "../src/dispatch.js";
 import { ValidationError } from "../src/errors.js";
-import { assertCoverage, extractRequirementIds, nextPlanState, triage, validateCoverage } from "../src/planning.js";
+import { assertCoverage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, triage, validateCoverage } from "../src/planning.js";
 import { StateStore } from "../src/state.js";
 
 const RUN_ID = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -118,6 +119,28 @@ test("state migration is recorded once and survives reopening", async () => {
     );
   } finally {
     store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("readonly state opens alongside a writer without locks, backups, or migrations", async () => {
+  const home = await temporaryHome();
+  const writer = await StateStore.open(home);
+  try {
+    const backupsBefore = await readdir(join(home, "backups"));
+    const reader = await StateStore.open(home, { readonly: true });
+    try {
+      assert.equal(
+        (reader.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count,
+        4,
+      );
+      assert.throws(() => reader.db.prepare("UPDATE runs SET state='failed'").run(), /readonly|read-only/i);
+    } finally {
+      reader.close();
+    }
+    assert.deepEqual(await readdir(join(home, "backups")), backupsBefore);
+  } finally {
+    writer.close();
     await rm(home, { recursive: true, force: true });
   }
 });
@@ -294,6 +317,65 @@ test("dispatch validates identity, requires claim, redacts artifacts, and reuses
   });
 });
 
+test("dispatch validation is a claimed active-run preflight with no state changes", async () => {
+  await withStore(async (store, home) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const packet: DispatchPacket = {
+      objective: "Validate without submitting",
+      allowed_read_paths: [],
+      allowed_write_paths: ["test/core.test.ts"],
+      acceptance_criteria: ["Validation is side-effect free"],
+      context: {},
+    };
+    const dispatchId = dispatches.create(runId, "backend-developer", packet);
+    const resultPath = join(home, "preflight.json");
+    await writeFile(resultPath, JSON.stringify(validResult(runId, dispatchId)));
+
+    await assert.rejects(
+      dispatches.validateFile(runId, dispatchId, "backend-developer", resultPath),
+      /must be claimed before validate/,
+    );
+    dispatches.claim(runId, dispatchId, "backend-developer");
+    const before = {
+      run: store.db.prepare("SELECT state,stage,updated_at FROM runs WHERE run_id=?").get(runId),
+      dispatch: store.db.prepare("SELECT state,claimed_at,completed_at,result_json FROM dispatches WHERE dispatch_id=?").get(dispatchId),
+      events: store.db.prepare("SELECT COUNT(*) AS count FROM run_events WHERE run_id=?").get(runId),
+    };
+    assert.deepEqual(await dispatches.validateFile(runId, dispatchId, "backend-developer", resultPath), validResult(runId, dispatchId));
+    assert.deepEqual({
+      run: store.db.prepare("SELECT state,stage,updated_at FROM runs WHERE run_id=?").get(runId),
+      dispatch: store.db.prepare("SELECT state,claimed_at,completed_at,result_json FROM dispatches WHERE dispatch_id=?").get(dispatchId),
+      events: store.db.prepare("SELECT COUNT(*) AS count FROM run_events WHERE run_id=?").get(runId),
+    }, before);
+
+    store.db.prepare("UPDATE runs SET state='failed' WHERE run_id=?").run(runId);
+    await assert.rejects(
+      dispatches.validateFile(runId, dispatchId, "backend-developer", resultPath),
+      /run must be active before validate/,
+    );
+  });
+});
+
+test("revision documents reject missing, unknown, and non-string fields with JSON paths", () => {
+  assert.throws(
+    () => assertRevisionDocuments({}),
+    (error: unknown) => error instanceof ValidationError
+      && assert.deepEqual(error.details, [
+        { path: "/spec", message: "must be a string" },
+        { path: "/plan", message: "must be a string" },
+      ]) === undefined,
+  );
+  assert.throws(
+    () => assertRevisionDocuments({ spec: "spec", plan: "plan", extra: true, taskFiles: { "TASK-001.md": 1 } }),
+    (error: unknown) => error instanceof ValidationError
+      && assert.deepEqual(error.details, [
+        { path: "/extra", message: "unknown field" },
+        { path: "/taskFiles/TASK-001.md", message: "must be a string" },
+      ]) === undefined,
+  );
+});
+
 test("planning coverage reports sorted missing and unknown identifiers", () => {
   const spec = "REQ-002 must follow AC-001. REQ-001 is repeated by REQ-001.";
   const documents = ["Implement REQ-002 and AC-999.", "Verify REQ-003."];
@@ -323,6 +405,26 @@ test("planning states allow only declared forward transitions", () => {
   assert.throws(() => nextPlanState("draft", "ready"), /invalid planning transition/);
   assert.throws(() => nextPlanState("implemented", "abandoned"), /terminal revision cannot transition/);
   assert.throws(() => nextPlanState("missing", "draft"), /unknown planning state/);
+});
+
+test("planning revision commit has one exact generated command contract", () => {
+  assert.deepEqual(COMMAND_SYNTAX["planning revision commit"], [
+    "ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>",
+  ]);
+  assert.deepEqual(commandContractFor(["planning revision commit"]).syntax, COMMAND_SYNTAX["planning revision commit"]);
+});
+
+test("revision state permits only compatible planning run stages, including plan-ready recovery", () => {
+  assert.doesNotThrow(() => assertRevisionRunStage("spec_ready", "plan_ready", "plan_ready"));
+  assert.doesNotThrow(() => assertRevisionRunStage("plan_ready", "tasks_preview", "tasks_preview"));
+  assert.throws(
+    () => assertRevisionRunStage("draft", "ready", "requirements_confirmed"),
+    /revision state draft is incompatible with planning run stage ready/,
+  );
+  assert.throws(
+    () => assertRevisionRunStage("ready", "plan_ready", "implemented"),
+    /revision state implemented is incompatible with planning run stage plan_ready/,
+  );
 });
 
 test("triage prioritizes an existing plan, recognizes evidenced bugs, and gates fast-path features", () => {

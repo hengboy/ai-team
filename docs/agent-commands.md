@@ -31,5 +31,5 @@ receives project context from File Explorer and writes cited conclusions as
 File Explorer also returns `payload.project_context`, including the project
 shape, four managed MEMORY entry groups, module boundaries, navigation entries,
 and maintenance status. Developers update the target project's `MEMORY.md` and
-`.ai-work-flow/index/feature-navigation.md` with `context update`; Test and
+`.ai-team/index/feature-navigation.md` with `context update`; Test and
 review roles validate them before completion.

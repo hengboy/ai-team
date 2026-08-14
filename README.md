@@ -23,7 +23,7 @@ ai-team install
 
 `ai-team init` creates `.ai-team/project.yaml`, planning directories, the
 required `.gitignore` entries, and the target project's `MEMORY.md` plus
-`.ai-work-flow/index/feature-navigation.md`. It appends the maintenance rule
+`.ai-team/index/feature-navigation.md`. It appends the maintenance rule
 to an existing `AGENTS.md` or `CLAUDE.md` without creating either file. If any
 existing target context or instruction file is modified, inspect the JSON
 diagnostic and repeat with `--yes`.

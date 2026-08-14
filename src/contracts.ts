@@ -182,21 +182,25 @@ export const checkResultEnvelope = (value: unknown): { valid: true; value: Resul
     return { valid: false, errors: [{ path: "/verification", message: "completed results require verification evidence" }] };
   }
   const payloadValidator = validateRolePayload[envelope.role];
-  if (envelope.status === "completed" && !payloadValidator(envelope.payload)) {
+  const requiresPayload = envelope.status === "completed" || envelope.role === "planning" && envelope.status === "needs_decision";
+  if (requiresPayload && !payloadValidator(envelope.payload)) {
     return { valid: false, errors: formatSchemaErrors(payloadValidator.errors).map((error) => ({ ...error, path: `/payload${error.path === "/" ? "" : error.path}` })) };
   }
   if (envelope.status === "completed" && envelope.role === "file-explorer") {
     const payload = envelope.payload as { allowed_read_paths: string[]; project_context: ProjectContext };
     const authorized = new Set(payload.allowed_read_paths);
-    const requiredContextPaths = ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md"];
+    const requiredContextPaths = ["MEMORY.md", ".ai-team/index/feature-navigation.md"];
     const missingContextPaths = requiredContextPaths.filter((path) => !authorized.has(path));
     const missingEntryPaths = payload.project_context.navigation.flatMap((entry) => entry.entry_paths.filter((path) => !authorized.has(path)));
     if (missingContextPaths.length || missingEntryPaths.length) {
       return { valid: false, errors: [{ path: "/payload/allowed_read_paths", message: `project context paths are not authorized: ${[...missingContextPaths, ...missingEntryPaths].join(", ")}` }] };
     }
   }
-  if (envelope.status === "completed" && envelope.role === "planning") {
+  if (requiresPayload && envelope.role === "planning") {
     const payload = envelope.payload as { pending_questions: string[]; decision: { question: string } | null };
+    if (envelope.status === "needs_decision" && payload.pending_questions.length !== 1) {
+      return { valid: false, errors: [{ path: "/payload/pending_questions", message: "needs_decision requires one pending question" }] };
+    }
     if (payload.pending_questions.length === 1 && payload.decision?.question !== payload.pending_questions[0]) {
       return { valid: false, errors: [{ path: "/payload/decision", message: "must match the single pending question" }] };
     }

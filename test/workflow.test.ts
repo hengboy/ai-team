@@ -228,7 +228,7 @@ test("project init is Git-only, idempotent, and appends the context rule once", 
     await stat(path.join(repository.directory, ".ai-team", "standards"));
     await stat(path.join(repository.directory, ".ai-team", "plans"));
     await stat(path.join(repository.directory, "MEMORY.md"));
-    await stat(path.join(repository.directory, ".ai-work-flow", "index", "feature-navigation.md"));
+    await stat(path.join(repository.directory, ".ai-team", "index", "feature-navigation.md"));
   } finally {
     await rm(nonRepository, { recursive: true, force: true });
     await rm(repository.directory, { recursive: true, force: true });
@@ -271,6 +271,14 @@ test("revision writing enforces coverage, frontmatter, and immutability", async 
       unknown: ["REQ-999"],
     });
     assert.throws(() => assertCoverage("REQ-001 AC-001", ["REQ-001"]), /coverage is incomplete/);
+    await assert.rejects(
+      () => writeRevision(project, planId, "001", "main", {} as never),
+      (error: unknown) => error instanceof ValidationError
+        && assert.deepEqual(error.details, [
+          { path: "/spec", message: "must be a string" },
+          { path: "/plan", message: "must be a string" },
+        ]) === undefined,
+    );
     await assert.rejects(
       () => writeRevision(project, planId, "001", "main", { spec: "REQ-001 AC-001", plan: "REQ-001 AC-001" }),
       /missing required sections/,

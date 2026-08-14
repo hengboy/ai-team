@@ -12,6 +12,10 @@ import { AGENT_BUILD, ROLE_MANIFEST_DIGEST } from "./roles.js";
 /** Increment when persisted state contracts change incompatibly. */
 export const STATE_SCHEMA_EPOCH = 2;
 
+export interface StateStoreOpenOptions {
+  readonly?: boolean;
+}
+
 const migrations = [
   {
     name: "001-initial",
@@ -168,10 +172,19 @@ export class StateStore {
     return false;
   }
 
-  static async open(home?: string): Promise<StateStore> {
+  static async open(home?: string, options: StateStoreOpenOptions = {}): Promise<StateStore> {
     const paths = getHomePaths(home);
+    if (options.readonly) {
+      const db = new Database(paths.database, { readonly: true, fileMustExist: true });
+      db.pragma("foreign_keys = ON");
+      return new StateStore(paths, db, () => {});
+    }
     await Promise.all([paths.state, paths.backups, paths.artifacts, paths.environments, paths.schemas, paths.templates].map((path) => mkdir(path, { recursive: true })));
-    const releaseLock = lockfile.lockSync(paths.state, { realpath: false, stale: 30_000 });
+    const releaseLock = await lockfile.lock(paths.state, {
+      realpath: false,
+      stale: 30_000,
+      retries: { retries: 20, factor: 1, minTimeout: 50, maxTimeout: 50 },
+    });
     let existing = false;
     try { existing = (await stat(paths.database)).size > 0; } catch { /* new database */ }
     if (existing && await StateStore.requiresEpochReset(paths.database, paths.root)) {

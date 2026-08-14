@@ -52,6 +52,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "context validate": ["ai-team context validate --project <path>"],
   "planning revision create": ["ai-team planning revision create --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> --documents-file <file> [--supersedes <revision>] [--run-id <run-id>]"],
   "planning revision transition": ["ai-team planning revision transition --project <path> --plan-id <plan-id> --revision <revision> --to <state> [--plan-commit <commit>]"],
+  "planning revision commit": ["ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>"],
   "planning tasks validate": ["ai-team planning tasks validate --file <json> [--preview]"],
   "coding start": [
     "ai-team coding start --project <path> --mode planned --plan-id <plan-id> [--revision <revision>]",

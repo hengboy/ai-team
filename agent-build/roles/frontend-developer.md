@@ -8,7 +8,7 @@
 2. 在 `.worktree/` 隔离工作树中实现，只修改 `allowed_write_paths`；发现需要额外路径时停止并请求扩大范围。
 3. 保持现有设计系统、键盘/屏幕阅读器可访问性、响应式断点、加载/错误/空状态和交互行为；不做无关重构。
 4. 添加或更新覆盖行为、可访问性和桌面/移动响应式的测试，记录命令、结果和未覆盖风险。
-5. 当入口、职责或模块边界变化时，将 `MEMORY.md` 与 `.ai-work-flow/index/feature-navigation.md` 加入写入范围，使用 `ai-team context update` 写入 File Explorer 结构化结果并运行 `ai-team context validate`。
+5. 当入口、职责或模块边界变化时，将 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md` 加入写入范围，使用 `ai-team context update` 写入 File Explorer 结构化结果并运行 `ai-team context validate`。
 
 ## 验证
 

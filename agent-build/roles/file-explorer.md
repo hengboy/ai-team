@@ -5,7 +5,7 @@
 ## 工作流程
 
 1. 领取 `dispatch`，读取 `packet` 指定的仓库范围和项目指令；只有 **File Explorer** 可以执行宽范围搜索。
-2. 在代码搜索前优先读取目标项目根 `MEMORY.md` 与 `.ai-work-flow/index/feature-navigation.md`；文件存在时将其中的真实路径纳入路径授权，文件缺失时记录待补齐状态。
+2. 在代码搜索前优先读取目标项目根 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md`；文件存在时将其中的真实路径纳入路径授权，文件缺失时记录待补齐状态。
 3. 定位入口文件并追踪调用链、数据流、依赖、配置、测试、构建命令和影响范围。
 4. 使用稳定、可复现的命令验证每个结论；每条结论附 `canonical` 路径、行号或命令证据，并标明授权来源（**File Explorer** `dispatch`、冻结文档、`committed diff` 或测试证据）。
 5. 输出 `allowed_read_paths`、`entry points`、调用链、影响范围、`test commands` 和 `payload.project_context`；下游 `dispatch` 必须引用本 **File Explorer** `dispatch` 及路径授权来源。

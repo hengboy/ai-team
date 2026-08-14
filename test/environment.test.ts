@@ -127,6 +127,18 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
   }
 });
 
+test("planning and Git Operator agents expose the immutable revision handoff contract", () => {
+  const files = renderAgents(balancedEnvironment());
+  const planning = files.get("codex/agents/planning.toml") ?? "";
+  const gitOperator = files.get("codex/agents/git-operator.toml") ?? "";
+
+  assert.match(planning, /完整.*spec.*plan/);
+  assert.match(planning, /最后.*planning revision create/);
+  assert.match(planning, /规划代理自身不得执行 `planning revision commit`/);
+  assert.match(gitOperator, /`planning revision commit`/);
+  assert.match(gitOperator, /ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>/);
+});
+
 test("generate dry-run returns a plan without writing managed user files", async (t) => {
   const { aiTeamHome, userHome } = await makeHomes(t);
   const service = new EnvironmentService(aiTeamHome, userHome);

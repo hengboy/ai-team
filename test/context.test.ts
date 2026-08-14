@@ -31,7 +31,7 @@ const context = (entryPaths = ["src/entry.ts"]) => ({
     module_boundaries: ["src/runtime"],
   },
   navigation: [{ feature: "Dispatch", keywords: ["dispatch"], entry_paths: entryPaths, module_boundary: "src/runtime" }],
-  maintenance: { status: "current", paths: ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md"] },
+  maintenance: { status: "current", paths: ["MEMORY.md", ".ai-team/index/feature-navigation.md"] },
 });
 
 test("context initialization is idempotent and preserves existing instructions", async (t) => {
@@ -40,11 +40,11 @@ test("context initialization is idempotent and preserves existing instructions",
   await writeFile(join(root, "AGENTS.md"), "# Keep this\n");
   await initializeProject(root, true);
   const firstMemory = await readFile(join(root, "MEMORY.md"), "utf8");
-  const firstNavigation = await readFile(join(root, ".ai-work-flow", "index", "feature-navigation.md"), "utf8");
+  const firstNavigation = await readFile(join(root, ".ai-team", "index", "feature-navigation.md"), "utf8");
   const second = await initializeProject(root);
   assert.equal(second.context.memory_status, "unchanged");
   assert.equal(await readFile(join(root, "MEMORY.md"), "utf8"), firstMemory);
-  assert.equal(await readFile(join(root, ".ai-work-flow", "index", "feature-navigation.md"), "utf8"), firstNavigation);
+  assert.equal(await readFile(join(root, ".ai-team", "index", "feature-navigation.md"), "utf8"), firstNavigation);
   const instructions = await readFile(join(root, "AGENTS.md"), "utf8");
   assert.equal(instructions.split(CONTEXT_RULE).length - 1, 1);
   assert.match(instructions, /\*\*File Explorer\*\*/);
@@ -63,12 +63,12 @@ test("context update merges and deduplicates managed entries while retaining use
   await writeFile(join(root, "src", "other.ts"), "export const other = true;\n");
   await writeFile(join(root, "MEMORY.md"), `${await readFile(join(root, "MEMORY.md"), "utf8")}\nUser notes stay here.\n`);
   const result = await updateProjectContext(root, context(["src/entry.ts"]));
-  assert.deepEqual(result.updated_paths, ["MEMORY.md", ".ai-work-flow/index/feature-navigation.md"]);
+  assert.deepEqual(result.updated_paths, ["MEMORY.md", ".ai-team/index/feature-navigation.md"]);
   await updateProjectContext(root, context(["src/entry.ts", "src/other.ts"]));
   const memory = await readFile(join(root, "MEMORY.md"), "utf8");
   assert.match(memory, /User notes stay here/);
   assert.equal(memory.match(/- dispatch/g)?.length, 1);
-  const navigation = await readFile(join(root, ".ai-work-flow", "index", "feature-navigation.md"), "utf8");
+  const navigation = await readFile(join(root, ".ai-team", "index", "feature-navigation.md"), "utf8");
   assert.match(navigation, /`src\/other\.ts`/);
   assert.equal((await validateProjectContext(root)).navigation.entries, 1);
 });

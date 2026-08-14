@@ -134,12 +134,10 @@ completed | retryable_failure | needs_decision | failed
 ## 5. 规划文档和项目目录
 
 ```text
-.ai-work-flow/
-└── index/
-    └── feature-navigation.md
-MEMORY.md
 .ai-team/
 ├── project.yaml
+├── index/
+│   └── feature-navigation.md
 ├── standards/
 ├── plans/
 │   └── <plan-id>/
@@ -153,6 +151,7 @@ MEMORY.md
 │           │   └── tasks/            # 仅拆分时
 │           └── 002/
 └── runtime/                          # 忽略，不提交
+MEMORY.md
 ```
 
 `plan_id` 格式为 `YYYYMMDD-<slug>-<4char>`；revision 为三位递增数字；Task 为 `TASK-001`；run 和 dispatch 使用 `run_<ULID>`、`dispatch_<ULID>`。
@@ -166,7 +165,7 @@ MEMORY.md
 /.ai-team/runtime/
 ```
 
-同时幂等创建根 `MEMORY.md` 与 `.ai-work-flow/index/feature-navigation.md`。已有 `AGENTS.md` 或 `CLAUDE.md` 时追加一条上下文维护规则，但不创建不存在的指令文件。任何将被修改的上下文、指令或 `.gitignore` 文件存在未提交内容时，显示诊断并要求用户以 `--yes` 确认；不覆盖用户内容或规划目录冲突文件。
+同时幂等创建根 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md`。已有 `AGENTS.md` 或 `CLAUDE.md` 时追加一条上下文维护规则，但不创建不存在的指令文件。任何将被修改的上下文、指令或 `.gitignore` 文件存在未提交内容时，显示诊断并要求用户以 `--yes` 确认；不覆盖用户内容或规划目录冲突文件。
 
 File Explorer 在代码搜索前读取已有 MEMORY 和导航索引，并返回严格的 `payload.project_context`。开发角色只通过 `ai-team context update` 合并领域术语、仓库约束、职责、模块边界和真实入口路径；结构重复、绝对/越界/敏感/不存在路径会阻断写入。入口、职责或模块边界变化时必须同轮更新并运行 `ai-team context validate`。
 

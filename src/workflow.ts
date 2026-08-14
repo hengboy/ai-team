@@ -24,7 +24,7 @@ export class WorkflowService {
     const branch = await currentBranch(repo.root);
     const runId = this.store.createRun({ repoId: repo.repoId, profile: "planning", mode: "planned", targetBranch: branch, request, clientPlatform: clientPlatform() });
     const dispatchId = this.dispatches.create(runId, "file-explorer", {
-      objective: "Explore the repository for the planning request. Read existing MEMORY.md and .ai-work-flow/index/feature-navigation.md first, then return entry points, constraints, risks, test locations, and project_context.",
+      objective: "Explore the repository for the planning request. Read existing MEMORY.md and .ai-team/index/feature-navigation.md first, then return entry points, constraints, risks, test locations, and project_context.",
       allowed_read_paths: ["."],
       allowed_write_paths: [],
       acceptance_criteria: ["Repository facts are supported by file paths", "Unknowns are explicit"],
@@ -64,7 +64,7 @@ export class WorkflowService {
     this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
     const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}), clientPlatform: clientPlatform() });
     const dispatchId = this.dispatches.create(runId, "file-explorer", {
-      objective: "Re-explore the repository at the implementation base. Read existing MEMORY.md and .ai-work-flow/index/feature-navigation.md first, then return exact implementation and test scope plus project_context.",
+      objective: "Re-explore the repository at the implementation base. Read existing MEMORY.md and .ai-team/index/feature-navigation.md first, then return exact implementation and test scope plus project_context.",
       allowed_read_paths: ["."],
       allowed_write_paths: [],
       acceptance_criteria: ["Scope is exhaustive", "Current HEAD and test entry points are reported"],

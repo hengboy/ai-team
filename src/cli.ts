@@ -13,7 +13,7 @@ import { commitPlanningRevision, repositoryIdentity, worktreeStatus } from "./gi
 import { GitOrchestrator } from "./git-orchestrator.js";
 import { ScopeGate } from "./gates.js";
 import { runnableTaskBatches, validateTaskPreview, type TaskDefinition } from "./tasks.js";
-import { writeRevision, nextPlanState, type RevisionDocuments } from "./planning.js";
+import { assertRevisionRunStage, writeRevision, nextPlanState, type RevisionDocuments } from "./planning.js";
 import { initializeProject } from "./project.js";
 import { updateProjectContext, validateProjectContext } from "./context.js";
 import { ReviewService, type FindingResolution, type ReviewResult } from "./review.js";
@@ -26,17 +26,20 @@ import { WorkflowService } from "./workflow.js";
 import { assertReadablePath } from "./security.js";
 
 let humanOutput = false;
+let legacyOutput = false;
 const humanize = (value: unknown): string => {
   if (value === null || typeof value !== "object") return String(value ?? "");
   if (Array.isArray(value)) return value.map((item) => humanize(item)).join("\n");
   return Object.entries(value as Record<string, unknown>).map(([key, item]) => `${key}: ${typeof item === "string" ? item : JSON.stringify(item)}`).join("\n");
 };
-/** Add the common success envelope while retaining legacy top-level fields. */
-const output = (value: unknown): void => {
+const output = (value: unknown, options: { legacyRaw?: boolean } = {}): void => {
+  if (legacyOutput && options.legacyRaw) { process.stdout.write(`${String(value)}\n`); return; }
   if (humanOutput) { process.stdout.write(`${humanize(value)}\n`); return; }
-  const envelope = value && typeof value === "object" && !Array.isArray(value)
-    ? { ok: true, data: value, ...(value as Record<string, unknown>) }
-    : value;
+  const envelope = {
+    ok: true,
+    data: value,
+    ...(legacyOutput && value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}),
+  };
   process.stdout.write(`${JSON.stringify(envelope, null, 2)}\n`);
 };
 const roleOption = (): Option => new Option("--role <role>").choices([...ROLES]).makeOptionMandatory();
@@ -46,9 +49,116 @@ const platformList = (value: string): Platform[] => {
   return platforms;
 };
 
-const withStore = async <T>(action: (store: StateStore) => Promise<T> | T): Promise<T> => {
-  const store = await StateStore.open();
+const withStore = async <T>(action: (store: StateStore) => Promise<T> | T, options: { readonly?: boolean } = {}): Promise<T> => {
+  const store = await StateStore.open(undefined, options);
   try { return await action(store); } finally { store.close(); }
+};
+
+interface PlanningCommitRequest {
+  repo_id: string;
+  run_id: string;
+  plan_id: string;
+  revision: string;
+  digest: string;
+  dispatch_id: string;
+  attempt?: number;
+}
+
+interface PlanningCommitOperation {
+  operation_id: string;
+  run_id: string;
+  idempotency_key: string;
+  kind: string;
+  state: string;
+  request_json: string;
+  evidence_json?: string;
+}
+
+const planningCommitBaseKey = (request: PlanningCommitRequest): string => [
+  "planning.revision.commit",
+  request.repo_id,
+  request.run_id,
+  request.plan_id,
+  request.revision,
+  request.digest,
+  request.dispatch_id,
+].join(":");
+
+const reconcilePlanningCommit = (
+  store: StateStore,
+  operation: PlanningCommitOperation,
+  runId: string,
+  dispatchId: string,
+  state: "completed" | "not_applied",
+  evidence: unknown,
+): { operation_id: string; state: string; plan_commit?: string; reused: boolean } => {
+  if (operation.run_id !== runId) throw new ValidationError("planning commit operation does not belong to run");
+  const request = JSON.parse(operation.request_json) as PlanningCommitRequest;
+  if (request.run_id !== runId || request.dispatch_id !== dispatchId) throw new ValidationError("planning commit operation identity does not match run and dispatch");
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) throw new ValidationError("planning commit reconciliation evidence must be an object");
+  const supplied = evidence as Record<string, unknown>;
+  const planCommit = supplied.plan_commit;
+  if (state === "completed" && (typeof planCommit !== "string" || !/^[a-f0-9]{40}$/.test(planCommit))) {
+    throw new ValidationError("completed planning commit reconciliation requires a 40-character plan_commit");
+  }
+  for (const [field, expected] of Object.entries({
+    repo_id: request.repo_id,
+    run_id: request.run_id,
+    plan_id: request.plan_id,
+    revision: request.revision,
+    digest: request.digest,
+    dispatch_id: request.dispatch_id,
+  })) {
+    if (supplied[field] !== undefined && supplied[field] !== expected) throw new ValidationError(`planning commit reconciliation ${field} does not match operation`);
+  }
+  const previousEvidence = operation.evidence_json ? JSON.parse(operation.evidence_json) as Record<string, unknown> : undefined;
+  if (operation.state !== "pending") {
+    const sameCompleted = state === "completed" && operation.state === "completed"
+      && previousEvidence?.reconciliation === "completed" && previousEvidence.plan_commit === planCommit;
+    const sameNotApplied = state === "not_applied" && operation.state === "failed"
+      && previousEvidence?.reconciliation === "not_applied";
+    if (sameCompleted) return { operation_id: operation.operation_id, state: "completed", plan_commit: planCommit as string, reused: true };
+    if (sameNotApplied) return { operation_id: operation.operation_id, state: "not_applied", reused: true };
+    throw new ValidationError(`planning commit operation cannot reconcile from ${operation.state}`);
+  }
+  const run = store.getRun(runId) as { repo_id: string; profile: string; plan_id?: string; revision?: string };
+  if (run.profile !== "planning" || run.repo_id !== request.repo_id || run.plan_id !== request.plan_id || run.revision !== request.revision) {
+    throw new ValidationError("planning commit operation does not match the bound planning run");
+  }
+  const revision = store.db.prepare("SELECT state,digest,plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+    .get(request.repo_id, request.plan_id, request.revision) as { state: string; digest?: string; plan_commit?: string } | undefined;
+  if (!revision || revision.digest !== request.digest) throw new ValidationError("planning commit operation does not match the bound revision digest");
+  if (state === "completed" && !["plan_ready", "tasks_preview", "ready"].includes(revision.state)) {
+    throw new ValidationError(`planning revision cannot reconcile completed from ${revision.state}`);
+  }
+  if (state === "completed" && revision.state === "ready" && revision.plan_commit !== planCommit) {
+    throw new ValidationError("planning revision is already ready with a different plan_commit");
+  }
+  const normalized = {
+    reconciliation: state,
+    repo_id: request.repo_id,
+    run_id: request.run_id,
+    plan_id: request.plan_id,
+    revision: request.revision,
+    digest: request.digest,
+    dispatch_id: request.dispatch_id,
+    ...(state === "completed" ? { state: "ready", plan_commit: planCommit } : {}),
+    confirmation: supplied,
+  };
+  store.db.transaction(() => {
+    if (state === "completed") {
+      store.db.prepare("UPDATE revisions SET state='ready',plan_commit=? WHERE repo_id=? AND plan_id=? AND revision=?")
+        .run(planCommit, request.repo_id, request.plan_id, request.revision);
+      store.db.prepare("UPDATE runs SET stage='ready',state='active',updated_at=? WHERE run_id=?")
+        .run(new Date().toISOString(), runId);
+      store.event(runId, "planning.revision_committed", { planId: request.plan_id, revision: request.revision, commit: planCommit, reconciled: true, operationId: operation.operation_id });
+      store.finishOperation(operation.operation_id, normalized);
+    } else {
+      store.reconcileOperation(operation.operation_id, "not_applied", normalized);
+    }
+    store.event(runId, "planning.revision_reconciled", { operationId: operation.operation_id, state, ...(state === "completed" ? { commit: planCommit } : {}) });
+  })();
+  return { operation_id: operation.operation_id, state, ...(state === "completed" ? { plan_commit: planCommit as string } : {}), reused: false };
 };
 
 const readSafeFile = async (path: string): Promise<string> => {
@@ -61,7 +171,9 @@ const readSafeFile = async (path: string): Promise<string> => {
 const requestOptions = (command: Command): Command => command.option("--request-file <file>").option("--request-stdin");
 
 export const buildProgram = (): Command => {
-  const program = new Command().name("ai-team").description("Local AI coding team workflow orchestration").version(PACKAGE_VERSION).option("--human", "render human-readable output");
+  const program = new Command().name("ai-team").description("Local AI coding team workflow orchestration").version(PACKAGE_VERSION)
+    .option("--human", "render human-readable output")
+    .option("--legacy-output", "include legacy top-level success fields");
   program.configureOutput({ outputError: (text) => process.stderr.write(text) });
 
   program.command("init").argument("<project>").option("--yes", "confirm patches to dirty project files").action(async (project, options) => output(await initializeProject(project, options.yes)));
@@ -92,15 +204,20 @@ export const buildProgram = (): Command => {
   const revision = planning.command("revision");
   revision.command("create").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--target-branch <branch>").requiredOption("--documents-file <file>").option("--supersedes <nnn>").option("--run-id <id>").action(async (options) => {
     const docs = JSON.parse(await readSafeFile(options.documentsFile)) as RevisionDocuments;
-    const result = await writeRevision(options.project, options.planId, options.revision, options.targetBranch, docs, options.supersedes);
     const repo = await repositoryIdentity(options.project);
-    await withStore((store) => {
+    output(await withStore(async (store) => {
+      if (options.runId) {
+        const run = store.getRun(options.runId) as { profile: string; repo_id: string; stage: string };
+        if (run.profile !== "planning" || run.repo_id !== repo.repoId) throw new ValidationError("planning revision does not belong to this run repository");
+        assertRevisionRunStage("draft", run.stage);
+      }
+      const result = await writeRevision(options.project, options.planId, options.revision, options.targetBranch, docs, options.supersedes);
       store.registerRepository(repo.repoId, repo.commonDir, repo.root);
       store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,supersedes,created_at) VALUES (?,?,?,'draft',?,?,?,?)")
         .run(options.planId, options.revision, repo.repoId, options.targetBranch, result.digest, options.supersedes ?? null, new Date().toISOString());
       if (options.runId) store.bindPlanningRevision(options.runId, repo.repoId, options.planId, options.revision);
-    });
-    output(result);
+      return result;
+    }));
   });
   revision.command("transition").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--to <state>").option("--plan-commit <sha>").action(async (options) => {
     const repo = await repositoryIdentity(options.project);
@@ -109,11 +226,13 @@ export const buildProgram = (): Command => {
       if (!row) throw new ValidationError("planning revision not found");
       if (options.to === "ready") throw new ValidationError("ready state requires planning revision commit");
       const state = nextPlanState(row.state, options.to);
+      const runs = store.db.prepare("SELECT run_id,stage FROM runs WHERE repo_id=? AND profile='planning' AND plan_id=? AND revision=? AND state='active'").all(repo.repoId, options.planId, options.revision) as Array<{ run_id: string; stage: string }>;
+      if (runs.length > 1) throw new ValidationError("planning revision has multiple bound active runs");
+      if (runs[0]) assertRevisionRunStage(row.state, runs[0].stage, state);
       let dispatchId: string | undefined;
       const transition = store.db.transaction(() => {
         store.db.prepare("UPDATE revisions SET state=?,plan_commit=COALESCE(?,plan_commit) WHERE repo_id=? AND plan_id=? AND revision=?").run(state, options.planCommit ?? null, repo.repoId, options.planId, options.revision);
         if (state === "plan_ready") {
-          const runs = store.db.prepare("SELECT run_id FROM runs WHERE repo_id=? AND profile='planning' AND plan_id=? AND revision=? AND state='active'").all(repo.repoId, options.planId, options.revision) as Array<{ run_id: string }>;
           if (runs.length !== 1) throw new ValidationError("plan_ready transition requires exactly one bound active planning run");
           dispatchId = new DispatchService(store).createPlanningCommit(runs[0]!.run_id, {
             objective: `Commit immutable planning revision ${options.planId}/${options.revision}.`,
@@ -131,14 +250,87 @@ export const buildProgram = (): Command => {
   revision.command("commit").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").action(async (options) => {
     const repo = await repositoryIdentity(options.project);
     output(await withStore(async (store) => {
-      new DispatchService(store).assertClaimed(options.runId, options.dispatchId, "git-operator");
-      const run = store.getRun(options.runId) as { repo_id: string; profile: string };
+      new DispatchService(store).assertPlanningCommitClaimed(options.runId, options.dispatchId, options.planId, options.revision);
+      const run = store.getRun(options.runId) as { repo_id: string; profile: string; stage: string; state: string };
       if (run.repo_id !== repo.repoId || run.profile !== "planning") throw new ValidationError("planning commit dispatch does not belong to this revision repository");
-      const row = store.db.prepare("SELECT * FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?").get(repo.repoId, options.planId, options.revision) as any;
-      if (!row || !["plan_ready", "tasks_preview"].includes(row.state) || !row.digest) throw new ValidationError("planning revision is not ready to commit");
-      const commit = await commitPlanningRevision(repo.root, options.planId, options.revision, row.digest);
-      store.db.prepare("UPDATE revisions SET state='ready',plan_commit=? WHERE repo_id=? AND plan_id=? AND revision=?").run(commit, repo.repoId, options.planId, options.revision);
-      return { state: "ready", plan_commit: commit };
+      if (run.state !== "active") throw new ValidationError("planning run must be active before revision commit");
+      const row = store.db.prepare("SELECT * FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?").get(repo.repoId, options.planId, options.revision) as { state: string; digest?: string; plan_commit?: string } | undefined;
+      if (!row || !["plan_ready", "tasks_preview", "ready"].includes(row.state) || !row.digest) throw new ValidationError("planning revision is not ready to commit");
+      assertRevisionRunStage(row.state, run.stage, "ready");
+      const operationRequest: PlanningCommitRequest = {
+        repo_id: repo.repoId,
+        run_id: options.runId,
+        plan_id: options.planId,
+        revision: options.revision,
+        digest: row.digest,
+        dispatch_id: options.dispatchId,
+      };
+      const operationBaseKey = planningCommitBaseKey(operationRequest);
+      const attempts = (store.db.prepare("SELECT operation_id,idempotency_key,state,evidence_json FROM operations WHERE idempotency_key=? OR idempotency_key GLOB ?")
+        .all(operationBaseKey, `${operationBaseKey}:attempt:*`) as Array<{ operation_id: string; idempotency_key: string; state: string; evidence_json?: string }>)
+        .map((item) => ({
+          ...item,
+          attempt: item.idempotency_key === operationBaseKey ? 1 : Number(item.idempotency_key.slice(`${operationBaseKey}:attempt:`.length)),
+        }))
+        .filter(({ attempt }) => Number.isSafeInteger(attempt) && attempt > 0)
+        .sort((left, right) => left.attempt - right.attempt);
+      const latestAttempt = attempts.at(-1);
+      if (row.state === "ready" && !latestAttempt) {
+        throw new ValidationError("ready planning revision has no matching commit operation; reconcile state before retry");
+      }
+      if (latestAttempt?.state === "completed") {
+        if (row.state === "ready" && latestAttempt.evidence_json) {
+          const evidence = JSON.parse(latestAttempt.evidence_json) as { state?: string; plan_commit?: string };
+          if (evidence.state === "ready" && evidence.plan_commit === row.plan_commit) {
+            return { state: "ready", plan_commit: evidence.plan_commit, operation_id: latestAttempt.operation_id, reused: true };
+          }
+        }
+        throw new ValidationError(`planning revision commit operation ${latestAttempt.operation_id} is completed but state has not converged; reconcile before retry`);
+      }
+      let attempt = 1;
+      if (latestAttempt) {
+        if (latestAttempt.state !== "failed") {
+          throw new ValidationError(`planning revision commit operation ${latestAttempt.operation_id} is ${latestAttempt.state}; reconcile before retry`, {
+            operation_id: latestAttempt.operation_id,
+            state: latestAttempt.state,
+          });
+        }
+        const priorEvidence = latestAttempt.evidence_json ? JSON.parse(latestAttempt.evidence_json) as { reconciliation?: string } : undefined;
+        if (priorEvidence?.reconciliation !== "not_applied") {
+          throw new ValidationError(`planning revision commit operation ${latestAttempt.operation_id} failed without confirmed not_applied evidence`);
+        }
+        attempt = latestAttempt.attempt + 1;
+      }
+      const operationKey = attempt === 1 ? operationBaseKey : `${operationBaseKey}:attempt:${attempt}`;
+      const operation = store.beginOperation("planning.revision.commit", operationKey, {
+        ...operationRequest,
+        attempt,
+      }, options.runId);
+      if (operation.reused) {
+        throw new ValidationError(`planning revision commit operation ${operation.operationId} is ${operation.state}; reconcile before retry`, {
+          operation_id: operation.operationId,
+          state: operation.state,
+        });
+      }
+      let commit: string;
+      try {
+        commit = await commitPlanningRevision(repo.root, options.planId, options.revision, row.digest);
+      } catch (error) {
+        store.event(options.runId, "planning.revision_commit_uncertain", {
+          operationId: operation.operationId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw new ValidationError("planning revision commit failed; reconcile pending operation before retry", {
+          operation_id: operation.operationId,
+        });
+      }
+      store.db.transaction(() => {
+        store.db.prepare("UPDATE revisions SET state='ready',plan_commit=? WHERE repo_id=? AND plan_id=? AND revision=?").run(commit, repo.repoId, options.planId, options.revision);
+        store.db.prepare("UPDATE runs SET stage='ready',updated_at=? WHERE run_id=?").run(new Date().toISOString(), options.runId);
+        store.event(options.runId, "planning.revision_committed", { planId: options.planId, revision: options.revision, commit });
+        store.finishOperation(operation.operationId, { state: "ready", plan_commit: commit });
+      })();
+      return { state: "ready", plan_commit: commit, operation_id: operation.operationId, reused: false };
     }));
   });
   const tasks = planning.command("tasks");
@@ -166,15 +358,9 @@ export const buildProgram = (): Command => {
     });
 
   const run = program.command("run");
-  run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId), decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId), dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId) }))));
-  run.command("resume").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({
-    run: store.getRun(runId),
-    pending_dispatches: store.db.prepare("SELECT dispatch_id,role,state FROM dispatches WHERE run_id=? AND state!='completed'").all(runId),
-    pending_decision: store.db.prepare("SELECT * FROM decisions WHERE run_id=? AND status='pending'").get(runId) ?? null,
-    pending_operations: store.db.prepare("SELECT operation_id,kind,state FROM operations WHERE run_id=? AND state='pending'").all(runId),
-    last_event: store.db.prepare("SELECT type,payload_json,created_at FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT 1").get(runId) ?? null,
-  }))));
-  run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined; store.decide(options.runId, options.decisionId, options.choice, note); const run = store.getRun(options.runId) as { profile: string }; const dispatchId = run.profile === "planning" ? new DispatchService(store).continuePlanning(options.runId) : undefined; output({ status: "resolved", ...(dispatchId ? { dispatch_id: dispatchId } : {}) }); }));
+  run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId), decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId), dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId) }), { readonly: true })));
+  run.command("resume").argument("<run-id>").action(async (runId) => output(await withStore((store) => new DispatchService(store).resume(runId))));
+  run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined; const run = store.getRun(options.runId) as { profile: string }; const dispatchId = run.profile === "planning" ? new DispatchService(store).resolvePlanningDecision(options.runId, options.decisionId, options.choice, note) : (store.decide(options.runId, options.decisionId, options.choice, note), undefined); output({ status: "resolved", ...(dispatchId ? { dispatch_id: dispatchId } : {}) }); }));
 
   const dispatch = program.command("dispatch");
   dispatch.command("create").requiredOption("--run-id <id>").addOption(roleOption()).requiredOption("--packet-file <file>").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).option("--actor-dispatch-id <id>").action(async (options) => output(await withStore(async (store) => {
@@ -185,14 +371,14 @@ export const buildProgram = (): Command => {
   })));
   const dispatchCommand = (name: string): Command => dispatch.command(name).requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").addOption(roleOption()).hook("preAction", (_command, action) => validateCommand("dispatch.identity", { runId: action.opts().runId, dispatchId: action.opts().dispatchId, role: action.opts().role }));
   dispatchCommand("claim").action(async (options) => output(await withStore((store) => new DispatchService(store).claim(options.runId, options.dispatchId, options.role))));
-  dispatchCommand("prompt").action(async (options) => { process.stdout.write(`${await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role))}\n`); });
-  dispatchCommand("schema").action(async (options) => output(await withStore((store) => new DispatchService(store).schema(options.runId, options.dispatchId, options.role))));
-  dispatchCommand("template").action(async (options) => output(await withStore((store) => new DispatchService(store).template(options.runId, options.dispatchId, options.role))));
-  dispatchCommand("validate").requiredOption("--result-file <file>").action(async (options) => output({ valid: true, result: await withStore((store) => new DispatchService(store).validateFile(options.runId, options.dispatchId, options.role, options.resultFile)) }));
+  dispatchCommand("prompt").action(async (options) => output(await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role), { readonly: true }), { legacyRaw: true }));
+  dispatchCommand("schema").action(async (options) => output(await withStore((store) => new DispatchService(store).schema(options.runId, options.dispatchId, options.role), { readonly: true })));
+  dispatchCommand("template").action(async (options) => output(await withStore((store) => new DispatchService(store).template(options.runId, options.dispatchId, options.role), { readonly: true })));
+  dispatchCommand("validate").requiredOption("--result-file <file>").action(async (options) => output({ valid: true, result: await withStore((store) => new DispatchService(store).validateFile(options.runId, options.dispatchId, options.role, options.resultFile), { readonly: true }) }));
   dispatchCommand("submit").requiredOption("--result-file <file>").action(async (options) => output(await withStore((store) => new DispatchService(store).submit(options.runId, options.dispatchId, options.role, options.resultFile))));
 
   const gitCommand = program.command("git");
-  gitCommand.command("status").requiredOption("--run-id <id>").action(async ({ runId }) => output(await withStore(async (store) => { const run = store.getRun(runId); const repo = store.db.prepare("SELECT * FROM repositories WHERE repo_id=?").get(run.repo_id); return { run_id: runId, repository: repo, worktree: await worktreeStatus((repo as any).project_path) }; })));
+  gitCommand.command("status").requiredOption("--run-id <id>").action(async ({ runId }) => output(await withStore(async (store) => { const run = store.getRun(runId); const repo = store.db.prepare("SELECT * FROM repositories WHERE repo_id=?").get(run.repo_id); return { run_id: runId, repository: repo, worktree: await worktreeStatus((repo as any).project_path) }; }, { readonly: true })));
   gitCommand.command("prepare").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--task-id <id>", "task id or implementation", "implementation").option("--integration").option("--base-commit <sha>").option("--depends-on <worktree-id>").action(async (options) => output(await withStore((store) => options.integration ? new GitOrchestrator(store).prepareIntegration(options.runId, options.dispatchId) : new GitOrchestrator(store).prepareTask(options.runId, options.taskId, options.baseCommit, options.dependsOn, options.dispatchId))));
   gitCommand.command("commit").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--worktree-id <id>").requiredOption("--message <message>").requiredOption("--scope <paths>", "comma-separated repository-relative scopes").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).commit(options.runId, options.worktreeId, options.message, options.scope.split(","), options.dispatchId))));
   gitCommand.command("merge-task").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--task-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).mergeTask(options.runId, options.integrationId, options.taskId, options.dispatchId)) }));
@@ -203,6 +389,12 @@ export const buildProgram = (): Command => {
     if (options.operationId) {
       if (!options.state || !options.evidenceFile) throw new ValidationError("reconcile mutation requires --state and --evidence-file");
       const evidence = JSON.parse(await readSafeFile(options.evidenceFile));
+      const operation = store.db.prepare("SELECT operation_id,run_id,idempotency_key,kind,state,request_json,evidence_json FROM operations WHERE operation_id=?")
+        .get(options.operationId) as PlanningCommitOperation | undefined;
+      if (operation?.kind === "planning.revision.commit") {
+        if (!["completed", "not_applied"].includes(options.state)) throw new ValidationError("planning commit reconciliation state must be completed or not_applied");
+        return reconcilePlanningCommit(store, operation, options.runId, options.dispatchId, options.state, evidence);
+      }
       store.reconcileOperation(options.operationId, options.state, evidence);
     }
     return new GitOrchestrator(store).reconcile(options.runId);
@@ -228,7 +420,7 @@ export const buildProgram = (): Command => {
   review.command("create").requiredOption("--run-id <id>").requiredOption("--revision-sha <sha>").option("--formal").action(async (options) => { validateCommand("review.create", { runId: options.runId, revisionSha: options.revisionSha, formal: options.formal }); output(await withStore((store) => new ReviewService(store).create(options.runId, options.revisionSha, options.formal))); });
   review.command("submit").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").requiredOption("--result-file <file>").action(async (options) => output(await withStore(async (store) => new ReviewService(store).submit(options.runId, options.barrierId, JSON.parse(await readSafeFile(options.resultFile)) as ReviewResult))));
   review.command("resolve").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").requiredOption("--resolution-file <file>").action(async (options) => output(await withStore(async (store) => new ReviewService(store).resolve(options.runId, options.barrierId, JSON.parse(await readSafeFile(options.resolutionFile)) as FindingResolution[]))));
-  review.command("status").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").action(async (options) => output(await withStore((store) => new ReviewService(store).status(options.runId, options.barrierId))));
+  review.command("status").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").action(async (options) => output(await withStore((store) => new ReviewService(store).status(options.runId, options.barrierId), { readonly: true })));
 
   program.command("install").option("--platform <list>", "comma-separated platforms", platformList).option("--dry-run").action(async (options) => { const service = new EnvironmentService(); const environment = await service.load(await service.active()); const platforms = options.platform ?? environment.platforms; const versions = await service.validateClientVersions(platforms); output({ versions, plan: await service.generate(environment.name, platforms, options.dryRun) }); });
   const env = program.command("env");
@@ -251,6 +443,7 @@ export const buildProgram = (): Command => {
 
 export const main = async (argv = process.argv): Promise<void> => {
   humanOutput = argv.includes("--human");
+  legacyOutput = argv.includes("--legacy-output");
   try { await buildProgram().parseAsync(argv); }
   catch (error) {
     if (error instanceof AiTeamError) {

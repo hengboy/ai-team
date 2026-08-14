@@ -57,10 +57,60 @@ export interface RevisionDocuments {
   taskFiles?: Record<string, string>;
 }
 
+const pointer = (value: string): string => value.replace(/~/g, "~0").replace(/\//g, "~1");
+
+export function assertRevisionDocuments(value: unknown): asserts value is RevisionDocuments {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ValidationError("revision documents are invalid", [{ path: "/", message: "must be an object" }]);
+  }
+  const documents = value as Record<string, unknown>;
+  const allowed = new Set(["spec", "plan", "tasks", "taskFiles"]);
+  const errors: Array<{ path: string; message: string }> = Object.keys(documents)
+    .filter((key) => !allowed.has(key))
+    .map((key) => ({ path: `/${pointer(key)}`, message: "unknown field" }));
+  for (const field of ["spec", "plan"] as const) {
+    if (typeof documents[field] !== "string") errors.push({ path: `/${field}`, message: "must be a string" });
+  }
+  if (documents.tasks !== undefined && typeof documents.tasks !== "string") {
+    errors.push({ path: "/tasks", message: "must be a string" });
+  }
+  if (documents.taskFiles !== undefined) {
+    if (!documents.taskFiles || typeof documents.taskFiles !== "object" || Array.isArray(documents.taskFiles)) {
+      errors.push({ path: "/taskFiles", message: "must be an object" });
+    } else {
+      for (const [name, document] of Object.entries(documents.taskFiles)) {
+        if (typeof document !== "string") errors.push({ path: `/taskFiles/${pointer(name)}`, message: "must be a string" });
+      }
+    }
+  }
+  if (errors.length) throw new ValidationError("revision documents are invalid", errors);
+}
+
+export const REVISION_RUN_STAGES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  draft: ["plan_ready"],
+  requirements_confirmed: ["plan_ready"],
+  spec_ready: ["plan_ready"],
+  plan_ready: ["plan_ready", "tasks_preview"],
+  tasks_preview: ["tasks_preview"],
+  ready: ["plan_ready", "tasks_preview", "ready"],
+  implemented: ["ready"],
+  superseded: ["ready"],
+  abandoned: ["plan_ready", "tasks_preview", "ready"],
+});
+
+export const assertRevisionRunStage = (revisionState: string, runStage: string, targetState = revisionState): void => {
+  for (const state of [revisionState, targetState]) {
+    if (!REVISION_RUN_STAGES[state]?.includes(runStage)) {
+      throw new ValidationError(`revision state ${state} is incompatible with planning run stage ${runStage}`);
+    }
+  }
+};
+
 export const writeRevision = async (project: string, planId: string, revision: string, targetBranch: string, docs: RevisionDocuments, supersedes?: string): Promise<{ path: string; digest: string }> => {
   if (!/^\d{8}-[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{4}$/.test(planId)) throw new ValidationError("invalid plan id");
   if (!/^\d{3}$/.test(revision)) throw new ValidationError("invalid revision");
   if (supersedes && !/^\d{3}$/.test(supersedes)) throw new ValidationError("invalid superseded revision");
+  assertRevisionDocuments(docs);
   const revisionPath = join(project, ".ai-team", "plans", planId, "revisions", revision);
   await canonicalizeInside(project, join(".ai-team", "plans", planId), true);
   try { await stat(revisionPath); throw new ValidationError("planning revisions are immutable; create a new revision"); } catch (error) { if (error instanceof ValidationError) throw error; }

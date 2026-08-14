@@ -6,6 +6,7 @@ import { ValidationError } from "./errors.js";
 import { ROLE_MANIFEST } from "./roles.js";
 import { assertReadablePath, assertWritablePath } from "./security.js";
 import { StateStore } from "./state.js";
+import { assertRevisionRunStage } from "./planning.js";
 import { assertRelativePosixPath, makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
 
 export interface DispatchPacket {
@@ -14,6 +15,14 @@ export interface DispatchPacket {
   allowed_write_paths: string[];
   acceptance_criteria: string[];
   context: Record<string, unknown>;
+}
+
+export interface RunResumeResult {
+  run: Record<string, unknown>;
+  pending_dispatches: Array<{ dispatch_id: string; role: string; state: string }>;
+  pending_decision: Record<string, unknown> | null;
+  pending_operations: Array<{ operation_id: string; kind: string; state: string }>;
+  last_event: Record<string, unknown> | null;
 }
 
 const RENDERER_VERSION = "dispatch-renderer-v2";
@@ -93,7 +102,14 @@ export class DispatchService {
     const revision = this.store.db.prepare("SELECT state FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
       .get(run.repo_id, run.plan_id, run.revision) as { state: string } | undefined;
     if (revision?.state !== "plan_ready") throw new ValidationError("planning commit dispatch requires a plan_ready revision");
-    const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator' AND state!='failed'").get(runId) as { dispatch_id: string } | undefined;
+    const context = packet.context as { plan_id?: string; revision?: string };
+    if (context.plan_id !== run.plan_id || context.revision !== run.revision) {
+      throw new ValidationError("planning commit packet does not match the bound planning revision");
+    }
+    const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches
+      WHERE run_id=? AND role='git-operator' AND state!='failed'
+      AND json_extract(packet_json,'$.context.plan_id')=? AND json_extract(packet_json,'$.context.revision')=?`)
+      .get(runId, run.plan_id, run.revision) as { dispatch_id: string } | undefined;
     if (existing) return existing.dispatch_id;
     return this.insert(runId, "git-operator", validatePacket(packet, "git-operator"));
   }
@@ -152,8 +168,34 @@ export class DispatchService {
     if (row.state !== "claimed") throw new ValidationError(`${role} dispatch must be claimed before this operation`);
   }
 
+  assertPlanningCommitClaimed(runId: string, dispatchId: string, planId: string, revision: string): void {
+    this.assertClaimed(runId, dispatchId, "git-operator");
+    const run = this.store.getRun(runId) as { profile: string; plan_id?: string; revision?: string };
+    let packet: DispatchPacket;
+    try {
+      const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+        .get(runId, dispatchId) as { packet_json: string };
+      packet = JSON.parse(row.packet_json) as DispatchPacket;
+    } catch {
+      throw new ValidationError("planning commit dispatch does not match the requested revision");
+    }
+    const context = packet.context as unknown;
+    const contextMatches = Boolean(context && typeof context === "object" && !Array.isArray(context)
+      && (context as { plan_id?: string }).plan_id === planId
+      && (context as { revision?: string }).revision === revision);
+    if (run.profile !== "planning" || run.plan_id !== planId || run.revision !== revision || !contextMatches) {
+      throw new ValidationError("planning commit dispatch does not match the requested revision");
+    }
+  }
+
   async validateFile(runId: string, dispatchId: string, role: Role, path: string): Promise<ResultEnvelope> {
-    this.get(runId, dispatchId, role);
+    const dispatch = this.get(runId, dispatchId, role) as { state: string };
+    if (!["claimed", "completed", "needs_decision"].includes(dispatch.state)) {
+      throw new ValidationError("dispatch must be claimed before validate");
+    }
+    const run = this.store.getRun(runId) as { state: string };
+    const validRunState = dispatch.state === "needs_decision" ? run.state === "needs_decision" : run.state === "active";
+    if (!validRunState) throw new ValidationError("run must be active before validate");
     assertReadablePath(path);
     const info = await stat(path);
     if (info.size > 2 * 1024 * 1024) throw new ValidationError("result file exceeds the 2 MiB limit");
@@ -167,7 +209,7 @@ export class DispatchService {
 
   async submit(runId: string, dispatchId: string, role: Role, path: string): Promise<{ reused: boolean; artifact: string }> {
     const row = this.get(runId, dispatchId, role);
-    if (row.state === "completed") {
+    if (["completed", "needs_decision"].includes(row.state) && row.result_json) {
       const result = JSON.parse(row.result_json) as ResultEnvelope;
       const incoming = await this.validateFile(runId, dispatchId, role, path);
       if (stableJson(result) !== stableJson(incoming)) throw new ValidationError("dispatch was already submitted with a different result");
@@ -182,13 +224,15 @@ export class DispatchService {
     await writeFile(artifact, redacted, { mode: 0o600 });
     const digest = sha256(redacted);
     const artifactId = `artifact_${digest.slice(0, 24)}`;
-    const dispatchState = result.status === "completed" ? "completed" : result.status;
+    const planningPayload = role === "planning" ? result.payload as { pending_questions?: string[] } : undefined;
+    const planningQuestion = role === "planning" && (result.status === "needs_decision" || result.status === "completed" && planningPayload?.pending_questions?.length === 1);
+    const dispatchState = planningQuestion ? "needs_decision" : result.status === "completed" ? "completed" : result.status;
     const transaction = this.store.db.transaction(() => {
       this.store.db.prepare("UPDATE dispatches SET state=?,result_json=?,completed_at=? WHERE dispatch_id=?").run(dispatchState, stableJson(result), new Date().toISOString(), dispatchId);
       this.store.db.prepare("INSERT OR IGNORE INTO artifacts(artifact_id,run_id,dispatch_id,kind,path,sha256,redacted,created_at) VALUES (?,?,?,'result',?,?,1,?)")
         .run(artifactId, runId, dispatchId, artifact, digest, new Date().toISOString());
       this.store.event(runId, "dispatch.completed", { dispatchId, status: result.status, artifactId, digest });
-      if (result.status === "completed") {
+      if (result.status === "completed" || planningQuestion) {
         if (role === "planning") this.advancePlanning(runId, result);
         else this.advanceRun(runId, role, result);
       } else {
@@ -220,7 +264,7 @@ export class DispatchService {
 
   private advancePlanning(runId: string, result: ResultEnvelope): void {
     const payload = result.payload as { stage: string; pending_questions: string[]; decision: { question: string; choices: Array<{ id: string; label: string; impact: string }>; recommendation: string } | null };
-    const run = this.store.getRun(runId) as { stage: string };
+    const run = this.store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string; stage: string };
     const transitions: Record<string, string[]> = {
       planning: ["requirements"],
       requirements: ["requirements", "requirements_confirmed"],
@@ -231,14 +275,24 @@ export class DispatchService {
       ready: [],
     };
     if (!transitions[run.stage]?.includes(payload.stage)) throw new ValidationError(`invalid planning stage transition: ${run.stage} -> ${payload.stage}`);
+    if (run.plan_id && run.revision) {
+      const revision = this.store.db.prepare("SELECT state FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+        .get(run.repo_id, run.plan_id, run.revision) as { state: string } | undefined;
+      if (!revision) throw new ValidationError("bound planning revision not found");
+      assertRevisionRunStage(revision.state, payload.stage);
+    }
     if (payload.pending_questions.length && payload.stage !== "requirements" && payload.stage !== "tasks_preview") {
       throw new ValidationError(`planning stage ${payload.stage} cannot have pending questions`);
     }
-    this.store.db.prepare("UPDATE runs SET stage=?,updated_at=? WHERE run_id=?").run(payload.stage, new Date().toISOString(), runId);
+    const needsDecision = payload.pending_questions.length === 1;
+    this.store.db.prepare("UPDATE runs SET stage=?,state=?,updated_at=? WHERE run_id=?")
+      .run(payload.stage, needsDecision ? "needs_decision" : "active", new Date().toISOString(), runId);
     this.store.event(runId, "planning.stage_changed", { stage: payload.stage });
-    if (payload.pending_questions.length === 1) {
+    if (needsDecision) {
       if (!payload.decision) throw new ValidationError("planning pending question requires one matching decision");
       this.store.createDecision(runId, payload.decision.question, payload.decision.choices, payload.decision.recommendation);
+    } else if (payload.stage !== "ready") {
+      this.continuePlanning(runId);
     }
   }
 
@@ -247,11 +301,77 @@ export class DispatchService {
     if (run.profile !== "planning") throw new ValidationError("only planning runs can continue planning");
     const pending = this.store.db.prepare("SELECT 1 FROM decisions WHERE run_id=? AND status='pending'").get(runId);
     if (pending) throw new ValidationError("planning cannot continue with a pending decision");
+    const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='planning' AND state IN ('pending','claimed') ORDER BY created_at DESC LIMIT 1")
+      .get(runId) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
     return this.create(runId, "planning", {
-      objective: "Continue the planning workflow from the resolved user decision, asking at most one highest-priority question.",
+      objective: "Continue the planning workflow from the current stage, asking at most one highest-priority question.",
       allowed_read_paths: ["package.json"], allowed_write_paths: [".ai-team/plans/**"],
       acceptance_criteria: ["Return the next planning stage", "Return at most one pending question"], context: { stage: run.stage },
     }, "planning");
+  }
+
+  resolvePlanningDecision(runId: string, decisionId: string, choice: string, note?: string): string {
+    const run = this.store.getRun(runId) as { profile: string };
+    if (run.profile !== "planning") throw new ValidationError("only planning runs can resolve planning decisions");
+    let dispatchId = "";
+    this.store.db.transaction(() => {
+      this.store.decide(runId, decisionId, choice, note);
+      this.store.db.prepare(`UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=(
+        SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='planning' AND state='needs_decision' ORDER BY created_at DESC LIMIT 1
+      )`)
+        .run(new Date().toISOString(), runId);
+      this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+      dispatchId = this.continuePlanning(runId);
+    })();
+    return dispatchId;
+  }
+
+  resume(runId: string): RunResumeResult {
+    this.store.db.transaction(() => {
+      const run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
+      const pendingDecision = this.store.db.prepare("SELECT 1 FROM decisions WHERE run_id=? AND status='pending'").get(runId);
+      const pendingOperation = this.store.db.prepare("SELECT 1 FROM operations WHERE run_id=? AND state='pending'").get(runId);
+      if (pendingDecision || pendingOperation || run.profile !== "planning") return;
+      const pendingDispatch = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId);
+      if (pendingDispatch) return;
+      const recoverableRetryableStage = ["file-explorer", "planning", "requirements", "requirements_confirmed", "spec_ready", "plan_ready", "tasks_preview"].includes(run.stage);
+      const retryableDispatch = run.state === "retryable_failure" && recoverableRetryableStage
+        ? this.store.db.prepare("SELECT dispatch_id,result_json FROM dispatches WHERE run_id=? AND role IN ('file-explorer','planning') AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1").get(runId) as { dispatch_id: string; result_json?: string } | undefined
+        : undefined;
+      let retryableHasNoSideEffects = false;
+      if (retryableDispatch?.result_json) {
+        try {
+          const result = JSON.parse(retryableDispatch.result_json) as { status?: string; side_effect_state?: string };
+          retryableHasNoSideEffects = result.status === "retryable_failure" && result.side_effect_state === "none";
+        } catch { /* corrupt legacy results remain blocked */ }
+      }
+      if (retryableDispatch && retryableHasNoSideEffects) {
+        this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
+          .run(new Date().toISOString(), retryableDispatch.dispatch_id);
+        this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+        this.continuePlanning(runId);
+        return;
+      }
+      if (run.state === "retryable_failure") return;
+      if (!["planning", "requirements", "requirements_confirmed", "spec_ready", "plan_ready", "tasks_preview", "ready"].includes(run.stage)) return;
+      if (run.state === "needs_decision") {
+        this.store.db.prepare(`UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=(
+          SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='planning' AND state='needs_decision' ORDER BY created_at DESC LIMIT 1
+        )`)
+          .run(new Date().toISOString(), runId);
+        this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+      }
+      if (run.state !== "active" && run.state !== "needs_decision") return;
+      if (run.stage !== "ready") this.continuePlanning(runId);
+    })();
+    return {
+      run: this.store.getRun(runId),
+      pending_dispatches: this.store.db.prepare("SELECT dispatch_id,role,state FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").all(runId) as RunResumeResult["pending_dispatches"],
+      pending_decision: (this.store.db.prepare("SELECT * FROM decisions WHERE run_id=? AND status='pending'").get(runId) as Record<string, unknown> | undefined) ?? null,
+      pending_operations: this.store.db.prepare("SELECT operation_id,kind,state FROM operations WHERE run_id=? AND state='pending'").all(runId) as RunResumeResult["pending_operations"],
+      last_event: (this.store.db.prepare("SELECT type,payload_json,created_at FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT 1").get(runId) as Record<string, unknown> | undefined) ?? null,
+    };
   }
 
   private artifactPath(runId: string, dispatchId: string): string { return join(this.store.paths.artifacts, runId, dispatchId, "result.json"); }
