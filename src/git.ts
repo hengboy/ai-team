@@ -1,12 +1,19 @@
 import { execFile } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
 import { promisify } from "node:util";
-import { ValidationError } from "./errors.js";
+import { GitGateError } from "./errors.js";
 import { sha256 } from "./utils.js";
 
 const execFileAsync = promisify(execFile);
 
-const FORBIDDEN = new Set(["push", "tag", "rebase", "reset", "clean", "stash", "cherry-pick", "am"]);
+/** Commands used by the orchestrator. Keep this allowlist intentionally small:
+ * callers cannot turn the low-level wrapper into an arbitrary git shell. */
+const ALLOWED = new Set([
+  "add", "branch", "cat-file", "commit", "diff", "diff-tree", "log", "merge", "merge-base", "rev-list", "rev-parse",
+  "show", "show-ref", "status", "worktree",
+]);
+const FORBIDDEN = new Set(["push", "remote", "tag", "fetch", "pull", "rebase", "reset", "clean", "stash", "cherry-pick", "am", "amend", "squash"]);
+const FORBIDDEN_FLAGS = new Set(["--amend", "--squash", "--no-verify", "--allow-empty", "--exec", "--upload-pack", "--receive-pack"]);
 
 export interface GitResult {
   stdout: string;
@@ -14,15 +21,25 @@ export interface GitResult {
 }
 
 export const git = async (cwd: string, args: readonly string[]): Promise<GitResult> => {
-  if (!args[0] || FORBIDDEN.has(args[0]) || args.includes("--amend") || args.includes("--squash")) {
-    throw new ValidationError(`forbidden Git operation: ${args.join(" ")}`);
+  const command = args[0];
+  // Reject option injection before command parsing as well as known dangerous verbs.
+  const subcommand = args[1];
+  const invalidSubcommand = command === "worktree" && !new Set(["add", "list", "remove"]).has(subcommand ?? "")
+    || command === "branch" && ["-D", "-f", "--force"].includes(subcommand ?? "");
+  const forbiddenArgument = args.some((arg) => FORBIDDEN_FLAGS.has(arg) || ["--force", "-f", "-D", "--hard", "-C", "-A", "--all"].includes(arg));
+  const malformedTemplate = command === "add" && !args.includes("--")
+    || command === "commit" && !(args.includes("--no-edit") || args.includes("-m"))
+    || command === "merge" && !args.includes("--no-ff")
+    || command === "worktree" && subcommand === "add" && !args.includes("-b");
+  if (!command || command.startsWith("-") || FORBIDDEN.has(command) || !ALLOWED.has(command) || invalidSubcommand || forbiddenArgument || malformedTemplate) {
+    throw new GitGateError(`forbidden Git operation: ${args.join(" ")}`);
   }
   try {
     const result = await execFileAsync("git", [...args], { cwd, maxBuffer: 10 * 1024 * 1024 });
     return { stdout: result.stdout.replace(/[\r\n]+$/, ""), stderr: result.stderr.replace(/[\r\n]+$/, "") };
   } catch (error) {
     const detail = error as { stderr?: string; message?: string };
-    throw new ValidationError(`Git command failed: ${detail.stderr?.trim() || detail.message}`);
+    throw new GitGateError(`Git command failed: ${detail.stderr?.trim() || detail.message}`);
   }
 };
 

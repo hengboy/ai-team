@@ -6,15 +6,17 @@ import { promisify } from "node:util";
 import semver from "semver";
 import lockfile from "proper-lockfile";
 import YAML from "yaml";
-import { CONTRACT_DIGEST } from "./contracts.js";
+import { COMMAND_CONTRACT, CONTRACT_DIGEST } from "./contracts.js";
 import { resultEnvelopeSchema } from "./contracts.js";
 import { Ajv } from "ajv";
-import { ValidationError } from "./errors.js";
+import { IncompatibleError, ValidationError } from "./errors.js";
 import { getHomePaths } from "./home.js";
 import { AGENT_BUILD, ROLE_MANIFEST, ROLE_MANIFEST_DIGEST } from "./roles.js";
 import { renderRoleBody } from "./agent-build.js";
 import { ROLES, type Role } from "./constants.js";
 import { sha256, stableJson } from "./utils.js";
+import { commandContractFor } from "./command-contract.js";
+import { assertReadablePath, assertWritablePath } from "./security.js";
 
 const execFileAsync = promisify(execFile);
 export type Platform = "codex" | "claude" | "opencode";
@@ -60,6 +62,26 @@ export const environmentSchema = {
   },
 } as const;
 const validateEnvironmentSchema = new Ajv({ allErrors: true, strict: false }).compile(environmentSchema);
+
+export const environmentConfigSchema = {
+  $id: "https://ai-team.local/schemas/config-v1.json",
+  type: "object",
+  additionalProperties: false,
+  required: ["active_environment", "enabled_platforms", "client_versions", "state_schema_epoch"],
+  properties: {
+    active_environment: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
+    state_schema_epoch: { type: "integer", minimum: 1 },
+    enabled_platforms: { type: "array", uniqueItems: true, minItems: 1, items: { enum: PLATFORMS } },
+    client_versions: {
+      type: "object", additionalProperties: false, required: PLATFORMS,
+      properties: Object.fromEntries(PLATFORMS.map((platform) => [platform, {
+        type: "object", additionalProperties: false, required: ["command", "minimum", "verified"],
+        properties: { command: { type: "string", minLength: 1 }, minimum: { type: "string", minLength: 1 }, verified: { type: "string", minLength: 1 }, detected_version: { type: "string", minLength: 1 } },
+      }])),
+    },
+  },
+} as const;
+const validateEnvironmentConfig = new Ajv({ allErrors: true, strict: false }).compile(environmentConfigSchema);
 
 export const CLIENT_VERSIONS: Record<Platform, { command: string; minimum: string; verified: string; detected_version?: string }> = {
   codex: { command: "codex", minimum: "0.145.0", verified: "0.145.0" },
@@ -130,7 +152,8 @@ export const resolveEnvironment = (environment: EnvironmentFile): Record<Role, R
 };
 
 export interface AgentRenderInput { role: Role; model: ModelConfig; environment: string; }
-const COMMAND_PARAMETER_TYPES = Object.freeze({
+/* command syntax and parameter types are sourced from command-contract.ts */
+/*
   path: "string; canonical local filesystem path",
   file: "string; readable file path",
   json: "string; readable JSON file path",
@@ -153,7 +176,7 @@ const COMMAND_PARAMETER_TYPES = Object.freeze({
   text: "non-empty string",
 });
 
-const COMMAND_SYNTAX: Record<string, string[]> = {
+const LEGACY_RENDERER_NOT_USED: Record<string, string[]> = {
   "planning start": ["ai-team planning start --project <path> (--request-file <file> | --request-stdin)"],
   "planning revision create": ["ai-team planning revision create --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> --documents-file <file> [--supersedes <revision>] [--run-id <run-id>]"],
   "planning revision transition": ["ai-team planning revision transition --project <path> --plan-id <plan-id> --revision <revision> --to <state> [--plan-commit <commit>]"],
@@ -198,16 +221,13 @@ const COMMAND_SYNTAX: Record<string, string[]> = {
   "uninstall": ["ai-team uninstall [--dry-run]"],
 };
 
-const commandContractFor = (commands: string[]): { allowed_commands: string[]; syntax: string[]; parameter_types: typeof COMMAND_PARAMETER_TYPES } => ({
+const legacyRendererNotUsed = (commands: string[]): { allowed_commands: string[]; syntax: string[]; parameter_types: Record<string, string> } => ({
   allowed_commands: commands,
   syntax: [...new Set(commands.flatMap((command) => {
-    if (command === "review *") return ["review create", "review submit", "review resolve", "review status"].flatMap((item) => COMMAND_SYNTAX[item] ?? []);
-    if (command === "git *") return ["git status", "git prepare", "git commit", "git merge-task", "git continue-conflict", "git integrate", "git reconcile", "git cleanup"].flatMap((item) => COMMAND_SYNTAX[item] ?? []);
-    if (command === "env *") return ["env list", "env show", "env validate", "env edit", "env generate", "env switch", "env status", "env doctor"].flatMap((item) => COMMAND_SYNTAX[item] ?? []);
-    return COMMAND_SYNTAX[command] ?? [];
+    return LEGACY_RENDERER_NOT_USED[command] ?? [];
   }))],
-  parameter_types: COMMAND_PARAMETER_TYPES,
-});
+  parameter_types: {},
+}); */
 const renderBody = (role: Role, platform: Platform, model: ModelConfig, environment: string): string => {
   const definition = ROLE_MANIFEST[role];
   const commandContract = commandContractFor(definition.commands);
@@ -265,8 +285,9 @@ const replaceManagedBlock = (source: string, block: string | null): string => {
 };
 
 interface ManifestFile { path: string; digest: string; kind: "agent" | "instructions"; }
-interface EnvironmentManifest { environment: string; agent_build_digest?: string; template_version?: number; files: ManifestFile[]; changes?: Array<{ type: "deleted" | "renamed"; from: string; to?: string }>; }
+interface EnvironmentManifest { environment: string; agent_build_digest?: string; role_manifest_digest?: string; contract_digest?: string; template_version?: number; files: ManifestFile[]; changes?: Array<{ type: "deleted" | "renamed"; from: string; to?: string }>; }
 export interface GenerationPlan { writes: Array<{ path: string; content: string; kind: "agent" | "instructions" }>; backups: Array<{ source: string; destination: string }>; removals: string[]; blocked: string[]; }
+interface EnvironmentConfig { state_schema_epoch: number; active_environment: string; enabled_platforms: Platform[]; client_versions: Record<Platform, { command: string; minimum: string; verified: string; detected_version?: string }>; }
 
 export class EnvironmentService {
   readonly paths;
@@ -279,9 +300,26 @@ export class EnvironmentService {
       try { await stat(path); } catch { await writeFile(path, YAML.stringify(environment), { mode: 0o600 }); }
     }
     const config = join(this.paths.root, "config.yaml");
-    try { await stat(config); } catch { await writeFile(config, YAML.stringify({ active_environment: "balanced", enabled_platforms: PLATFORMS, client_versions: CLIENT_VERSIONS }), { mode: 0o600 }); }
+    try { await stat(config); } catch { await writeFile(config, YAML.stringify({ state_schema_epoch: 2, active_environment: "balanced", enabled_platforms: PLATFORMS, client_versions: CLIENT_VERSIONS }), { mode: 0o600 }); }
     await writeFile(join(this.paths.schemas, "result-envelope-v1.json"), `${JSON.stringify(resultEnvelopeSchema, null, 2)}\n`, { mode: 0o600 });
     await writeFile(join(this.paths.schemas, "environment-v1.json"), `${JSON.stringify(environmentSchema, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(join(this.paths.schemas, "config-v1.json"), `${JSON.stringify(environmentConfigSchema, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(join(this.paths.schemas, "command-contract-v1.json"), `${JSON.stringify(COMMAND_CONTRACT, null, 2)}\n`, { mode: 0o600 });
+  }
+
+  private async config(): Promise<EnvironmentConfig> {
+    await this.bootstrap();
+    const value = YAML.parse(await readFile(join(this.paths.root, "config.yaml"), "utf8")) as Partial<EnvironmentConfig>;
+    if (!validateEnvironmentConfig(value)) throw new ValidationError("environment config schema is invalid", validateEnvironmentConfig.errors);
+    const normalized = value as EnvironmentConfig;
+    return { state_schema_epoch: normalized.state_schema_epoch, active_environment: normalized.active_environment, enabled_platforms: [...new Set(normalized.enabled_platforms)], client_versions: normalized.client_versions };
+  }
+
+  private async enabledPlatforms(): Promise<Platform[]> { return (await this.config()).enabled_platforms; }
+
+  private assertEnabled(platforms: Platform[], enabled: Platform[]): void {
+    const disabled = platforms.filter((platform) => !enabled.includes(platform));
+    if (disabled.length) throw new ValidationError("platform is disabled", disabled);
   }
 
   async list(): Promise<string[]> { await this.bootstrap(); return (await readdir(this.paths.environments)).filter((file) => file.endsWith(".yaml")).map((file) => basename(file, ".yaml")).sort(); }
@@ -293,7 +331,7 @@ export class EnvironmentService {
     return parsed;
   }
 
-  async active(): Promise<string> { await this.bootstrap(); return (YAML.parse(await readFile(join(this.paths.root, "config.yaml"), "utf8")) as any).active_environment; }
+  async active(): Promise<string> { return (await this.config()).active_environment; }
 
   async validate(name: string): Promise<{ name: string; roles: number; platforms: number; digest: string }> {
     const environment = await this.load(name);
@@ -301,22 +339,24 @@ export class EnvironmentService {
   }
 
   async validateClientVersions(platforms: Platform[]): Promise<Array<{ platform: Platform; status: string; version?: string }>> {
-    await this.bootstrap();
-    const config = YAML.parse(await readFile(join(this.paths.root, "config.yaml"), "utf8")) as { client_versions: Record<Platform, { minimum: string; verified: string; detected_version?: string }> };
+    const config = await this.config();
     const selected = platforms.map((platform) => {
+      if (!config.enabled_platforms.includes(platform)) return { platform, status: "disabled" };
       const value = config.client_versions[platform]; const version = value.detected_version;
       if (!version) return { platform, status: "missing" };
       if (semver.lt(version, value.minimum)) return { platform, status: "blocked", version };
       return { platform, status: semver.gt(version, value.verified) ? "warning-unverified" : "supported", version };
     });
     const blocked = selected.filter((item) => item.status === "blocked" || item.status === "missing" || item.status === "unknown-version");
-    if (blocked.length) throw new ValidationError("client version gate blocked generation", blocked);
+    if (blocked.length) throw new IncompatibleError("client version gate blocked generation", blocked);
     return selected;
   }
 
   async plan(name: string, selected?: Platform[]): Promise<GenerationPlan> {
     const environment = await this.load(name);
-    if (selected) environment.platforms = selected;
+    const enabled = await this.enabledPlatforms();
+    if (selected) this.assertEnabled(selected, enabled);
+    environment.platforms = (selected ?? environment.platforms).filter((platform) => enabled.includes(platform));
     const rendered = renderAgents(environment);
     const targets = platformTargets(this.userHome);
     const writes: GenerationPlan["writes"] = [];
@@ -350,9 +390,16 @@ export class EnvironmentService {
       writes.push({ path, content: replaceManagedBlock(current, managedBlock(name)), kind: "instructions" });
     }
     const nextPaths = new Set(writes.map((item) => item.path));
-    const obsolete = (previous?.files ?? []).filter((file) => !nextPaths.has(file.path));
+    const obsolete = (previous?.files ?? []).filter((file) => {
+      if (nextPaths.has(file.path)) return false;
+      const platform = PLATFORMS.find((candidate) => file.path === targets[candidate].instructions || file.path.startsWith(`${targets[candidate].agents}${sep}`));
+      return !platform || enabled.includes(platform);
+    });
     const removals: string[] = [];
+    const disabledTargets = new Set<Platform>(PLATFORMS.filter((platform) => !enabled.includes(platform)));
     for (const file of obsolete) {
+      const disabled = [...disabledTargets].some((platform) => file.path === targets[platform].instructions || file.path.startsWith(`${targets[platform].agents}${sep}`));
+      if (disabled) continue;
       try {
         const current = await readFile(file.path, "utf8");
         if (sha256(current) !== file.digest) blocked.push(file.path);
@@ -414,7 +461,7 @@ export class EnvironmentService {
       const previousPaths = new Set(previousManifest?.files.map((file) => file.path) ?? []);
       const nextPaths = new Set(plan.writes.map((item) => item.path));
       const changes = [...previousPaths].filter((path) => !nextPaths.has(path)).map((path) => ({ type: "deleted" as const, from: path }));
-      await writeFile(stagedManifest, `${JSON.stringify({ environment: name, agent_build_digest: AGENT_BUILD.digest, template_version: AGENT_BUILD.templateVersion, files: plan.writes.map((item) => ({ path: item.path, digest: sha256(item.content), kind: item.kind })), changes }, null, 2)}\n`, { mode: 0o600 });
+      await writeFile(stagedManifest, `${JSON.stringify({ environment: name, agent_build_digest: AGENT_BUILD.digest, role_manifest_digest: ROLE_MANIFEST_DIGEST, contract_digest: CONTRACT_DIGEST, template_version: AGENT_BUILD.templateVersion, files: plan.writes.map((item) => ({ path: item.path, digest: sha256(item.content), kind: item.kind })), changes }, null, 2)}\n`, { mode: 0o600 });
       await writeFile(stagedConfig, YAML.stringify(config), { mode: 0o600 });
       await rename(stagedManifest, manifestPath);
       await rename(stagedConfig, configPath);
@@ -426,10 +473,14 @@ export class EnvironmentService {
     } finally { await rm(stage, { recursive: true, force: true }); }
   }
 
-  async status(): Promise<Array<{ path: string; state: "in-sync" | "missing" | "drifted" }>> {
+  async status(): Promise<Array<{ path: string; state: "in-sync" | "missing" | "drifted" | "disabled" }>> {
     const manifestPath = join(this.paths.root, "manifest.json");
     let manifest: any; try { manifest = JSON.parse(await readFile(manifestPath, "utf8")); } catch { return []; }
+    const enabled = await this.enabledPlatforms();
+    const targets = platformTargets(this.userHome);
     return Promise.all(manifest.files.map(async (file: any) => {
+      const platform = PLATFORMS.find((candidate) => file.path === targets[candidate].instructions || file.path.startsWith(`${targets[candidate].agents}${sep}`));
+      if (platform && !enabled.includes(platform)) return { path: file.path, state: "disabled" as const };
       try { return { path: file.path, state: sha256(await readFile(file.path, "utf8")) === file.digest ? "in-sync" : "drifted" }; }
       catch { return { path: file.path, state: "missing" }; }
     }));
@@ -456,6 +507,7 @@ export class EnvironmentService {
   }
 
   async restore(path: string, dryRun = false): Promise<{ source: string; destination: string }> {
+    assertReadablePath(path);
     const absolute = resolve(path);
     const backupRoot = resolve(this.paths.backups);
     const backupRel = relative(backupRoot, absolute);
@@ -468,6 +520,7 @@ export class EnvironmentService {
     const backupRelative = absolute.slice(resolve(this.paths.backups).length + 1).split("/");
     const legacyRelative = backupRelative.length > 2 ? backupRelative.slice(1).join("/") : undefined;
     const destination = indexed ?? (legacyRelative ? join(this.userHome, legacyRelative) : join(this.userHome, basename(absolute)));
+    assertWritablePath(destination);
     const destinationParent = dirname(destination);
     let existingParent = destinationParent;
     while (true) {
@@ -490,9 +543,10 @@ export class EnvironmentService {
   }
 
   async doctor(probe = false): Promise<Array<{ platform: Platform; status: string; version?: string }>> {
-    await this.bootstrap();
-    if (!probe) return PLATFORMS.map((platform) => ({ platform, status: "not-probed" }));
-    const results = await Promise.all(PLATFORMS.map(async (platform) => {
+    const config = await this.config();
+    const disabled = PLATFORMS.filter((platform) => !config.enabled_platforms.includes(platform));
+    const results = await Promise.all(PLATFORMS.filter((platform) => config.enabled_platforms.includes(platform)).map(async (platform) => {
+      if (!probe) return { platform, status: "not-probed" };
       try {
         const { stdout } = await execFileAsync(CLIENT_VERSIONS[platform].command, ["--version"]);
         const version = stdout.match(/\d+\.\d+\.\d+/)?.[0];
@@ -501,10 +555,12 @@ export class EnvironmentService {
         return { platform, status: semver.gt(version, CLIENT_VERSIONS[platform].verified) ? "warning-unverified" : "supported", version };
       } catch { return { platform, status: "missing" }; }
     }));
-    const configPath = join(this.paths.root, "config.yaml");
-    const config = YAML.parse(await readFile(configPath, "utf8"));
-    for (const result of results) if (result.version) config.client_versions[result.platform].detected_version = result.version;
-    await writeFile(configPath, YAML.stringify(config), { mode: 0o600 });
-    return results;
+    if (probe) {
+      const configPath = join(this.paths.root, "config.yaml");
+      const stored = YAML.parse(await readFile(configPath, "utf8")) as EnvironmentConfig;
+      for (const result of results) if (result.version) stored.client_versions[result.platform].detected_version = result.version;
+      await writeFile(configPath, YAML.stringify(stored), { mode: 0o600 });
+    }
+    return [...results, ...disabled.map((platform) => ({ platform, status: "disabled" }))].sort((left, right) => PLATFORMS.indexOf(left.platform) - PLATFORMS.indexOf(right.platform));
   }
 }

@@ -18,7 +18,7 @@ const supportedPlatforms: AgentBuildPlatform[] = ["codex", "claude", "opencode"]
 const reasoningValues = new Set(["low", "medium", "high", "xhigh"]);
 const effortValues = new Set(["low", "medium", "high"]);
 const variantValues = new Set(["low", "medium", "high"]);
-const supportedCommandPrefixes = ["planning start", "planning revision ", "coding start", "dispatch ", "decision create", "scope check", "run ", "review ", "git ", "install", "env ", "backup restore", "uninstall"];
+const supportedCommandPrefixes = ["planning start", "planning revision ", "planning tasks ", "coding start", "dispatch ", "decision create", "scope check", "run ", "review ", "git ", "install", "env ", "backup restore", "uninstall"];
 const allowedVariables = new Set(["role", "purpose", "allowed_commands", "delegates", "discovery", "stop_conditions", "platform", "environment", "contract_digest", "role_manifest_digest", "template_version", "spec_template", "plan_template", "task_template"]);
 const packageRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 
@@ -48,6 +48,34 @@ const validateModel = (value: unknown, platform: AgentBuildPlatform, source: str
   if (platform === "codex" && (typeof config.reasoning !== "string" || !reasoningValues.has(config.reasoning))) fail(`invalid Codex reasoning: ${source}`);
   if (platform === "claude" && (typeof config.effort !== "string" || !effortValues.has(config.effort))) fail(`invalid Claude effort: ${source}`);
   if (platform === "opencode" && (typeof config.variant !== "string" || !variantValues.has(config.variant) || !config.options || typeof config.options !== "object" || Array.isArray(config.options))) fail(`invalid OpenCode configuration: ${source}`);
+};
+
+const assertBlockYaml = (document: YAML.Document, source: string): void => {
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    const value = node as { flow?: boolean; items?: unknown[] };
+    if (value.flow === true) fail(`flow collection is not allowed in ${source}`);
+    for (const item of value.items ?? []) {
+      if (item && typeof item === "object" && "key" in item) visit((item as { key: unknown }).key);
+      if (item && typeof item === "object" && "value" in item) visit((item as { value: unknown }).value);
+      else visit(item);
+    }
+  };
+  visit(document.contents);
+};
+
+const parseEnvironment = (root: string, path: string): EnvironmentFile => {
+  const source = readText(root, path);
+  const document = YAML.parseDocument(source);
+  if (document.errors.length) fail(`invalid environment YAML: ${path}`, document.errors.map((error) => error.message));
+  assertBlockYaml(document, path);
+  const value = document.toJS() as EnvironmentFile;
+  const normalizeOpenCode = (config: Record<string, unknown> | undefined): void => {
+    if (config && !Object.hasOwn(config, "options")) config.options = {};
+  };
+  normalizeOpenCode(value.defaults?.opencode as Record<string, unknown> | undefined);
+  for (const override of Object.values(value.overrides ?? {})) normalizeOpenCode(override?.opencode as Record<string, unknown> | undefined);
+  return value;
 };
 
 function parseAndValidate(root: string): AgentBuild {
@@ -80,7 +108,7 @@ function parseAndValidate(root: string): AgentBuild {
   if (!existsSync(envDir) || !lstatSync(envDir).isDirectory()) fail("agent-build environment directory is missing");
   for (const file of readdirSync(envDir).sort()) {
     if (!file.endsWith(".yaml")) fail(`unexpected agent-build environment resource: ${file}`);
-    const value = YAML.parse(readText(root, join(manifest.environment_directory, file))) as EnvironmentFile;
+    const value = parseEnvironment(root, join(manifest.environment_directory, file));
     if (!value?.name || value.name !== file.slice(0, -5) || !Array.isArray(value.platforms) || value.platforms.some((p) => !supportedPlatforms.includes(p as AgentBuildPlatform))) fail(`invalid environment configuration: ${file}`);
     if (!value.defaults || Object.keys(value.defaults).sort().join("\0") !== supportedPlatforms.slice().sort().join("\0")) fail(`environment defaults must cover all platforms: ${file}`);
     for (const platform of supportedPlatforms) {

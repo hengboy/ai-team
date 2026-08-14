@@ -1,55 +1,136 @@
 name: quality
-platforms: [codex, claude, opencode]
+platforms:
+  - codex
+  - claude
+  - opencode
 defaults:
-  codex: { model: gpt-5.5, reasoning: high }
-  claude: { model: claude-opus-4-6, effort: high }
-  opencode: { model: openai/gpt-5.4, variant: high, options: {} }
+  codex:
+    model: gpt-5.5
+    reasoning: high
+  claude:
+    model: claude-opus-4-6
+    effort: high
+  opencode:
+    model: openai/gpt-5.4
+    variant: high
 overrides:
   planning:
-    codex: { model: gpt-5.5, reasoning: xhigh }
-    claude: { model: claude-opus-4-6, effort: high }
-    opencode: { model: openai/gpt-5.4, variant: high, options: {} }
+    codex:
+      model: gpt-5.5
+      reasoning: xhigh
+    claude:
+      model: claude-opus-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.4
+      variant: high
   coding:
-    codex: { model: gpt-5.5, reasoning: xhigh }
-    claude: { model: claude-opus-4-6, effort: high }
-    opencode: { model: openai/gpt-5.4, variant: high, options: {} }
+    codex:
+      model: gpt-5.5
+      reasoning: xhigh
+    claude:
+      model: claude-opus-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.4
+      variant: high
   file-explorer:
-    codex: { model: gpt-5.2, reasoning: high }
-    claude: { model: claude-sonnet-4-6, effort: high }
-    opencode: { model: openai/gpt-5.2, variant: high, options: {} }
+    codex:
+      model: gpt-5.2
+      reasoning: high
+    claude:
+      model: claude-sonnet-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.2
+      variant: high
   frontend-developer:
-    codex: { model: gpt-5.2, reasoning: high }
-    claude: { model: claude-sonnet-4-6, effort: high }
-    opencode: { model: openai/gpt-5.2, variant: high, options: {} }
+    codex:
+      model: gpt-5.2
+      reasoning: high
+    claude:
+      model: claude-sonnet-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.2
+      variant: high
   backend-developer:
-    codex: { model: gpt-5.5, reasoning: xhigh }
-    claude: { model: claude-opus-4-6, effort: high }
-    opencode: { model: openai/gpt-5.4, variant: high, options: {} }
+    codex:
+      model: gpt-5.5
+      reasoning: xhigh
+    claude:
+      model: claude-opus-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.4
+      variant: high
   test:
-    codex: { model: gpt-5.2, reasoning: high }
-    claude: { model: claude-sonnet-4-6, effort: high }
-    opencode: { model: openai/gpt-5.2, variant: high, options: {} }
+    codex:
+      model: gpt-5.2
+      reasoning: high
+    claude:
+      model: claude-sonnet-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.2
+      variant: high
   git-operator:
-    codex: { model: gpt-5.2, reasoning: high }
-    claude: { model: claude-sonnet-4-6, effort: high }
-    opencode: { model: openai/gpt-5.2, variant: high, options: {} }
+    codex:
+      model: gpt-5.2
+      reasoning: high
+    claude:
+      model: claude-sonnet-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.2
+      variant: high
   code-reviewer:
-    codex: { model: gpt-5.5, reasoning: xhigh }
-    claude: { model: claude-opus-4-6, effort: high }
-    opencode: { model: openai/gpt-5.4, variant: high, options: {} }
+    codex:
+      model: gpt-5.5
+      reasoning: xhigh
+    claude:
+      model: claude-opus-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.4
+      variant: high
   review-spec:
-    codex: { model: gpt-5.5, reasoning: xhigh }
-    claude: { model: claude-opus-4-6, effort: high }
-    opencode: { model: openai/gpt-5.4, variant: high, options: {} }
+    codex:
+      model: gpt-5.5
+      reasoning: xhigh
+    claude:
+      model: claude-opus-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.4
+      variant: high
   review-standards:
-    codex: { model: gpt-5.5, reasoning: high }
-    claude: { model: claude-opus-4-6, effort: high }
-    opencode: { model: openai/gpt-5.4, variant: high, options: {} }
+    codex:
+      model: gpt-5.5
+      reasoning: high
+    claude:
+      model: claude-opus-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.4
+      variant: high
   environment-operator:
-    codex: { model: gpt-5.2, reasoning: high }
-    claude: { model: claude-sonnet-4-6, effort: high }
-    opencode: { model: openai/gpt-5.2, variant: high, options: {} }
+    codex:
+      model: gpt-5.2
+      reasoning: high
+    claude:
+      model: claude-sonnet-4-6
+      effort: high
+    opencode:
+      model: openai/gpt-5.2
+      variant: high
   researcher:
-    codex: { model: gpt-5.2, reasoning: medium }
-    claude: { model: claude-sonnet-4-6, effort: medium }
-    opencode: { model: openai/gpt-5.2, variant: medium, options: {} }
+    codex:
+      model: gpt-5.2
+      reasoning: medium
+    claude:
+      model: claude-sonnet-4-6
+      effort: medium
+    opencode:
+      model: openai/gpt-5.2
+      variant: medium

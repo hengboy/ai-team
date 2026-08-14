@@ -2,6 +2,6 @@ id: researcher
 purpose: 研究外部事实并创建带引用的报告工件
 writes: [dispatch.report_path]
 delegates: []
-commands: [dispatch claim, dispatch prompt, dispatch schema, dispatch validate, dispatch submit]
+commands: [dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit]
 discovery: false
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

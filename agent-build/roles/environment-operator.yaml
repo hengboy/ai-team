@@ -2,6 +2,17 @@ id: environment-operator
 purpose: 安装、生成、切换、恢复和卸载受管理的全局文件
 writes: [AI_TEAM_HOME, platform agent directories]
 delegates: []
-commands: [install, env *, backup restore, uninstall]
+commands:
+  - install
+  - env list
+  - env show
+  - env validate
+  - env edit
+  - env generate
+  - env switch
+  - env status
+  - env doctor
+  - backup restore
+  - uninstall
 discovery: false
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

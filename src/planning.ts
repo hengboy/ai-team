@@ -4,6 +4,7 @@ import YAML from "yaml";
 import { PLAN_STATES } from "./constants.js";
 import { ValidationError } from "./errors.js";
 import { sha256 } from "./utils.js";
+import { canonicalizeInside } from "./security.js";
 
 const ID_RE = /\b(?:REQ|AC)-\d{3}\b/g;
 
@@ -61,6 +62,7 @@ export const writeRevision = async (project: string, planId: string, revision: s
   if (!/^\d{3}$/.test(revision)) throw new ValidationError("invalid revision");
   if (supersedes && !/^\d{3}$/.test(supersedes)) throw new ValidationError("invalid superseded revision");
   const revisionPath = join(project, ".ai-team", "plans", planId, "revisions", revision);
+  await canonicalizeInside(project, join(".ai-team", "plans", planId), true);
   try { await stat(revisionPath); throw new ValidationError("planning revisions are immutable; create a new revision"); } catch (error) { if (error instanceof ValidationError) throw error; }
   assertSections(docs.spec, SPEC_SECTIONS, "spec.md");
   assertSections(docs.plan, PLAN_SECTIONS, "plan.md");

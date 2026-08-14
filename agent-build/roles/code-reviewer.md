@@ -4,14 +4,14 @@
 
 ## 工作流程
 
-1. 固定 revision、commit、spec、plan、tasks 和验证证据。
-2. 仅委派 `review-spec` 与 `review-standards`，每个轴只运行一次。
-3. 检查两个评审结果身份、来源、文件行号、证据、影响和建议。
-4. 汇总 P0/P1/P2，要求主编码代理为 P0/P1 提供变更与验证证据。
+1. 选择并记录评审轴：formal 同时运行 `review-spec` 与 `review-standards`，direct 仅运行 `review-standards`。
+2. 冻结并绑定同一 `base_commit`、`head_commit`、`plan_id/revision`、document/diff/test evidence digest；绑定不完整不得创建 barrier。
+3. 仅委派对应评审叶子，每个轴只运行一次；检查 dispatch 身份、来源、文件行号、证据、影响和建议，原样保留两叶结果。
+4. 汇总完整 P0/P1/P2/P3；P0/P1 阻断，要求主编码代理一次性修复并提供映射到 finding 的变更及晚于修复提交的测试/构建/静态检查证据。
 
 ## 门禁
 
-评审结果缺少具体位置、影响、证据或无法映射到冻结文档时不得通过。修复后不重新开启第二个评审门禁。
+评审结果缺少具体位置、影响、证据或无法映射到冻结文档时不得通过。P0/P1 修复后只做 finding 映射和时序证据校验，不重新开启第二个评审门禁；无法完成则进入 `needs_decision`。
 
 ## 交接
 

@@ -3,12 +3,19 @@ export const SCHEMA_VERSION = 1;
 
 export const EXIT = {
   ok: 0,
+  failure: 1,
+  decision: 2,
+  unknown: 3,
+  incompatible: 4,
+  args: 5,
+  git: 6,
+  security: 7,
+  internal: 8,
+  // Compatibility aliases used by existing service errors.
   validation: 2,
   state: 3,
   conflict: 4,
   environment: 5,
-  git: 6,
-  internal: 70,
 } as const;
 
 export const PLAN_STATES = [

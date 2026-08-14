@@ -45,6 +45,7 @@ export class ReviewService {
     const pathArgs = firstParent ? ["diff", "--name-only", "-z", firstParent, revisionSha] : ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", revisionSha];
     const changedPaths = [...new Set(execFileSync("git", ["-C", frozenPath, ...pathArgs], { encoding: "utf8" }).split("\0").filter(Boolean))];
     const committedDiff = redact(execFileSync("git", ["-C", frozenPath, ...diffArgs], { encoding: "utf8", maxBuffer: 5 * 1024 * 1024 }));
+    const diffDigest = sha256(committedDiff);
     const planningCandidates = requiredFormal && run.plan_id && run.revision ? [
       `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/spec.md`,
       `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/plan.md`,
@@ -54,12 +55,28 @@ export class ReviewService {
       try { execFileSync("git", ["-C", frozenPath, "cat-file", "-e", `${revisionSha}:${path}`], { stdio: "ignore" }); return true; }
       catch { return false; }
     });
-    const barrierId = `review_${sha256(`${runId}:${revisionSha}`).slice(0, 24)}`;
+    const documentDigest = sha256(planningPaths.map((path) => {
+      try { return `${path}\0${execFileSync("git", ["-C", frozenPath, "show", `${revisionSha}:${path}`], { encoding: "utf8", maxBuffer: 2 * 1024 * 1024 })}`; }
+      catch { return `${path}\0`; }
+    }).join("\n"));
+    const testEvidence = test.result_json ? JSON.parse(test.result_json) : { state: test.state, completed_at: test.completed_at ?? null };
+    const testEvidenceDigest = sha256(stableJson(testEvidence));
+    const baseCommit = firstParent ?? "0".repeat(40);
+    const barrierId = `review_${sha256(`${runId}:${baseCommit}:${revisionSha}:${run.plan_id ?? ""}:${run.revision ?? ""}:${documentDigest}:${diffDigest}:${testEvidenceDigest}`).slice(0, 24)}`;
     const axes = formal ? ["spec", "standards"] as const : ["standards"] as const;
     const dispatches = new DispatchService(this.store);
     const create = this.store.db.transaction(() => {
-      const inserted = this.store.db.prepare("INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,created_at) VALUES (?,?,?,?, 'pending', ?)")
-        .run(barrierId, runId, revisionSha, formal ? 1 : 0, new Date().toISOString());
+      const columns = (this.store.db.prepare("PRAGMA table_info(review_barriers)").all() as Array<{ name: string }>).map((item) => item.name);
+      const now = new Date().toISOString();
+      const binding = { base_commit: baseCommit, head_commit: revisionSha, plan_id: run.plan_id ?? null, revision: run.revision ?? null, document_digest: documentDigest, diff_digest: diffDigest, test_evidence_digest: testEvidenceDigest };
+      let inserted;
+      if (["base_commit", "head_commit", "document_digest", "diff_digest", "test_evidence_digest"].every((column) => columns.includes(column))) {
+        inserted = this.store.db.prepare(`INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,base_commit,head_commit,plan_id,revision,document_digest,diff_digest,test_evidence_digest,created_at)
+          VALUES (?,?,?,?, 'pending',?,?,?,?,?,?,?,?)`).run(barrierId, runId, revisionSha, formal ? 1 : 0, binding.base_commit, binding.head_commit, binding.plan_id, binding.revision, binding.document_digest, binding.diff_digest, binding.test_evidence_digest, now);
+      } else {
+        inserted = this.store.db.prepare("INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,created_at) VALUES (?,?,?,?, 'pending', ?)")
+          .run(barrierId, runId, revisionSha, formal ? 1 : 0, now);
+      }
       if (!inserted.changes) throw new ValidationError("review already exists for this frozen revision; reviews run once");
       for (const axis of axes) {
         dispatches.create(runId, axis === "spec" ? "review-spec" : "review-standards", {
@@ -71,8 +88,15 @@ export class ReviewService {
             barrier_id: barrierId,
             revision_sha: revisionSha,
             axis,
+            base_commit: baseCommit,
+            head_commit: revisionSha,
+            plan_id: run.plan_id ?? null,
+            revision: run.revision ?? null,
+            document_digest: documentDigest,
+            diff_digest: diffDigest,
+            test_evidence_digest: testEvidenceDigest,
             committed_diff: committedDiff,
-            test_evidence: test.result_json ? JSON.parse(test.result_json) : { state: test.state, completed_at: test.completed_at ?? null },
+            test_evidence: testEvidence,
           },
         }, "code-reviewer");
       }
@@ -91,6 +115,10 @@ export class ReviewService {
     const leaf = (this.store.db.prepare("SELECT state,packet_json,result_json FROM dispatches WHERE run_id=? AND role=? ORDER BY created_at DESC").all(runId, role) as Array<{ state: string; packet_json: string; result_json?: string }>)
       .find((item) => (JSON.parse(item.packet_json) as { context?: { barrier_id?: string } }).context?.barrier_id === barrierId);
     if (leaf?.state !== "completed" || !leaf.result_json) throw new ValidationError(`${result.axis} review leaf dispatch has not completed`);
+    const packetContext = (JSON.parse(leaf.packet_json) as { context?: Record<string, unknown> }).context ?? {};
+    for (const field of ["base_commit", "head_commit", "document_digest", "diff_digest", "test_evidence_digest"] as const) {
+      if (barrier[field] && packetContext[field] !== barrier[field]) throw new ValidationError(`${result.axis} review packet is not bound to the frozen review barrier`);
+    }
     const envelope = JSON.parse(leaf.result_json) as { summary?: string; findings?: ReviewFinding[]; payload?: { finding_ids?: string[] } };
     const findingIds = result.findings.map((finding) => finding.finding_id);
     if (envelope.summary !== result.summary || stableJson(envelope.findings ?? []) !== stableJson(result.findings) || stableJson(envelope.payload?.finding_ids ?? []) !== stableJson(findingIds)) {
@@ -117,7 +145,7 @@ export class ReviewService {
     if (missing.length || unknown.length) throw new ValidationError("finding resolution mapping is incomplete", { missing, unknown });
     const insert = this.store.db.prepare("INSERT INTO finding_resolutions(barrier_id,finding_id,change_evidence,verification_evidence,created_at) VALUES (?,?,?,?,?)");
     const transaction = this.store.db.transaction(() => {
-      for (const item of resolutions) insert.run(barrierId, item.finding_id, item.change_evidence, item.verification_evidence, new Date().toISOString());
+      for (const item of resolutions) insert.run(barrierId, item.finding_id, redact(item.change_evidence).slice(0, 16_384), redact(item.verification_evidence).slice(0, 16_384), new Date().toISOString());
       this.store.db.prepare("UPDATE review_barriers SET state='resolved' WHERE barrier_id=?").run(barrierId);
     });
     transaction();
@@ -131,7 +159,7 @@ export class ReviewService {
 
   assertGate(runId: string, frozenHead?: string): void {
     const test = this.store.db.prepare("SELECT state FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string } | undefined;
-    const review = this.store.db.prepare("SELECT state,revision_sha FROM review_barriers WHERE run_id=? ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; revision_sha: string } | undefined;
+    const review = this.store.db.prepare("SELECT state,revision_sha,test_evidence_digest FROM review_barriers WHERE run_id=? ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; revision_sha: string; test_evidence_digest?: string } | undefined;
     if (!test || test.state !== "completed") throw new ValidationError("latest independent test dispatch has not completed");
     if (!review || !["passed", "resolved"].includes(review.state)) throw new ValidationError("review gate has not passed");
     if (frozenHead && frozenHead !== review.revision_sha) {

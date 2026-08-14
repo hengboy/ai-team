@@ -1,10 +1,10 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Role } from "./constants.js";
 import { checkResultEnvelope, createResultTemplate, resultSchemaForRole, type ResultEnvelope } from "./contracts.js";
 import { ValidationError } from "./errors.js";
 import { ROLE_MANIFEST } from "./roles.js";
-import { assertWritablePath } from "./security.js";
+import { assertReadablePath, assertWritablePath } from "./security.js";
 import { StateStore } from "./state.js";
 import { assertRelativePosixPath, makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
 
@@ -15,6 +15,20 @@ export interface DispatchPacket {
   acceptance_criteria: string[];
   context: Record<string, unknown>;
 }
+
+const RENDERER_VERSION = "dispatch-renderer-v2";
+
+const promptFor = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
+  `Role: ${role}`,
+  `Run: ${runId}`,
+  `Dispatch: ${dispatchId}`,
+  `Objective: ${packet.objective}`,
+  `Allowed read paths: ${packet.allowed_read_paths.join(", ") || "none"}`,
+  `Allowed write paths: ${packet.allowed_write_paths.join(", ") || "none"}`,
+  `Acceptance criteria: ${packet.acceptance_criteria.join("; ")}`,
+  `Context: ${stableJson(packet.context)}`,
+  "Return only the frozen result envelope and role payload schema.",
+].join("\n");
 
 const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   if (!packet || typeof packet !== "object" || Array.isArray(packet)) throw new ValidationError("dispatch packet must be an object");
@@ -35,26 +49,42 @@ const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   for (const path of [...reads, ...writes]) {
     if (path !== "." && path !== "**") assertRelativePosixPath(path);
   }
+  for (const path of reads) if (path !== "." && path !== "**") assertReadablePath(path);
   for (const path of writes) assertWritablePath(path);
   const broad = reads.filter((path) => path === "**" || path === "." || path.endsWith("/**"));
   if (role !== "file-explorer" && broad.length) throw new ValidationError(`${role} requires exact allowed_read_paths`);
   return value as unknown as DispatchPacket;
 };
 
+const assertExplorerAuthorization = (store: StateStore, runId: string, role: Role, packet: DispatchPacket): void => {
+  if (role === "file-explorer") return;
+  const context = packet.context as { explorer_dispatch_id?: string; path_authorization?: string[] };
+  if (!context.explorer_dispatch_id) return;
+  const explorer = store.db.prepare("SELECT state,role,result_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, context.explorer_dispatch_id) as { state: string; role: string; result_json?: string } | undefined;
+  if (!explorer || explorer.role !== "file-explorer" || explorer.state !== "completed" || !explorer.result_json) throw new ValidationError("downstream dispatch requires a completed Explorer dispatch");
+  const payload = JSON.parse(explorer.result_json) as { payload?: { allowed_read_paths?: string[] } };
+  const authorized = new Set([...(payload.payload?.allowed_read_paths ?? []), ...(context.path_authorization ?? [])]);
+  const unauthorized = packet.allowed_read_paths.filter((path) => !authorized.has(path));
+  if (unauthorized.length) throw new ValidationError("downstream read paths are not authorized by Explorer evidence", unauthorized);
+};
+
 export class DispatchService {
   constructor(readonly store: StateStore) {}
 
-  create(runId: string, role: Role, packet: DispatchPacket, actorRole?: Role): string {
+  create(runId: string, role: Role, packet: DispatchPacket, actorRole?: Role, actorDispatchId?: string): string {
     const run = this.store.getRun(runId) as { profile: Role };
     const actor = actorRole ?? run.profile;
-    const reviewerLeaf = run.profile === "coding" && actor === "code-reviewer" && (role === "review-spec" || role === "review-standards");
-    if (actorRole && actorRole !== run.profile && !reviewerLeaf) throw new ValidationError(`${actorRole} cannot act for ${run.profile} run`);
+    const reviewerActor = run.profile === "coding" && actor === "code-reviewer" && (role === "code-reviewer" || role === "review-spec" || role === "review-standards");
+    if (actorRole && actorRole !== run.profile && !reviewerActor) throw new ValidationError(`${actorRole} cannot act for ${run.profile} run`);
+    if (actorDispatchId) this.assertClaimed(runId, actorDispatchId, actor);
     this.assertCommandAllowed(actor, "dispatch create");
     const definition = ROLE_MANIFEST[actor];
     if (role !== actor && !definition.delegates.includes(role)) {
       throw new ValidationError(`${actor} cannot delegate to ${role}`);
     }
-    return this.insert(runId, role, validatePacket(packet, role));
+    const validated = validatePacket(packet, role);
+    assertExplorerAuthorization(this.store, runId, role, validated);
+    return this.insert(runId, role, validated);
   }
 
   createPlanningCommit(runId: string, packet: DispatchPacket): string {
@@ -70,27 +100,33 @@ export class DispatchService {
 
   private insert(runId: string, role: Role, packet: DispatchPacket): string {
     const dispatchId = makeId("dispatch");
-    const prompt = [
-      `Role: ${role}`,
-      `Dispatch: ${dispatchId}`,
-      `目标：${packet.objective}`,
-      `允许读取：${packet.allowed_read_paths.join(", ") || "无"}`,
-      `允许写入：${packet.allowed_write_paths.join(", ") || "无"}`,
-      `验收条件：${packet.acceptance_criteria.join("；")}`,
-      `上下文：${stableJson(packet.context)}`,
-      "返回字段：schema_version, run_id, dispatch_id, role, status, summary, findings, changes, verification, risks, decisions_needed, requested_support, handoff, payload。",
-      "只能返回符合冻结 schema 的结果。遇到数据包之外的工作时请求支持。",
-    ].join("\n");
+    const packetJson = redact(stableJson(packet));
+    const frozenPacket = JSON.parse(packetJson) as DispatchPacket;
+    const prompt = redact(promptFor(runId, dispatchId, role, frozenPacket));
     const template = createResultTemplate(runId, dispatchId, role);
-    this.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,created_at)
-      VALUES (?,?,?,'pending',?,?,?,?,?)`).run(dispatchId, runId, role, stableJson(packet), prompt, stableJson(resultSchemaForRole(role)), stableJson(template), new Date().toISOString());
-    this.store.event(runId, "dispatch.created", { dispatchId, role, prompt_digest: sha256(prompt) });
+    const schemaJson = stableJson(resultSchemaForRole(role));
+    const templateJson = stableJson(template);
+    const digests = { packet: sha256(packetJson), schema: sha256(schemaJson), template: sha256(templateJson), prompt: sha256(prompt) };
+    const columns = new Set((this.store.db.prepare("PRAGMA table_info(dispatches)").all() as Array<{ name: string }>).map((item) => item.name));
+    if (["packet_digest", "prompt_digest", "schema_digest", "template_digest", "renderer_version"].every((column) => columns.has(column))) {
+      this.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,packet_digest,prompt_digest,schema_digest,template_digest,renderer_version,created_at)
+        VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?)`).run(dispatchId, runId, role, packetJson, "", schemaJson, templateJson, digests.packet, digests.prompt, digests.schema, digests.template, RENDERER_VERSION, new Date().toISOString());
+    } else {
+      this.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,created_at)
+        VALUES (?,?,?,'pending',?,?,?,?,?)`).run(dispatchId, runId, role, packetJson, "", schemaJson, templateJson, new Date().toISOString());
+    }
+    this.store.event(runId, "dispatch.created", { dispatchId, role, packet_digest: digests.packet, schema_digest: digests.schema, template_digest: digests.template, prompt_digest: digests.prompt, renderer_version: RENDERER_VERSION });
     return dispatchId;
   }
 
   private get(runId: string, dispatchId: string, role: Role): any {
     const row = this.store.db.prepare("SELECT * FROM dispatches WHERE run_id=? AND dispatch_id=? AND role=?").get(runId, dispatchId, role);
     if (!row) throw new ValidationError("dispatch identity does not match run and role");
+    const platform = process.env.AI_TEAM_CLIENT_PLATFORM ?? process.env.AI_TEAM_PLATFORM;
+    if (platform) {
+      const run = this.store.getRun(runId) as { client_platform?: string };
+      if (run.client_platform && run.client_platform !== platform) throw new ValidationError("client platform is locked to this run", { expected: run.client_platform, actual: platform });
+    }
     return row;
   }
 
@@ -102,7 +138,12 @@ export class DispatchService {
     return { reused, packet: JSON.parse(row.packet_json) as DispatchPacket };
   }
 
-  prompt(runId: string, dispatchId: string, role: Role): string { return this.get(runId, dispatchId, role).prompt as string; }
+  prompt(runId: string, dispatchId: string, role: Role): string {
+    const row = this.get(runId, dispatchId, role);
+    const rendered = promptFor(runId, dispatchId, role, JSON.parse(row.packet_json) as DispatchPacket);
+    if (row.renderer_version === RENDERER_VERSION && row.prompt_digest && row.prompt_digest !== sha256(rendered)) throw new ValidationError("dispatch prompt digest mismatch; frozen asset is corrupted");
+    return rendered;
+  }
   schema(runId: string, dispatchId: string, role: Role): unknown { return JSON.parse(this.get(runId, dispatchId, role).schema_json); }
   template(runId: string, dispatchId: string, role: Role): ResultEnvelope { return JSON.parse(this.get(runId, dispatchId, role).template_json) as ResultEnvelope; }
 
@@ -113,6 +154,9 @@ export class DispatchService {
 
   async validateFile(runId: string, dispatchId: string, role: Role, path: string): Promise<ResultEnvelope> {
     this.get(runId, dispatchId, role);
+    assertReadablePath(path);
+    const info = await stat(path);
+    if (info.size > 2 * 1024 * 1024) throw new ValidationError("result file exceeds the 2 MiB limit");
     const result = checkResultEnvelope(await readJson(path));
     if (!result.valid) throw new ValidationError("result envelope is invalid", result.errors);
     if (result.value.run_id !== runId || result.value.dispatch_id !== dispatchId || result.value.role !== role) {

@@ -10,6 +10,22 @@ export interface TaskDefinition {
   allowed_write_paths: string[];
 }
 
+export interface TaskPreview extends TaskDefinition {
+  summary: string;
+  candidate_scope: string[];
+  parallel_recommendation: string;
+}
+
+export function validateTaskPreview(tasks: unknown): asserts tasks is TaskPreview[] {
+  if (!Array.isArray(tasks) || tasks.some((task) => !task || typeof task !== "object")) throw new ValidationError("task preview must be an array of typed tasks");
+  for (const task of tasks as Array<Partial<TaskPreview>>) {
+    if (!task.summary?.trim() || !task.parallel_recommendation?.trim() || !Array.isArray(task.candidate_scope) || !task.candidate_scope.length) {
+      throw new ValidationError(`task preview is missing summary, candidate scope, or parallel recommendation: ${task.task_id ?? "unknown"}`);
+    }
+  }
+  validateTaskGraph(tasks as TaskDefinition[]);
+}
+
 const overlaps = (left: string[], right: string[]): boolean => left.some((a) => right.some((b) => pathMatchesScope(a, [b]) || pathMatchesScope(b, [a])));
 
 export const validateTaskGraph = (tasks: TaskDefinition[]): void => {

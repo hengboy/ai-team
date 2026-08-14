@@ -1,7 +1,17 @@
-import { ValidationError } from "./errors.js";
+import { ArgumentError, ValidationError } from "./errors.js";
+import { SCHEMA_VERSION } from "./constants.js";
 
+/** Values accepted by the CLI command guards. */
 export type CommandValue = string | boolean | undefined;
-export interface CommandSpec { required: string[]; optional: string[]; patterns?: Record<string, RegExp>; exclusive?: string[][]; }
+
+/** The typed portion of the command contract used by Commander and agents. */
+export interface CommandSpec {
+  readonly required: readonly string[];
+  readonly optional: readonly string[];
+  readonly patterns?: Readonly<Record<string, RegExp>>;
+  readonly exclusive?: readonly (readonly string[])[];
+  readonly syntax?: readonly string[];
+}
 
 const IDS = {
   runId: /^run_[0-9A-HJKMNP-TV-Z]{26}$/,
@@ -11,24 +21,126 @@ const IDS = {
   commit: /^[a-f0-9]{40}$/,
 } as const;
 
-export const COMMAND_SPECS: Record<string, CommandSpec> = {
-  "planning.start": { required: ["project"], optional: ["requestFile", "requestStdin"], exclusive: [["requestFile", "requestStdin"]] },
-  "coding.start": { required: ["project"], optional: ["mode", "planId", "revision", "requestFile", "requestStdin"], patterns: { planId: IDS.planId, revision: IDS.revision } },
-  "dispatch.identity": { required: ["runId", "dispatchId", "role"], optional: [], patterns: { runId: IDS.runId, dispatchId: IDS.dispatchId } },
-  "run.identity": { required: ["runId"], optional: [], patterns: { runId: IDS.runId } },
-  "review.create": { required: ["runId", "revisionSha"], optional: ["formal"], patterns: { runId: IDS.runId, revisionSha: IDS.commit } },
-};
+/** Stable parameter vocabulary rendered into every generated agent manual. */
+export const COMMAND_PARAMETER_TYPES = Object.freeze({
+  path: "string; canonical local filesystem path",
+  file: "string; readable file path",
+  json: "string; readable JSON file path",
+  name: "string; lowercase environment name matching ^[a-z][a-z0-9-]*$",
+  role: "enum; one of the 12 manifest role IDs",
+  mode: "enum; planned, bug, or feature",
+  "platform-list": "comma-separated enum; codex, claude, or opencode",
+  "plan-id": "string; eight decimal digits, lowercase slug, and four lowercase hex digits",
+  revision: "string; exactly three decimal digits",
+  "task-id": "string; TASK- followed by three decimal digits",
+  "run-id": "string; run_ followed by a 26-character Crockford ULID",
+  "dispatch-id": "string; dispatch_ followed by a 26-character Crockford ULID",
+  commit: "string; exactly 40 lowercase hexadecimal characters",
+  "opaque-id": "string; CLI-issued identifier",
+  branch: "string; Git branch name",
+  state: "enum; planning or reconciliation state",
+  stage: "enum; triage, pre_write, or pre_commit",
+  paths: "comma-separated repository-relative POSIX paths",
+  boolean: "boolean; presence of the flag means true",
+  text: "non-empty string",
+} as const);
+
+/** Exact command spellings. This is the only syntax table used by renderers. */
+export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  "planning start": ["ai-team planning start --project <path> (--request-file <file> | --request-stdin)"],
+  "planning revision create": ["ai-team planning revision create --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> --documents-file <file> [--supersedes <revision>] [--run-id <run-id>]"],
+  "planning revision transition": ["ai-team planning revision transition --project <path> --plan-id <plan-id> --revision <revision> --to <state> [--plan-commit <commit>]"],
+  "planning tasks validate": ["ai-team planning tasks validate --file <json> [--preview]"],
+  "coding start": [
+    "ai-team coding start --project <path> --mode planned --plan-id <plan-id> [--revision <revision>]",
+    "ai-team coding start --project <path> --mode bug (--request-file <file> | --request-stdin)",
+    "ai-team coding start --project <path> --mode feature (--request-file <file> | --request-stdin)",
+  ],
+  "dispatch create": ["ai-team dispatch create --run-id <run-id> --role <role> --actor-role <role> [--actor-dispatch-id <dispatch-id>] --packet-file <json>"],
+  "dispatch claim": ["ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
+  "dispatch prompt": ["ai-team dispatch prompt --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
+  "dispatch schema": ["ai-team dispatch schema --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
+  "dispatch template": ["ai-team dispatch template --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
+  "dispatch validate": ["ai-team dispatch validate --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --result-file <json>"],
+  "dispatch submit": ["ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --result-file <json>"],
+  "decision create": ["ai-team decision create --run-id <run-id> --file <json>"],
+  "run show": ["ai-team run show <run-id>"],
+  "run resume": ["ai-team run resume <run-id>"],
+  "run decide": ["ai-team run decide --run-id <run-id> --decision-id <opaque-id> --choice <text> [--note-file <file>]"],
+  "scope check": ["ai-team scope check --run-id <run-id> --stage <stage> --paths <paths>"],
+  "review create": ["ai-team review create --run-id <run-id> --revision-sha <commit> [--formal]"],
+  "review submit": ["ai-team review submit --run-id <run-id> --barrier-id <opaque-id> --result-file <json>"],
+  "review resolve": ["ai-team review resolve --run-id <run-id> --barrier-id <opaque-id> --resolution-file <json>"],
+  "review status": ["ai-team review status --run-id <run-id> --barrier-id <opaque-id>"],
+  "git status": ["ai-team git status --run-id <run-id>"],
+  "git prepare": ["ai-team git prepare --run-id <run-id> --dispatch-id <dispatch-id> [--task-id <task-id>] [--integration] [--base-commit <commit>] [--depends-on <opaque-id>]"],
+  "git commit": ["ai-team git commit --run-id <run-id> --dispatch-id <dispatch-id> --worktree-id <opaque-id> --message <text> --scope <paths>"],
+  "git merge-task": ["ai-team git merge-task --run-id <run-id> --dispatch-id <dispatch-id> --integration-id <opaque-id> --task-id <task-id>"],
+  "git continue-conflict": ["ai-team git continue-conflict --run-id <run-id> --dispatch-id <dispatch-id> --integration-id <opaque-id> --scope <paths>"],
+  "git integrate": ["ai-team git integrate --run-id <run-id> --dispatch-id <dispatch-id> --integration-id <opaque-id>"],
+  "git reconcile": ["ai-team git reconcile --run-id <run-id> --dispatch-id <dispatch-id> [--operation-id <opaque-id> --state <state> --evidence-file <json>]"],
+  "git cleanup": ["ai-team git cleanup --run-id <run-id> --dispatch-id <dispatch-id>"],
+  install: ["ai-team install [--platform <platform-list>] [--dry-run]"],
+  "env list": ["ai-team env list"],
+  "env show": ["ai-team env show <name> [--resolved]"],
+  "env validate": ["ai-team env validate <name>"],
+  "env edit": ["ai-team env edit <name>"],
+  "env generate": ["ai-team env generate [--platform <platform-list>] [--dry-run]"],
+  "env switch": ["ai-team env switch <name> [--dry-run]"],
+  "env status": ["ai-team env status"],
+  "env doctor": ["ai-team env doctor [--probe]"],
+  "backup restore": ["ai-team backup restore <path> [--dry-run]"],
+  uninstall: ["ai-team uninstall [--dry-run]"],
+});
+
+const PUBLIC_COMMANDS = ["init", "install", "status", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
+const AGENT_COMMANDS = ["planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "scope check", "git status", "git prepare", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "review create", "review submit", "review resolve", "review status"] as const;
+
+/** Runtime guards for commands whose values are consumed as an identity. */
+export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.freeze({
+  "planning.start": { required: ["project"], optional: ["requestFile", "requestStdin"], exclusive: [["requestFile", "requestStdin"]], ...((COMMAND_SYNTAX["planning start"]) ? { syntax: COMMAND_SYNTAX["planning start"] } : {}) },
+  "coding.start": { required: ["project"], optional: ["mode", "planId", "revision", "requestFile", "requestStdin"], patterns: { planId: IDS.planId, revision: IDS.revision }, ...((COMMAND_SYNTAX["coding start"]) ? { syntax: COMMAND_SYNTAX["coding start"] } : {}) },
+  "dispatch.identity": { required: ["runId", "dispatchId", "role"], optional: [], patterns: { runId: IDS.runId, dispatchId: IDS.dispatchId }, syntax: ["ai-team dispatch <claim|prompt|schema|template|validate|submit> --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"] },
+  "run.identity": { required: ["runId"], optional: [], patterns: { runId: IDS.runId }, syntax: ["ai-team run <show|resume> <run-id>"] },
+  "review.create": { required: ["runId", "revisionSha"], optional: ["formal"], patterns: { runId: IDS.runId, revisionSha: IDS.commit }, ...((COMMAND_SYNTAX["review create"]) ? { syntax: COMMAND_SYNTAX["review create"] } : {}) },
+});
+
+/** Canonical serialisable command contract. Consumers should derive metadata from this value. */
+export const COMMAND_CONTRACT_BASE = {
+  schema_version: SCHEMA_VERSION,
+  identifiers: {
+    plan_id: "^[0-9]{8}-[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{4}$",
+    revision: "^[0-9]{3}$",
+    task_id: "^TASK-[0-9]{3}$",
+    run_id: "^run_[0-9A-HJKMNP-TV-Z]{26}$",
+    dispatch_id: "^dispatch_[0-9A-HJKMNP-TV-Z]{26}$",
+    commit: "^[a-f0-9]{40}$",
+  },
+  commands: { public: [...PUBLIC_COMMANDS], agent: [...AGENT_COMMANDS] },
+  command_specs: Object.fromEntries(Object.entries(COMMAND_VALIDATORS).map(([name, spec]) => [name, {
+    required: [...spec.required], optional: [...spec.optional],
+    ...(spec.syntax ? { syntax: [...spec.syntax] } : {}),
+  }])),
+  syntax: Object.fromEntries(Object.entries(COMMAND_SYNTAX).map(([name, syntax]) => [name, [...syntax]])),
+  parameter_types: COMMAND_PARAMETER_TYPES,
+} as const;
+
+export const commandContractFor = (commands: readonly string[]) => ({
+  allowed_commands: [...commands],
+  syntax: [...new Set(commands.flatMap((command) => COMMAND_SYNTAX[command] ?? []))],
+  parameter_types: COMMAND_PARAMETER_TYPES,
+});
 
 export const validateCommand = (name: string, values: Record<string, CommandValue>): void => {
-  const spec = COMMAND_SPECS[name];
-  if (!spec) throw new ValidationError(`unknown command contract: ${name}`);
+  const spec = COMMAND_VALIDATORS[name];
+  if (!spec) throw new ArgumentError(`unknown command contract: ${name}`);
   const allowed = new Set([...spec.required, ...spec.optional]);
   const unknown = Object.keys(values).filter((key) => !allowed.has(key));
-  if (unknown.length) throw new ValidationError(`${name} has unknown parameters`, unknown);
+  if (unknown.length) throw new ArgumentError(`${name} has unknown parameters`, unknown);
   const missing = spec.required.filter((key) => values[key] === undefined || values[key] === "");
   if (missing.length) throw new ValidationError(`${name} is missing required parameters`, missing);
   for (const [key, pattern] of Object.entries(spec.patterns ?? {})) {
-    const value = values[key]; if (typeof value === "string" && !pattern.test(value)) throw new ValidationError(`${name}.${key} has invalid format`);
+    const value = values[key]; if (typeof value === "string" && !pattern.test(value)) throw new ArgumentError(`${name}.${key} has invalid format`);
   }
   for (const group of spec.exclusive ?? []) {
     if (group.filter((key) => Boolean(values[key])).length !== 1) throw new ValidationError(`${name} requires exactly one of ${group.join(", ")}`);

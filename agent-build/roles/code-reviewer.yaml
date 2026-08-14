@@ -2,6 +2,6 @@ id: code-reviewer
 purpose: 协调并汇总一个评审门禁
 writes: []
 delegates: [review-spec, review-standards]
-commands: [dispatch create, dispatch claim, dispatch prompt, dispatch schema, dispatch validate, dispatch submit]
+commands: [dispatch create, dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit]
 discovery: false
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }

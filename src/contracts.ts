@@ -1,6 +1,7 @@
 import { Ajv } from "ajv";
 import type { ErrorObject } from "ajv";
 import { RESULT_STATUSES, ROLES, SCHEMA_VERSION, type ResultStatus, type Role } from "./constants.js";
+import { COMMAND_CONTRACT_BASE } from "./command-contract.js";
 import { sha256, stableJson } from "./utils.js";
 
 export interface ResultEnvelope {
@@ -127,28 +128,10 @@ export const checkResultEnvelope = (value: unknown): { valid: true; value: Resul
 };
 
 export const COMMAND_CONTRACT = {
-  schema_version: SCHEMA_VERSION,
-  identifiers: {
-    plan_id: "^[0-9]{8}-[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{4}$",
-    revision: "^[0-9]{3}$",
-    task_id: "^TASK-[0-9]{3}$",
-    run_id: "^run_[0-9A-HJKMNP-TV-Z]{26}$",
-    dispatch_id: "^dispatch_[0-9A-HJKMNP-TV-Z]{26}$",
-    commit: "^[a-f0-9]{40}$",
-  },
+  ...COMMAND_CONTRACT_BASE,
   result_envelope: resultEnvelopeSchema,
   roles: ROLES,
-  commands: {
-    public: ["init", "install", "status", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"],
-    agent: ["planning revision create", "planning revision transition", "planning revision commit", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch validate", "dispatch submit", "decision create", "scope check", "git status", "git prepare", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "review create", "review submit", "review resolve", "review status"],
-  },
-  command_specs: {
-    "planning.start": { required: ["project"], optional: ["requestFile", "requestStdin"] },
-    "coding.start": { required: ["project"], optional: ["mode", "planId", "revision", "requestFile", "requestStdin"] },
-    "dispatch.identity": { required: ["runId", "dispatchId", "role"], optional: [] },
-    "review.create": { required: ["runId", "revisionSha"], optional: ["formal"] },
-  },
-};
+} as const;
 
 export const CONTRACT_DIGEST = sha256(stableJson(COMMAND_CONTRACT));
 

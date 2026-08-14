@@ -1,11 +1,16 @@
 import Database from "better-sqlite3";
-import { copyFile, mkdir, stat } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { Umzug } from "umzug";
 import lockfile from "proper-lockfile";
 import { getHomePaths, type HomePaths } from "./home.js";
 import { ValidationError } from "./errors.js";
-import { makeId, sha256, stableJson } from "./utils.js";
+import { makeId, redact, sha256, stableJson } from "./utils.js";
+import { CONTRACT_DIGEST } from "./contracts.js";
+import { AGENT_BUILD, ROLE_MANIFEST_DIGEST } from "./roles.js";
+
+/** Increment when persisted state contracts change incompatibly. */
+export const STATE_SCHEMA_EPOCH = 2;
 
 const migrations = [
   {
@@ -69,6 +74,38 @@ const migrations = [
           SELECT plan_id,revision,repo_id,state,target_branch,digest,plan_commit,supersedes,created_at FROM revisions_legacy;
         DROP TABLE revisions_legacy;
       `);
+      const addColumn = (table: string, name: string, definition: string): void => {
+        const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+        if (!columns.some((column) => column.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+      };
+      // These columns are nullable to keep the migration compatible with existing rows;
+      // new runs/dispatches always freeze their values at creation time.
+      addColumn("runs", "client_platform", "TEXT");
+      addColumn("runs", "environment", "TEXT");
+      addColumn("runs", "contract_digest", "TEXT");
+      addColumn("runs", "role_manifest_digest", "TEXT");
+      addColumn("runs", "template_digest", "TEXT");
+      addColumn("runs", "implementation_base_commit", "TEXT");
+      addColumn("runs", "plan_digest", "TEXT");
+      addColumn("decisions", "decision_type", "TEXT NOT NULL DEFAULT 'workflow'");
+      addColumn("decisions", "receipt_json", "TEXT");
+      addColumn("dispatches", "packet_digest", "TEXT");
+      addColumn("dispatches", "prompt_digest", "TEXT");
+      addColumn("dispatches", "schema_digest", "TEXT");
+      addColumn("dispatches", "template_digest", "TEXT");
+      addColumn("dispatches", "renderer_version", "TEXT");
+      addColumn("review_barriers", "base_commit", "TEXT");
+      addColumn("review_barriers", "head_commit", "TEXT");
+      addColumn("review_barriers", "plan_id", "TEXT");
+      addColumn("review_barriers", "revision", "TEXT");
+      addColumn("review_barriers", "document_digest", "TEXT");
+      addColumn("review_barriers", "diff_digest", "TEXT");
+      addColumn("review_barriers", "test_evidence_digest", "TEXT");
+      addColumn("review_barriers", "repair_commit", "TEXT");
+      addColumn("review_barriers", "verification_evidence", "TEXT");
+      db.exec("CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
+      db.prepare("INSERT INTO state_meta(key,value) VALUES ('schema_epoch', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        .run(String(STATE_SCHEMA_EPOCH));
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
@@ -83,12 +120,65 @@ export class StateStore {
     this.db = db;
   }
 
+  private static async backupLegacyState(paths: HomePaths, timestamp: string): Promise<string> {
+    const directory = join(paths.backups, `state-${timestamp}`);
+    await mkdir(directory, { recursive: true });
+    const copyIfPresent = async (source: string, destination: string): Promise<void> => {
+      try { await mkdir(join(destination, ".."), { recursive: true }); await copyFile(source, destination); } catch { /* optional state asset */ }
+    };
+    await copyIfPresent(paths.database, join(directory, "state.sqlite"));
+    for (const suffix of ["-wal", "-shm", "-journal"]) await copyIfPresent(`${paths.database}${suffix}`, join(directory, `state.sqlite${suffix}`));
+    for (const name of ["config.yaml", "manifest.json", "backup-index.json"]) {
+      await copyIfPresent(join(paths.root, name), join(directory, name));
+    }
+    try {
+      const files = await readdir(paths.environments);
+      await mkdir(join(directory, "environments"), { recursive: true });
+      for (const file of files.filter((entry) => entry.endsWith(".yaml") || entry.endsWith(".yml"))) {
+        await copyIfPresent(join(paths.environments, file), join(directory, "environments", file));
+      }
+    } catch { /* environments may not exist before first install */ }
+    return directory;
+  }
+
+  private static async removeDatabase(database: string): Promise<void> {
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) await rm(`${database}${suffix}`, { force: true });
+  }
+
+  private static async requiresEpochReset(database: string, root: string): Promise<boolean> {
+    let db: Database.Database | undefined;
+    try {
+      db = new Database(database, { readonly: true });
+      const hasMeta = (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='state_meta'").get() as unknown) !== undefined;
+      if (!hasMeta) return true;
+      const epoch = db.prepare("SELECT value FROM state_meta WHERE key='schema_epoch'").get() as { value: string } | undefined;
+      if (!epoch || Number(epoch.value) !== STATE_SCHEMA_EPOCH) return true;
+    } catch {
+      return true;
+    } finally {
+      db?.close();
+    }
+    // A marked config from an older epoch is incompatible even when the DB itself
+    // happens to have been upgraded. Unmarked configs are valid pre-bootstrap state.
+    try {
+      const text = await readFile(join(root, "config.yaml"), "utf8");
+      const marker = text.match(/^state_schema_epoch:\s*([0-9]+)\s*$/m);
+      if (marker && Number(marker[1]) !== STATE_SCHEMA_EPOCH) return true;
+    } catch { /* optional config */ }
+    return false;
+  }
+
   static async open(home?: string): Promise<StateStore> {
     const paths = getHomePaths(home);
     await Promise.all([paths.state, paths.backups, paths.artifacts, paths.environments, paths.schemas, paths.templates].map((path) => mkdir(path, { recursive: true })));
     const releaseLock = lockfile.lockSync(paths.state, { realpath: false, stale: 30_000 });
     let existing = false;
     try { existing = (await stat(paths.database)).size > 0; } catch { /* new database */ }
+    if (existing && await StateStore.requiresEpochReset(paths.database, paths.root)) {
+      await StateStore.backupLegacyState(paths, new Date().toISOString().replace(/[:.]/g, "-"));
+      await StateStore.removeDatabase(paths.database);
+      existing = false;
+    }
     const backup = join(paths.backups, `state-${Date.now()}.sqlite`);
     if (existing) {
       await copyFile(paths.database, backup);
@@ -122,6 +212,8 @@ export class StateStore {
           try { await copyFile(snapshot, configFile); } catch { /* optional snapshot */ }
         }
       }
+      // A reset starts from an empty state. The complete legacy snapshot is kept
+      // for explicit recovery, but is intentionally never auto-restored.
       releaseLock();
       throw error;
     }
@@ -135,11 +227,34 @@ export class StateStore {
       ON CONFLICT(repo_id) DO UPDATE SET project_path=excluded.project_path`).run(repoId, commonDir, projectPath, new Date().toISOString());
   }
 
-  createRun(input: { repoId: string; profile: string; mode: string; planId?: string; revision?: string; baseCommit?: string; targetBranch?: string; request?: string }): string {
+  createRun(input: {
+    repoId: string;
+    profile: string;
+    mode: string;
+    planId?: string;
+    revision?: string;
+    baseCommit?: string;
+    targetBranch?: string;
+    request?: string;
+    clientPlatform?: string;
+    environment?: string;
+    contractDigest?: string;
+    roleManifestDigest?: string;
+    templateDigest?: string;
+    implementationBaseCommit?: string;
+    planDigest?: string;
+  }): string {
     const runId = makeId("run");
     const now = new Date().toISOString();
-    this.db.prepare(`INSERT INTO runs(run_id, repo_id, profile, mode, state, stage, plan_id, revision, base_commit, target_branch, request, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'active', 'file-explorer', ?, ?, ?, ?, ?, ?, ?)`).run(runId, input.repoId, input.profile, input.mode, input.planId ?? null, input.revision ?? null, input.baseCommit ?? null, input.targetBranch ?? null, input.request ?? null, now, now);
+    const implementationBaseCommit = input.implementationBaseCommit ?? input.baseCommit ?? null;
+    this.db.prepare(`INSERT INTO runs(run_id, repo_id, profile, mode, state, stage, plan_id, revision, base_commit, target_branch, request,
+      client_platform, environment, contract_digest, role_manifest_digest, template_digest, implementation_base_commit, plan_digest, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'active', 'file-explorer', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      runId, input.repoId, input.profile, input.mode, input.planId ?? null, input.revision ?? null, input.baseCommit ?? null,
+      input.targetBranch ?? null, input.request ?? null, input.clientPlatform ?? "codex", input.environment ?? "balanced",
+      input.contractDigest ?? CONTRACT_DIGEST, input.roleManifestDigest ?? ROLE_MANIFEST_DIGEST,
+      input.templateDigest ?? AGENT_BUILD.digest, implementationBaseCommit, input.planDigest ?? null, now, now,
+    );
     this.event(runId, "run.created", input);
     return runId;
   }
@@ -147,8 +262,10 @@ export class StateStore {
   bindPlanningRevision(runId: string, repoId: string, planId: string, revision: string): void {
     const run = this.getRun(runId) as { repo_id: string; profile: string };
     if (run.profile !== "planning" || run.repo_id !== repoId) throw new ValidationError("planning revision does not belong to this run repository");
-    this.db.prepare("UPDATE runs SET plan_id=?,revision=?,updated_at=? WHERE run_id=?")
-      .run(planId, revision, new Date().toISOString(), runId);
+    const revisionRow = this.db.prepare("SELECT digest FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+      .get(repoId, planId, revision) as { digest?: string } | undefined;
+    this.db.prepare("UPDATE runs SET plan_id=?,revision=?,plan_digest=COALESCE(?,plan_digest),updated_at=? WHERE run_id=?")
+      .run(planId, revision, revisionRow?.digest ?? null, new Date().toISOString(), runId);
     this.event(runId, "planning.revision_bound", { planId, revision });
   }
 
@@ -159,34 +276,46 @@ export class StateStore {
   }
 
   event(runId: string, type: string, payload: unknown): void {
-    this.db.prepare("INSERT INTO run_events(run_id,type,payload_json,created_at) VALUES (?,?,?,?)").run(runId, type, stableJson(payload), new Date().toISOString());
+    const serialized = redact(stableJson(payload));
+    if (serialized.length > 128 * 1024) throw new ValidationError("event payload exceeds the 128 KiB limit");
+    this.db.prepare("INSERT INTO run_events(run_id,type,payload_json,created_at) VALUES (?,?,?,?)").run(runId, type, serialized, new Date().toISOString());
   }
 
   beginOperation(kind: string, key: string, request: unknown, runId?: string): { operationId: string; reused: boolean; state: string } {
     const existing = this.db.prepare("SELECT operation_id,state FROM operations WHERE idempotency_key=?").get(key) as { operation_id: string; state: string } | undefined;
     if (existing) return { operationId: existing.operation_id, reused: true, state: existing.state };
     const operationId = `op_${sha256(key).slice(0, 26)}`;
+    const serialized = redact(stableJson(request));
+    if (serialized.length > 128 * 1024) throw new ValidationError("operation request exceeds the 128 KiB limit");
     this.db.prepare("INSERT INTO operations(operation_id,run_id,idempotency_key,kind,state,request_json,created_at) VALUES (?,?,?,?, 'pending', ?,?)")
-      .run(operationId, runId ?? null, key, kind, stableJson(request), new Date().toISOString());
+      .run(operationId, runId ?? null, key, kind, serialized, new Date().toISOString());
     return { operationId, reused: false, state: "pending" };
   }
 
   finishOperation(operationId: string, evidence: unknown): void {
-    this.db.prepare("UPDATE operations SET state='completed',evidence_json=?,completed_at=? WHERE operation_id=?").run(stableJson(evidence), new Date().toISOString(), operationId);
+    const serialized = redact(stableJson(evidence));
+    if (serialized.length > 128 * 1024) throw new ValidationError("operation evidence exceeds the 128 KiB limit");
+    this.db.prepare("UPDATE operations SET state='completed',evidence_json=?,completed_at=? WHERE operation_id=?").run(serialized, new Date().toISOString(), operationId);
   }
 
   reconcileOperation(operationId: string, state: "completed" | "not_applied" | "unknown", evidence: unknown): void {
     if (state === "unknown") throw new ValidationError("unknown side effect cannot be marked reconciled without external evidence");
+    const serialized = redact(stableJson({ reconciliation: state, evidence }));
+    if (serialized.length > 128 * 1024) throw new ValidationError("reconciliation evidence exceeds the 128 KiB limit");
     this.db.prepare("UPDATE operations SET state=?,evidence_json=?,completed_at=? WHERE operation_id=? AND state='pending'")
-      .run(state === "completed" ? "completed" : "failed", stableJson({ reconciliation: state, evidence }), new Date().toISOString(), operationId);
+      .run(state === "completed" ? "completed" : "failed", serialized, new Date().toISOString(), operationId);
   }
 
-  createDecision(runId: string, question: string, choices: Array<{ id: string; label: string; impact: string }>, recommendation?: string): string {
+  createDecision(runId: string, question: string, choices: Array<{ id: string; label: string; impact: string }>, recommendation?: string, type = "workflow"): string {
+    if (!question.trim() || choices.length < 2 || choices.some((choice) => !choice.id || !choice.label || !choice.impact)) {
+      throw new ValidationError("typed decision requires a question and at least two complete choices");
+    }
     const existing = this.db.prepare("SELECT decision_id FROM decisions WHERE run_id=? AND status='pending'").get(runId);
     if (existing) throw new ValidationError(`run already has a pending decision: ${(existing as any).decision_id}`);
     const decisionId = `decision_${makeId("dispatch").slice(9)}`;
-    this.db.prepare("INSERT INTO decisions(decision_id,run_id,question,choices_json,recommendation,status,created_at) VALUES (?,?,?,?,?,'pending',?)")
-      .run(decisionId, runId, question, stableJson(choices), recommendation ?? null, new Date().toISOString());
+    const receipt = { type, question, choices, recommendation: recommendation ?? null };
+    this.db.prepare("INSERT INTO decisions(decision_id,run_id,question,choices_json,recommendation,decision_type,receipt_json,status,created_at) VALUES (?,?,?,?,?,?,?,'pending',?)")
+      .run(decisionId, runId, question, stableJson(choices), recommendation ?? null, type, stableJson(receipt), new Date().toISOString());
     return decisionId;
   }
 
@@ -195,7 +324,10 @@ export class StateStore {
     if (!row || row.status !== "pending") throw new ValidationError("decision is unknown, stale, or already resolved");
     const choices = JSON.parse(row.choices_json) as Array<{ id: string }>;
     if (!choices.some((item) => item.id === choice)) throw new ValidationError(`unknown decision choice: ${choice}`);
-    this.db.prepare("UPDATE decisions SET status='resolved',choice=?,note=?,resolved_at=? WHERE decision_id=?").run(choice, note ?? null, new Date().toISOString(), decisionId);
+    const resolvedAt = new Date().toISOString();
+    const receipt = { ...JSON.parse(row.receipt_json ?? "{}"), decision_id: decisionId, choice, note: note ?? null, resolved_at: resolvedAt };
+    this.db.prepare("UPDATE decisions SET status='resolved',choice=?,note=?,receipt_json=?,resolved_at=? WHERE decision_id=?")
+      .run(choice, note ?? null, stableJson(receipt), resolvedAt, decisionId);
     this.event(runId, "decision.resolved", { decisionId, choice });
   }
 }

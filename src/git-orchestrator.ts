@@ -18,6 +18,14 @@ const safeSegment = (value: string): string => {
 export class GitOrchestrator {
   constructor(readonly store: StateStore) {}
 
+  /** Every mutating operation can be tied to the claimed git-operator dispatch.
+   * The optional argument preserves the programmatic API used by older
+   * integrations; CLI callers should always provide it. */
+  private assertGitOperator(runId: string, dispatchId?: string): void {
+    if (!dispatchId) return;
+    new DispatchService(this.store).assertClaimed(runId, dispatchId, "git-operator");
+  }
+
   private repositoryForRun(runId: string): { root: string; run: any } {
     const run = this.store.getRun(runId) as any;
     const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
@@ -25,7 +33,8 @@ export class GitOrchestrator {
     return { root: repository.project_path, run };
   }
 
-  async prepareTask(runId: string, taskId = "implementation", baseCommit?: string, dependsOn?: string): Promise<PreparedWorktree> {
+  async prepareTask(runId: string, taskId = "implementation", baseCommit?: string, dependsOn?: string, dispatchId?: string): Promise<PreparedWorktree> {
+    this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
     if ((["bug", "feature"] as string[]).includes(run.mode)) new ScopeGate(this.store).assertPassed(runId, "pre_write");
     const plan = safeSegment(run.plan_id ?? `direct-${runId.slice(-8).toLowerCase()}`);
@@ -63,7 +72,8 @@ export class GitOrchestrator {
     return { worktree_id: worktreeId, branch, path, base_commit: base, reused: false };
   }
 
-  async prepareIntegration(runId: string): Promise<PreparedWorktree> {
+  async prepareIntegration(runId: string, dispatchId?: string): Promise<PreparedWorktree> {
+    this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
     const plan = safeSegment(run.plan_id ?? `direct-${runId.slice(-8).toLowerCase()}`);
     const short = runId.slice(-8).toLowerCase();
@@ -98,7 +108,8 @@ export class GitOrchestrator {
     return row;
   }
 
-  async commit(runId: string, worktreeId: string, message: string, allowedScopes: string[]): Promise<{ commit: string; paths: string[]; reused: boolean }> {
+  async commit(runId: string, worktreeId: string, message: string, allowedScopes: string[], dispatchId?: string): Promise<{ commit: string; paths: string[]; reused: boolean }> {
+    this.assertGitOperator(runId, dispatchId);
     const worktree = this.worktree(runId, worktreeId);
     const changed = (await git(worktree.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3));
     if (!changed.length) throw new ValidationError("implementation has no changes to commit");
@@ -120,7 +131,8 @@ export class GitOrchestrator {
     return { commit, paths: changed, reused: false };
   }
 
-  async mergeTask(runId: string, integrationId: string, taskId: string): Promise<string> {
+  async mergeTask(runId: string, integrationId: string, taskId: string, dispatchId?: string): Promise<string> {
+    this.assertGitOperator(runId, dispatchId);
     const integration = this.worktree(runId, integrationId);
     const task = this.worktree(runId, taskId);
     const operation = this.store.beginOperation("git.merge.task", `merge-task:${runId}:${integration.branch}:${task.branch}:${await currentHead(task.path)}`, { integration: integration.branch, task: task.branch }, runId);
@@ -133,7 +145,8 @@ export class GitOrchestrator {
     return commit;
   }
 
-  async integrateTarget(runId: string, integrationId: string): Promise<string> {
+  async integrateTarget(runId: string, integrationId: string, dispatchId?: string): Promise<string> {
+    this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
     const integration = this.worktree(runId, integrationId);
     const targetStatus = await worktreeStatus(root);
@@ -178,7 +191,8 @@ export class GitOrchestrator {
     return commit;
   }
 
-  async continueConflict(runId: string, integrationId: string, allowedScopes: string[]): Promise<string> {
+  async continueConflict(runId: string, integrationId: string, allowedScopes: string[], dispatchId?: string): Promise<string> {
+    this.assertGitOperator(runId, dispatchId);
     const integration = this.worktree(runId, integrationId);
     try { await git(integration.path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]); }
     catch { throw new ValidationError("worktree has no merge conflict in progress"); }
@@ -186,7 +200,11 @@ export class GitOrchestrator {
     if (unresolved.length) throw new ValidationError("merge still has unresolved paths", unresolved);
     const changed = (await git(integration.path, ["status", "--porcelain=v1", "-z"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3));
     if (!changed.length) throw new ValidationError("no conflict resolution changes are present");
-    for (const path of changed) if (!pathMatchesScope(path, allowedScopes)) throw new ValidationError(`conflict resolution changed path outside allowed scope: ${path}`);
+    for (const path of changed) {
+      assertWritablePath(path);
+      if (!pathMatchesScope(path, allowedScopes)) throw new ValidationError(`conflict resolution changed path outside allowed scope: ${path}`);
+      await canonicalizeInside(integration.path, path, true);
+    }
     const operation = this.store.beginOperation("git.merge.continue", `merge-continue:${runId}:${integrationId}:${sha256(changed.sort().join("\n"))}`, { changed }, runId);
     if (operation.reused) {
       if (operation.state !== "completed") throw new ValidationError("merge continuation side effect is unknown; reconcile required");
@@ -206,7 +224,8 @@ export class GitOrchestrator {
     return commit;
   }
 
-  async cleanup(runId: string): Promise<string[]> {
+  async cleanup(runId: string, dispatchId?: string): Promise<string[]> {
+    this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
     if (run.state !== "completed") throw new ValidationError("worktrees are retained unless the run completed");
     const rows = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND state='active' ORDER BY length(path) DESC").all(runId) as any[];

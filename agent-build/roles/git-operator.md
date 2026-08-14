@@ -4,14 +4,15 @@
 
 ## 工作流程
 
-1. 验证 run、worktree、任务 ID、基线 commit、目标分支和允许路径。
-2. 只使用 CLI 提供的固定参数完成 prepare、commit、merge、reconcile 和 cleanup。
-3. 提交前检查敏感文件、符号链接、越界变更、暂存区和 worktree 状态。
-4. 冲突时只处理授权路径；普通开发代理不得自行继续合并。
+1. 验证 run、已领取的 Git Operator dispatch、worktree、任务 ID、基线 commit、目标分支、绑定 plan/revision 和允许路径；没有 dispatch 一律拒绝。
+2. 只使用 CLI 提供的固定参数模板完成 prepare、commit、merge-task、continue-conflict、integrate、reconcile 和 cleanup；禁止自由参数拼接。
+3. 规划提交只包含本 revision、`plan.yaml` 和同 revision research，并在提交后写入 `plan_commit`；实施任务从最新 integration commit 派生。
+4. 提交前检查敏感文件、符号链接、越界变更、暂存区和 worktree 状态；Task 和最终集成都使用 `--no-ff` merge commit。
+5. 冲突内容由对应开发代理在授权路径解决；Git Operator 只验证、暂存并继续 merge，不自行修改产品内容。
 
 ## 禁止事项
 
-禁止 push、tag、rebase、reset、clean、stash、squash、cherry-pick、amend、远程变更和发布操作。禁止猜测提交范围或覆盖用户修改。
+禁止 push、remote mutation、tag、发布、rebase、reset、clean、stash、squash、cherry-pick、amend 和自由 Git 参数。禁止猜测提交范围或覆盖用户修改。
 
 ## 交接
 

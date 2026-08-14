@@ -12,7 +12,7 @@ import { AiTeamError, ValidationError } from "./errors.js";
 import { commitPlanningRevision, repositoryIdentity, worktreeStatus } from "./git.js";
 import { GitOrchestrator } from "./git-orchestrator.js";
 import { ScopeGate } from "./gates.js";
-import { runnableTaskBatches, type TaskDefinition } from "./tasks.js";
+import { runnableTaskBatches, validateTaskPreview, type TaskDefinition } from "./tasks.js";
 import { writeRevision, nextPlanState, type RevisionDocuments } from "./planning.js";
 import { initializeProject } from "./project.js";
 import { ReviewService, type FindingResolution, type ReviewResult } from "./review.js";
@@ -22,8 +22,22 @@ import { ROLE_MANIFEST_DIGEST } from "./roles.js";
 import { AGENT_BUILD } from "./roles.js";
 import { StateStore } from "./state.js";
 import { WorkflowService } from "./workflow.js";
+import { assertReadablePath } from "./security.js";
 
-const output = (value: unknown): void => { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); };
+let humanOutput = false;
+const humanize = (value: unknown): string => {
+  if (value === null || typeof value !== "object") return String(value ?? "");
+  if (Array.isArray(value)) return value.map((item) => humanize(item)).join("\n");
+  return Object.entries(value as Record<string, unknown>).map(([key, item]) => `${key}: ${typeof item === "string" ? item : JSON.stringify(item)}`).join("\n");
+};
+/** Add the common success envelope while retaining legacy top-level fields. */
+const output = (value: unknown): void => {
+  if (humanOutput) { process.stdout.write(`${humanize(value)}\n`); return; }
+  const envelope = value && typeof value === "object" && !Array.isArray(value)
+    ? { ok: true, data: value, ...(value as Record<string, unknown>) }
+    : value;
+  process.stdout.write(`${JSON.stringify(envelope, null, 2)}\n`);
+};
 const roleOption = (): Option => new Option("--role <role>").choices([...ROLES]).makeOptionMandatory();
 const platformList = (value: string): Platform[] => {
   const platforms = value.split(",") as Platform[];
@@ -36,10 +50,17 @@ const withStore = async <T>(action: (store: StateStore) => Promise<T> | T): Prom
   try { return await action(store); } finally { store.close(); }
 };
 
+const readSafeFile = async (path: string): Promise<string> => {
+  assertReadablePath(path);
+  const value = await readFile(path, "utf8");
+  if (value.length > 2 * 1024 * 1024) throw new ValidationError("input file exceeds the 2 MiB limit");
+  return value;
+};
+
 const requestOptions = (command: Command): Command => command.option("--request-file <file>").option("--request-stdin");
 
 export const buildProgram = (): Command => {
-  const program = new Command().name("ai-team").description("Local AI coding team workflow orchestration").version(PACKAGE_VERSION);
+  const program = new Command().name("ai-team").description("Local AI coding team workflow orchestration").version(PACKAGE_VERSION).option("--human", "render human-readable output");
   program.configureOutput({ outputError: (text) => process.stderr.write(text) });
 
   program.command("init").argument("<project>").option("--yes", "confirm a patch to a dirty .gitignore").action(async (project, options) => output(await initializeProject(project, options.yes)));
@@ -56,7 +77,7 @@ export const buildProgram = (): Command => {
   });
   const revision = planning.command("revision");
   revision.command("create").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--target-branch <branch>").requiredOption("--documents-file <file>").option("--supersedes <nnn>").option("--run-id <id>").action(async (options) => {
-    const docs = JSON.parse(await readFile(options.documentsFile, "utf8")) as RevisionDocuments;
+    const docs = JSON.parse(await readSafeFile(options.documentsFile)) as RevisionDocuments;
     const result = await writeRevision(options.project, options.planId, options.revision, options.targetBranch, docs, options.supersedes);
     const repo = await repositoryIdentity(options.project);
     await withStore((store) => {
@@ -107,8 +128,9 @@ export const buildProgram = (): Command => {
     }));
   });
   const tasks = planning.command("tasks");
-  tasks.command("validate").requiredOption("--file <json>").action(async ({ file }) => {
-    const definitions = JSON.parse(await readFile(file, "utf8")) as TaskDefinition[];
+  tasks.command("validate").requiredOption("--file <json>").option("--preview").action(async ({ file, preview }) => {
+    const definitions = JSON.parse(await readSafeFile(file)) as TaskDefinition[];
+    if (preview) validateTaskPreview(definitions);
     output({ valid: true, batches: runnableTaskBatches(definitions) });
   });
 
@@ -138,56 +160,60 @@ export const buildProgram = (): Command => {
     pending_operations: store.db.prepare("SELECT operation_id,kind,state FROM operations WHERE run_id=? AND state='pending'").all(runId),
     last_event: store.db.prepare("SELECT type,payload_json,created_at FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT 1").get(runId) ?? null,
   }))));
-  run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readFile(options.noteFile, "utf8") : undefined; store.decide(options.runId, options.decisionId, options.choice, note); const run = store.getRun(options.runId) as { profile: string }; const dispatchId = run.profile === "planning" ? new DispatchService(store).continuePlanning(options.runId) : undefined; output({ status: "resolved", ...(dispatchId ? { dispatch_id: dispatchId } : {}) }); }));
+  run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined; store.decide(options.runId, options.decisionId, options.choice, note); const run = store.getRun(options.runId) as { profile: string }; const dispatchId = run.profile === "planning" ? new DispatchService(store).continuePlanning(options.runId) : undefined; output({ status: "resolved", ...(dispatchId ? { dispatch_id: dispatchId } : {}) }); }));
 
   const dispatch = program.command("dispatch");
-  dispatch.command("create").requiredOption("--run-id <id>").addOption(roleOption()).requiredOption("--packet-file <file>").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).action(async (options) => output(await withStore(async (store) => {
-    const packet = JSON.parse(await readFile(options.packetFile, "utf8"));
-    return { dispatch_id: new DispatchService(store).create(options.runId, options.role, packet, options.actorRole) };
+  dispatch.command("create").requiredOption("--run-id <id>").addOption(roleOption()).requiredOption("--packet-file <file>").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).option("--actor-dispatch-id <id>").action(async (options) => output(await withStore(async (store) => {
+    if ((options.actorRole === "coding" || options.actorRole === "code-reviewer") && !options.actorDispatchId) throw new ValidationError(`${options.actorRole} dispatch creation requires --actor-dispatch-id`);
+    const packet = JSON.parse(await readSafeFile(options.packetFile));
+    if (options.actorRole === "coding" && options.role !== "file-explorer" && !packet?.context?.explorer_dispatch_id) throw new ValidationError("downstream dispatch requires --packet-file context.explorer_dispatch_id");
+    return { dispatch_id: new DispatchService(store).create(options.runId, options.role, packet, options.actorRole, options.actorDispatchId) };
   })));
   const dispatchCommand = (name: string): Command => dispatch.command(name).requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").addOption(roleOption()).hook("preAction", (_command, action) => validateCommand("dispatch.identity", { runId: action.opts().runId, dispatchId: action.opts().dispatchId, role: action.opts().role }));
   dispatchCommand("claim").action(async (options) => output(await withStore((store) => new DispatchService(store).claim(options.runId, options.dispatchId, options.role))));
   dispatchCommand("prompt").action(async (options) => { process.stdout.write(`${await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role))}\n`); });
   dispatchCommand("schema").action(async (options) => output(await withStore((store) => new DispatchService(store).schema(options.runId, options.dispatchId, options.role))));
+  dispatchCommand("template").action(async (options) => output(await withStore((store) => new DispatchService(store).template(options.runId, options.dispatchId, options.role))));
   dispatchCommand("validate").requiredOption("--result-file <file>").action(async (options) => output({ valid: true, result: await withStore((store) => new DispatchService(store).validateFile(options.runId, options.dispatchId, options.role, options.resultFile)) }));
   dispatchCommand("submit").requiredOption("--result-file <file>").action(async (options) => output(await withStore((store) => new DispatchService(store).submit(options.runId, options.dispatchId, options.role, options.resultFile))));
 
   const gitCommand = program.command("git");
   gitCommand.command("status").requiredOption("--run-id <id>").action(async ({ runId }) => output(await withStore(async (store) => { const run = store.getRun(runId); const repo = store.db.prepare("SELECT * FROM repositories WHERE repo_id=?").get(run.repo_id); return { run_id: runId, repository: repo, worktree: await worktreeStatus((repo as any).project_path) }; })));
-  gitCommand.command("prepare").requiredOption("--run-id <id>").option("--task-id <id>", "task id or implementation", "implementation").option("--integration").option("--base-commit <sha>").option("--depends-on <worktree-id>").action(async (options) => output(await withStore((store) => options.integration ? new GitOrchestrator(store).prepareIntegration(options.runId) : new GitOrchestrator(store).prepareTask(options.runId, options.taskId, options.baseCommit, options.dependsOn))));
-  gitCommand.command("commit").requiredOption("--run-id <id>").requiredOption("--worktree-id <id>").requiredOption("--message <message>").requiredOption("--scope <paths>", "comma-separated repository-relative scopes").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).commit(options.runId, options.worktreeId, options.message, options.scope.split(",")))));
-  gitCommand.command("merge-task").requiredOption("--run-id <id>").requiredOption("--integration-id <id>").requiredOption("--task-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).mergeTask(options.runId, options.integrationId, options.taskId)) }));
-  gitCommand.command("continue-conflict").requiredOption("--run-id <id>").requiredOption("--integration-id <id>").requiredOption("--scope <paths>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).continueConflict(options.runId, options.integrationId, options.scope.split(","))) }));
-  gitCommand.command("integrate").requiredOption("--run-id <id>").requiredOption("--integration-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).integrateTarget(options.runId, options.integrationId)) }));
-  gitCommand.command("reconcile").requiredOption("--run-id <id>").option("--operation-id <id>").option("--state <state>").option("--evidence-file <file>").action(async (options) => output(await withStore(async (store) => {
+  gitCommand.command("prepare").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--task-id <id>", "task id or implementation", "implementation").option("--integration").option("--base-commit <sha>").option("--depends-on <worktree-id>").action(async (options) => output(await withStore((store) => options.integration ? new GitOrchestrator(store).prepareIntegration(options.runId, options.dispatchId) : new GitOrchestrator(store).prepareTask(options.runId, options.taskId, options.baseCommit, options.dependsOn, options.dispatchId))));
+  gitCommand.command("commit").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--worktree-id <id>").requiredOption("--message <message>").requiredOption("--scope <paths>", "comma-separated repository-relative scopes").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).commit(options.runId, options.worktreeId, options.message, options.scope.split(","), options.dispatchId))));
+  gitCommand.command("merge-task").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--task-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).mergeTask(options.runId, options.integrationId, options.taskId, options.dispatchId)) }));
+  gitCommand.command("continue-conflict").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--scope <paths>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).continueConflict(options.runId, options.integrationId, options.scope.split(","), options.dispatchId)) }));
+  gitCommand.command("integrate").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).integrateTarget(options.runId, options.integrationId, options.dispatchId)) }));
+  gitCommand.command("reconcile").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--operation-id <id>").option("--state <state>").option("--evidence-file <file>").action(async (options) => output(await withStore(async (store) => {
+    new DispatchService(store).assertClaimed(options.runId, options.dispatchId, "git-operator");
     if (options.operationId) {
       if (!options.state || !options.evidenceFile) throw new ValidationError("reconcile mutation requires --state and --evidence-file");
-      const evidence = JSON.parse(await readFile(options.evidenceFile, "utf8"));
+      const evidence = JSON.parse(await readSafeFile(options.evidenceFile));
       store.reconcileOperation(options.operationId, options.state, evidence);
     }
     return new GitOrchestrator(store).reconcile(options.runId);
   })));
-  gitCommand.command("cleanup").requiredOption("--run-id <id>").action(async ({ runId }) => output({ removed: await withStore((store) => new GitOrchestrator(store).cleanup(runId)) }));
+  gitCommand.command("cleanup").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").action(async ({ runId, dispatchId }) => output({ removed: await withStore((store) => new GitOrchestrator(store).cleanup(runId, dispatchId)) }));
 
   const scope = program.command("scope");
   scope.command("check").requiredOption("--run-id <id>").addOption(new Option("--stage <stage>").choices(["triage", "pre_write", "pre_commit"]).makeOptionMandatory()).requiredOption("--paths <paths>", "comma-separated repository-relative paths").action(async (options) => output(await withStore((store) => new ScopeGate(store).check(options.runId, options.stage, options.paths.split(",")))));
 
   const decision = program.command("decision");
   decision.command("create").requiredOption("--run-id <id>").requiredOption("--file <json>").action(async (options) => output(await withStore(async (store) => {
-    const value = JSON.parse(await readFile(options.file, "utf8"));
+    const value = JSON.parse(await readSafeFile(options.file));
     return { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation) };
   })));
 
   const research = program.command("research");
   research.command("archive").requiredOption("--run-id <id>").requiredOption("--project <path>").requiredOption("--topic <topic>").requiredOption("--report-file <file>").action(async (options) => output(await withStore(async (store) => {
-    const conclusions = JSON.parse(await readFile(options.reportFile, "utf8")) as ResearchConclusion[];
+    const conclusions = JSON.parse(await readSafeFile(options.reportFile)) as ResearchConclusion[];
     return new ResearchService(store).archive(options.runId, options.project, options.topic, conclusions);
   })));
 
   const review = program.command("review");
   review.command("create").requiredOption("--run-id <id>").requiredOption("--revision-sha <sha>").option("--formal").action(async (options) => { validateCommand("review.create", { runId: options.runId, revisionSha: options.revisionSha, formal: options.formal }); output(await withStore((store) => new ReviewService(store).create(options.runId, options.revisionSha, options.formal))); });
-  review.command("submit").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").requiredOption("--result-file <file>").action(async (options) => output(await withStore(async (store) => new ReviewService(store).submit(options.runId, options.barrierId, JSON.parse(await readFile(options.resultFile, "utf8")) as ReviewResult))));
-  review.command("resolve").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").requiredOption("--resolution-file <file>").action(async (options) => output(await withStore(async (store) => new ReviewService(store).resolve(options.runId, options.barrierId, JSON.parse(await readFile(options.resolutionFile, "utf8")) as FindingResolution[]))));
+  review.command("submit").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").requiredOption("--result-file <file>").action(async (options) => output(await withStore(async (store) => new ReviewService(store).submit(options.runId, options.barrierId, JSON.parse(await readSafeFile(options.resultFile)) as ReviewResult))));
+  review.command("resolve").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").requiredOption("--resolution-file <file>").action(async (options) => output(await withStore(async (store) => new ReviewService(store).resolve(options.runId, options.barrierId, JSON.parse(await readSafeFile(options.resolutionFile)) as FindingResolution[]))));
   review.command("status").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").action(async (options) => output(await withStore((store) => new ReviewService(store).status(options.runId, options.barrierId))));
 
   program.command("install").option("--platform <list>", "comma-separated platforms", platformList).option("--dry-run").action(async (options) => { const service = new EnvironmentService(); const environment = await service.load(await service.active()); const platforms = options.platform ?? environment.platforms; const versions = await service.validateClientVersions(platforms); output({ versions, plan: await service.generate(environment.name, platforms, options.dryRun) }); });
@@ -210,12 +236,22 @@ export const buildProgram = (): Command => {
 };
 
 export const main = async (argv = process.argv): Promise<void> => {
+  humanOutput = argv.includes("--human");
   try { await buildProgram().parseAsync(argv); }
   catch (error) {
-    if (error instanceof AiTeamError) { process.stderr.write(`${JSON.stringify({ error: error.message, details: error.details ?? null })}\n`); process.exitCode = error.code; return; }
+    if (error instanceof AiTeamError) {
+      const failure = { ok: false, error: error.message, details: error.details ?? null, code: error.code };
+      process.stderr.write(`${humanOutput ? humanize(failure) : JSON.stringify(failure)}\n`);
+      process.exitCode = error.code; return;
+    }
     const commander = error as { code?: string; exitCode?: number; message?: string };
-    if (commander.code?.startsWith("commander.")) { process.exitCode = commander.exitCode ?? EXIT.validation; return; }
-    process.stderr.write(`${JSON.stringify({ error: error instanceof Error ? error.message : String(error) })}\n`); process.exitCode = EXIT.internal;
+    if (commander.code?.startsWith("commander.")) {
+      const failure = { ok: false, error: commander.message ?? commander.code, details: null, code: EXIT.args };
+      process.stderr.write(`${humanOutput ? humanize(failure) : JSON.stringify(failure)}\n`);
+      process.exitCode = EXIT.args; return;
+    }
+    const failure = { ok: false, error: error instanceof Error ? error.message : String(error), details: null, code: EXIT.internal };
+    process.stderr.write(`${humanOutput ? humanize(failure) : JSON.stringify(failure)}\n`); process.exitCode = EXIT.internal;
   }
 };
 
