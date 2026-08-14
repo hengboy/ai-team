@@ -378,6 +378,8 @@ opencode:
 
 每个生成 Agent 包含 managed marker、role id、模板版本、平台、环境、模型/推理配置、contract digest、角色允许命令和精确参数类型说明。平台不支持的硬约束标记为 `unsupported` 时阻断生成；`instruction` 只能表示无法机械执行但仍需提示和评审的软约束。
 
+OpenCode 文件必须以 YAML frontmatter 开头，使客户端能解析角色模式。`planning` 和 `coding` 使用 `mode: primary`；其余角色使用 `mode: subagent` 与 `hidden: true`，只能由主代理委派，不出现在用户的主代理切换列表中。
+
 ## 13. 安装、初始化和卸载
 
 `ai-team init` 必须在 Git 仓库内运行，幂等创建 `.ai-team`、`.gitignore` 条目和目标项目上下文骨架；只向已有 `AGENTS.md/CLAUDE.md` 追加维护规则。将被修改的上下文、指令或 `.gitignore` 文件有未提交内容时展示诊断并要求确认。目标项目上下文属于源码，由用户决定何时提交。

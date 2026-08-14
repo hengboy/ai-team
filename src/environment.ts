@@ -237,15 +237,19 @@ const renderBody = (role: Role, platform: Platform, model: ModelConfig, environm
   if (platform === "codex") {
     return `# ${FILE_MARKER}\n# ai_team.metadata = ${stableJson(metadata)}\nname = ${JSON.stringify(role)}\ndescription = ${JSON.stringify(definition.purpose)}\nmodel = ${JSON.stringify(model.model)}\nmodel_reasoning_effort = ${JSON.stringify(model.reasoning)}\ndeveloper_instructions = ${JSON.stringify(instructions)}\n`;
   }
+  const isPrimary = role === "planning" || role === "coding";
   const frontmatter = YAML.stringify({
-    ...(platform === "opencode" ? { mode: role === "planning" || role === "coding" ? "primary" : "subagent" } : {}),
+    ...(platform === "opencode" ? { mode: isPrimary ? "primary" : "subagent", ...(!isPrimary ? { hidden: true } : {}) } : {}),
     model: model.model,
     effort: model.effort,
     variant: model.variant,
     options: model.options,
     ai_team: metadata,
   });
-  return `<!-- ${FILE_MARKER} -->\n---\n${frontmatter}---\n\n# ${role}\n\n${instructions}\n`;
+  const marker = `<!-- ${FILE_MARKER} -->`;
+  return platform === "opencode"
+    ? `---\n${frontmatter}---\n${marker}\n\n# ${role}\n\n${instructions}\n`
+    : `${marker}\n---\n${frontmatter}---\n\n# ${role}\n\n${instructions}\n`;
 };
 
 export const renderCodexAgent = (input: AgentRenderInput): string => renderBody(input.role, "codex", input.model, input.environment);

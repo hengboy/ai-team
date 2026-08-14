@@ -116,7 +116,10 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
       }
       if (platform === "claude") assert.match(content, /^effort: medium$/m);
       if (platform === "opencode") {
+        assert.ok(content.startsWith("---\n"), `${role} OpenCode frontmatter must be the first block`);
         assert.match(content, new RegExp(`^mode: ${role === "planning" || role === "coding" ? "primary" : "subagent"}$`, "m"));
+        if (role === "planning" || role === "coding") assert.doesNotMatch(content, /^hidden:/m);
+        else assert.match(content, /^hidden: true$/m);
         assert.match(content, /^variant: medium$/m);
         assert.match(content, /^options: (?:&\w+ )?\{\}$/m);
       }
