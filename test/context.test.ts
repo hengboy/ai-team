@@ -50,6 +50,8 @@ test("context initialization is idempotent and preserves existing instructions",
   assert.match(instructions, /\*\*File Explorer\*\*/);
   assert.match(instructions, /`仓库文件检索`/);
   assert.match(instructions, /不得自行使用 `rg`、`find`、`glob`/);
+  assert.match(instructions, /\.ai-team\/plans\/<planId>\/screenshot\//);
+  assert.match(instructions, /`plan_id`/);
   await assert.rejects(stat(join(root, "CLAUDE.md")));
   assert.equal((await validateProjectContext(root)).valid, true);
 });

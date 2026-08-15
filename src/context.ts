@@ -11,7 +11,7 @@ import { assertRelativePosixPath, stableJson } from "./utils.js";
 export const MEMORY_PATH = "MEMORY.md";
 export const NAVIGATION_PATH = ".ai-team/index/feature-navigation.md";
 export const INSTRUCTION_PATHS = ["AGENTS.md", "CLAUDE.md"] as const;
-export const CONTEXT_RULE = "所有`仓库文件检索`、`目录遍历`、`文件名/全文搜索`、`入口定位`、`调用链`和`未知依赖探索`必须委派给 **File Explorer**；其他代理只能读取 `packet` 明确授权或 **File Explorer** 返回的精确路径，遇到未知路径时请求支持，不得自行使用 `rg`、`find`、`glob` 或`全仓扫描`。入口、职责或模块边界变化时，同轮更新根 `MEMORY.md` 与唯一权威路径 `.ai-team/index/feature-navigation.md`。评审以已提交 `MEMORY.md` 为 standards source。";
+export const CONTEXT_RULE = "所有`仓库文件检索`、`目录遍历`、`文件名/全文搜索`、`入口定位`、`调用链`和`未知依赖探索`必须委派给 **File Explorer**；其他代理只能读取 `packet` 明确授权或 **File Explorer** 返回的精确路径，遇到未知路径时请求支持，不得自行使用 `rg`、`find`、`glob` 或`全仓扫描`。测试过程中产生的所有截图必须保存到对应计划的 `.ai-team/plans/<planId>/screenshot/` 目录；执行角色必须使用 `packet` 提供的 `plan_id` 和精确截图目录，缺失时停止并请求支持。入口、职责或模块边界变化时，同轮更新根 `MEMORY.md` 与唯一权威路径 `.ai-team/index/feature-navigation.md`。评审以已提交 `MEMORY.md` 为 standards source。";
 
 const MEMORY_START = "<!-- ai-team:project-context:start -->";
 const MEMORY_END = "<!-- ai-team:project-context:end -->";

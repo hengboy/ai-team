@@ -7,4 +7,6 @@
 
 所有`仓库文件检索`、`目录遍历`、`文件名/全文搜索`、`入口定位`、`调用链`和`未知依赖探索`必须委派给 **File Explorer**。其他代理只能读取 `packet` 明确授权或 **File Explorer** 返回的精确路径；遇到未知路径时请求 **File Explorer** 支持，不得自行使用 `rg`、`find`、`glob` 或`全仓扫描`。
 
+测试过程中产生的所有截图必须保存到对应计划的 `.ai-team/plans/<planId>/screenshot/` 目录。执行角色必须使用 `packet` 提供的 `plan_id` 和精确截图目录，不得自行推断或写入其他位置；缺少这些信息时停止并请求支持。
+
 目标项目的根 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md` 属于项目源码。入口、职责或模块边界变化时，开发角色必须通过 `ai-team context update` 同步 File Explorer 的 `payload.project_context`，再运行 `ai-team context validate`；评审以已提交 `MEMORY.md` 为 standards source。

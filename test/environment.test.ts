@@ -255,6 +255,16 @@ test("planning and Git Operator agents expose the immutable revision handoff con
   assert.match(gitOperator, /ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>/);
 });
 
+test("generated agents keep screenshots in the owning plan directory", () => {
+  const files = renderAgents(balancedEnvironment());
+
+  for (const role of ["coding", "test", "frontend-developer"]) {
+    const content = files.get(`codex/agents/${role}.toml`) ?? "";
+    assert.match(content, /\.ai-team\/plans\/<planId>\/screenshot\//);
+    assert.match(content, /`plan_id`/);
+  }
+});
+
 test("generate dry-run returns a plan without writing managed user files", async (t) => {
   const { aiTeamHome, userHome } = await makeHomes(t);
   const service = new EnvironmentService(aiTeamHome, userHome);
@@ -268,6 +278,8 @@ test("generate dry-run returns a plan without writing managed user files", async
     assert.match(write.content, /\*\*File Explorer\*\*/);
     assert.match(write.content, /`仓库文件检索`/);
     assert.match(write.content, /不得自行使用 `rg`、`find`、`glob`/);
+    assert.match(write.content, /\.ai-team\/plans\/<planId>\/screenshot\//);
+    assert.match(write.content, /`plan_id`/);
     assert.match(write.content, /ai-team:managed:start/);
     assert.match(write.content, /ai-team:managed:end/);
   }
