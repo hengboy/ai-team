@@ -17,6 +17,8 @@ const readPackageVersion = (): string => {
 
 export const PACKAGE_VERSION = readPackageVersion();
 export const SCHEMA_VERSION = 1;
+export const PROJECT_CONTEXT_SCHEMA_VERSION = 2;
+export const PROJECT_CONTEXT_RENDERER_VERSION = "context-renderer-v2";
 
 export const EXIT = {
   ok: 0,

@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { lstat, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, posix } from "node:path";
 import { checkProjectContext, type ProjectContext } from "./contracts.js";
+import { PROJECT_CONTEXT_RENDERER_VERSION, PROJECT_CONTEXT_SCHEMA_VERSION } from "./constants.js";
 import { ValidationError } from "./errors.js";
 import { git, repositoryIdentity } from "./git.js";
 import { canonicalizeInside, isSensitivePath } from "./security.js";
@@ -18,7 +19,10 @@ const MEMORY_HEADING = "## 项目上下文";
 const NAVIGATION_START = "<!-- ai-team:feature-navigation:start -->";
 const NAVIGATION_END = "<!-- ai-team:feature-navigation:end -->";
 const NAVIGATION_HEADING = "# 功能导航";
+const LEGACY_NAVIGATION_HEADINGS = ["# Feature Navigation"] as const;
 const NAVIGATION_ENTRY = "<!-- ai-team:feature-navigation-entry ";
+const CONTEXT_FORMAT_PREFIX = "<!-- ai-team:context-format ";
+const CONTEXT_FORMAT = `${CONTEXT_FORMAT_PREFIX}${stableJson({ renderer_version: PROJECT_CONTEXT_RENDERER_VERSION, schema_version: PROJECT_CONTEXT_SCHEMA_VERSION })} -->`;
 const EMPTY = "_待补充_";
 
 interface MemoryData {
@@ -67,6 +71,7 @@ const bulletBlock = (values: string[]): string => values.length ? values.map((va
 
 const renderMemorySection = (data: MemoryData): string => [
   MEMORY_START,
+  CONTEXT_FORMAT,
   MEMORY_HEADING,
   "",
   "### 项目形态",
@@ -139,7 +144,9 @@ const ensureSingleManagedSection = (source: string | undefined, kind: "memory" |
     : [NAVIGATION_START, NAVIGATION_END, NAVIGATION_HEADING];
   const starts = occurrences(source, start);
   const ends = occurrences(source, end);
-  const headings = occurrences(source, heading);
+  const headings = kind === "navigation"
+    ? [heading, ...LEGACY_NAVIGATION_HEADINGS].reduce((count, candidate) => count + occurrences(source, candidate), 0)
+    : occurrences(source, heading);
   if (starts === 0 && ends === 0 && headings === 0) return;
   if (starts !== 1 || ends !== 1 || headings !== 1 || source.indexOf(start) > source.indexOf(end)) {
     throw new ValidationError(`${kind === "memory" ? "MEMORY.md" : NAVIGATION_PATH} has duplicate or malformed managed sections`);
@@ -155,6 +162,7 @@ const renderNavigationSection = (entries: ProjectContext["navigation"]): string 
   const metadata = entries.map((entry) => `${NAVIGATION_ENTRY}${stableJson(entry)} -->`);
   return [
     NAVIGATION_START,
+    CONTEXT_FORMAT,
     NAVIGATION_HEADING,
     "",
     "| 功能 | 关键词 | 入口路径 | 模块边界 |",
@@ -172,7 +180,8 @@ const parseNavigation = (source: string): { entries: ProjectContext["navigation"
   if (start < 0 || endMarker < start) throw new ValidationError(`${NAVIGATION_PATH} managed section is missing`);
   const end = endMarker + NAVIGATION_END.length;
   const managed = source.slice(start, end);
-  if (occurrences(managed, NAVIGATION_HEADING) !== 1) throw new ValidationError(`${NAVIGATION_PATH} must contain exactly one heading`);
+  const headings = [NAVIGATION_HEADING, ...LEGACY_NAVIGATION_HEADINGS].reduce((count, heading) => count + occurrences(managed, heading), 0);
+  if (headings !== 1) throw new ValidationError(`${NAVIGATION_PATH} must contain exactly one supported heading`);
   const lines = managed.split("\n");
   const headerIndex = lines.indexOf("| 功能 | 关键词 | 入口路径 | 模块边界 |");
   const separatorIndex = lines.indexOf("| --- | --- | --- | --- |");
@@ -400,11 +409,17 @@ export const validateProjectContext = async (project: string): Promise<ContextVa
   let navigationEntries: ProjectContext["navigation"] = [];
   if (memorySource !== undefined) {
     memorySections = occurrences(memorySource, MEMORY_START);
-    try { parseMemory(memorySource); } catch (error) { memoryIssues.push((error as Error).message); }
+    try {
+      parseMemory(memorySource);
+      if (!memorySource.includes(CONTEXT_FORMAT)) memoryIssues.push(`legacy context format; run ai-team context update --project ${root} with the current File Explorer project_context`);
+    } catch (error) { memoryIssues.push((error as Error).message); }
   } else memoryIssues.push("MEMORY.md is missing");
   if (navigationSource !== undefined) {
     navigationSections = occurrences(navigationSource, NAVIGATION_START);
-    try { navigationEntries = parseNavigation(navigationSource).entries; } catch (error) { navigationIssues.push((error as Error).message); }
+    try {
+      navigationEntries = parseNavigation(navigationSource).entries;
+      if (!navigationSource.includes(CONTEXT_FORMAT)) navigationIssues.push(`legacy context format; run ai-team context update --project ${root} with the current File Explorer project_context`);
+    } catch (error) { navigationIssues.push((error as Error).message); }
   } else navigationIssues.push(`${NAVIGATION_PATH} is missing`);
   const invalidPaths: string[] = [];
   for (const entry of navigationEntries) for (const path of entry.entry_paths) {

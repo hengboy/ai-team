@@ -723,8 +723,12 @@ test("run resume repairs a stale planning retryable failure without crossing blo
       { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
     ], "current");
     const decisionResult = dispatches.resume(decisionBlocked.runId);
-    assert.equal((decisionResult.run as { state: string }).state, "retryable_failure");
+    assert.equal((decisionResult.run as { state: string }).state, "needs_decision");
     assert.equal(decisionResult.pending_dispatches.length, 0);
+    assert.equal(
+      (store.db.prepare("SELECT dispatch_id FROM decisions WHERE run_id=? AND status='pending'").get(decisionBlocked.runId) as { dispatch_id: string }).dispatch_id,
+      decisionBlocked.explorerId,
+    );
 
     const operationBlocked = await makeRetryable("planning");
     store.beginOperation("git.commit", `commit:${operationBlocked.runId}`, {}, operationBlocked.runId);
@@ -756,6 +760,127 @@ test("run resume repairs a stale planning retryable failure without crossing blo
       assert.equal((blockedResult.run as { state: string }).state, "retryable_failure", name);
       assert.equal(blockedResult.pending_dispatches.length, 0, name);
     }
+  });
+});
+
+test("retryable frontend recovery preserves the claimed coordinator and creates a linked replacement", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+    store.db.prepare("INSERT INTO artifacts(artifact_id,run_id,dispatch_id,kind,path,sha256,redacted,created_at) VALUES (?,?,?,'result',?,?,1,?)")
+      .run("artifact_recovery_explorer", runId, explorerId, "/tmp/explorer-result.json", "a".repeat(64), new Date().toISOString());
+    const codingId = dispatches.create(runId, "coding", dispatchPacket(["src/dispatch.ts"]));
+    dispatches.claim(runId, codingId, "coding");
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_recovered_owner", runId, "task/recovered/implementation", "/tmp/recovered-owner", REVIEW_HEAD, new Date().toISOString());
+    const adoption = store.beginOperation("git.worktree.adopt", `adopt:${runId}`, {}, runId);
+    store.finishOperation(adoption.operationId, { implementation_revision: REVIEW_HEAD, worktree_id: "worktree_recovered_owner" });
+    const frontendId = dispatches.create(runId, "frontend-developer", {
+      ...dispatchPacket(["src/dispatch.ts"]),
+      acceptance_criteria: ["Operate only in /tmp/old-owner on branch task/old/implementation."],
+      context: {
+        explorer_dispatch_id: explorerId,
+        revision: "001",
+        implementation_commit: REVIEW_HEAD,
+        worktree_id: "worktree_old_owner",
+        implementation_worktree_path: "/tmp/old-owner",
+        implementation_branch: "task/old/implementation",
+      },
+    });
+    dispatches.claim(runId, frontendId, "frontend-developer");
+    await dispatches.submitValue(runId, frontendId, "frontend-developer", {
+      ...createResultTemplate(runId, frontendId, "frontend-developer"),
+      status: "retryable_failure",
+      summary: "Context renderer is stale",
+      verification: [{ command: "unit tests", outcome: "passed before context validation" }],
+      payload: {},
+      failure_class: "context_migration_required",
+      side_effect_state: "none",
+    });
+
+    const resumed = dispatches.resume(runId);
+    assert.equal((resumed.run as { state: string }).state, "active");
+    assert.ok(resumed.pending_dispatches.some((item) => item.dispatch_id === codingId && item.state === "claimed"));
+    const replacement = store.db.prepare("SELECT dispatch_id,replacement_for,packet_json FROM dispatches WHERE replacement_for=?").get(frontendId) as { dispatch_id: string; replacement_for: string; packet_json: string };
+    assert.equal(replacement.replacement_for, frontendId);
+    const packet = JSON.parse(replacement.packet_json);
+    assert.equal(packet.context.revision, "001");
+    assert.equal(packet.context.implementation_commit, REVIEW_HEAD);
+    assert.equal(packet.context.implementation_revision, REVIEW_HEAD);
+    assert.equal(packet.context.worktree_id, "worktree_recovered_owner");
+    assert.deepEqual(packet.acceptance_criteria, ["Operate only in /tmp/recovered-owner on branch task/recovered/implementation."]);
+    assert.equal(packet.context.explorer_dispatch_id, explorerId);
+    assert.equal(packet.context.recovery.replacement_for, frontendId);
+    assert.deepEqual(packet.context.recovery.completed_verification, [{ command: "unit tests", outcome: "passed before context validation" }]);
+
+    dispatches.claim(runId, replacement.dispatch_id, "frontend-developer");
+    await dispatches.submitValue(runId, replacement.dispatch_id, "frontend-developer", {
+      ...createResultTemplate(runId, replacement.dispatch_id, "frontend-developer"),
+      status: "retryable_failure",
+      summary: "Frozen text still referenced the root worktree",
+      verification: [],
+      payload: {},
+      failure_class: "stale_recovery_packet",
+      side_effect_state: "none",
+    });
+    dispatches.resume(runId);
+    const second = store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE replacement_for=?").get(replacement.dispatch_id) as { dispatch_id: string; packet_json: string };
+    const secondPacket = JSON.parse(second.packet_json);
+    assert.deepEqual(secondPacket.acceptance_criteria, ["Operate only in /tmp/recovered-owner on branch task/recovered/implementation."]);
+    assert.deepEqual(secondPacket.context.recovery.completed_verification, [{ command: "unit tests", outcome: "passed before context validation" }]);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_recovered_integration", runId, "integration/recovered", process.cwd(), REVIEW_HEAD, new Date().toISOString());
+    const commit = store.beginOperation("git.commit", `commit:${runId}:recovered`, {}, runId);
+    store.finishOperation(commit.operationId, { commit: REVIEW_HEAD, paths: ["src/dispatch.ts"], worktree_id: "worktree_recovered_owner" });
+    dispatches.claim(runId, second.dispatch_id, "frontend-developer");
+    await dispatches.submitValue(runId, second.dispatch_id, "frontend-developer", completedResult(runId, second.dispatch_id, "frontend-developer", {
+      modified_paths: ["src/dispatch.ts"], self_tests: [{ command: "npm test", outcome: "passed" }],
+    }));
+    await dispatches.submitValue(runId, codingId, "coding", completedResult(runId, codingId, "coding", { actions: ["resume replacement"] }));
+    assert.equal(
+      (store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='git-operator' AND json_extract(packet_json,'$.context.phase')='integrate_implementation'").get(runId) as { count: number }).count,
+      1,
+    );
+  });
+});
+
+test("retryable recovery decision is dispatch-bound and regenerate-context activates one replacement", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const frontendId = dispatches.create(runId, "frontend-developer", dispatchPacket(["src/context.ts"]));
+    dispatches.claim(runId, frontendId, "frontend-developer");
+    await dispatches.submitValue(runId, frontendId, "frontend-developer", {
+      ...createResultTemplate(runId, frontendId, "frontend-developer"),
+      status: "retryable_failure",
+      summary: "Choose context recovery",
+      verification: [],
+      decisions_needed: [{
+        question: "How should context recover?",
+        choices: [
+          { id: "regenerate-context", label: "Regenerate", impact: "Migrate managed context" },
+          { id: "stop", label: "Stop", impact: "Leave the run blocked" },
+        ],
+        recommendation: "regenerate-context",
+        type: "workflow_recovery",
+      }],
+      payload: {},
+      failure_class: "context_migration_required",
+      side_effect_state: "completed",
+    });
+    const decision = store.db.prepare("SELECT decision_id,dispatch_id FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; dispatch_id: string };
+    assert.equal(decision.dispatch_id, frontendId);
+    assert.equal(store.getRun(runId).state, "needs_decision");
+    const replacementId = dispatches.resolveDecision(runId, decision.decision_id, "regenerate-context");
+    assert.equal(store.getRun(runId).state, "active");
+    assert.deepEqual(
+      store.db.prepare("SELECT state,replacement_for FROM dispatches WHERE dispatch_id=?").get(replacementId),
+      { state: "pending", replacement_for: frontendId },
+    );
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE replacement_for=?").get(frontendId) as { count: number }).count, 1);
   });
 });
 
@@ -875,7 +1000,7 @@ test("implementation dependencies and commit gate test creation and freeze the c
     const codingId = dispatches.create(runId, "coding", dispatchPacket());
     dispatches.claim(runId, codingId, "coding");
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
-      .run("worktree_defect_regression", runId, "task/regression", process.cwd(), REVIEW_HEAD, new Date().toISOString());
+      .run("worktree_defect_regression", runId, "task/regression", `${process.cwd()}/.worktree/defect-regression`, REVIEW_HEAD, new Date().toISOString());
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
       .run("worktree_defect_integration", runId, "integration/regression", process.cwd(), REVIEW_HEAD, new Date().toISOString());
     const changedPaths = ["src/dispatch.ts", "src/state.ts", "src/contracts.ts", "src/cli.ts", "src/review.ts", "test/review-fixes.test.ts"];
@@ -924,19 +1049,25 @@ test("implementation dependencies and commit gate test creation and freeze the c
     await dispatches.submitValue(runId, testRow.dispatch_id, "test", completedResult(runId, testRow.dispatch_id, "test", {
       checks: [{ command: "npm test", outcome: "passed" }],
     }));
+    const storedTest = JSON.parse((store.db.prepare("SELECT result_json FROM dispatches WHERE dispatch_id=?").get(testRow.dispatch_id) as { result_json: string }).result_json);
+    assert.equal(storedTest.payload.testedCommit, REVIEW_HEAD);
     const review = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='code-reviewer'").get(runId) as { packet_json: string };
     const packet = JSON.parse(review.packet_json);
+    const committedPaths = execFileSync("git", ["diff", "--name-only", `${REVIEW_HEAD}^`, REVIEW_HEAD], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
     assert.equal(packet.context.implementation_commit, REVIEW_HEAD);
     assert.equal(packet.context.revision_sha, REVIEW_HEAD);
     assert.match(packet.context.base_commit, /^[a-f0-9]{40}$/);
     assert.match(packet.context.document_digest, /^[a-f0-9]{64}$/);
-    assert.ok(changedPaths.every((path) => packet.context.changed_paths.includes(path)));
+    assert.deepEqual(packet.context.changed_paths, committedPaths);
+    assert.equal(packet.context.changed_paths.includes("package.json"), committedPaths.includes("package.json"));
     assert.match(packet.context.diff_digest, /^[a-f0-9]{64}$/);
     assert.match(packet.context.test_evidence_digest, /^[a-f0-9]{64}$/);
     assert.match(packet.context.revision_digest, /^[a-f0-9]{64}$/);
+    assert.match(packet.context.evidence_digest, /^[a-f0-9]{64}$/);
+    assert.equal(packet.context.testedCommit, REVIEW_HEAD);
     assert.deepEqual(new Set(packet.context.artifacts.map((artifact: { role: string }) => artifact.role)), new Set(["coding", "frontend-developer", "backend-developer", "git-operator", "test"]));
     assert.ok(packet.context.artifacts.every((artifact: { artifact_id: string; sha256: string }) => /^artifact_/.test(artifact.artifact_id) && /^[a-f0-9]{64}$/.test(artifact.sha256)));
-    assert.ok(changedPaths.every((path) => packet.allowed_read_paths.includes(path)));
+    assert.ok(committedPaths.every((path) => packet.allowed_read_paths.includes(path)));
   });
 });
 

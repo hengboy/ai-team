@@ -191,10 +191,10 @@ test("decision commands expose a template and return field-level errors for empt
 
   const requestFile = join(sandbox.root, "decision-request.md");
   await writeFile(requestFile, "Need a decision.\n");
-  const started = json<{ run_id: string }>(await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]));
+  const started = json<{ run_id: string; dispatch_id: string }>(await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]));
   const empty = join(sandbox.root, "empty-decision.json");
   await writeFile(empty, "{}\n");
-  const failed = await cli(sandbox, ["decision", "create", "--run-id", started.run_id, "--file", empty]);
+  const failed = await cli(sandbox, ["decision", "create", "--run-id", started.run_id, "--dispatch-id", started.dispatch_id, "--file", empty]);
   assert.equal(failed.status, 2);
   const error = JSON.parse(failed.stderr.trim().split("\n").at(-1) ?? "null") as { details: Array<{ path: string }> };
   assert.deepEqual(error.details.map((item) => item.path).sort(), ["/choices", "/question"]);
@@ -261,6 +261,23 @@ test("context update accepts File Explorer output and validate reports maintenan
   assert.equal(validation.valid, true);
   assert.equal(validation.navigation.entries, 1);
   assert.deepEqual(validation.maintenance, { status: "current", paths: [] });
+
+  const memoryPath = join(sandbox.repo, "MEMORY.md");
+  const navigationPath = join(sandbox.repo, ".ai-team", "index", "feature-navigation.md");
+  const formatLine = /^<!-- ai-team:context-format .* -->\n/gm;
+  await writeFile(memoryPath, (await readFile(memoryPath, "utf8")).replace(formatLine, ""));
+  await writeFile(navigationPath, (await readFile(navigationPath, "utf8")).replace(formatLine, "").replace("# 功能导航", "# Feature Navigation"));
+  const legacy = json<{ valid: boolean; navigation: { issues: string[] }; maintenance: { status: string } }>(
+    await cli(sandbox, ["context", "validate", "--project", sandbox.repo]),
+  );
+  assert.equal(legacy.valid, false);
+  assert.equal(legacy.maintenance.status, "needs_update");
+  assert.ok(legacy.navigation.issues.some((issue) => issue.includes("ai-team context update")));
+  const businessBefore = await readFile(join(sandbox.repo, "README.md"), "utf8");
+  json(await cli(sandbox, ["context", "update", "--project", sandbox.repo, "--context-file", explorerResult]));
+  assert.equal((json<{ valid: boolean }>(await cli(sandbox, ["context", "validate", "--project", sandbox.repo]))).valid, true);
+  assert.match(await readFile(navigationPath, "utf8"), /schema_version.*2/);
+  assert.equal(await readFile(join(sandbox.repo, "README.md"), "utf8"), businessBefore);
 });
 
 test("staging CLI initializes frozen dispatch results and consumes only after submit", async (t) => {
@@ -427,7 +444,7 @@ test("planning dispatch can be claimed, inspected, submitted, resumed, and decid
   const shown = json<{
     run: { run_id: string; profile: string };
     events: Array<{ type: string }>;
-    dispatches: Array<{ state: string }>;
+    dispatches: Array<{ dispatch_id: string; state: string }>;
   }>(await cli(sandbox, ["run", "show", started.run_id]));
   assert.equal(shown.run.profile, "planning");
   assert.ok(shown.events.some(({ type }) => type === "dispatch.completed"));
@@ -443,7 +460,7 @@ test("planning dispatch can be claimed, inspected, submitted, resumed, and decid
     recommendation: "minimal",
   }));
   const decision = json<{ decision_id: string }>(
-    await cli(sandbox, ["decision", "create", "--run-id", started.run_id, "--file", decisionFile]),
+    await cli(sandbox, ["decision", "create", "--run-id", started.run_id, "--dispatch-id", shown.dispatches.at(-1)!.dispatch_id, "--file", decisionFile]),
   );
   const resumed = json<{
     pending_dispatches: unknown[];

@@ -55,6 +55,7 @@ const result = (axis: "spec" | "standards", findings: ReviewResult["findings"] =
 });
 
 const completeTest = (store: StateStore, runId: string): void => {
+  store.db.prepare("UPDATE worktrees SET state='removed' WHERE path=? AND state='active'").run(process.cwd());
   store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
     .run(`worktree_${runId.slice(-12)}`, runId, `integration/test/${runId.slice(-12)}`, process.cwd(), REVIEW_HEAD, new Date().toISOString());
   const dispatchId = new WorkflowService(store).dispatches.create(runId, "test", {

@@ -49,7 +49,7 @@ export class ReviewService {
       .find((row) => row.packet.context.revision_sha === revisionSha && row.state !== "failed");
     if (!coordinator) throw new ValidationError("review requires a frozen code-reviewer packet for the tested integration commit");
     const context = coordinator.packet.context;
-    const bindingFields = ["plan_id", "revision", "base_commit", "revision_sha", "changed_paths", "document_digest", "diff_digest", "test_evidence_digest"] as const;
+    const bindingFields = ["plan_id", "revision", "base_commit", "revision_sha", "changed_paths", "document_digest", "diff_digest", "test_evidence_digest", "revision_digest", "evidence_digest"] as const;
     const missing = bindingFields.filter((field) => context[field] === undefined);
     if (missing.length) throw new ValidationError("code-reviewer packet is missing frozen review bindings", missing.map((field) => `/context/${field}`));
     if (context.plan_id !== (run.plan_id ?? null) || context.revision !== (run.revision ?? null)) throw new ValidationError("code-reviewer packet does not match the run planning revision");
@@ -68,18 +68,20 @@ export class ReviewService {
     const documentDigest = context.document_digest as string;
     const diffDigest = context.diff_digest as string;
     const testEvidenceDigest = context.test_evidence_digest as string;
+    const revisionDigest = context.revision_digest as string;
+    const evidenceDigest = context.evidence_digest as string;
     const committedDiff = context.committed_diff;
     const testEvidence = context.test_evidence;
-    const barrierId = `review_${sha256(`${runId}:${baseCommit}:${revisionSha}:${run.plan_id ?? ""}:${run.revision ?? ""}:${documentDigest}:${diffDigest}:${testEvidenceDigest}`).slice(0, 24)}`;
+    const barrierId = `review_${sha256(`${runId}:${baseCommit}:${revisionSha}:${run.plan_id ?? ""}:${run.revision ?? ""}:${documentDigest}:${diffDigest}:${testEvidenceDigest}:${revisionDigest}:${evidenceDigest}`).slice(0, 24)}`;
     const axes = formal ? ["spec", "standards"] as const : ["standards"] as const;
     const create = this.store.db.transaction(() => {
       const columns = (this.store.db.prepare("PRAGMA table_info(review_barriers)").all() as Array<{ name: string }>).map((item) => item.name);
       const now = new Date().toISOString();
-      const binding = { base_commit: baseCommit, head_commit: revisionSha, plan_id: run.plan_id ?? null, revision: run.revision ?? null, document_digest: documentDigest, diff_digest: diffDigest, test_evidence_digest: testEvidenceDigest };
+      const binding = { base_commit: baseCommit, head_commit: revisionSha, plan_id: run.plan_id ?? null, revision: run.revision ?? null, document_digest: documentDigest, diff_digest: diffDigest, test_evidence_digest: testEvidenceDigest, revision_digest: revisionDigest, evidence_digest: evidenceDigest };
       let inserted;
-      if (["base_commit", "head_commit", "document_digest", "diff_digest", "test_evidence_digest"].every((column) => columns.includes(column))) {
-        inserted = this.store.db.prepare(`INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,base_commit,head_commit,plan_id,revision,document_digest,diff_digest,test_evidence_digest,created_at)
-          VALUES (?,?,?,?, 'pending',?,?,?,?,?,?,?,?)`).run(barrierId, runId, revisionSha, formal ? 1 : 0, binding.base_commit, binding.head_commit, binding.plan_id, binding.revision, binding.document_digest, binding.diff_digest, binding.test_evidence_digest, now);
+      if (["base_commit", "head_commit", "document_digest", "diff_digest", "test_evidence_digest", "revision_digest", "evidence_digest"].every((column) => columns.includes(column))) {
+        inserted = this.store.db.prepare(`INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,base_commit,head_commit,plan_id,revision,document_digest,diff_digest,test_evidence_digest,revision_digest,evidence_digest,created_at)
+          VALUES (?,?,?,?, 'pending',?,?,?,?,?,?,?,?,?,?)`).run(barrierId, runId, revisionSha, formal ? 1 : 0, binding.base_commit, binding.head_commit, binding.plan_id, binding.revision, binding.document_digest, binding.diff_digest, binding.test_evidence_digest, binding.revision_digest, binding.evidence_digest, now);
       } else {
         inserted = this.store.db.prepare("INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,created_at) VALUES (?,?,?,?, 'pending', ?)")
           .run(barrierId, runId, revisionSha, formal ? 1 : 0, now);

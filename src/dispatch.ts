@@ -121,7 +121,7 @@ export class DispatchService {
     return this.insert(runId, "git-operator", validatePacket(packet, "git-operator"));
   }
 
-  private insert(runId: string, role: Role, packet: DispatchPacket): string {
+  private insert(runId: string, role: Role, packet: DispatchPacket, replacementFor?: string): string {
     const dispatchId = makeId("dispatch");
     const packetJson = redact(stableJson(packet));
     const frozenPacket = JSON.parse(packetJson) as DispatchPacket;
@@ -138,8 +138,73 @@ export class DispatchService {
       this.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,created_at)
         VALUES (?,?,?,'pending',?,?,?,?,?)`).run(dispatchId, runId, role, packetJson, "", schemaJson, templateJson, new Date().toISOString());
     }
-    this.store.event(runId, "dispatch.created", { dispatchId, role, packet_digest: digests.packet, schema_digest: digests.schema, template_digest: digests.template, prompt_digest: digests.prompt, renderer_version: RENDERER_VERSION });
+    if (replacementFor) this.store.db.prepare("UPDATE dispatches SET replacement_for=? WHERE dispatch_id=?").run(replacementFor, dispatchId);
+    this.store.event(runId, "dispatch.created", { dispatchId, role, replacement_for: replacementFor ?? null, packet_digest: digests.packet, schema_digest: digests.schema, template_digest: digests.template, prompt_digest: digests.prompt, renderer_version: RENDERER_VERSION });
     return dispatchId;
+  }
+
+  private recoveryReplacement(runId: string, failed: { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string }, resolvedDecision?: Record<string, unknown>): string {
+    const previous = JSON.parse(failed.packet_json) as DispatchPacket;
+    const result = failed.result_json ? JSON.parse(failed.result_json) as ResultEnvelope : undefined;
+    let root = failed;
+    const lineagePackets: DispatchPacket[] = [previous];
+    while (root.replacement_for) {
+      const parent = this.store.db.prepare("SELECT dispatch_id,role,packet_json,packet_digest,result_json,replacement_for FROM dispatches WHERE run_id=? AND dispatch_id=?")
+        .get(runId, root.replacement_for) as typeof root | undefined;
+      if (!parent) break;
+      root = parent;
+      lineagePackets.push(JSON.parse(parent.packet_json) as DispatchPacket);
+    }
+    const rootPacket = JSON.parse(root.packet_json) as DispatchPacket;
+    const lineageRecovery = lineagePackets.map((packet) => (packet.context as { recovery?: { completed_verification?: unknown[]; source_artifact_id?: string | null; source_artifact_digest?: string | null; source_packet_digest?: string | null } }).recovery).filter(Boolean);
+    const completedVerification = lineageRecovery.flatMap((recovery) => recovery?.completed_verification ?? []);
+    const originalRecovery = [...lineageRecovery].reverse().find((recovery) => recovery?.source_packet_digest || recovery?.source_artifact_id);
+    const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? ORDER BY created_at DESC LIMIT 1")
+      .get(runId, failed.dispatch_id) as { artifact_id: string; sha256: string } | undefined;
+    const activeWorktree = this.store.db.prepare("SELECT worktree_id,path,branch FROM worktrees WHERE run_id=? AND state='active' AND branch LIKE 'task/%' ORDER BY created_at DESC LIMIT 1")
+      .get(runId) as { worktree_id: string; path: string; branch: string } | undefined;
+    const adoption = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.worktree.adopt' AND state='completed' ORDER BY completed_at DESC LIMIT 1")
+      .get(runId) as { evidence_json?: string } | undefined;
+    const adoptionEvidence = adoption?.evidence_json ? JSON.parse(adoption.evidence_json) as { implementation_revision?: string } : undefined;
+    const previousContext = previous.context as { worktree_id?: unknown; implementation_worktree_id?: unknown; recovery?: { completed_verification?: unknown[]; source_artifact_id?: string | null; source_artifact_digest?: string | null; source_packet_digest?: string | null } };
+    const worktreeContext = activeWorktree && (typeof previousContext.worktree_id === "string" || typeof previousContext.implementation_worktree_id === "string") ? {
+      worktree_id: activeWorktree.worktree_id,
+      implementation_worktree_id: activeWorktree.worktree_id,
+      implementation_worktree_path: activeWorktree.path,
+      implementation_branch: activeWorktree.branch,
+    } : {};
+    const replaceOwnedLocation = (value: string): string => {
+      if (!activeWorktree) return value;
+      const previousPath = typeof (rootPacket.context as { implementation_worktree_path?: unknown }).implementation_worktree_path === "string"
+        ? (rootPacket.context as { implementation_worktree_path: string }).implementation_worktree_path
+        : undefined;
+      const previousBranch = typeof (rootPacket.context as { implementation_branch?: unknown }).implementation_branch === "string"
+        ? (rootPacket.context as { implementation_branch: string }).implementation_branch
+        : undefined;
+      return [[previousPath, activeWorktree.path], [previousBranch, activeWorktree.branch]].reduce(
+        (text, [from, to]) => from && to ? text.replaceAll(from, to) : text,
+        value,
+      );
+    };
+    const packet = validatePacket({
+      ...previous,
+      objective: replaceOwnedLocation(previous.objective),
+      acceptance_criteria: previous.acceptance_criteria.map(replaceOwnedLocation),
+      context: {
+        ...previous.context,
+        ...worktreeContext,
+        ...(adoptionEvidence?.implementation_revision ? { implementation_revision: adoptionEvidence.implementation_revision } : {}),
+        ...(resolvedDecision ? { resolved_decision: resolvedDecision } : {}),
+        recovery: {
+          replacement_for: failed.dispatch_id,
+          source_packet_digest: originalRecovery?.source_packet_digest ?? root.packet_digest ?? sha256(root.packet_json),
+          source_artifact_id: originalRecovery?.source_artifact_id ?? artifact?.artifact_id ?? null,
+          source_artifact_digest: originalRecovery?.source_artifact_digest ?? artifact?.sha256 ?? null,
+          completed_verification: [...completedVerification, ...(result?.verification ?? [])],
+        },
+      },
+    }, failed.role);
+    return this.insert(runId, failed.role, packet, failed.dispatch_id);
   }
 
   private get(runId: string, dispatchId: string, role: Role): any {
@@ -236,10 +301,17 @@ export class DispatchService {
     }
     if (row.state !== "claimed") throw new ValidationError("dispatch must be claimed before submit");
     const result = this.validateValue(runId, dispatchId, role, value);
+    if (role === "test" && result.status === "completed") {
+      const packet = JSON.parse(row.packet_json) as DispatchPacket;
+      const testedCommit = (packet.context as { implementation_commit?: unknown }).implementation_commit;
+      if (typeof testedCommit === "string" && /^[a-f0-9]{40}$/.test(testedCommit)) {
+        result.payload = { ...result.payload, testedCommit };
+      }
+    }
     const artifactDirectory = join(this.store.paths.artifacts, runId, dispatchId);
     await mkdir(artifactDirectory, { recursive: true });
     const artifact = this.artifactPath(runId, dispatchId);
-    const redacted = redact(source ?? `${JSON.stringify(value, null, 2)}\n`);
+    const redacted = redact(role === "test" ? `${JSON.stringify(result, null, 2)}\n` : source ?? `${JSON.stringify(value, null, 2)}\n`);
     await writeFile(artifact, redacted, { mode: 0o600 });
     const digest = sha256(redacted);
     const artifactId = `artifact_${digest.slice(0, 24)}`;
@@ -255,13 +327,13 @@ export class DispatchService {
         if (role === "planning") this.advancePlanning(runId, result);
         else this.advanceRun(runId, role, result);
       } else {
-        if (result.status === "needs_decision") {
+        if (result.status === "needs_decision" || result.status === "retryable_failure" && result.decisions_needed.length === 1) {
           const checked = checkDecisionInput(result.decisions_needed[0]);
           if (!checked.valid) throw new ValidationError("needs_decision result requires one typed decision", checked.errors);
-          this.store.createDecision(runId, checked.value.question, checked.value.choices, checked.value.recommendation, checked.value.type ?? "workflow");
+          this.store.createDecision(runId, checked.value.question, checked.value.choices, checked.value.recommendation, checked.value.type ?? "workflow", dispatchId);
         }
         this.store.db.prepare("UPDATE runs SET state=?,updated_at=? WHERE run_id=?")
-          .run(result.status === "retryable_failure" ? "retryable_failure" : result.status === "needs_decision" ? "needs_decision" : "failed", new Date().toISOString(), runId);
+          .run(result.status === "needs_decision" || result.status === "retryable_failure" && result.decisions_needed.length === 1 ? "needs_decision" : result.status === "retryable_failure" ? "retryable_failure" : "failed", new Date().toISOString(), runId);
       }
     });
     transaction();
@@ -298,7 +370,7 @@ export class DispatchService {
   }
 
   private completedImplementationOperation(runId: string): { commit: string; paths: string[]; kind: string } | undefined {
-    const rows = this.store.db.prepare("SELECT kind,evidence_json FROM operations WHERE run_id=? AND kind IN ('git.merge.task','git.commit') AND state='completed' ORDER BY completed_at DESC").all(runId) as Array<{ kind: string; evidence_json?: string }>;
+    const rows = this.store.db.prepare("SELECT kind,evidence_json FROM operations WHERE run_id=? AND kind IN ('git.merge.task','git.commit') AND state='completed' ORDER BY completed_at DESC, CASE kind WHEN 'git.merge.task' THEN 0 ELSE 1 END").all(runId) as Array<{ kind: string; evidence_json?: string }>;
     for (const row of rows) {
       try {
         const evidence = JSON.parse(row.evidence_json ?? "{}") as { commit?: string; paths?: string[] };
@@ -346,7 +418,9 @@ export class DispatchService {
 
   private advanceImplementation(runId: string): void {
     const coordinator = this.store.db.prepare("SELECT state FROM dispatches WHERE run_id=? AND role='coding' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string } | undefined;
-    const developers = this.store.db.prepare("SELECT state,result_json,packet_json FROM dispatches WHERE run_id=? AND role IN ('frontend-developer','backend-developer')").all(runId) as Array<{ state: string; result_json?: string; packet_json: string }>;
+    const developers = this.store.db.prepare(`SELECT d.state,d.result_json,d.packet_json FROM dispatches d
+      WHERE d.run_id=? AND d.role IN ('frontend-developer','backend-developer')
+      AND NOT EXISTS (SELECT 1 FROM dispatches successor WHERE successor.replacement_for=d.dispatch_id)`).all(runId) as Array<{ state: string; result_json?: string; packet_json: string }>;
     if (coordinator?.state !== "completed" || !developers.length || developers.some((item) => item.state !== "completed")) return;
     const developerWorktreeIds = developers.map((item) => {
       try { return (JSON.parse(item.packet_json) as { context?: { worktree_id?: string } }).context?.worktree_id; }
@@ -423,7 +497,7 @@ export class DispatchService {
     const gitChangedPaths = baseCommit === "0".repeat(40)
       ? execFileSync("git", ["-C", repository.project_path, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", revisionSha], { encoding: "utf8" }).trim().split("\n").filter(Boolean)
       : execFileSync("git", ["-C", repository.project_path, "diff", "--name-only", baseCommit, revisionSha], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
-    const changedPaths = [...new Set([...(testContext.changed_paths ?? []), ...gitChangedPaths])];
+    const changedPaths = [...new Set(gitChangedPaths)];
     const planningPaths = run.plan_id && run.revision ? ["spec.md", "plan.md", "tasks.md"].map((name) => `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/${name}`) : [];
     const existingPlanningPaths = planningPaths.filter((path) => {
       try { execFileSync("git", ["-C", repository.project_path, "cat-file", "-e", `${revisionSha}:${path}`], { stdio: "ignore" }); return true; }
@@ -431,13 +505,16 @@ export class DispatchService {
     });
     const documentDigest = sha256(existingPlanningPaths.map((path) => `${path}\0${execFileSync("git", ["-C", repository.project_path, "show", `${revisionSha}:${path}`], { encoding: "utf8", maxBuffer: 2 * 1024 * 1024 })}`).join("\n"));
     const frozenTestResult = testResult ?? JSON.parse(test.result_json) as ResultEnvelope;
+    const testedCommit = (frozenTestResult.payload as { testedCommit?: unknown }).testedCommit ?? testContext.implementation_commit;
+    if (testedCommit !== revisionSha) return undefined;
     const testEvidenceDigest = sha256(stableJson(frozenTestResult));
     const diffDigest = sha256(committedDiff);
     const artifacts = this.store.db.prepare(`SELECT a.artifact_id,a.dispatch_id,a.kind,a.path,a.sha256,d.role
       FROM artifacts a JOIN dispatches d ON d.dispatch_id=a.dispatch_id
       WHERE a.run_id=? AND d.role IN ('coding','frontend-developer','backend-developer','git-operator','test')
       ORDER BY a.created_at,a.artifact_id`).all(runId) as Array<{ artifact_id: string; dispatch_id: string; kind: string; path: string; sha256: string; role: string }>;
-    const revisionDigest = sha256(stableJson({ plan_id: run.plan_id ?? null, revision: run.revision ?? null, base_commit: baseCommit, revision_sha: revisionSha, document_digest: documentDigest, diff_digest: diffDigest, test_evidence_digest: testEvidenceDigest, artifact_digests: artifacts.map((artifact) => artifact.sha256) }));
+    const evidenceDigest = sha256(stableJson({ test_dispatch_id: test.dispatch_id, test_evidence_digest: testEvidenceDigest, artifact_digests: artifacts.map((artifact) => artifact.sha256) }));
+    const revisionDigest = sha256(stableJson({ plan_id: run.plan_id ?? null, revision: run.revision ?? null, base_commit: baseCommit, revision_sha: revisionSha, document_digest: documentDigest, diff_digest: diffDigest, evidence_digest: evidenceDigest }));
     const allowedReadPaths = [...new Set([...changedPaths, ...existingPlanningPaths])];
     return validatePacket({
       objective: `Create the review barrier for frozen integration commit ${revisionSha}.`,
@@ -449,7 +526,7 @@ export class DispatchService {
         plan_id: run.plan_id ?? null, revision: run.revision ?? null, plan_digest: run.plan_digest ?? null,
         changed_paths: changedPaths, document_digest: documentDigest,
         committed_diff: committedDiff, diff_digest: diffDigest, test_dispatch_id: test.dispatch_id, test_evidence: frozenTestResult,
-        test_evidence_digest: testEvidenceDigest, artifacts, revision_digest: revisionDigest,
+        test_evidence_digest: testEvidenceDigest, testedCommit, artifacts, evidence_digest: evidenceDigest, revision_digest: revisionDigest,
         ...(reissue ? { reissue: { decision_id: reissue.decision_id, dispatch_id: reissue.dispatch_id }, resolved_decision: reissue.resolved_decision ?? null } : {}),
       },
     }, "code-reviewer");
@@ -483,7 +560,7 @@ export class DispatchService {
     this.store.event(runId, "planning.stage_changed", { stage: payload.stage });
     if (needsDecision) {
       if (!payload.decision) throw new ValidationError("planning pending question requires one matching decision");
-      this.store.createDecision(runId, payload.decision.question, payload.decision.choices, payload.decision.recommendation);
+      this.store.createDecision(runId, payload.decision.question, payload.decision.choices, payload.decision.recommendation, "workflow", result.dispatch_id);
     } else if (payload.stage !== "ready") {
       this.continuePlanning(runId);
     }
@@ -523,7 +600,7 @@ export class DispatchService {
   resolveDecision(runId: string, decisionId: string, choice: string, note?: string): string {
     const run = this.store.getRun(runId) as { profile: string };
     if (run.profile === "planning") return this.resolvePlanningDecision(runId, decisionId, choice, note);
-    const existingDecision = this.store.db.prepare("SELECT status,choice,receipt_json FROM decisions WHERE run_id=? AND decision_id=?").get(runId, decisionId) as { status: string; choice?: string; receipt_json?: string } | undefined;
+    const existingDecision = this.store.db.prepare("SELECT status,choice,receipt_json,dispatch_id FROM decisions WHERE run_id=? AND decision_id=?").get(runId, decisionId) as { status: string; choice?: string; receipt_json?: string; dispatch_id?: string } | undefined;
     if (existingDecision?.status === "resolved") {
       const receipt = JSON.parse(existingDecision.receipt_json ?? "{}") as { successor_dispatch_id?: string };
       if (choice === existingDecision.choice && receipt.successor_dispatch_id) return receipt.successor_dispatch_id;
@@ -531,7 +608,9 @@ export class DispatchService {
     }
     let dispatchId = "";
     this.store.db.transaction(() => {
-      const blocked = this.store.db.prepare("SELECT dispatch_id,role,packet_json FROM dispatches WHERE run_id=? AND state='needs_decision' ORDER BY created_at DESC LIMIT 1").get(runId) as { dispatch_id: string; role: Role; packet_json: string } | undefined;
+      if (!existingDecision?.dispatch_id) throw new ValidationError("decision is not bound to a dispatch");
+      const blocked = this.store.db.prepare("SELECT dispatch_id,role,packet_json,packet_digest,result_json,replacement_for,state FROM dispatches WHERE run_id=? AND dispatch_id=? AND state IN ('needs_decision','retryable_failure')")
+        .get(runId, existingDecision.dispatch_id) as { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string; state: string } | undefined;
       if (!blocked) throw new ValidationError("run has no dispatch waiting on this decision");
       this.store.decide(runId, decisionId, choice, note);
       const receipt = this.store.db.prepare("SELECT receipt_json FROM decisions WHERE decision_id=?").get(decisionId) as { receipt_json: string };
@@ -558,10 +637,10 @@ export class DispatchService {
           },
         }, blocked.role);
       } else {
-        const previous = JSON.parse(blocked.packet_json) as DispatchPacket;
-        packet = validatePacket({ ...previous, context: { ...previous.context, resolved_decision: resolvedDecision } }, blocked.role);
+        dispatchId = this.recoveryReplacement(runId, blocked, resolvedDecision);
+        packet = JSON.parse((this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatchId) as { packet_json: string }).packet_json) as DispatchPacket;
       }
-      dispatchId = this.insert(runId, blocked.role, packet);
+      if (choice === "reissue") dispatchId = this.insert(runId, blocked.role, packet, blocked.dispatch_id);
       const successor = this.store.db.prepare("SELECT packet_digest FROM dispatches WHERE dispatch_id=?").get(dispatchId) as { packet_digest?: string };
       this.store.db.prepare("UPDATE decisions SET receipt_json=? WHERE decision_id=?")
         .run(stableJson({ ...resolvedDecision, successor_dispatch_id: dispatchId, successor_packet_digest: successor.packet_digest ?? null }), decisionId);
@@ -573,14 +652,25 @@ export class DispatchService {
   resume(runId: string): RunResumeResult {
     this.store.db.transaction(() => {
       const run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
-      const pendingDecision = this.store.db.prepare("SELECT 1 FROM decisions WHERE run_id=? AND status='pending'").get(runId);
+      const pendingDecision = this.store.db.prepare("SELECT decision_id,dispatch_id,receipt_json FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; dispatch_id?: string; receipt_json?: string } | undefined;
       const pendingOperation = this.store.db.prepare("SELECT 1 FROM operations WHERE run_id=? AND state='pending'").get(runId);
-      if (pendingDecision || pendingOperation) return;
-      const pendingDispatch = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId);
-      if (pendingDispatch) return;
+      if (pendingOperation) return;
       const retryableDispatch = run.state === "retryable_failure"
-        ? this.store.db.prepare("SELECT dispatch_id,role,packet_json,result_json FROM dispatches WHERE run_id=? AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1").get(runId) as { dispatch_id: string; role: Role; packet_json: string; result_json?: string } | undefined
+        ? this.store.db.prepare("SELECT dispatch_id,role,packet_json,packet_digest,result_json,replacement_for FROM dispatches WHERE run_id=? AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1").get(runId) as { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string } | undefined
         : undefined;
+      if (pendingDecision) {
+        if (retryableDispatch && !pendingDecision.dispatch_id) {
+          const receipt = { ...JSON.parse(pendingDecision.receipt_json ?? "{}"), dispatch_id: retryableDispatch.dispatch_id };
+          this.store.db.prepare("UPDATE decisions SET dispatch_id=?,receipt_json=? WHERE decision_id=?")
+            .run(retryableDispatch.dispatch_id, stableJson(receipt), pendingDecision.decision_id);
+          this.store.db.prepare("UPDATE runs SET state='needs_decision',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+        }
+        return;
+      }
+      if (!retryableDispatch) {
+        const pendingDispatch = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId);
+        if (pendingDispatch) return;
+      }
       let retryableHasNoSideEffects = false;
       if (retryableDispatch?.result_json) {
         try {
@@ -592,7 +682,7 @@ export class DispatchService {
         this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
           .run(new Date().toISOString(), retryableDispatch.dispatch_id);
         this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
-        this.insert(runId, retryableDispatch.role, JSON.parse(retryableDispatch.packet_json) as DispatchPacket);
+        this.recoveryReplacement(runId, retryableDispatch);
         return;
       }
       if (run.state === "retryable_failure") return;

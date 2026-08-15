@@ -70,7 +70,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "dispatch template": ["ai-team dispatch template --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
   "dispatch validate": ["ai-team dispatch validate --run-id <run-id> --dispatch-id <dispatch-id> --role <role> (--result-file <json> | --staging-id <staging-id>)"],
   "dispatch submit": ["ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> (--result-file <json> | --staging-id <staging-id>)"],
-  "decision create": ["ai-team decision create --run-id <run-id> (--file <json> | --staging-id <staging-id>)"],
+  "decision create": ["ai-team decision create --run-id <run-id> --dispatch-id <dispatch-id> (--file <json> | --staging-id <staging-id>)"],
   "decision schema": ["ai-team decision schema"],
   "decision template": ["ai-team decision template"],
   "staging create": ["ai-team staging create --run-id <run-id> --role <role> --kind <kind> [--dispatch-id <dispatch-id>]"],
@@ -87,6 +87,11 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "review status": ["ai-team review status --run-id <run-id> --barrier-id <opaque-id>"],
   "git status": ["ai-team git status --run-id <run-id>"],
   "git prepare": ["ai-team git prepare --run-id <run-id> --dispatch-id <dispatch-id> [--task-id <task-id>] [--integration] [--base-commit <commit>] [--depends-on <opaque-id>]"],
+  "git adopt": [
+    "ai-team git adopt --run-id <run-id> --dispatch-id <dispatch-id> --commit <commit> [--task-id <task-id>]",
+    "ai-team git adopt --run-id <run-id> --dispatch-id <dispatch-id> --path <path> --branch <branch> --base-commit <commit> [--commit <commit>]",
+  ],
+  "git transfer": ["ai-team git transfer --run-id <run-id> --dispatch-id <dispatch-id> --worktree-id <opaque-id>"],
   "git commit": ["ai-team git commit --run-id <run-id> --dispatch-id <dispatch-id> --worktree-id <opaque-id> --message <text> --scope <paths>"],
   "git merge-task": ["ai-team git merge-task --run-id <run-id> --dispatch-id <dispatch-id> --integration-id <opaque-id> --task-id <task-id>"],
   "git continue-conflict": ["ai-team git continue-conflict --run-id <run-id> --dispatch-id <dispatch-id> --integration-id <opaque-id> --scope <paths>"],
@@ -110,7 +115,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
 });
 
 const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
-const AGENT_COMMANDS = ["context update", "context validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
+const AGENT_COMMANDS = ["context update", "context validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */
 export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.freeze({

@@ -108,9 +108,10 @@ test("prepareTask owns deterministic names and is idempotent per run", async () 
   const fixture = await createFixture();
   try {
     const runId = fixture.createRun("20260813-feature.alpha");
+    const suffix = runId.slice(-8).toLowerCase();
     const prepared = await fixture.orchestrator.prepareTask(runId, "API-Fix");
-    assert.equal(prepared.branch, "task/20260813-feature.alpha/api-fix");
-    assert.equal(prepared.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktree", "tasks", "20260813-feature.alpha", "api-fix"))));
+    assert.equal(prepared.branch, `task/20260813-feature.alpha/${suffix}/api-fix`);
+    assert.equal(prepared.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktree", "tasks", "20260813-feature.alpha", suffix, "api-fix"))));
     assert.match(prepared.worktree_id, /^worktree_[a-f0-9]{24}$/);
     assert.equal(prepared.reused, false);
 
@@ -125,13 +126,47 @@ test("prepareTask owns deterministic names and is idempotent per run", async () 
     assert.equal(dependent.base_commit, await rawGit(integration.path, ["rev-parse", "HEAD"]));
 
     const competingRun = fixture.createRun("20260813-feature.alpha");
-    await assert.rejects(
-      fixture.orchestrator.prepareTask(competingRun, "api-fix"),
-      /branch or worktree belongs to another run/,
-    );
+    const competing = await fixture.orchestrator.prepareTask(competingRun, "api-fix");
+    assert.notEqual(competing.path, prepared.path);
+    assert.notEqual(competing.branch, prepared.branch);
     assert.equal(
       (fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.worktree.create'").get(competingRun) as { count: number }).count,
-      0,
+      1,
+    );
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("managed adopt binds a direct-child commit and transfer changes only the registered owner", async () => {
+  const fixture = await createFixture();
+  try {
+    const sourceRun = fixture.createRun("20260813-recovery.alpha");
+    const targetRun = fixture.createRun("20260813-recovery.alpha");
+    const base = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    const path = join(fixture.root, ".worktree", "tasks", "legacy", "implementation");
+    const branch = "task/legacy/implementation";
+    await mkdir(join(path, ".."), { recursive: true });
+    await rawGit(fixture.root, ["worktree", "add", "-b", branch, path, base]);
+    await writeFile(join(path, "README.md"), "recovered\n");
+    await rawGit(path, ["add", "README.md"]);
+    await rawGit(path, ["commit", "-m", "Recovered implementation"]);
+    const implementation = await rawGit(path, ["rev-parse", "HEAD"]);
+
+    const adopted = await fixture.orchestrator.adopt(sourceRun, path, branch, base, implementation);
+    assert.equal((fixture.store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id=?").get(adopted.worktree_id) as { run_id: string }).run_id, sourceRun);
+    const transferred = await fixture.orchestrator.transfer(targetRun, adopted.worktree_id);
+    assert.equal(transferred.worktree_id, adopted.worktree_id);
+    assert.deepEqual(
+      fixture.store.db.prepare("SELECT run_id,adopted_from_run_id FROM worktrees WHERE worktree_id=?").get(adopted.worktree_id),
+      { run_id: targetRun, adopted_from_run_id: sourceRun },
+    );
+    const commitRun = fixture.createRun("20260813-recovery.beta");
+    const adoptedCommit = await fixture.orchestrator.adoptCommit(commitRun, implementation);
+    assert.equal(await rawGit(adoptedCommit.path, ["rev-parse", "HEAD"]), implementation);
+    assert.equal(
+      (fixture.store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id=?").get(adoptedCommit.worktree_id) as { run_id: string }).run_id,
+      commitRun,
     );
   } finally {
     await fixture.dispose();

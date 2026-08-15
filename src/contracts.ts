@@ -163,7 +163,7 @@ export const ROLE_PAYLOAD_SCHEMAS: Record<Role, object> = {
   "file-explorer": { type: "object", additionalProperties: false, required: ["allowed_read_paths", "entry_points", "test_commands", "project_context"], properties: { allowed_read_paths: stringArray, entry_points: stringArray, test_commands: stringArray, project_context: projectContextSchema } },
   "frontend-developer": { type: "object", additionalProperties: false, required: ["modified_paths", "self_tests"], properties: { modified_paths: stringArray, self_tests: evidenceArray } },
   "backend-developer": { type: "object", additionalProperties: false, required: ["modified_paths", "self_tests"], properties: { modified_paths: stringArray, self_tests: evidenceArray } },
-  test: { type: "object", additionalProperties: false, required: ["checks"], properties: { checks: evidenceArray } },
+  test: { type: "object", additionalProperties: false, required: ["checks"], properties: { checks: evidenceArray, testedCommit: { type: "string", pattern: "^[a-f0-9]{40}$" } } },
   "git-operator": { type: "object", additionalProperties: false, required: ["operations"], properties: { operations: evidenceArray } },
   "code-reviewer": { type: "object", additionalProperties: false, required: ["axes"], properties: { axes: { type: "array", items: { enum: ["spec", "standards"] }, minItems: 1, uniqueItems: true } } },
   "review-spec": { type: "object", additionalProperties: false, required: ["finding_ids"], properties: { finding_ids: stringArray } },

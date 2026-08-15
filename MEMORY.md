@@ -1,4 +1,5 @@
 <!-- ai-team:project-context:start -->
+<!-- ai-team:context-format {"renderer_version":"context-renderer-v2","schema_version":2} -->
 ## 项目上下文
 
 ### 项目形态
@@ -19,6 +20,10 @@
 - cleanup_pending
 - environment provenance
 - packed install gate
+- replacement dispatch
+- worktree ownership transfer
+- context renderer version
+- testedCommit
 
 ### 仓库约束
 - 要求 Node.js >=22.13.0，并必须通过 npm 验证脚本。
@@ -32,8 +37,8 @@
 - `src/cli.ts` 负责绑定命令、恢复操作和规范 JSON 输出。
 - `src/workflow.ts` 负责 coding run 启动、主工作树 clean gate 与实现基线冻结。
 - `src/dispatch.ts` 负责校验、提交、规划生命周期、恢复和提交调度门禁。
-- `src/dispatch.ts` 同时负责开发依赖、integration commit 门禁、冻结 review packet，以及非规划 decision 的原子幂等 reissue。
-- `src/state.ts` 负责 SQLite 的读写打开路径、锁、运行、决策和操作记录。
+- `src/dispatch.ts` 同时负责 retryable replacement lineage、dispatch-bound typed decision、开发依赖、integration commit 门禁和冻结 review packet。
+- `src/state.ts` 负责 SQLite 的读写打开路径、前向迁移、锁、运行、决策、replacement 和操作记录。
 - `src/planning.ts` 负责校验完整修订文档以及修订与运行阶段的一致性。
 - `src/contracts.ts` 负责结果信封和角色载荷 schema。
 - `src/command-contract.ts` 负责公共命令和代理命令的精确语法。
@@ -44,9 +49,9 @@
 - `skills/init-ai-team` 负责在目标 Git 项目中初始化并校验 AI Team 的可复用 Codex 工作流。
 
 ### 模块边界
-- `src/git-orchestrator.ts` 与 `src/git.ts` 负责 Git 编排，并将 task/worktree/integration 身份写入操作证据。
-- `src/review.ts` 仅评审已通过独立测试的 integration HEAD，并验证 code-reviewer packet 的规划、文档、diff 与测试绑定。
-- `src/context.ts` 仅以 `.ai-team/index/feature-navigation.md` 为权威导航路径，不读取或生成其他导航路径。
+- `src/git-orchestrator.ts` 与 `src/git.ts` 负责 run-scoped Git 编排、clean worktree adopt/transfer，并将 task/worktree/integration 身份写入操作证据。
+- `src/review.ts` 仅评审已通过独立测试的 integration HEAD，并验证 code-reviewer packet 的 revision、文档、diff、testedCommit 与 evidence digest 绑定。
+- `src/context.ts` 仅以 `.ai-team/index/feature-navigation.md` 为权威导航路径，并负责 schema/renderer 版本记录及旧格式迁移。
 - `src/environment.ts` 与 `agent-build/roles` 负责受管角色生成、能力定义及只读环境查询。
 - `src/cli.ts` 绑定 10 类支持 staging 的 JSON 消费命令，同时保留旧文件参数。
 - `skills/init-ai-team` 封装公共初始化和上下文校验命令，不改变 CLI 行为。

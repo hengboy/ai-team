@@ -554,6 +554,12 @@ export const buildProgram = (): Command => {
   const gitCommand = program.command("git");
   gitCommand.command("status").requiredOption("--run-id <id>").action(async ({ runId }) => output(await withStore(async (store) => { const run = store.getRun(runId); const repo = store.db.prepare("SELECT * FROM repositories WHERE repo_id=?").get(run.repo_id); return { run_id: runId, repository: repo, worktree: await worktreeStatus((repo as any).project_path) }; }, { readonly: true })));
   gitCommand.command("prepare").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--task-id <id>", "task id or implementation", "implementation").option("--integration").option("--base-commit <sha>").option("--depends-on <worktree-id>").action(async (options) => output(await withStore((store) => options.integration ? new GitOrchestrator(store).prepareIntegration(options.runId, options.dispatchId) : new GitOrchestrator(store).prepareTask(options.runId, options.taskId, options.baseCommit, options.dependsOn, options.dispatchId))));
+  gitCommand.command("adopt").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--path <path>").option("--branch <branch>").option("--base-commit <sha>").option("--commit <sha>").option("--task-id <id>", "task id or implementation", "implementation").action(async (options) => output(await withStore((store) => {
+    if (options.commit && !options.path && !options.branch && !options.baseCommit) return new GitOrchestrator(store).adoptCommit(options.runId, options.commit, options.taskId, options.dispatchId);
+    if (options.path && options.branch && options.baseCommit) return new GitOrchestrator(store).adopt(options.runId, options.path, options.branch, options.baseCommit, options.commit, options.dispatchId);
+    throw new ValidationError("git adopt requires --commit alone, or --path, --branch, and --base-commit together");
+  })));
+  gitCommand.command("transfer").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--worktree-id <id>").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).transfer(options.runId, options.worktreeId, options.dispatchId))));
   gitCommand.command("commit").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--worktree-id <id>").requiredOption("--message <message>").requiredOption("--scope <paths>", "comma-separated repository-relative scopes").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).commit(options.runId, options.worktreeId, options.message, options.scope.split(","), options.dispatchId))));
   gitCommand.command("merge-task").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--task-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).mergeTask(options.runId, options.integrationId, options.taskId, options.dispatchId)) }));
   gitCommand.command("continue-conflict").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--scope <paths>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).continueConflict(options.runId, options.integrationId, options.scope.split(","), options.dispatchId)) }));
@@ -592,7 +598,7 @@ export const buildProgram = (): Command => {
   const decision = program.command("decision");
   decision.command("schema").action(() => output(DECISION_INPUT_SCHEMA));
   decision.command("template").action(() => output(DECISION_INPUT_TEMPLATE));
-  jsonOptions(decision.command("create").requiredOption("--run-id <id>"), "--file").action(async (options) => {
+  jsonOptions(decision.command("create").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>"), "--file").action(async (options) => {
     const retention = await retentionHours();
     output(await withStore(async (store) => {
       const run = store.getRun(options.runId) as { profile: Role };
@@ -602,7 +608,7 @@ export const buildProgram = (): Command => {
         const checked = checkDecisionInput(input.value);
         if (!checked.valid) throw new ValidationError("decision input is invalid", checked.errors);
         const value = checked.value;
-        const result = { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation, value.type ?? "workflow") };
+        const result = { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation, value.type ?? "workflow", options.dispatchId) };
         await input.consume();
         return result;
       } catch (error) { input.validationFailed(error); throw error; }

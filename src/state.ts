@@ -213,6 +213,27 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "006-recovery-provenance",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      const addColumn = (table: string, name: string, definition: string): void => {
+        const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+        if (!columns.some((column) => column.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+      };
+      addColumn("decisions", "dispatch_id", "TEXT REFERENCES dispatches(dispatch_id)");
+      addColumn("dispatches", "replacement_for", "TEXT REFERENCES dispatches(dispatch_id)");
+      addColumn("worktrees", "adopted_from_run_id", "TEXT");
+      addColumn("review_barriers", "revision_digest", "TEXT");
+      addColumn("review_barriers", "evidence_digest", "TEXT");
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS decisions_dispatch ON decisions(run_id,dispatch_id,status);
+        CREATE INDEX IF NOT EXISTS dispatches_replacement ON dispatches(run_id,replacement_for);
+        CREATE UNIQUE INDEX IF NOT EXISTS active_worktree_path ON worktrees(path) WHERE state='active';
+        CREATE UNIQUE INDEX IF NOT EXISTS active_worktree_branch ON worktrees(branch) WHERE state='active';
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
@@ -420,15 +441,19 @@ export class StateStore {
       .run(state === "completed" ? "completed" : "failed", serialized, new Date().toISOString(), operationId);
   }
 
-  createDecision(runId: string, question: string, choices: Array<{ id: string; label: string; impact: string }>, recommendation?: string, type = "workflow"): string {
+  createDecision(runId: string, question: string, choices: Array<{ id: string; label: string; impact: string }>, recommendation?: string, type = "workflow", dispatchId?: string): string {
     const existing = this.db.prepare("SELECT decision_id FROM decisions WHERE run_id=? AND status='pending'").get(runId);
     if (existing) throw new ValidationError(`run already has a pending decision: ${(existing as any).decision_id}`);
+    if (dispatchId) {
+      const dispatch = this.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, dispatchId);
+      if (!dispatch) throw new ValidationError("decision dispatch binding does not match run");
+    }
     const checked = checkDecisionInput({ question, choices, recommendation, type });
     if (!checked.valid) throw new ValidationError("decision input is invalid", checked.errors);
     const decisionId = `decision_${makeId("dispatch").slice(9)}`;
-    const receipt = { type: checked.value.type ?? "workflow", question, choices, recommendation: recommendation ?? null };
-    this.db.prepare("INSERT INTO decisions(decision_id,run_id,question,choices_json,recommendation,decision_type,receipt_json,status,created_at) VALUES (?,?,?,?,?,?,?,'pending',?)")
-      .run(decisionId, runId, question, stableJson(choices), recommendation, checked.value.type ?? "workflow", stableJson(receipt), new Date().toISOString());
+    const receipt = { type: checked.value.type ?? "workflow", question, choices, recommendation: recommendation ?? null, dispatch_id: dispatchId ?? null };
+    this.db.prepare("INSERT INTO decisions(decision_id,run_id,dispatch_id,question,choices_json,recommendation,decision_type,receipt_json,status,created_at) VALUES (?,?,?,?,?,?,?,?, 'pending',?)")
+      .run(decisionId, runId, dispatchId ?? null, question, stableJson(choices), recommendation, checked.value.type ?? "workflow", stableJson(receipt), new Date().toISOString());
     return decisionId;
   }
 
