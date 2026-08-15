@@ -24,6 +24,9 @@
 - worktree ownership transfer
 - context renderer version
 - testedCommit
+- formal review barrier
+- review reconciliation
+- finalize_integration
 
 ### 仓库约束
 - 要求 Node.js >=22.13.0，并必须通过 npm 验证脚本。
@@ -47,6 +50,8 @@
 - `scripts/verify-packed-install.ts` 负责在隔离 consumer 中验证真实 npm tarball。
 - `src/security.ts` 与 `src/state.ts` 负责 staging 文件系统安全、生命周期元数据、保留和清理。
 - `skills/init-ai-team` 负责在目标 Git 项目中初始化并校验 AI Team 的可复用 Codex 工作流。
+- `src/dispatch.ts` 将已完成的评审叶子汇总到所属 barrier，并幂等创建唯一的 review resolution 或最终 Git Operator continuation。
+- `src/review.ts` 提供 barrier 幂等创建，以及按 barrier ID 或 run revision 查询状态。
 
 ### 模块边界
 - `src/git-orchestrator.ts` 与 `src/git.ts` 负责 run-scoped Git 编排、clean worktree adopt/transfer，并将 task/worktree/integration 身份写入操作证据。
@@ -56,4 +61,5 @@
 - `src/cli.ts` 绑定 10 类支持 staging 的 JSON 消费命令，同时保留旧文件参数。
 - `skills/init-ai-team` 封装公共初始化和上下文校验命令，不改变 CLI 行为。
 - `test/*.test.ts` 包含单元测试、CLI 端到端测试、锁测试、契约测试和工作流回归测试。
+- `src/review.ts` 负责 formal review 绑定和公共状态查询，`src/dispatch.ts` 负责叶子汇总、恢复和 run 阶段推进。
 <!-- ai-team:project-context:end -->

@@ -256,7 +256,7 @@ const LEGACY_RENDERER_NOT_USED: Record<string, string[]> = {
   "review create": ["ai-team review create --run-id <run-id> --revision-sha <commit> [--formal]"],
   "review submit": ["ai-team review submit --run-id <run-id> --barrier-id <opaque-id> --result-file <json>"],
   "review resolve": ["ai-team review resolve --run-id <run-id> --barrier-id <opaque-id> --resolution-file <json>"],
-  "review status": ["ai-team review status --run-id <run-id> --barrier-id <opaque-id>"],
+  "review status": ["ai-team review status --run-id <run-id> (--barrier-id <opaque-id> | --revision-sha <commit>)"],
   "git status": ["ai-team git status --run-id <run-id>"],
   "git prepare": ["ai-team git prepare --run-id <run-id> [--task-id <task-id>] [--integration] [--base-commit <commit>] [--depends-on <opaque-id>]"],
   "git commit": ["ai-team git commit --run-id <run-id> --worktree-id <opaque-id> --message <text> --scope <paths>"],

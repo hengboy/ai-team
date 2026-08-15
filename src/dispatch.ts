@@ -9,6 +9,7 @@ import { assertReadablePath, assertWritablePath } from "./security.js";
 import { StateStore } from "./state.js";
 import { assertRevisionRunStage } from "./planning.js";
 import { assertRelativePosixPath, makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
+import type { ReviewFinding, ReviewResult } from "./review.js";
 
 export interface DispatchPacket {
   objective: string;
@@ -24,6 +25,17 @@ export interface RunResumeResult {
   pending_decision: Record<string, unknown> | null;
   pending_operations: Array<{ operation_id: string; kind: string; state: string }>;
   last_event: Record<string, unknown> | null;
+}
+
+interface ReviewBarrierRow {
+  barrier_id: string;
+  run_id: string;
+  revision_sha: string;
+  formal: number;
+  state: string;
+  axes_json?: string;
+  spec_dispatch_id?: string;
+  standards_dispatch_id?: string;
 }
 
 const RENDERER_VERSION = "dispatch-renderer-v2";
@@ -64,6 +76,20 @@ const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   const broad = reads.filter((path) => path === "**" || path === "." || path.endsWith("/**"));
   if (role !== "file-explorer" && broad.length) throw new ValidationError(`${role} requires exact allowed_read_paths`);
   return value as unknown as DispatchPacket;
+};
+
+const validateReviewResult = (result: ReviewResult): void => {
+  if (!result.summary || !Array.isArray(result.findings)) throw new ValidationError("review result requires summary and findings");
+  const ids = new Set<string>();
+  for (const finding of result.findings) {
+    if (!/^FIND-[A-Z]+-\d{3}$/.test(finding.finding_id)) throw new ValidationError(`invalid finding id: ${finding.finding_id}`);
+    if (!["P0", "P1", "P2", "P3"].includes(finding.severity)) throw new ValidationError(`invalid finding severity: ${finding.finding_id}`);
+    if (!finding.title || !finding.source || !finding.source_file || !Number.isInteger(finding.source_line) || finding.source_line < 1 || !finding.evidence || !finding.impact || !finding.recommendation) {
+      throw new ValidationError(`finding lacks source, location, impact, or recommendation: ${finding.finding_id}`);
+    }
+    if (ids.has(finding.finding_id)) throw new ValidationError(`duplicate finding id: ${finding.finding_id}`);
+    ids.add(finding.finding_id);
+  }
 };
 
 const assertExplorerAuthorization = (store: StateStore, runId: string, role: Role, packet: DispatchPacket): void => {
@@ -127,6 +153,10 @@ export class DispatchService {
     const frozenPacket = JSON.parse(packetJson) as DispatchPacket;
     const prompt = redact(promptFor(runId, dispatchId, role, frozenPacket));
     const template = createResultTemplate(runId, dispatchId, role);
+    if (role === "review-spec" || role === "review-standards") {
+      const barrierId = (frozenPacket.context as { barrier_id?: unknown }).barrier_id;
+      if (typeof barrierId === "string") template.payload = { barrier_id: barrierId, finding_ids: [] };
+    }
     const schemaJson = stableJson(resultSchemaForRole(role));
     const templateJson = stableJson(template);
     const digests = { packet: sha256(packetJson), schema: sha256(schemaJson), template: sha256(templateJson), prompt: sha256(prompt) };
@@ -293,9 +323,17 @@ export class DispatchService {
 
   async submitValue(runId: string, dispatchId: string, role: Role, value: unknown, source?: string): Promise<{ reused: boolean; artifact: string }> {
     const row = this.get(runId, dispatchId, role);
+    const bindReviewBarrier = (result: ResultEnvelope): void => {
+      if ((role !== "review-spec" && role !== "review-standards") || result.status !== "completed") return;
+      const packet = JSON.parse(row.packet_json) as DispatchPacket;
+      const barrierId = (packet.context as { barrier_id?: unknown }).barrier_id;
+      if (typeof barrierId !== "string") throw new ValidationError(`${role} dispatch is not bound to a review barrier`);
+      result.payload = { ...result.payload, barrier_id: barrierId };
+    };
     if (["completed", "needs_decision"].includes(row.state) && row.result_json) {
       const result = JSON.parse(row.result_json) as ResultEnvelope;
       const incoming = this.validateValue(runId, dispatchId, role, value);
+      bindReviewBarrier(incoming);
       if (stableJson(result) !== stableJson(incoming)) throw new ValidationError("dispatch was already submitted with a different result");
       return { reused: true, artifact: this.artifactPath(runId, dispatchId) };
     }
@@ -308,10 +346,11 @@ export class DispatchService {
         result.payload = { ...result.payload, testedCommit };
       }
     }
+    bindReviewBarrier(result);
     const artifactDirectory = join(this.store.paths.artifacts, runId, dispatchId);
     await mkdir(artifactDirectory, { recursive: true });
     const artifact = this.artifactPath(runId, dispatchId);
-    const redacted = redact(role === "test" ? `${JSON.stringify(result, null, 2)}\n` : source ?? `${JSON.stringify(value, null, 2)}\n`);
+    const redacted = redact(role === "test" || role === "review-spec" || role === "review-standards" ? `${JSON.stringify(result, null, 2)}\n` : source ?? `${JSON.stringify(value, null, 2)}\n`);
     await writeFile(artifact, redacted, { mode: 0o600 });
     const digest = sha256(redacted);
     const artifactId = `artifact_${digest.slice(0, 24)}`;
@@ -325,6 +364,12 @@ export class DispatchService {
       this.store.event(runId, "dispatch.completed", { dispatchId, status: result.status, artifactId, digest });
       if (result.status === "completed" || planningQuestion) {
         if (role === "planning") this.advancePlanning(runId, result);
+        else if (role === "review-spec" || role === "review-standards") {
+          const packet = JSON.parse(row.packet_json) as DispatchPacket;
+          const barrierId = (packet.context as { barrier_id?: unknown }).barrier_id;
+          if (typeof barrierId !== "string") throw new ValidationError(`${role} dispatch is not bound to a review barrier`);
+          this.reconcileReview(runId, barrierId);
+        }
         else this.advanceRun(runId, role, result);
       } else {
         if (result.status === "needs_decision" || result.status === "retryable_failure" && result.decisions_needed.length === 1) {
@@ -473,6 +518,117 @@ export class DispatchService {
     if (!packet) return;
     const dispatchId = this.insert(runId, "code-reviewer", packet);
     this.changeStage(runId, "code-reviewer", dispatchId);
+  }
+
+  reconcileReview(runId: string, barrierId?: string): Array<{ barrier_id: string; state: string; blocking: ReviewFinding[] }> {
+    this.store.getRun(runId);
+    const barriers = this.store.db.prepare(`SELECT * FROM review_barriers WHERE run_id=?${barrierId ? " AND barrier_id=?" : ""} ORDER BY created_at`)
+      .all(...(barrierId ? [runId, barrierId] : [runId])) as ReviewBarrierRow[];
+    if (barrierId && barriers.length === 0) throw new ValidationError("review barrier does not belong to run");
+    const outcomes: Array<{ barrier_id: string; state: string; blocking: ReviewFinding[] }> = [];
+    for (const barrier of barriers) {
+      let outcome = { barrier_id: barrier.barrier_id, state: barrier.state, blocking: [] as ReviewFinding[] };
+      this.store.db.transaction(() => {
+        const axes: Array<"spec" | "standards"> = barrier.axes_json ? JSON.parse(barrier.axes_json) as Array<"spec" | "standards"> : barrier.formal ? ["spec", "standards"] : ["standards"];
+        for (const axis of axes) {
+          const role = axis === "spec" ? "review-spec" : "review-standards";
+          const dispatchColumn = axis === "spec" ? "spec_dispatch_id" : "standards_dispatch_id";
+          let dispatchId = axis === "spec" ? barrier.spec_dispatch_id : barrier.standards_dispatch_id;
+          let leaf = dispatchId
+            ? this.store.db.prepare("SELECT dispatch_id,state,packet_json,result_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role=?").get(runId, dispatchId, role)
+            : undefined;
+          if (!leaf) {
+            leaf = (this.store.db.prepare("SELECT dispatch_id,state,packet_json,result_json FROM dispatches WHERE run_id=? AND role=? ORDER BY created_at DESC").all(runId, role) as Array<{ dispatch_id: string; state: string; packet_json: string; result_json?: string }>)
+              .find((row) => (JSON.parse(row.packet_json) as DispatchPacket).context.barrier_id === barrier.barrier_id);
+            dispatchId = (leaf as { dispatch_id?: string } | undefined)?.dispatch_id;
+            if (dispatchId) this.store.db.prepare(`UPDATE review_barriers SET ${dispatchColumn}=? WHERE barrier_id=?`).run(dispatchId, barrier.barrier_id);
+          }
+          const row = leaf as { dispatch_id: string; state: string; packet_json: string; result_json?: string } | undefined;
+          if (row?.state !== "completed" || !row.result_json) continue;
+          const packet = JSON.parse(row.packet_json) as DispatchPacket;
+          if (packet.context.barrier_id !== barrier.barrier_id) throw new ValidationError(`${axis} review packet is not bound to its barrier`);
+          const envelope = JSON.parse(row.result_json) as ResultEnvelope;
+          const payload = envelope.payload as { finding_ids?: unknown; barrier_id?: unknown };
+          if (payload.barrier_id !== undefined && payload.barrier_id !== barrier.barrier_id) throw new ValidationError(`${axis} review result is not bound to its barrier`);
+          const reviewResult: ReviewResult = { axis, summary: envelope.summary, findings: envelope.findings as ReviewFinding[] };
+          validateReviewResult(reviewResult);
+          const findingIds = reviewResult.findings.map((finding) => finding.finding_id);
+          if (stableJson(payload.finding_ids ?? []) !== stableJson(findingIds)) throw new ValidationError(`${axis} review result finding ids do not match its findings`);
+          const serialized = stableJson(reviewResult);
+          const existing = this.store.db.prepare("SELECT result_json FROM review_results WHERE barrier_id=? AND axis=?").get(barrier.barrier_id, axis) as { result_json: string } | undefined;
+          if (existing && existing.result_json !== serialized) throw new ValidationError(`${axis} review was already submitted with a different result`);
+          this.store.db.prepare("INSERT OR IGNORE INTO review_results(barrier_id,axis,result_json,created_at) VALUES (?,?,?,?)")
+            .run(barrier.barrier_id, axis, serialized, new Date().toISOString());
+          const artifact = this.store.db.prepare("SELECT sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result' ORDER BY created_at DESC LIMIT 1")
+            .get(runId, row.dispatch_id) as { sha256: string } | undefined;
+          const digestColumn = axis === "spec" ? "spec_result_digest" : "standards_result_digest";
+          this.store.db.prepare(`UPDATE review_barriers SET ${digestColumn}=? WHERE barrier_id=?`).run(artifact?.sha256 ?? sha256(row.result_json), barrier.barrier_id);
+          if (payload.barrier_id === undefined) {
+            envelope.payload = { ...envelope.payload, barrier_id: barrier.barrier_id };
+            this.store.db.prepare("UPDATE dispatches SET result_json=? WHERE dispatch_id=?").run(stableJson(envelope), row.dispatch_id);
+          }
+        }
+        const results = (this.store.db.prepare("SELECT result_json FROM review_results WHERE barrier_id=? ORDER BY axis").all(barrier.barrier_id) as Array<{ result_json: string }>)
+          .map((row) => JSON.parse(row.result_json) as ReviewResult);
+        const blocking = results.flatMap((result) => result.findings).filter((finding) => finding.severity === "P0" || finding.severity === "P1");
+        let state = barrier.state;
+        if (results.length === axes.length && !["resolved"].includes(state)) state = blocking.length ? "blocked" : "passed";
+        const aggregate = {
+          status: state,
+          axes,
+          completed_axes: results.map((result) => result.axis),
+          finding_ids: results.flatMap((result) => result.findings.map((finding) => finding.finding_id)),
+          blocking_finding_ids: blocking.map((finding) => finding.finding_id),
+        };
+        this.store.db.prepare("UPDATE review_barriers SET axes_json=?,state=?,aggregate_json=?,completed_at=CASE WHEN ?='pending' THEN completed_at ELSE COALESCE(completed_at,?) END WHERE barrier_id=?")
+          .run(stableJson(axes), state, stableJson(aggregate), state, new Date().toISOString(), barrier.barrier_id);
+        if (state === "blocked") this.ensureReviewResolutionDispatch(runId, barrier, blocking);
+        if (state === "passed" || state === "resolved") this.ensureFinalGitDispatch(runId, barrier);
+        outcome = { barrier_id: barrier.barrier_id, state, blocking };
+      })();
+      outcomes.push(outcome);
+    }
+    return outcomes;
+  }
+
+  private ensureReviewResolutionDispatch(runId: string, barrier: ReviewBarrierRow, blocking: ReviewFinding[]): string {
+    const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='coding'
+      AND json_extract(packet_json,'$.context.phase')='review_resolution'
+      AND json_extract(packet_json,'$.context.barrier_id')=? LIMIT 1`).get(runId, barrier.barrier_id) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
+    const leafId = barrier.spec_dispatch_id ?? barrier.standards_dispatch_id;
+    const leaf = leafId ? this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(leafId) as { packet_json: string } | undefined : undefined;
+    const reviewPaths = leaf ? (JSON.parse(leaf.packet_json) as DispatchPacket).allowed_read_paths : [];
+    const writablePaths = reviewPaths.filter((path) => !path.startsWith(".ai-team/plans/"));
+    const dispatchId = this.insert(runId, "coding", validatePacket({
+      objective: `Resolve every blocking finding for review barrier ${barrier.barrier_id}.`,
+      allowed_read_paths: reviewPaths,
+      allowed_write_paths: writablePaths,
+      acceptance_criteria: ["Map every P0/P1 finding to change evidence", "Provide verification evidence after the repair commit"],
+      context: { stage: "coding", phase: "review_resolution", barrier_id: barrier.barrier_id, revision_sha: barrier.revision_sha, blocking_findings: blocking },
+    }, "coding"));
+    this.changeStage(runId, "coding", dispatchId);
+    return dispatchId;
+  }
+
+  private ensureFinalGitDispatch(runId: string, barrier: ReviewBarrierRow): string {
+    const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator'
+      AND json_extract(packet_json,'$.context.phase')='finalize_integration'
+      AND json_extract(packet_json,'$.context.barrier_id')=? LIMIT 1`).get(runId, barrier.barrier_id) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
+    const integration = this.store.db.prepare("SELECT worktree_id FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1")
+      .get(runId) as { worktree_id: string } | undefined;
+    if (!integration) throw new ValidationError("passed review requires an active integration worktree");
+    const dispatchId = this.insert(runId, "git-operator", validatePacket({
+      objective: `Merge reviewed integration commit ${barrier.revision_sha} into the target branch and clean up owned worktrees.`,
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Merge the reviewed integration worktree into the target branch", "Clean up all run-owned worktrees after integration"],
+      context: { stage: "git-operator", phase: "finalize_integration", barrier_id: barrier.barrier_id, revision_sha: barrier.revision_sha, integration_worktree_id: integration.worktree_id, actions: ["integrate", "cleanup"] },
+    }, "git-operator"));
+    const run = this.store.getRun(runId) as { state: string };
+    if (run.state === "active") this.changeStage(runId, "git-operator", dispatchId);
+    return dispatchId;
   }
 
   buildReviewPacket(runId: string, testResult?: ResultEnvelope, reissue?: { decision_id: string; dispatch_id: string; resolved_decision?: Record<string, unknown> }): DispatchPacket | undefined {
@@ -651,10 +807,14 @@ export class DispatchService {
 
   resume(runId: string): RunResumeResult {
     this.store.db.transaction(() => {
-      const run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
+      let run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
       const pendingDecision = this.store.db.prepare("SELECT decision_id,dispatch_id,receipt_json FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; dispatch_id?: string; receipt_json?: string } | undefined;
       const pendingOperation = this.store.db.prepare("SELECT 1 FROM operations WHERE run_id=? AND state='pending'").get(runId);
       if (pendingOperation) return;
+      if (run.profile === "coding") {
+        this.reconcileReview(runId);
+        run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
+      }
       const retryableDispatch = run.state === "retryable_failure"
         ? this.store.db.prepare("SELECT dispatch_id,role,packet_json,packet_digest,result_json,replacement_for FROM dispatches WHERE run_id=? AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1").get(runId) as { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string } | undefined
         : undefined;

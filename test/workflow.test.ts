@@ -96,8 +96,8 @@ test("direct and formal reviews require the correct axes and run once per frozen
     );
     assert.throws(() => reviews.submit(directRun, direct.barrier_id, result("spec")), /not required/);
     assert.equal(submitReview(reviews, store, directRun, direct.barrier_id, result("standards")).state, "passed");
-    assert.throws(() => reviews.submit(directRun, direct.barrier_id, result("standards")), /already complete/);
-    assert.throws(() => reviews.create(directRun, REVIEW_HEAD, false), /reviews run once/);
+    assert.equal(reviews.submit(directRun, direct.barrier_id, result("standards")).state, "passed");
+    assert.deepEqual(reviews.create(directRun, REVIEW_HEAD, false), { ...direct, reused: true });
 
     const formalRun = createRun(store, "planned");
     completeTest(store, formalRun);
@@ -109,8 +109,100 @@ test("direct and formal reviews require the correct axes and run once per frozen
       ["review-spec", "review-standards"],
     );
     assert.equal(submitReview(reviews, store, formalRun, formal.barrier_id, result("spec")).state, "pending");
-    assert.throws(() => reviews.submit(formalRun, formal.barrier_id, result("spec")), /already submitted/);
+    assert.equal(reviews.submit(formalRun, formal.barrier_id, result("spec")).state, "pending");
     assert.equal(submitReview(reviews, store, formalRun, formal.barrier_id, result("standards")).state, "passed");
+  } finally {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("run resume rebuilds a completed formal barrier and creates one final Git Operator dispatch", async () => {
+  const { store, home } = await openStore();
+  let reopened: StateStore | undefined;
+  try {
+    const runId = createRun(store, "planned");
+    completeTest(store, runId);
+    const reviews = new ReviewService(store);
+    const created = reviews.create(runId, REVIEW_HEAD, true);
+    completeReviewLeaf(store, runId, result("spec"));
+    completeReviewLeaf(store, runId, result("standards"));
+    store.db.prepare("UPDATE runs SET stage='code-reviewer' WHERE run_id=?").run(runId);
+    store.close();
+
+    reopened = await StateStore.open(home);
+    const dispatches = new WorkflowService(reopened).dispatches;
+    const first = dispatches.resume(runId);
+    const second = dispatches.resume(runId);
+    assert.equal((first.run as { stage: string }).stage, "git-operator");
+    assert.equal((second.run as { stage: string }).stage, "git-operator");
+
+    const status = new ReviewService(reopened).status(runId, undefined, REVIEW_HEAD) as {
+      barrier_id: string;
+      state: string;
+      axes: string[];
+      spec_dispatch_id: string;
+      standards_dispatch_id: string;
+      result_artifact_digests: Record<string, string | null>;
+      results: ReviewResult[];
+    };
+    assert.equal(status.barrier_id, created.barrier_id);
+    assert.equal(status.state, "passed");
+    assert.deepEqual(status.axes, ["spec", "standards"]);
+    assert.ok(status.spec_dispatch_id);
+    assert.ok(status.standards_dispatch_id);
+    assert.equal(status.results.length, 2);
+    assert.equal(Object.keys(status.result_artifact_digests).length, 2);
+
+    const finalDispatches = reopened.db.prepare(`SELECT dispatch_id,packet_json FROM dispatches
+      WHERE run_id=? AND role='git-operator' AND json_extract(packet_json,'$.context.phase')='finalize_integration'`).all(runId) as Array<{ dispatch_id: string; packet_json: string }>;
+    assert.equal(finalDispatches.length, 1);
+    assert.equal(JSON.parse(finalDispatches[0]!.packet_json).context.revision_sha, REVIEW_HEAD);
+    assert.equal(JSON.parse(finalDispatches[0]!.packet_json).context.barrier_id, created.barrier_id);
+    assert.deepEqual(new ReviewService(reopened).create(runId, REVIEW_HEAD, true), { ...created, reused: true });
+  } finally {
+    if (reopened) reopened.close();
+    else store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("completed review leaf submissions automatically aggregate once", async () => {
+  const { store, home } = await openStore();
+  try {
+    const runId = createRun(store, "planned");
+    completeTest(store, runId);
+    const reviews = new ReviewService(store);
+    const barrier = reviews.create(runId, REVIEW_HEAD, true);
+    const dispatches = new WorkflowService(store).dispatches;
+    for (const axis of ["spec", "standards"] as const) {
+      const role = axis === "spec" ? "review-spec" : "review-standards";
+      const leaf = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role=?").get(runId, role) as { dispatch_id: string };
+      dispatches.claim(runId, leaf.dispatch_id, role);
+      const envelope = {
+        ...createResultTemplate(runId, leaf.dispatch_id, role),
+        summary: `${axis} review complete`,
+        verification: [{ command: "review", outcome: "completed" }],
+        payload: { finding_ids: [] },
+      };
+      assert.equal((dispatches.template(runId, leaf.dispatch_id, role).payload as { barrier_id: string }).barrier_id, barrier.barrier_id);
+      assert.equal((await dispatches.submitValue(runId, leaf.dispatch_id, role, envelope)).reused, false);
+      assert.equal((await dispatches.submitValue(runId, leaf.dispatch_id, role, structuredClone(envelope))).reused, true);
+    }
+    const status = reviews.status(runId, barrier.barrier_id) as {
+      state: string;
+      results: ReviewResult[];
+      result_artifact_digests: Record<string, string>;
+    };
+    assert.equal(status.state, "passed");
+    assert.equal(status.results.length, 2);
+    assert.match(status.result_artifact_digests.spec!, /^[a-f0-9]{64}$/);
+    assert.match(status.result_artifact_digests.standards!, /^[a-f0-9]{64}$/);
+    assert.equal(
+      (store.db.prepare(`SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='git-operator'
+        AND json_extract(packet_json,'$.context.phase')='finalize_integration'`).get(runId) as { count: number }).count,
+      1,
+    );
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });
@@ -130,6 +222,12 @@ test("blocked review resolution maps every P0 and P1 finding exactly", async () 
       { finding_id: "FIND-TEST-003", severity: "P2", title: "P2", source: "test", source_file: "test/a.ts", source_line: 3, evidence: "e2", impact: "coverage", recommendation: "test" },
     ];
     assert.equal(submitReview(reviews, store, runId, barrier.barrier_id, result("standards", findings)).state, "blocked");
+    new WorkflowService(store).dispatches.reconcileReview(runId, barrier.barrier_id);
+    assert.equal(
+      (store.db.prepare(`SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='coding'
+        AND json_extract(packet_json,'$.context.phase')='review_resolution'`).get(runId) as { count: number }).count,
+      1,
+    );
 
     assert.throws(
       () => reviews.resolve(runId, barrier.barrier_id, [
@@ -154,6 +252,11 @@ test("blocked review resolution maps every P0 and P1 finding exactly", async () 
     const status = reviews.status(runId, barrier.barrier_id) as { state: string; resolutions: unknown[] };
     assert.equal(status.state, "resolved");
     assert.equal(status.resolutions.length, 2);
+    assert.equal(
+      (store.db.prepare(`SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='git-operator'
+        AND json_extract(packet_json,'$.context.phase')='finalize_integration'`).get(runId) as { count: number }).count,
+      1,
+    );
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });

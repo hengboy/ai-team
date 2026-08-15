@@ -234,6 +234,26 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "007-review-barrier-reconciliation",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      const addColumn = (name: string, definition: string): void => {
+        const columns = db.prepare("PRAGMA table_info(review_barriers)").all() as Array<{ name: string }>;
+        if (!columns.some((column) => column.name === name)) db.exec(`ALTER TABLE review_barriers ADD COLUMN ${name} ${definition}`);
+      };
+      addColumn("axes_json", "TEXT");
+      addColumn("spec_dispatch_id", "TEXT REFERENCES dispatches(dispatch_id)");
+      addColumn("standards_dispatch_id", "TEXT REFERENCES dispatches(dispatch_id)");
+      addColumn("spec_result_digest", "TEXT");
+      addColumn("standards_result_digest", "TEXT");
+      addColumn("aggregate_json", "TEXT");
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS review_barriers_run_revision ON review_barriers(run_id,revision_sha);
+        CREATE INDEX IF NOT EXISTS review_barriers_leaf_dispatches ON review_barriers(spec_dispatch_id,standards_dispatch_id);
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {

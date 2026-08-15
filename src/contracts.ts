@@ -166,8 +166,8 @@ export const ROLE_PAYLOAD_SCHEMAS: Record<Role, object> = {
   test: { type: "object", additionalProperties: false, required: ["checks"], properties: { checks: evidenceArray, testedCommit: { type: "string", pattern: "^[a-f0-9]{40}$" } } },
   "git-operator": { type: "object", additionalProperties: false, required: ["operations"], properties: { operations: evidenceArray } },
   "code-reviewer": { type: "object", additionalProperties: false, required: ["axes"], properties: { axes: { type: "array", items: { enum: ["spec", "standards"] }, minItems: 1, uniqueItems: true } } },
-  "review-spec": { type: "object", additionalProperties: false, required: ["finding_ids"], properties: { finding_ids: stringArray } },
-  "review-standards": { type: "object", additionalProperties: false, required: ["finding_ids"], properties: { finding_ids: stringArray } },
+  "review-spec": { type: "object", additionalProperties: false, required: ["finding_ids"], properties: { finding_ids: stringArray, barrier_id: { type: "string", pattern: "^review_[a-f0-9]{24}$" } } },
+  "review-standards": { type: "object", additionalProperties: false, required: ["finding_ids"], properties: { finding_ids: stringArray, barrier_id: { type: "string", pattern: "^review_[a-f0-9]{24}$" } } },
   "environment-operator": { type: "object", additionalProperties: false, required: ["managed_paths"], properties: { managed_paths: stringArray } },
   researcher: { type: "object", additionalProperties: false, required: ["report_path", "conclusion_count"], properties: { report_path: { type: "string" }, conclusion_count: { type: "integer", minimum: 1 } } },
 };

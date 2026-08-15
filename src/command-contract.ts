@@ -84,7 +84,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "review create": ["ai-team review create --run-id <run-id> --revision-sha <commit> [--formal]"],
   "review submit": ["ai-team review submit --run-id <run-id> --barrier-id <opaque-id> (--result-file <json> | --staging-id <staging-id>)"],
   "review resolve": ["ai-team review resolve --run-id <run-id> --barrier-id <opaque-id> (--resolution-file <json> | --staging-id <staging-id>)"],
-  "review status": ["ai-team review status --run-id <run-id> --barrier-id <opaque-id>"],
+  "review status": ["ai-team review status --run-id <run-id> (--barrier-id <opaque-id> | --revision-sha <commit>)"],
   "git status": ["ai-team git status --run-id <run-id>"],
   "git prepare": ["ai-team git prepare --run-id <run-id> --dispatch-id <dispatch-id> [--task-id <task-id>] [--integration] [--base-commit <commit>] [--depends-on <opaque-id>]"],
   "git adopt": [

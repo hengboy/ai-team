@@ -449,7 +449,7 @@ export const buildProgram = (): Command => {
     });
 
   const run = program.command("run");
-  run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId), decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId), dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId) }), { readonly: true })));
+  run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), review_barrier: new ReviewService(store).current(runId), events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId), decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId), dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId) }), { readonly: true })));
   run.command("resume").argument("<run-id>").action(async (runId) => output(await withStore((store) => new DispatchService(store).resume(runId))));
   run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined; const dispatchId = new DispatchService(store).resolveDecision(options.runId, options.decisionId, options.choice, note); output({ status: "resolved", dispatch_id: dispatchId }); }));
 
@@ -655,7 +655,7 @@ export const buildProgram = (): Command => {
       } catch (error) { input.validationFailed(error); throw error; }
     }));
   });
-  review.command("status").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").action(async (options) => output(await withStore((store) => new ReviewService(store).status(options.runId, options.barrierId), { readonly: true })));
+  review.command("status").requiredOption("--run-id <id>").option("--barrier-id <id>").option("--revision-sha <sha>").action(async (options) => output(await withStore((store) => new ReviewService(store).status(options.runId, options.barrierId, options.revisionSha), { readonly: true })));
 
   program.command("install").option("--platform <list>", "comma-separated platforms", platformList).option("--dry-run").action(async (options) => { const service = new EnvironmentService(); const environment = await service.load(await service.active()); const platforms = options.platform ?? environment.platforms; const versions = await service.validateClientVersions(platforms); output({ versions, plan: await service.generate(environment.name, platforms, options.dryRun) }); });
   const env = program.command("env");

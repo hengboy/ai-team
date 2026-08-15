@@ -8,6 +8,7 @@ export type Severity = "P0" | "P1" | "P2" | "P3";
 export interface ReviewFinding { finding_id: string; severity: Severity; title: string; source: string; source_file: string; source_line: number; evidence: string; impact: string; recommendation: string; }
 export interface ReviewResult { axis: "spec" | "standards"; summary: string; findings: ReviewFinding[]; }
 export interface FindingResolution { finding_id: string; change_evidence: string; verification_evidence: string; }
+export interface ReviewCreateResult { barrier_id: string; axes: string[]; reused: boolean; }
 
 const validateFindings = (result: ReviewResult): void => {
   if (!result.summary || !Array.isArray(result.findings)) throw new ValidationError("review result requires summary and findings");
@@ -24,11 +25,18 @@ const validateFindings = (result: ReviewResult): void => {
 export class ReviewService {
   constructor(readonly store: StateStore) {}
 
-  create(runId: string, revisionSha: string, formal: boolean): { barrier_id: string; axes: string[] } {
+  create(runId: string, revisionSha: string, formal: boolean): ReviewCreateResult {
     const run = this.store.getRun(runId) as { mode: string; repo_id: string; plan_id?: string; revision?: string };
     const requiredFormal = run.mode === "planned";
     if (formal !== requiredFormal) throw new ValidationError(`${run.mode} runs require ${requiredFormal ? "formal" : "direct"} review axes`);
     if (!/^[a-f0-9]{40}$/.test(revisionSha)) throw new ValidationError("review revision must be a 40-character commit SHA");
+    const existing = this.store.db.prepare("SELECT barrier_id,formal,axes_json FROM review_barriers WHERE run_id=? AND revision_sha=?")
+      .get(runId, revisionSha) as { barrier_id: string; formal: number; axes_json?: string } | undefined;
+    if (existing) {
+      if (Boolean(existing.formal) !== formal) throw new ValidationError("existing review barrier has different axes");
+      const existingAxes = existing.axes_json ? JSON.parse(existing.axes_json) as string[] : formal ? ["spec", "standards"] : ["standards"];
+      return { barrier_id: existing.barrier_id, axes: existingAxes, reused: true };
+    }
     const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
     if (!repository) throw new ValidationError("review repository is not registered");
     try { execFileSync("git", ["-C", repository.project_path, "cat-file", "-e", `${revisionSha}^{commit}`], { stdio: "ignore" }); }
@@ -74,21 +82,22 @@ export class ReviewService {
     const testEvidence = context.test_evidence;
     const barrierId = `review_${sha256(`${runId}:${baseCommit}:${revisionSha}:${run.plan_id ?? ""}:${run.revision ?? ""}:${documentDigest}:${diffDigest}:${testEvidenceDigest}:${revisionDigest}:${evidenceDigest}`).slice(0, 24)}`;
     const axes = formal ? ["spec", "standards"] as const : ["standards"] as const;
+    let reused = false;
     const create = this.store.db.transaction(() => {
       const columns = (this.store.db.prepare("PRAGMA table_info(review_barriers)").all() as Array<{ name: string }>).map((item) => item.name);
       const now = new Date().toISOString();
       const binding = { base_commit: baseCommit, head_commit: revisionSha, plan_id: run.plan_id ?? null, revision: run.revision ?? null, document_digest: documentDigest, diff_digest: diffDigest, test_evidence_digest: testEvidenceDigest, revision_digest: revisionDigest, evidence_digest: evidenceDigest };
       let inserted;
       if (["base_commit", "head_commit", "document_digest", "diff_digest", "test_evidence_digest", "revision_digest", "evidence_digest"].every((column) => columns.includes(column))) {
-        inserted = this.store.db.prepare(`INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,base_commit,head_commit,plan_id,revision,document_digest,diff_digest,test_evidence_digest,revision_digest,evidence_digest,created_at)
-          VALUES (?,?,?,?, 'pending',?,?,?,?,?,?,?,?,?,?)`).run(barrierId, runId, revisionSha, formal ? 1 : 0, binding.base_commit, binding.head_commit, binding.plan_id, binding.revision, binding.document_digest, binding.diff_digest, binding.test_evidence_digest, binding.revision_digest, binding.evidence_digest, now);
+        inserted = this.store.db.prepare(`INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,base_commit,head_commit,plan_id,revision,document_digest,diff_digest,test_evidence_digest,revision_digest,evidence_digest,axes_json,created_at)
+          VALUES (?,?,?,?, 'pending',?,?,?,?,?,?,?,?,?,?,?)`).run(barrierId, runId, revisionSha, formal ? 1 : 0, binding.base_commit, binding.head_commit, binding.plan_id, binding.revision, binding.document_digest, binding.diff_digest, binding.test_evidence_digest, binding.revision_digest, binding.evidence_digest, stableJson(axes), now);
       } else {
         inserted = this.store.db.prepare("INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,created_at) VALUES (?,?,?,?, 'pending', ?)")
           .run(barrierId, runId, revisionSha, formal ? 1 : 0, now);
       }
-      if (!inserted.changes) throw new ValidationError("review already exists for this frozen revision; reviews run once");
+      if (!inserted.changes) { reused = true; return; }
       for (const axis of axes) {
-        dispatches.create(runId, axis === "spec" ? "review-spec" : "review-standards", {
+        const dispatchId = dispatches.create(runId, axis === "spec" ? "review-spec" : "review-standards", {
           objective: `Review frozen commit ${revisionSha} on the ${axis} axis.`,
           allowed_read_paths: coordinator.packet.allowed_read_paths,
           allowed_write_paths: [],
@@ -107,16 +116,18 @@ export class ReviewService {
             test_evidence: testEvidence,
           },
         }, "code-reviewer");
+        const column = axis === "spec" ? "spec_dispatch_id" : "standards_dispatch_id";
+        this.store.db.prepare(`UPDATE review_barriers SET ${column}=? WHERE barrier_id=?`).run(dispatchId, barrierId);
       }
     });
     create();
-    return { barrier_id: barrierId, axes: [...axes] };
+    const row = this.store.db.prepare("SELECT barrier_id FROM review_barriers WHERE run_id=? AND revision_sha=?").get(runId, revisionSha) as { barrier_id: string };
+    return { barrier_id: row.barrier_id, axes: [...axes], reused };
   }
 
   submit(runId: string, barrierId: string, result: ReviewResult): { state: string; blocking: ReviewFinding[] } {
     validateFindings(result);
     const barrier = this.barrier(runId, barrierId);
-    if (barrier.state !== "pending") throw new ValidationError("review barrier is already complete");
     const required = barrier.formal ? ["spec", "standards"] : ["standards"];
     if (!required.includes(result.axis)) throw new ValidationError(`${result.axis} review is not required for this run`);
     const role = result.axis === "spec" ? "review-spec" : "review-standards";
@@ -132,15 +143,8 @@ export class ReviewService {
     if (envelope.summary !== result.summary || stableJson(envelope.findings ?? []) !== stableJson(result.findings) || stableJson(envelope.payload?.finding_ids ?? []) !== stableJson(findingIds)) {
       throw new ValidationError(`${result.axis} review result does not match its completed leaf dispatch`);
     }
-    try { this.store.db.prepare("INSERT INTO review_results(barrier_id,axis,result_json,created_at) VALUES (?,?,?,?)").run(barrierId, result.axis, stableJson(result), new Date().toISOString()); }
-    catch { throw new ValidationError(`${result.axis} review was already submitted`); }
-    const results = this.results(barrierId);
-    if (results.length === required.length) {
-      const blocking = results.flatMap((item) => item.findings).filter((finding) => finding.severity === "P0" || finding.severity === "P1");
-      this.store.db.prepare("UPDATE review_barriers SET state=?,completed_at=? WHERE barrier_id=?").run(blocking.length ? "blocked" : "passed", new Date().toISOString(), barrierId);
-      return { state: blocking.length ? "blocked" : "passed", blocking };
-    }
-    return { state: "pending", blocking: [] };
+    const reconciled = new DispatchService(this.store).reconcileReview(runId, barrierId)[0];
+    return { state: reconciled?.state ?? barrier.state, blocking: reconciled?.blocking ?? [] };
   }
 
   resolve(runId: string, barrierId: string, resolutions: FindingResolution[]): { state: "resolved" } {
@@ -157,12 +161,37 @@ export class ReviewService {
       this.store.db.prepare("UPDATE review_barriers SET state='resolved' WHERE barrier_id=?").run(barrierId);
     });
     transaction();
+    new DispatchService(this.store).reconcileReview(runId, barrierId);
     return { state: "resolved" };
   }
 
-  status(runId: string, barrierId: string): Record<string, unknown> {
-    const barrier = this.barrier(runId, barrierId);
-    return { ...barrier, results: this.results(barrierId), resolutions: this.store.db.prepare("SELECT * FROM finding_resolutions WHERE barrier_id=? ORDER BY finding_id").all(barrierId) };
+  status(runId: string, barrierId?: string, revisionSha?: string): Record<string, unknown> {
+    if (Boolean(barrierId) === Boolean(revisionSha)) throw new ValidationError("review status requires exactly one barrier id or revision sha");
+    const barrier = barrierId
+      ? this.barrier(runId, barrierId)
+      : this.store.db.prepare("SELECT * FROM review_barriers WHERE run_id=? AND revision_sha=?").get(runId, revisionSha) as any;
+    if (!barrier) throw new ValidationError("review barrier was not found for run and revision");
+    const axes = barrier.axes_json ? JSON.parse(barrier.axes_json) : barrier.formal ? ["spec", "standards"] : ["standards"];
+    const aggregate = barrier.aggregate_json ? JSON.parse(barrier.aggregate_json) : { status: barrier.state, axes };
+    const leafDispatches = [barrier.spec_dispatch_id, barrier.standards_dispatch_id].filter(Boolean).map((dispatchId: string) => {
+      const leaf = this.store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at FROM dispatches WHERE dispatch_id=?").get(dispatchId);
+      return leaf;
+    });
+    return {
+      ...barrier,
+      formal: Boolean(barrier.formal),
+      axes,
+      aggregate,
+      result_artifact_digests: { spec: barrier.spec_result_digest ?? null, standards: barrier.standards_result_digest ?? null },
+      leaf_dispatches: leafDispatches,
+      results: this.results(barrier.barrier_id),
+      resolutions: this.store.db.prepare("SELECT * FROM finding_resolutions WHERE barrier_id=? ORDER BY finding_id").all(barrier.barrier_id),
+    };
+  }
+
+  current(runId: string): Record<string, unknown> | null {
+    const row = this.store.db.prepare("SELECT barrier_id FROM review_barriers WHERE run_id=? ORDER BY created_at DESC LIMIT 1").get(runId) as { barrier_id: string } | undefined;
+    return row ? this.status(runId, row.barrier_id) : null;
   }
 
   assertGate(runId: string, frozenHead?: string): void {
