@@ -134,6 +134,54 @@ test("CLI JSON output is stable by default and exposes top-level fields only in 
   assert.equal(error.ok, false);
 });
 
+test("CLI syntax errors use one JSON stderr object and exit code 5", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const cases = [
+    ["missing-command"],
+    ["env", "validate"],
+    ["env", "list", "--unknown"],
+    ["env", "generate", "--platform", "missing"],
+    ["env", "explain", "balanced", "--role", "missing", "--platform", "codex"],
+  ];
+
+  for (const args of cases) {
+    const result = await cli(sandbox, args);
+    assert.equal(result.status, 5, `${args.join(" ")}: ${result.stderr}`);
+    assert.equal(result.stdout, "");
+    const lines = result.stderr.trim().split("\n");
+    assert.equal(lines.length, 1, `${args.join(" ")}: ${result.stderr}`);
+    const failure = JSON.parse(lines[0]!) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(failure).sort(), ["code", "details", "error", "ok"]);
+    assert.equal(failure.ok, false);
+    assert.equal(failure.code, 5);
+    assert.equal(failure.details, null);
+  }
+});
+
+test("CLI help and version preserve Commander success output", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const manifest = JSON.parse(await readFile(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")) as { version: string };
+
+  const help = await cli(sandbox, ["--help"]);
+  assert.equal(help.status, 0);
+  assert.equal(help.stderr, "");
+  assert.match(help.stdout, /^Usage: ai-team/m);
+
+  const version = await cli(sandbox, ["--version"]);
+  assert.equal(version.status, 0);
+  assert.equal(version.stderr, "");
+  assert.equal(version.stdout, `${manifest.version}\n`);
+});
+
+test("CLI human syntax errors remain human-readable", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const result = await cli(sandbox, ["--human", "env", "explain", "balanced", "--role", "missing", "--platform", "codex"]);
+  assert.equal(result.status, 5);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /^ok: false$/m);
+  assert.doesNotMatch(result.stderr, /^\{/);
+});
+
 test("decision commands expose a template and return field-level errors for empty JSON", async (t) => {
   const sandbox = await makeSandbox(t);
   const schema = json<Record<string, any>>(await cli(sandbox, ["decision", "schema"]));
@@ -883,6 +931,45 @@ test("environment commands isolate homes, dry-run generation, status, and non-pr
     platforms: 3,
   });
   assert.match(validation.digest, /^[a-f0-9]{64}$/);
+
+  const explanation = json<{
+    environment: string;
+    role: string;
+    platform: string;
+    value: Record<string, unknown>;
+    source: { kind: string; file: string; pointer: string };
+  }>(await cli(sandbox, ["env", "explain", "balanced", "--role", "coding", "--platform", "codex"]));
+  assert.deepEqual(explanation, {
+    environment: "balanced",
+    role: "coding",
+    platform: "codex",
+    value: { model: "gpt-5.2", reasoning: "medium" },
+    source: {
+      kind: "override",
+      file: join(sandbox.aiTeamHome, "environments", "balanced.yaml"),
+      pointer: "/overrides/coding/codex",
+    },
+  });
+
+  const allChanges = json<{ changes: Array<{ role: string; platform: string }> }>(
+    await cli(sandbox, ["env", "diff", "balanced", "quality"]),
+  );
+  assert.ok(allChanges.changes.length > 0);
+  const roleChanges = json<{ changes: Array<{ role: string; platform: string }> }>(
+    await cli(sandbox, ["env", "diff", "balanced", "quality", "--role", "coding"]),
+  );
+  assert.ok(roleChanges.changes.length > 0);
+  assert.ok(roleChanges.changes.every(({ role }) => role === "coding"));
+  const platformChanges = json<{ changes: Array<{ role: string; platform: string }> }>(
+    await cli(sandbox, ["env", "diff", "balanced", "quality", "--platform", "codex"]),
+  );
+  assert.ok(platformChanges.changes.length > 0);
+  assert.ok(platformChanges.changes.every(({ platform }) => platform === "codex"));
+  assert.deepEqual(json(await cli(sandbox, ["env", "diff", "balanced", "balanced"])), {
+    from: "balanced",
+    to: "balanced",
+    changes: [],
+  });
 
   const plan = json<{ writes: Array<{ path: string }>; backups: unknown[]; removals: unknown[] }>(
     await cli(sandbox, ["env", "generate", "--dry-run"]),

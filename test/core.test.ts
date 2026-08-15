@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { checkResultEnvelope, createResultTemplate } from "../src/contracts.js";
-import { COMMAND_SYNTAX, commandContractFor } from "../src/command-contract.js";
+import { COMMAND_CONTRACT_BASE, COMMAND_PARAMETER_TYPES, COMMAND_SYNTAX, commandContractFor } from "../src/command-contract.js";
 import { DispatchService, type DispatchPacket } from "../src/dispatch.js";
 import { ValidationError } from "../src/errors.js";
 import { assertCoverage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, triage, validateCoverage } from "../src/planning.js";
@@ -501,6 +501,18 @@ test("planning revision commit has one exact generated command contract", () => 
     "ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>",
   ]);
   assert.deepEqual(commandContractFor(["planning revision commit"]).syntax, COMMAND_SYNTAX["planning revision commit"]);
+});
+
+test("environment explanation and diff commands have exact public contracts", () => {
+  assert.deepEqual(COMMAND_SYNTAX["env explain"], [
+    "ai-team env explain <name> --role <role> --platform <platform>",
+  ]);
+  assert.deepEqual(COMMAND_SYNTAX["env diff"], [
+    "ai-team env diff <from> <to> [--role <role>] [--platform <platform>]",
+  ]);
+  assert.ok(COMMAND_CONTRACT_BASE.commands.public.includes("env explain"));
+  assert.ok(COMMAND_CONTRACT_BASE.commands.public.includes("env diff"));
+  assert.equal(COMMAND_PARAMETER_TYPES.platform, "enum; codex, claude, or opencode");
 });
 
 test("revision state permits only compatible planning run stages, including plan-ready recovery", () => {

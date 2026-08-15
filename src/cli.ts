@@ -8,7 +8,7 @@ import { validateCommand } from "./command-contract.js";
 import { EXIT, PACKAGE_VERSION, ROLES, STAGING_KINDS, STAGING_MAX_BYTES, type Role, type StagingKind } from "./constants.js";
 import { DispatchService } from "./dispatch.js";
 import { EnvironmentService, PLATFORMS, type Platform } from "./environment.js";
-import { AiTeamError, ValidationError } from "./errors.js";
+import { AiTeamError, ArgumentError, ValidationError } from "./errors.js";
 import { commitPlanningRevision, repositoryIdentity, worktreeStatus } from "./git.js";
 import { GitOrchestrator } from "./git-orchestrator.js";
 import { ScopeGate } from "./gates.js";
@@ -45,7 +45,7 @@ const output = (value: unknown, options: { legacyRaw?: boolean } = {}): void => 
 const roleOption = (): Option => new Option("--role <role>").choices([...ROLES]).makeOptionMandatory();
 const platformList = (value: string): Platform[] => {
   const platforms = value.split(",") as Platform[];
-  if (platforms.some((item) => !PLATFORMS.includes(item))) throw new ValidationError(`invalid platform list: ${value}`);
+  if (platforms.some((item) => !PLATFORMS.includes(item))) throw new ArgumentError(`invalid platform list: ${value}`);
   return platforms;
 };
 
@@ -236,10 +236,10 @@ const retentionHours = (): Promise<number> => new EnvironmentService().stagingRe
 const requestOptions = (command: Command): Command => command.option("--request-file <file>").option("--request-stdin");
 
 export const buildProgram = (): Command => {
-  const program = new Command().name("ai-team").description("Local AI coding team workflow orchestration").version(PACKAGE_VERSION)
+  const program = new Command().exitOverride().name("ai-team").description("Local AI coding team workflow orchestration").version(PACKAGE_VERSION)
     .option("--human", "render human-readable output")
     .option("--legacy-output", "include legacy top-level success fields");
-  program.configureOutput({ outputError: (text) => process.stderr.write(text) });
+  program.configureOutput({ outputError: () => {} });
 
   program.command("init").argument("<project>").option("--yes", "confirm patches to dirty project files").action(async (project, options) => output(await initializeProject(project, options.yes)));
   const context = program.command("context");
@@ -656,6 +656,14 @@ export const buildProgram = (): Command => {
   env.command("list").action(async () => output(await new EnvironmentService().list()));
   env.command("show").argument("<name>").option("--resolved").action(async (name, options) => { const service = new EnvironmentService(); const value = await service.load(name); output(options.resolved ? { environment: value, resolved: (await import("./environment.js")).resolveEnvironment(value) } : value); });
   env.command("validate").argument("<name>").action(async (name) => output(await new EnvironmentService().validate(name)));
+  env.command("explain").argument("<name>")
+    .addOption(new Option("--role <role>").choices([...ROLES]).makeOptionMandatory())
+    .addOption(new Option("--platform <platform>").choices([...PLATFORMS]).makeOptionMandatory())
+    .action(async (name, options) => output(await new EnvironmentService().explain(name, options.role as Role, options.platform as Platform)));
+  env.command("diff").argument("<from>").argument("<to>")
+    .addOption(new Option("--role <role>").choices([...ROLES]))
+    .addOption(new Option("--platform <platform>").choices([...PLATFORMS]))
+    .action(async (from, to, options) => output(await new EnvironmentService().diff(from, to, options.role as Role | undefined, options.platform as Platform | undefined)));
   env.command("edit").argument("<name>").action(async (name) => { const service = new EnvironmentService(); await service.load(name); output({ path: `${service.paths.environments}/${name}.yaml`, edited: false, note: "edit the validated YAML file with your preferred editor" }); });
   env.command("generate").option("--platform <list>", "comma-separated platforms", platformList).option("--dry-run").action(async (options) => { const service = new EnvironmentService(); output(await service.generate(await service.active(), options.platform, options.dryRun)); });
   env.command("switch").argument("<name>").option("--dry-run").action(async (name, options) => output(await new EnvironmentService().generate(name, undefined, options.dryRun)));
@@ -682,6 +690,7 @@ export const main = async (argv = process.argv): Promise<void> => {
     }
     const commander = error as { code?: string; exitCode?: number; message?: string };
     if (commander.code?.startsWith("commander.")) {
+      if (commander.exitCode === EXIT.ok) return;
       const failure = { ok: false, error: commander.message ?? commander.code, details: null, code: EXIT.args };
       process.stderr.write(`${humanOutput ? humanize(failure) : JSON.stringify(failure)}\n`);
       process.exitCode = EXIT.args; return;

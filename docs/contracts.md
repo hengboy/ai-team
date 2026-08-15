@@ -22,12 +22,14 @@ fields are rejected.
 | Code | Meaning |
 | --- | --- |
 | 0 | success |
-| 2 | command, schema, or input validation failure |
-| 3 | invalid workflow state |
-| 4 | concurrent or ownership conflict |
-| 5 | environment or managed-file failure |
-| 6 | Git operation failure |
-| 70 | unexpected internal failure |
+| 1 | generic command failure |
+| 2 | business, schema, or input validation failure; decision required |
+| 3 | unknown or invalid workflow state |
+| 4 | incompatible installation, concurrent change, or ownership conflict |
+| 5 | argument syntax or format failure |
+| 6 | Git gate or operation failure |
+| 7 | security policy failure |
+| 8 | unexpected internal failure |
 
 All successful structured commands write JSON to stdout. Failures write one
 JSON object with `error` and optional `details` to stderr. Schema errors use
