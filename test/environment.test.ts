@@ -219,7 +219,9 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
       assert.deepEqual(metadata.writes, ROLE_MANIFEST[role].writes);
       assert.deepEqual(metadata.staging, ROLE_MANIFEST[role].staging);
       assert.match(content, /staging\.owned_entries/);
+      assert.match(content, /staging create.*staging write --input-stdin.*--staging-id/s);
       assert.match(content, /不得直接写入.*\$TMPDIR.*项目目录.*AI_TEAM_HOME/);
+      assert.doesNotMatch(content, /--(?:context-file|documents-file|file|packet-file|result-file|evidence-file|report-file|resolution-file) <(?:json|file)>/);
       if (platform === "codex") {
         assert.doesNotMatch(content, /^\[ai_team\]$/m);
         assert.match(content, new RegExp(`^name = "${role}"$`, "m"));
@@ -241,6 +243,17 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
       }
     }
   }
+});
+
+test("planning and coding coordinate managed staging for every generated JSON", () => {
+  const files = renderAgents(balancedEnvironment());
+  const planning = files.get("claude/agents/planning.md") ?? "";
+  const coding = files.get("claude/agents/coding.md") ?? "";
+
+  assert.match(planning, /每个规划 JSON.*staging create.*staging write --input-stdin.*--staging-id/s);
+  assert.match(planning, /planning-documents.*planning revision create/s);
+  assert.match(coding, /每个调度、结果、决策和评审 JSON.*staging create.*staging write --input-stdin.*--staging-id/s);
+  assert.match(coding, /要求下游角色遵循同一流程/);
 });
 
 test("planning and Git Operator agents expose the immutable revision handoff contract", () => {

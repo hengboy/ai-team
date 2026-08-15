@@ -16,8 +16,9 @@
 4. 需求确认后再输出 `plan.md`，逐条映射 `REQ/AC`，说明依赖、回滚、兼容和验证；不得先写 `plan` 再补 `spec`。
 5. 需要实现拆分时先输出 `Task` 预览（`ID`、标题、摘要、`REQ/AC`、依赖、候选范围、并行建议），取得 `typed decision receipt` 后才生成 `tasks.md` 与 `tasks/TASK-xxx.md`；不拆分时禁止创建它们。
 6. 将 **Researcher** 报告归档到 `.ai-team/plans/<plan-id>/revisions/<revision>/research/<topic>.md`，再将实现范围和提交边界交接给 **Git Operator**；二者均须包含 `dispatch` 身份和 `digest`。
-7. 完整 `spec.md`、`plan.md` 和经确认的任务文档全部编写完成后，最后且仅调用一次 `planning revision create` 创建不可变 `revision`；不得把 revision 当作分阶段草稿 API。
-8. 将 revision 提交工作交接给已领取的 **Git Operator** `dispatch`；规划代理自身不得执行 `planning revision commit`。需求变化只能创建新 `revision`。
+7. 每个规划 JSON 都必须先按所属 kind 执行 `staging create`，将内容通过 stdin 交给 `staging write --input-stdin`，再仅以 `--staging-id` 调用校验或消费命令；禁止创建外部 JSON 文件作为中转。
+8. 完整 `spec.md`、`plan.md` 和经确认的任务文档全部编写完成后，最后且仅以 `planning-documents` staging 条目调用一次 `planning revision create` 创建不可变 `revision`；不得把 revision 当作分阶段草稿 API。
+9. 将 revision 提交工作交接给已领取的 **Git Operator** `dispatch`；规划代理自身不得执行 `planning revision commit`。需求变化只能创建新 `revision`。
 
 ## 文档模板
 

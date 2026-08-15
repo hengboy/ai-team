@@ -114,6 +114,21 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   uninstall: ["ai-team uninstall [--dry-run]"],
 });
 
+/** Agent manuals only expose managed staging for JSON produced during a run. */
+const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  "context update": ["ai-team context update --project <path> --run-id <run-id> --staging-id <staging-id>"],
+  "planning revision create": ["ai-team planning revision create --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> --run-id <run-id> --staging-id <staging-id> [--supersedes <revision>]"],
+  "planning tasks validate": ["ai-team planning tasks validate --run-id <run-id> --staging-id <staging-id> [--preview]"],
+  "dispatch create": ["ai-team dispatch create --run-id <run-id> --role <role> --actor-role <role> [--actor-dispatch-id <dispatch-id>] --staging-id <staging-id>"],
+  "dispatch validate": ["ai-team dispatch validate --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --staging-id <staging-id>"],
+  "dispatch submit": ["ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --staging-id <staging-id>"],
+  "decision create": ["ai-team decision create --run-id <run-id> --dispatch-id <dispatch-id> --staging-id <staging-id>"],
+  "review submit": ["ai-team review submit --run-id <run-id> --barrier-id <opaque-id> --staging-id <staging-id>"],
+  "review resolve": ["ai-team review resolve --run-id <run-id> --barrier-id <opaque-id> --staging-id <staging-id>"],
+  "git reconcile": ["ai-team git reconcile --run-id <run-id> --dispatch-id <dispatch-id> [--operation-id <opaque-id> --state <state> --staging-id <staging-id>]"],
+  "research archive": ["ai-team research archive --run-id <run-id> --project <path> --topic <text> --staging-id <staging-id>"],
+});
+
 const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
 const AGENT_COMMANDS = ["context update", "context validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
 
@@ -151,7 +166,7 @@ export const COMMAND_CONTRACT_BASE = {
 
 export const commandContractFor = (commands: readonly string[]) => ({
   allowed_commands: [...commands],
-  syntax: [...new Set(commands.flatMap((command) => COMMAND_SYNTAX[command] ?? []))],
+  syntax: [...new Set(commands.flatMap((command) => AGENT_COMMAND_SYNTAX_OVERRIDES[command] ?? COMMAND_SYNTAX[command] ?? []))],
   parameter_types: COMMAND_PARAMETER_TYPES,
 });
 

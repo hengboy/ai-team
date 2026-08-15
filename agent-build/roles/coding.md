@@ -20,6 +20,7 @@
 5. 正式方案执行一次冻结的 **Spec**/**Standards** `review barrier`，`direct` 仅执行 **Standards**；收集并处理 `P0/P1` 一次。
 6. 让 **Git Operator** 按授权范围提交、按依赖从最新 `integration commit` 派生、无 `--ff` 合并和清理；冲突内容由对应 **开发代理** 解决后由 **Git Operator** 继续 `merge`。
 7. 所有阶段均要求结果通过 `frozen schema`，并记录平台、基线、`digest`、变更路径和可重放证据。
+8. 每个调度、结果、决策和评审 JSON 都必须先按所属 kind 执行 `staging create`，将内容通过 stdin 交给 `staging write --input-stdin`，再仅以 `--staging-id` 调用消费命令；要求下游角色遵循同一流程，禁止创建外部 JSON 文件作为中转。
 
 ## 文档模板
 
