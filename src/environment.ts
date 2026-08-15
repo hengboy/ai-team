@@ -40,6 +40,38 @@ export interface EnvironmentFile {
   overrides?: Partial<Record<Role, Partial<Record<Platform, ModelConfig>>>>;
 }
 
+export interface EnvironmentSource {
+  kind: "default" | "override";
+  file: string;
+  pointer: string;
+}
+
+export interface EnvironmentExplanation {
+  environment: string;
+  role: Role;
+  platform: Platform;
+  value: ModelConfig;
+  source: EnvironmentSource;
+}
+
+export interface EnvironmentDiffValue {
+  value: ModelConfig;
+  source: EnvironmentSource;
+}
+
+export interface EnvironmentDiffChange {
+  role: Role;
+  platform: Platform;
+  before: EnvironmentDiffValue | null;
+  after: EnvironmentDiffValue | null;
+}
+
+export interface EnvironmentDiff {
+  from: string;
+  to: string;
+  changes: EnvironmentDiffChange[];
+}
+
 export const environmentSchema = {
   $id: "https://ai-team.local/schemas/environment-v1.json",
   type: "object",
@@ -153,6 +185,27 @@ export const resolveEnvironment = (environment: EnvironmentFile): Record<Role, R
     }
   }
   return result;
+};
+
+const explainEnvironment = (environment: EnvironmentFile, file: string, role: Role, platform: Platform): EnvironmentExplanation => {
+  if (!ROLES.includes(role)) throw new ValidationError(`invalid environment role: ${role}`);
+  if (!PLATFORMS.includes(platform)) throw new ValidationError(`invalid environment platform: ${platform}`);
+  if (!environment.platforms.includes(platform)) throw new ValidationError(`${environment.name}.${platform} platform is not enabled`);
+  const roleOverrides = environment.overrides?.[role];
+  const override = roleOverrides && Object.hasOwn(roleOverrides, platform);
+  const value = override ? roleOverrides[platform] : environment.defaults[platform];
+  if (!value) throw new ValidationError(`${environment.name}.${role}.${platform} has no model`);
+  return {
+    environment: environment.name,
+    role,
+    platform,
+    value: structuredClone(value),
+    source: {
+      kind: override ? "override" : "default",
+      file: resolve(file),
+      pointer: override ? `/overrides/${role}/${platform}` : `/defaults/${platform}`,
+    },
+  };
 };
 
 export interface AgentRenderInput { role: Role; model: ModelConfig; environment: string; }
@@ -354,6 +407,43 @@ export class EnvironmentService {
   async validate(name: string): Promise<{ name: string; roles: number; platforms: number; digest: string }> {
     const environment = await this.load(name);
     return { name, roles: ROLES.length, platforms: environment.platforms.length, digest: sha256(stableJson(resolveEnvironment(environment))) };
+  }
+
+  async explain(name: string, role: Role, platform: Platform): Promise<EnvironmentExplanation> {
+    const environment = await this.load(name);
+    return explainEnvironment(environment, join(this.paths.environments, `${name}.yaml`), role, platform);
+  }
+
+  async diff(from: string, to: string, role?: Role, platform?: Platform): Promise<EnvironmentDiff> {
+    if (role !== undefined && !ROLES.includes(role)) throw new ValidationError(`invalid environment role: ${role}`);
+    if (platform !== undefined && !PLATFORMS.includes(platform)) throw new ValidationError(`invalid environment platform: ${platform}`);
+    const [beforeEnvironment, afterEnvironment] = await Promise.all([this.load(from), this.load(to)]);
+    if (platform !== undefined && !beforeEnvironment.platforms.includes(platform) && !afterEnvironment.platforms.includes(platform)) {
+      throw new ValidationError(`${platform} platform is not enabled in either environment`);
+    }
+    const roles = role === undefined ? ROLES : [role];
+    const platforms = platform === undefined
+      ? PLATFORMS.filter((candidate) => beforeEnvironment.platforms.includes(candidate) || afterEnvironment.platforms.includes(candidate))
+      : [platform];
+    const changes: EnvironmentDiffChange[] = [];
+    for (const selectedRole of roles) {
+      for (const selectedPlatform of platforms) {
+        const beforeExplanation = beforeEnvironment.platforms.includes(selectedPlatform)
+          ? explainEnvironment(beforeEnvironment, join(this.paths.environments, `${from}.yaml`), selectedRole, selectedPlatform)
+          : null;
+        const afterExplanation = afterEnvironment.platforms.includes(selectedPlatform)
+          ? explainEnvironment(afterEnvironment, join(this.paths.environments, `${to}.yaml`), selectedRole, selectedPlatform)
+          : null;
+        if (stableJson(beforeExplanation?.value ?? null) === stableJson(afterExplanation?.value ?? null)) continue;
+        changes.push({
+          role: selectedRole,
+          platform: selectedPlatform,
+          before: beforeExplanation ? { value: beforeExplanation.value, source: beforeExplanation.source } : null,
+          after: afterExplanation ? { value: afterExplanation.value, source: afterExplanation.source } : null,
+        });
+      }
+    }
+    return { from, to, changes };
   }
 
   async validateClientVersions(platforms: Platform[]): Promise<Array<{ platform: Platform; status: string; version?: string }>> {

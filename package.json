@@ -22,6 +22,7 @@
     "pretest": "npm run build",
     "test": "node --import tsx --test 'test/**/*.test.ts'",
     "verify": "npm run typecheck && npm run lint && npm test && npm run build",
+    "verify:packed": "npm run verify && node --import tsx scripts/verify-packed-install.ts",
     "prepack": "npm run verify"
   },
   "dependencies": {

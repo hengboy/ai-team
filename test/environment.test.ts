@@ -76,6 +76,100 @@ test("environment overrides configure each role independently", () => {
   assert.deepEqual(resolved.test.codex, { model: "gpt-5.2", reasoning: "medium" });
 });
 
+test("environment explanations report whole-object default and override sources", async (t) => {
+  const { aiTeamHome, userHome } = await makeHomes(t);
+  const service = new EnvironmentService(aiTeamHome, userHome);
+  await service.bootstrap();
+  const environment = balancedEnvironment();
+  environment.name = "provenance";
+  environment.overrides = {
+    coding: { codex: { model: "gpt-source", reasoning: "high" } },
+  };
+  const file = join(service.paths.environments, "provenance.yaml");
+  await writeFile(file, YAML.stringify(environment));
+
+  assert.deepEqual(await service.explain("provenance", "planning", "codex"), {
+    environment: "provenance",
+    role: "planning",
+    platform: "codex",
+    value: { model: "gpt-5.2", reasoning: "medium" },
+    source: { kind: "default", file, pointer: "/defaults/codex" },
+  });
+  assert.deepEqual(await service.explain("provenance", "coding", "codex"), {
+    environment: "provenance",
+    role: "coding",
+    platform: "codex",
+    value: { model: "gpt-source", reasoning: "high" },
+    source: { kind: "override", file, pointer: "/overrides/coding/codex" },
+  });
+
+  environment.name = "codex-only";
+  environment.platforms = ["codex"];
+  await writeFile(join(service.paths.environments, "codex-only.yaml"), YAML.stringify(environment));
+  await assert.rejects(service.explain("codex-only", "coding", "claude"), /platform is not enabled/);
+});
+
+test("environment diffs compare resolved values with stable ordering and null single-sided platforms", async (t) => {
+  const { aiTeamHome, userHome } = await makeHomes(t);
+  const service = new EnvironmentService(aiTeamHome, userHome);
+  await service.bootstrap();
+  const from = balancedEnvironment();
+  from.name = "diff-from";
+  from.platforms = ["codex", "opencode"];
+  delete from.overrides;
+  from.defaults.opencode = { model: "openai/source", variant: "medium", options: { nested: { enabled: false }, temperature: 0 } };
+  const to = structuredClone(from);
+  to.name = "diff-to";
+  to.platforms = ["claude", "opencode"];
+  to.defaults.opencode = { model: "openai/source", variant: "medium", options: { temperature: 0, nested: { enabled: true } } };
+  await writeFile(join(service.paths.environments, "diff-from.yaml"), YAML.stringify(from));
+  await writeFile(join(service.paths.environments, "diff-to.yaml"), YAML.stringify(to));
+
+  const result = await service.diff("diff-from", "diff-to");
+  assert.deepEqual({ from: result.from, to: result.to }, { from: "diff-from", to: "diff-to" });
+  assert.deepEqual(result.changes.slice(0, 3).map(({ role, platform }) => [role, platform]), [
+    ["planning", "codex"],
+    ["planning", "claude"],
+    ["planning", "opencode"],
+  ]);
+  assert.equal(result.changes[0]?.after, null);
+  assert.equal(result.changes[1]?.before, null);
+  assert.deepEqual(result.changes[2]?.after?.value.options, { temperature: 0, nested: { enabled: true } });
+  assert.equal(result.changes.length, ROLES.length * 3);
+
+  const filtered = await service.diff("diff-from", "diff-to", "coding", "opencode");
+  assert.deepEqual(filtered.changes.map(({ role, platform }) => [role, platform]), [["coding", "opencode"]]);
+  const codexOnly = structuredClone(from);
+  codexOnly.name = "diff-codex-only";
+  codexOnly.platforms = ["codex"];
+  const claudeOnly = structuredClone(to);
+  claudeOnly.name = "diff-claude-only";
+  claudeOnly.platforms = ["claude"];
+  await writeFile(join(service.paths.environments, "diff-codex-only.yaml"), YAML.stringify(codexOnly));
+  await writeFile(join(service.paths.environments, "diff-claude-only.yaml"), YAML.stringify(claudeOnly));
+  await assert.rejects(service.diff("diff-codex-only", "diff-claude-only", undefined, "opencode"), /platform is not enabled/);
+});
+
+test("environment diffs ignore source-only changes", async (t) => {
+  const { aiTeamHome, userHome } = await makeHomes(t);
+  const service = new EnvironmentService(aiTeamHome, userHome);
+  await service.bootstrap();
+  const from = balancedEnvironment();
+  from.name = "source-from";
+  delete from.overrides;
+  const to = structuredClone(from);
+  to.name = "source-to";
+  to.overrides = { coding: { codex: structuredClone(to.defaults.codex) } };
+  await writeFile(join(service.paths.environments, "source-from.yaml"), YAML.stringify(from));
+  await writeFile(join(service.paths.environments, "source-to.yaml"), YAML.stringify(to));
+
+  assert.deepEqual(await service.diff("source-from", "source-to", "coding", "codex"), {
+    from: "source-from",
+    to: "source-to",
+    changes: [],
+  });
+});
+
 test("environment validation rejects unknown override roles and unsafe names", async (t) => {
   const environment = balancedEnvironment() as EnvironmentFile & { overrides: Record<string, unknown> };
   environment.overrides = { unknown: { codex: { model: "gpt", reasoning: "high" } } };

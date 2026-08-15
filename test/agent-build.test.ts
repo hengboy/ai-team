@@ -64,4 +64,6 @@ test("role manifests declare staging ownership separately from project writes", 
   assert.ok(build.roles.coding.commands.includes("staging cleanup"));
   assert.ok(build.roles.researcher.commands.includes("research archive"));
   assert.ok(!build.roles["environment-operator"].commands.includes("staging create"));
+  assert.ok(build.roles["environment-operator"].commands.includes("env explain"));
+  assert.ok(build.roles["environment-operator"].commands.includes("env diff"));
 });

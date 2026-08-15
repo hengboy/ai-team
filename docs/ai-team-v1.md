@@ -245,6 +245,8 @@ ai-team run decide --run-id <id> --decision-id <id> --choice <id> [--note-file <
 ai-team env list
 ai-team env show <name> [--resolved]
 ai-team env validate <name>
+ai-team env explain <name> --role <role> --platform <platform>
+ai-team env diff <from> <to> [--role <role>] [--platform <platform>]
 ai-team env edit <name>
 ai-team env generate [--platform <list>] [--dry-run]
 ai-team env switch <name> [--dry-run]

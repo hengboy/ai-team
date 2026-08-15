@@ -68,6 +68,8 @@ platform.
 ai-team env list
 ai-team env show balanced --resolved
 ai-team env validate balanced
+ai-team env explain balanced --role coding --platform codex
+ai-team env diff balanced quality
 ai-team env generate --dry-run
 ai-team env switch quality --dry-run
 ai-team env status
@@ -150,8 +152,14 @@ does not scan, migrate, or remove historical `$TMPDIR/opencode` files.
 ```sh
 npm install
 npm run verify
+npm run verify:packed
 npm pack --dry-run
 ```
+
+`verify:packed` is the networked release gate. It packs without lifecycle scripts,
+installs the tarball into an isolated external consumer, and verifies only the
+installed CLI and packaged resources. It is intentionally separate from the
+daily `verify` command.
 
 Tests create isolated temporary homes and Git repositories and never call a
 real model. Client processes are only exercised by explicit probe tests.

@@ -8,6 +8,8 @@ commands:
   - env list
   - env show
   - env validate
+  - env explain
+  - env diff
   - env edit
   - env generate
   - env switch

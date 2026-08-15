@@ -1,4 +1,21 @@
-export const PACKAGE_VERSION = "1.0.0";
+import { readFileSync } from "node:fs";
+
+const readPackageVersion = (): string => {
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`ai-team installation is corrupt: cannot read package.json (${reason})`);
+  }
+  const version = (manifest as { version?: unknown } | null)?.version;
+  if (typeof version !== "string" || version.length === 0) {
+    throw new Error("ai-team installation is corrupt: package.json version must be a non-empty string");
+  }
+  return version;
+};
+
+export const PACKAGE_VERSION = readPackageVersion();
 export const SCHEMA_VERSION = 1;
 
 export const EXIT = {

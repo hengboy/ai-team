@@ -29,6 +29,7 @@ export const COMMAND_PARAMETER_TYPES = Object.freeze({
   json: "string; readable JSON file path",
   name: "string; lowercase environment name matching ^[a-z][a-z0-9-]*$",
   role: "enum; one of the 12 manifest role IDs",
+  platform: "enum; codex, claude, or opencode",
   mode: "enum; planned, bug, or feature",
   "platform-list": "comma-separated enum; codex, claude, or opencode",
   "plan-id": "string; eight decimal digits, lowercase slug, and four lowercase hex digits",
@@ -97,6 +98,8 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "env list": ["ai-team env list"],
   "env show": ["ai-team env show <name> [--resolved]"],
   "env validate": ["ai-team env validate <name>"],
+  "env explain": ["ai-team env explain <name> --role <role> --platform <platform>"],
+  "env diff": ["ai-team env diff <from> <to> [--role <role>] [--platform <platform>]"],
   "env edit": ["ai-team env edit <name>"],
   "env generate": ["ai-team env generate [--platform <platform-list>] [--dry-run]"],
   "env switch": ["ai-team env switch <name> [--dry-run]"],
@@ -106,7 +109,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   uninstall: ["ai-team uninstall [--dry-run]"],
 });
 
-const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
+const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
 const AGENT_COMMANDS = ["context update", "context validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */
