@@ -127,7 +127,7 @@ export class GitOrchestrator {
       return { commit: await currentHead(worktree.path), paths: changed, reused: true };
     }
     const commit = await commitPaths(worktree.path, changed, message);
-    this.store.finishOperation(operation.operationId, { commit, paths: changed });
+    this.store.finishOperation(operation.operationId, { commit, paths: changed, worktree_id: worktreeId });
     return { commit, paths: changed, reused: false };
   }
 
@@ -135,13 +135,19 @@ export class GitOrchestrator {
     this.assertGitOperator(runId, dispatchId);
     const integration = this.worktree(runId, integrationId);
     const task = this.worktree(runId, taskId);
-    const operation = this.store.beginOperation("git.merge.task", `merge-task:${runId}:${integration.branch}:${task.branch}:${await currentHead(task.path)}`, { integration: integration.branch, task: task.branch }, runId);
+    const taskCommit = await currentHead(task.path);
+    const operation = this.store.beginOperation("git.merge.task", `merge-task:${runId}:${integration.branch}:${task.branch}:${taskCommit}`, { integration: integration.branch, task: task.branch }, runId);
     if (operation.reused) {
       if (operation.state !== "completed") throw new ValidationError("merge side effect is unknown; reconcile required");
       return currentHead(integration.path);
     }
     const commit = await mergeNoFastForward(integration.path, task.branch, `Merge ${task.branch} into ${integration.branch}`);
-    this.store.finishOperation(operation.operationId, { commit });
+    this.store.finishOperation(operation.operationId, {
+      commit,
+      task_commit: taskCommit,
+      task_worktree_id: taskId,
+      integration_worktree_id: integrationId,
+    });
     return commit;
   }
 

@@ -9,9 +9,8 @@ import { assertRelativePosixPath, stableJson } from "./utils.js";
 
 export const MEMORY_PATH = "MEMORY.md";
 export const NAVIGATION_PATH = ".ai-team/index/feature-navigation.md";
-export const LEGACY_NAVIGATION_PATH = ".ai-work-flow/index/feature-navigation.md";
 export const INSTRUCTION_PATHS = ["AGENTS.md", "CLAUDE.md"] as const;
-export const CONTEXT_RULE = "所有`仓库文件检索`、`目录遍历`、`文件名/全文搜索`、`入口定位`、`调用链`和`未知依赖探索`必须委派给 **File Explorer**；其他代理只能读取 `packet` 明确授权或 **File Explorer** 返回的精确路径，遇到未知路径时请求支持，不得自行使用 `rg`、`find`、`glob` 或`全仓扫描`。入口、职责或模块边界变化时，同轮更新根 `MEMORY.md` 与权威路径 `.ai-team/index/feature-navigation.md`；旧 `.ai-work-flow/index/feature-navigation.md` 仅在初始化时单向迁移，不得双写。评审以已提交 `MEMORY.md` 为 standards source。";
+export const CONTEXT_RULE = "所有`仓库文件检索`、`目录遍历`、`文件名/全文搜索`、`入口定位`、`调用链`和`未知依赖探索`必须委派给 **File Explorer**；其他代理只能读取 `packet` 明确授权或 **File Explorer** 返回的精确路径，遇到未知路径时请求支持，不得自行使用 `rg`、`find`、`glob` 或`全仓扫描`。入口、职责或模块边界变化时，同轮更新根 `MEMORY.md` 与唯一权威路径 `.ai-team/index/feature-navigation.md`。评审以已提交 `MEMORY.md` 为 standards source。";
 
 const MEMORY_START = "<!-- ai-team:project-context:start -->";
 const MEMORY_END = "<!-- ai-team:project-context:end -->";
@@ -19,7 +18,6 @@ const MEMORY_HEADING = "## 项目上下文";
 const NAVIGATION_START = "<!-- ai-team:feature-navigation:start -->";
 const NAVIGATION_END = "<!-- ai-team:feature-navigation:end -->";
 const NAVIGATION_HEADING = "# 功能导航";
-const LEGACY_NAVIGATION_HEADING = "# Feature Navigation";
 const NAVIGATION_ENTRY = "<!-- ai-team:feature-navigation-entry ";
 const EMPTY = "_待补充_";
 
@@ -141,7 +139,7 @@ const ensureSingleManagedSection = (source: string | undefined, kind: "memory" |
     : [NAVIGATION_START, NAVIGATION_END, NAVIGATION_HEADING];
   const starts = occurrences(source, start);
   const ends = occurrences(source, end);
-  const headings = occurrences(source, heading) + (kind === "navigation" ? occurrences(source, LEGACY_NAVIGATION_HEADING) : 0);
+  const headings = occurrences(source, heading);
   if (starts === 0 && ends === 0 && headings === 0) return;
   if (starts !== 1 || ends !== 1 || headings !== 1 || source.indexOf(start) > source.indexOf(end)) {
     throw new ValidationError(`${kind === "memory" ? "MEMORY.md" : NAVIGATION_PATH} has duplicate or malformed managed sections`);
@@ -174,7 +172,7 @@ const parseNavigation = (source: string): { entries: ProjectContext["navigation"
   if (start < 0 || endMarker < start) throw new ValidationError(`${NAVIGATION_PATH} managed section is missing`);
   const end = endMarker + NAVIGATION_END.length;
   const managed = source.slice(start, end);
-  if (occurrences(managed, NAVIGATION_HEADING) + occurrences(managed, LEGACY_NAVIGATION_HEADING) !== 1) throw new ValidationError(`${NAVIGATION_PATH} must contain exactly one heading`);
+  if (occurrences(managed, NAVIGATION_HEADING) !== 1) throw new ValidationError(`${NAVIGATION_PATH} must contain exactly one heading`);
   const lines = managed.split("\n");
   const headerIndex = lines.indexOf("| 功能 | 关键词 | 入口路径 | 模块边界 |");
   const separatorIndex = lines.indexOf("| --- | --- | --- | --- |");
@@ -233,7 +231,7 @@ const prepareInitialization = async (root: string): Promise<{ plan: ContextInitP
   const navigationFile = join(root, NAVIGATION_PATH);
   const memory = await readOptional(memoryFile);
   const canonicalNavigation = await readOptional(navigationFile);
-  const navigation = canonicalNavigation ?? await readOptional(join(root, LEGACY_NAVIGATION_PATH));
+  const navigation = canonicalNavigation;
   ensureSingleManagedSection(memory, "memory");
   ensureSingleManagedSection(navigation, "navigation");
 

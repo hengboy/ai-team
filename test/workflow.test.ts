@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -45,7 +45,7 @@ const REVIEW_HEAD = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8
 const REVIEW_COMMON_DIR = execFileSync("git", ["rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
 const createRun = (store: StateStore, mode = "feature"): string => {
   store.registerRepository("repo", path.resolve(REVIEW_COMMON_DIR), process.cwd());
-  return store.createRun({ repoId: "repo", profile: "coding", mode });
+  return store.createRun({ repoId: "repo", profile: "coding", mode, baseCommit: REVIEW_HEAD });
 };
 
 const result = (axis: "spec" | "standards", findings: ReviewResult["findings"] = []): ReviewResult => ({
@@ -55,11 +55,16 @@ const result = (axis: "spec" | "standards", findings: ReviewResult["findings"] =
 });
 
 const completeTest = (store: StateStore, runId: string): void => {
+  store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+    .run(`worktree_${runId.slice(-12)}`, runId, `integration/test/${runId.slice(-12)}`, process.cwd(), REVIEW_HEAD, new Date().toISOString());
   const dispatchId = new WorkflowService(store).dispatches.create(runId, "test", {
-    objective: "independent verification", allowed_read_paths: ["package.json"], allowed_write_paths: [], acceptance_criteria: ["tests pass"], context: {},
+    objective: "independent verification", allowed_read_paths: ["package.json"], allowed_write_paths: [], acceptance_criteria: ["tests pass"], context: { implementation_commit: REVIEW_HEAD, changed_paths: ["package.json"] },
   });
   store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
     .run(JSON.stringify({ ...createResultTemplate(runId, dispatchId, "test"), summary: "tests passed", verification: [{ command: "npm test", outcome: "passed" }], payload: { checks: [{ command: "npm test", outcome: "passed" }] } }), new Date().toISOString(), dispatchId);
+  const reviewPacket = new WorkflowService(store).dispatches.buildReviewPacket(runId);
+  assert.ok(reviewPacket);
+  new WorkflowService(store).dispatches.create(runId, "code-reviewer", reviewPacket);
 };
 
 const completeReviewLeaf = (store: StateStore, runId: string, review: ReviewResult): void => {
@@ -254,39 +259,6 @@ test("project init requires confirmation before appending to a dirty .gitignore"
       await readFile(path.join(repository.directory, ".gitignore"), "utf8"),
       "dist/\ncoverage/\n/.worktree/\n/.ai-team/runtime/\n",
     );
-  } finally {
-    await rm(repository.directory, { recursive: true, force: true });
-  }
-});
-
-test("project init migrates the legacy navigation path once and keeps .ai-team authoritative", async () => {
-  const repository = await createRepository();
-  try {
-    const legacyDirectory = path.join(repository.directory, ".ai-work-flow", "index");
-    await mkdir(legacyDirectory, { recursive: true });
-    const legacyPath = path.join(legacyDirectory, "feature-navigation.md");
-    const legacy = [
-      "<!-- ai-team:feature-navigation:start -->",
-      "# 功能导航",
-      "",
-      "| 功能 | 关键词 | 入口路径 | 模块边界 |",
-      "| --- | --- | --- | --- |",
-      "| Legacy | readme | `README.md` | root |",
-      "",
-      '<!-- ai-team:feature-navigation-entry {"entry_paths":["README.md"],"feature":"Legacy","keywords":["readme"],"module_boundary":"root"} -->',
-      "<!-- ai-team:feature-navigation:end -->",
-      "",
-    ].join("\n");
-    await writeFile(legacyPath, legacy);
-    await writeFile(path.join(repository.directory, "AGENTS.md"), "# Instructions\n");
-
-    await initializeProject(repository.directory, true);
-    const canonical = await readFile(path.join(repository.directory, ".ai-team", "index", "feature-navigation.md"), "utf8");
-    assert.equal(canonical, legacy);
-    assert.equal(await readFile(legacyPath, "utf8"), legacy);
-    const agents = await readFile(path.join(repository.directory, "AGENTS.md"), "utf8");
-    assert.match(agents, /权威路径.*\.ai-team\/index\/feature-navigation\.md/);
-    assert.match(agents, /仅在初始化时单向迁移，不得双写/);
   } finally {
     await rm(repository.directory, { recursive: true, force: true });
   }

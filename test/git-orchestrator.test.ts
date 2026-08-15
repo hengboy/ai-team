@@ -25,6 +25,22 @@ const completeStandardsReview = (store: StateStore, runId: string, summary = "pa
     .run(JSON.stringify({ ...createResultTemplate(runId, row.dispatch_id, "review-standards"), summary, verification: [{ command: "review", outcome: "completed" }], payload: { finding_ids: [] } }), new Date().toISOString(), row.dispatch_id);
 };
 
+const completeFrozenTest = (store: StateStore, runId: string, commit: string, completedAt = new Date().toISOString()): void => {
+  const dispatches = new DispatchService(store);
+  const testDispatch = dispatches.create(runId, "test", {
+    objective: "Verify frozen integration", allowed_read_paths: ["README.md"], allowed_write_paths: [], acceptance_criteria: ["passes"], context: { implementation_commit: commit, changed_paths: ["README.md"] },
+  });
+  fixtureCompleteTest(store, runId, testDispatch, completedAt);
+  const packet = dispatches.buildReviewPacket(runId);
+  assert.ok(packet);
+  dispatches.create(runId, "code-reviewer", packet);
+};
+
+const fixtureCompleteTest = (store: StateStore, runId: string, dispatchId: string, completedAt = new Date().toISOString()): void => {
+  store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+    .run(JSON.stringify({ ...createResultTemplate(runId, dispatchId, "test"), summary: "passed", verification: [{ command: "test", outcome: "passed" }], payload: { checks: [{ command: "test", outcome: "passed" }] } }), completedAt, dispatchId);
+};
+
 interface Fixture {
   root: string;
   store: StateStore;
@@ -158,18 +174,15 @@ test("integration uses no-ff merges and cleanup removes owned worktrees", async 
     const integrationCommit = await fixture.orchestrator.mergeTask(runId, integration.worktree_id, task.worktree_id);
     assert.equal((await rawGit(integration.path, ["rev-list", "--parents", "-n", "1", integrationCommit])).split(" ").length, 3);
 
-    const testDispatch = new DispatchService(fixture.store).create(runId, "test", {
-      objective: "Verify integration", allowed_read_paths: ["package.json"], allowed_write_paths: [], acceptance_criteria: ["passes"], context: {},
-    });
-    fixture.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), testDispatch);
+    completeFrozenTest(fixture.store, runId, integrationCommit);
     const reviews = new ReviewService(fixture.store);
     const staleCommit = await rawGit(integration.path, ["rev-parse", `${integrationCommit}^1`]);
-    assert.throws(() => reviews.create(runId, staleCommit, false), /stale for the current integration HEAD/);
+    assert.throws(() => reviews.create(runId, staleCommit, false), /same integration commit/);
     const barrier = reviews.create(runId, integrationCommit, false);
     const reviewPacket = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='review-standards'").get(runId) as { packet_json: string };
     const packet = JSON.parse(reviewPacket.packet_json);
     assert.match(packet.context.committed_diff, /feature\.ts/);
-    assert.equal(packet.context.test_evidence.state, "completed");
+    assert.equal(packet.context.test_evidence.status, "completed");
     completeStandardsReview(fixture.store, runId);
     reviews.submit(runId, barrier.barrier_id, { axis: "standards", summary: "passed", findings: [] });
     const targetCommit = await fixture.orchestrator.integrateTarget(runId, integration.worktree_id);
@@ -188,7 +201,7 @@ test("integration uses no-ff merges and cleanup removes owned worktrees", async 
   }
 });
 
-test("review may bind the task implementation commit before an equivalent integration merge", async () => {
+test("review rejects a task commit and binds the tested integration commit", async () => {
   const fixture = await createFixture();
   try {
     const runId = fixture.createRun();
@@ -199,18 +212,20 @@ test("review may bind the task implementation commit before an equivalent integr
     const integration = await fixture.orchestrator.prepareIntegration(runId);
     assert.notEqual(await rawGit(integration.path, ["rev-parse", "HEAD"]), implementation.commit);
 
-    const testDispatch = new DispatchService(fixture.store).create(runId, "test", {
-      objective: "Verify implementation", allowed_read_paths: ["package.json"], allowed_write_paths: [], acceptance_criteria: ["passes"], context: {},
+    const taskTest = new DispatchService(fixture.store).create(runId, "test", {
+      objective: "Verify task commit", allowed_read_paths: ["README.md"], allowed_write_paths: [], acceptance_criteria: ["passes"], context: { implementation_commit: implementation.commit },
     });
-    fixture.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), testDispatch);
+    fixtureCompleteTest(fixture.store, runId, taskTest);
     const reviews = new ReviewService(fixture.store);
-    const barrier = reviews.create(runId, implementation.commit, false);
-    const packet = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='review-standards'").get(runId) as { packet_json: string }).packet_json);
-    assert.equal(packet.context.review_strategy, "implementation_commit");
-    completeStandardsReview(fixture.store, runId);
-    reviews.submit(runId, barrier.barrier_id, { axis: "standards", summary: "passed", findings: [] });
+    assert.throws(() => reviews.create(runId, implementation.commit, false), /must equal the frozen integration HEAD/);
 
     const integrated = await fixture.orchestrator.mergeTask(runId, integration.worktree_id, task.worktree_id);
+    completeFrozenTest(fixture.store, runId, integrated);
+    const barrier = reviews.create(runId, integrated, false);
+    const packet = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='review-standards'").get(runId) as { packet_json: string }).packet_json);
+    assert.equal(packet.context.review_strategy, "integration_head");
+    completeStandardsReview(fixture.store, runId);
+    reviews.submit(runId, barrier.barrier_id, { axis: "standards", summary: "passed", findings: [] });
     assert.doesNotThrow(() => reviews.assertGate(runId, integrated));
   } finally {
     await fixture.dispose();
@@ -228,11 +243,7 @@ test("target drift sync runs once and requires a newer final test before integra
     const integration = await fixture.orchestrator.prepareIntegration(runId);
     const reviewedCommit = await fixture.orchestrator.mergeTask(runId, integration.worktree_id, task.worktree_id);
 
-    const dispatches = new DispatchService(fixture.store);
-    const initialTest = dispatches.create(runId, "test", {
-      objective: "Verify frozen implementation", allowed_read_paths: ["package.json"], allowed_write_paths: [], acceptance_criteria: ["passes"], context: {},
-    });
-    fixture.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=? WHERE dispatch_id=?").run("2026-08-14T00:00:00.000Z", initialTest);
+    completeFrozenTest(fixture.store, runId, reviewedCommit, "2026-08-14T00:00:00.000Z");
     const reviews = new ReviewService(fixture.store);
     const barrier = reviews.create(runId, reviewedCommit, false);
     completeStandardsReview(fixture.store, runId);

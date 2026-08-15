@@ -901,6 +901,8 @@ test("direct coding rejects a dirty repository before creating a run and starts 
   assert.equal(runCount.count, 0);
 
   await unlink(dirtyFile);
+  await mkdir(join(sandbox.repo, ".worktree", "runtime"), { recursive: true });
+  await writeFile(join(sandbox.repo, ".worktree", "runtime", "owned.txt"), "owned worktree state\n");
   const started = json<{ run_id: string; dispatch_id: string }>(
     await cli(sandbox, [
       "coding", "start",

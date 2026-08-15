@@ -114,6 +114,11 @@ test("an exact File Explorer result creates one planning or coding dispatch and 
         "SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role=?",
       ).get(runId, nextRole) as { count: number };
       assert.equal(count.count, 1);
+      if (profile === "coding") {
+        const prepare = store.db.prepare("SELECT state,packet_json FROM dispatches WHERE run_id=? AND role='git-operator'").get(runId) as { state: string; packet_json: string };
+        assert.equal(prepare.state, "pending");
+        assert.equal(JSON.parse(prepare.packet_json).context.phase, "prepare_worktrees");
+      }
     }
   });
 });
@@ -242,6 +247,14 @@ test("completed results enforce the payload schema selected for every role", () 
     }),
     status: "needs_decision" as const,
     verification: [],
+    decisions_needed: [{
+      question,
+      choices: [
+        { id: "current", label: "Current", impact: "No migration" },
+        { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
+      ],
+      recommendation: "current",
+    }],
   };
   assert.equal(checkResultEnvelope(needsDecision).valid, true);
   assert.equal(checkResultEnvelope({ ...needsDecision, payload: {} }).valid, false);
@@ -267,9 +280,16 @@ test("review findings without a concrete location or impact are rejected", async
   await withStore((store) => {
     const runId = createRun(store);
     const dispatches = new DispatchService(store);
-    const testId = dispatches.create(runId, "test", dispatchPacket());
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run(`worktree_integration_${runId.slice(-8)}`, runId, `integration/review/${runId.slice(-8)}`, process.cwd(), REVIEW_HEAD, new Date().toISOString());
+    const testId = dispatches.create(runId, "test", {
+      ...dispatchPacket(), context: { implementation_commit: REVIEW_HEAD, changed_paths: ["src/dispatch.ts"] },
+    });
     store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
       .run(JSON.stringify(completedResult(runId, testId, "test", { checks: [{ command: "npm test", outcome: "passed" }] })), new Date().toISOString(), testId);
+    const reviewPacket = dispatches.buildReviewPacket(runId);
+    assert.ok(reviewPacket);
+    dispatches.create(runId, "code-reviewer", reviewPacket);
     const reviews = new ReviewService(store);
     const barrier = reviews.create(runId, REVIEW_HEAD, false);
     const validFinding: ReviewResult["findings"][number] = {
@@ -515,6 +535,14 @@ test("planning question results normalize completed and needs_decision into one 
           },
         }),
         status,
+        decisions_needed: status === "needs_decision" ? [{
+          question,
+          choices: [
+            { id: "current", label: "Current", impact: "No migration" },
+            { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
+          ],
+          recommendation: "current",
+        }] : [],
       }));
 
       const first = await dispatches.submit(runId, planningId, "planning", resultPath);
@@ -793,6 +821,53 @@ test("coding decisions are created from results and resolution atomically resume
   });
 });
 
+test("reissue rebuilds the review packet once and returns the same successor on retry", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_reissue_integration", runId, "integration/reissue", process.cwd(), REVIEW_HEAD, new Date().toISOString());
+    const testId = dispatches.create(runId, "test", {
+      ...dispatchPacket(), context: { implementation_commit: REVIEW_HEAD, changed_paths: ["src/dispatch.ts"] },
+    });
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(completedResult(runId, testId, "test", { checks: [{ command: "npm test", outcome: "passed" }] })), new Date().toISOString(), testId);
+    const frozen = dispatches.buildReviewPacket(runId);
+    assert.ok(frozen);
+    const reviewerId = dispatches.create(runId, "code-reviewer", frozen);
+    dispatches.claim(runId, reviewerId, "code-reviewer");
+    await dispatches.submitValue(runId, reviewerId, "code-reviewer", {
+      ...createResultTemplate(runId, reviewerId, "code-reviewer"),
+      status: "needs_decision",
+      summary: "Review packet must be reissued",
+      verification: [],
+      decisions_needed: [{
+        question: "How should the frozen review continue?",
+        choices: [
+          { id: "reissue", label: "Reissue", impact: "Rebuild from current frozen evidence" },
+          { id: "abort", label: "Abort", impact: "Stop the review" },
+        ],
+        recommendation: "reissue",
+        type: "review_reissue",
+      }],
+      payload: {},
+    });
+    const decision = store.db.prepare("SELECT decision_id FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string };
+    const oldDigest = (store.db.prepare("SELECT packet_digest FROM dispatches WHERE dispatch_id=?").get(reviewerId) as { packet_digest: string }).packet_digest;
+
+    const successor = dispatches.resolveDecision(runId, decision.decision_id, "reissue");
+    assert.equal(dispatches.resolveDecision(runId, decision.decision_id, "reissue"), successor);
+    const newRow = store.db.prepare("SELECT packet_json,packet_digest FROM dispatches WHERE dispatch_id=?").get(successor) as { packet_json: string; packet_digest: string };
+    const packet = JSON.parse(newRow.packet_json);
+    assert.notEqual(newRow.packet_digest, oldDigest);
+    assert.equal(packet.context.revision_sha, REVIEW_HEAD);
+    assert.equal(packet.context.reissue.decision_id, decision.decision_id);
+    assert.equal(packet.context.resolved_decision.choice, "reissue");
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='code-reviewer' AND state='pending'").get(runId) as { count: number }).count, 1);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM review_barriers WHERE run_id=?").get(runId) as { count: number }).count, 0);
+  });
+});
+
 test("implementation dependencies and commit gate test creation and freeze the complete review packet", async () => {
   await withStore(async (store) => {
     const runId = createRun(store);
@@ -801,8 +876,13 @@ test("implementation dependencies and commit gate test creation and freeze the c
     dispatches.claim(runId, codingId, "coding");
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
       .run("worktree_defect_regression", runId, "task/regression", process.cwd(), REVIEW_HEAD, new Date().toISOString());
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_defect_integration", runId, "integration/regression", process.cwd(), REVIEW_HEAD, new Date().toISOString());
     const changedPaths = ["src/dispatch.ts", "src/state.ts", "src/contracts.ts", "src/cli.ts", "src/review.ts", "test/review-fixes.test.ts"];
     const developerId = dispatches.create(runId, "backend-developer", {
+      ...dispatchPacket(changedPaths), context: { worktree_id: "worktree_defect_regression" },
+    }, "coding", codingId);
+    const frontendId = dispatches.create(runId, "frontend-developer", {
       ...dispatchPacket(changedPaths), context: { worktree_id: "worktree_defect_regression" },
     }, "coding", codingId);
     const gitId = dispatches.create(runId, "git-operator", dispatchPacket(changedPaths), "coding", codingId);
@@ -814,12 +894,28 @@ test("implementation dependencies and commit gate test creation and freeze the c
       modified_paths: changedPaths, self_tests: [{ command: "npm test", outcome: "passed" }],
     }));
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='test'").get(runId) as { count: number }).count, 0);
+    dispatches.claim(runId, frontendId, "frontend-developer");
+    await dispatches.submitValue(runId, frontendId, "frontend-developer", completedResult(runId, frontendId, "frontend-developer", {
+      modified_paths: changedPaths, self_tests: [{ command: "npm test", outcome: "passed" }],
+    }));
 
     const commit = store.beginOperation("git.commit", `commit:${runId}:regression`, { paths: changedPaths }, runId);
-    store.finishOperation(commit.operationId, { commit: REVIEW_HEAD, paths: changedPaths });
+    store.finishOperation(commit.operationId, { commit: REVIEW_HEAD, paths: changedPaths, worktree_id: "worktree_defect_regression" });
     dispatches.claim(runId, gitId, "git-operator");
     await dispatches.submitValue(runId, gitId, "git-operator", completedResult(runId, gitId, "git-operator", {
       operations: [{ command: "git commit", outcome: REVIEW_HEAD }],
+    }));
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='test'").get(runId) as { count: number }).count, 0);
+    const integrationDispatch = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator' AND json_extract(packet_json,'$.context.phase')='integrate_implementation'").get(runId) as { dispatch_id: string };
+    const merge = store.beginOperation("git.merge.task", `merge:${runId}:regression`, {}, runId);
+    store.finishOperation(merge.operationId, {
+      commit: REVIEW_HEAD,
+      task_worktree_id: "worktree_defect_regression",
+      integration_worktree_id: "worktree_defect_integration",
+    });
+    dispatches.claim(runId, integrationDispatch.dispatch_id, "git-operator");
+    await dispatches.submitValue(runId, integrationDispatch.dispatch_id, "git-operator", completedResult(runId, integrationDispatch.dispatch_id, "git-operator", {
+      operations: [{ command: "git merge", outcome: REVIEW_HEAD }],
     }));
     const testRow = store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='test'").get(runId) as { dispatch_id: string; packet_json: string };
     assert.equal(JSON.parse(testRow.packet_json).context.implementation_commit, REVIEW_HEAD);
@@ -831,13 +927,16 @@ test("implementation dependencies and commit gate test creation and freeze the c
     const review = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='code-reviewer'").get(runId) as { packet_json: string };
     const packet = JSON.parse(review.packet_json);
     assert.equal(packet.context.implementation_commit, REVIEW_HEAD);
-    assert.deepEqual(packet.context.changed_paths, changedPaths);
+    assert.equal(packet.context.revision_sha, REVIEW_HEAD);
+    assert.match(packet.context.base_commit, /^[a-f0-9]{40}$/);
+    assert.match(packet.context.document_digest, /^[a-f0-9]{64}$/);
+    assert.ok(changedPaths.every((path) => packet.context.changed_paths.includes(path)));
     assert.match(packet.context.diff_digest, /^[a-f0-9]{64}$/);
     assert.match(packet.context.test_evidence_digest, /^[a-f0-9]{64}$/);
     assert.match(packet.context.revision_digest, /^[a-f0-9]{64}$/);
-    assert.deepEqual(new Set(packet.context.artifacts.map((artifact: { role: string }) => artifact.role)), new Set(["coding", "backend-developer", "git-operator", "test"]));
+    assert.deepEqual(new Set(packet.context.artifacts.map((artifact: { role: string }) => artifact.role)), new Set(["coding", "frontend-developer", "backend-developer", "git-operator", "test"]));
     assert.ok(packet.context.artifacts.every((artifact: { artifact_id: string; sha256: string }) => /^artifact_/.test(artifact.artifact_id) && /^[a-f0-9]{64}$/.test(artifact.sha256)));
-    assert.deepEqual(packet.allowed_read_paths, changedPaths);
+    assert.ok(changedPaths.every((path) => packet.allowed_read_paths.includes(path)));
   });
 });
 

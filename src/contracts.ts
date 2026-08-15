@@ -210,12 +210,18 @@ export const DECISION_INPUT_TEMPLATE: TypedDecisionInput = {
 export const checkResultEnvelope = (value: unknown): { valid: true; value: ResultEnvelope } | { valid: false; errors: Array<{ path: string; message: string }> } => {
   if (!validateResult(value)) return { valid: false, errors: formatSchemaErrors(validateResult.errors) };
   const envelope = value as ResultEnvelope;
-  if (envelope.status === "needs_decision" && envelope.role !== "planning") {
+  if (envelope.status === "needs_decision") {
     if (envelope.decisions_needed.length !== 1) {
       return { valid: false, errors: [{ path: "/decisions_needed", message: "needs_decision requires exactly one typed decision" }] };
     }
     const decision = checkDecisionInput(envelope.decisions_needed[0]);
     if (!decision.valid) return { valid: false, errors: decision.errors.map((error) => ({ ...error, path: `/decisions_needed/0${error.path === "/" ? "" : error.path}` })) };
+    if (envelope.role === "planning") {
+      const payloadDecision = (envelope.payload as { decision?: unknown }).decision;
+      if (stableJson(payloadDecision) !== stableJson(decision.value)) {
+        return { valid: false, errors: [{ path: "/payload/decision", message: "planning decision must match decisions_needed[0]" }] };
+      }
+    }
   }
   if (envelope.status === "completed" && envelope.verification.length === 0) {
     return { valid: false, errors: [{ path: "/verification", message: "completed results require verification evidence" }] };

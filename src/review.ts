@@ -34,44 +34,44 @@ export class ReviewService {
     try { execFileSync("git", ["-C", repository.project_path, "cat-file", "-e", `${revisionSha}^{commit}`], { stdio: "ignore" }); }
     catch { throw new ValidationError("review revision commit does not exist", { revisionSha }); }
     const integration = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1").get(runId) as { path: string } | undefined;
-    const frozenPath = integration?.path ?? repository.project_path;
-    const frozenHead = execFileSync("git", ["-C", frozenPath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-    const implementationOperations = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind IN ('git.merge.task','git.commit') AND state='completed' ORDER BY completed_at DESC").all(runId) as Array<{ evidence_json?: string }>;
-    const implementationCommit = implementationOperations.map((item) => {
-      try { return (JSON.parse(item.evidence_json ?? "{}") as { commit?: string }).commit; } catch { return undefined; }
-    }).find((commit) => /^[a-f0-9]{40}$/.test(commit ?? ""));
-    if (revisionSha !== frozenHead && revisionSha !== implementationCommit) {
-      throw new ValidationError("review revision is stale for the current integration HEAD and the latest implementation commit", { revisionSha, frozenHead, implementationCommit: implementationCommit ?? null });
+    const test = this.store.db.prepare("SELECT state,packet_json FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; packet_json: string } | undefined;
+    const testedCommit = test ? (JSON.parse(test.packet_json) as { context?: { implementation_commit?: string } }).context?.implementation_commit : undefined;
+    if (test?.state !== "completed" || testedCommit !== revisionSha) {
+      throw new ValidationError("review requires a completed independent test bound to the same integration commit", { revisionSha, testedCommit: testedCommit ?? null });
     }
-    const reviewPath = repository.project_path;
-    const test = this.store.db.prepare("SELECT state,result_json,completed_at FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; result_json?: string; completed_at?: string } | undefined;
-    if (test?.state !== "completed") throw new ValidationError("review requires a completed independent test dispatch");
-    const revisionLine = execFileSync("git", ["-C", reviewPath, "rev-list", "--parents", "-n", "1", revisionSha], { encoding: "utf8" }).trim().split(" ");
-    const firstParent = revisionLine[1];
-    const diffArgs = firstParent ? ["diff", firstParent, revisionSha] : ["diff-tree", "--root", "--no-commit-id", "-p", revisionSha];
-    const pathArgs = firstParent ? ["diff", "--name-only", "-z", firstParent, revisionSha] : ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", revisionSha];
-    const changedPaths = [...new Set(execFileSync("git", ["-C", reviewPath, ...pathArgs], { encoding: "utf8" }).split("\0").filter(Boolean))];
-    const committedDiff = redact(execFileSync("git", ["-C", reviewPath, ...diffArgs], { encoding: "utf8", maxBuffer: 5 * 1024 * 1024 }));
-    const diffDigest = sha256(committedDiff);
-    const planningCandidates = requiredFormal && run.plan_id && run.revision ? [
-      `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/spec.md`,
-      `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/plan.md`,
-      `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/tasks.md`,
-    ] : [];
-    const planningPaths = planningCandidates.filter((path) => {
-      try { execFileSync("git", ["-C", reviewPath, "cat-file", "-e", `${revisionSha}:${path}`], { stdio: "ignore" }); return true; }
-      catch { return false; }
-    });
-    const documentDigest = sha256(planningPaths.map((path) => {
-      try { return `${path}\0${execFileSync("git", ["-C", reviewPath, "show", `${revisionSha}:${path}`], { encoding: "utf8", maxBuffer: 2 * 1024 * 1024 })}`; }
-      catch { return `${path}\0`; }
-    }).join("\n"));
-    const testEvidence = test.result_json ? JSON.parse(test.result_json) : { state: test.state, completed_at: test.completed_at ?? null };
-    const testEvidenceDigest = sha256(stableJson(testEvidence));
-    const baseCommit = firstParent ?? "0".repeat(40);
+    if (!integration) throw new ValidationError("review requires a prepared active integration worktree");
+    const frozenHead = execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    if (revisionSha !== frozenHead) {
+      throw new ValidationError("review revision must equal the frozen integration HEAD", { revisionSha, integrationHead: frozenHead });
+    }
+    const coordinator = (this.store.db.prepare("SELECT dispatch_id,state,packet_json,packet_digest FROM dispatches WHERE run_id=? AND role='code-reviewer' ORDER BY created_at DESC").all(runId) as Array<{ dispatch_id: string; state: string; packet_json: string; packet_digest?: string }>)
+      .map((row) => ({ ...row, packet: JSON.parse(row.packet_json) as { allowed_read_paths: string[]; context: Record<string, unknown> } }))
+      .find((row) => row.packet.context.revision_sha === revisionSha && row.state !== "failed");
+    if (!coordinator) throw new ValidationError("review requires a frozen code-reviewer packet for the tested integration commit");
+    const context = coordinator.packet.context;
+    const bindingFields = ["plan_id", "revision", "base_commit", "revision_sha", "changed_paths", "document_digest", "diff_digest", "test_evidence_digest"] as const;
+    const missing = bindingFields.filter((field) => context[field] === undefined);
+    if (missing.length) throw new ValidationError("code-reviewer packet is missing frozen review bindings", missing.map((field) => `/context/${field}`));
+    if (context.plan_id !== (run.plan_id ?? null) || context.revision !== (run.revision ?? null)) throw new ValidationError("code-reviewer packet does not match the run planning revision");
+    const dispatches = new DispatchService(this.store);
+    const canonicalPacket = dispatches.buildReviewPacket(runId);
+    if (!canonicalPacket) throw new ValidationError("review evidence cannot be reconstructed for the frozen integration commit");
+    for (const field of bindingFields) {
+      if (stableJson(context[field]) !== stableJson(canonicalPacket.context[field])) {
+        throw new ValidationError(`code-reviewer packet ${field} does not match current frozen evidence`);
+      }
+    }
+    if (stableJson(coordinator.packet.allowed_read_paths) !== stableJson(canonicalPacket.allowed_read_paths)) {
+      throw new ValidationError("code-reviewer packet changed paths do not match current frozen evidence");
+    }
+    const baseCommit = context.base_commit as string;
+    const documentDigest = context.document_digest as string;
+    const diffDigest = context.diff_digest as string;
+    const testEvidenceDigest = context.test_evidence_digest as string;
+    const committedDiff = context.committed_diff;
+    const testEvidence = context.test_evidence;
     const barrierId = `review_${sha256(`${runId}:${baseCommit}:${revisionSha}:${run.plan_id ?? ""}:${run.revision ?? ""}:${documentDigest}:${diffDigest}:${testEvidenceDigest}`).slice(0, 24)}`;
     const axes = formal ? ["spec", "standards"] as const : ["standards"] as const;
-    const dispatches = new DispatchService(this.store);
     const create = this.store.db.transaction(() => {
       const columns = (this.store.db.prepare("PRAGMA table_info(review_barriers)").all() as Array<{ name: string }>).map((item) => item.name);
       const now = new Date().toISOString();
@@ -88,7 +88,7 @@ export class ReviewService {
       for (const axis of axes) {
         dispatches.create(runId, axis === "spec" ? "review-spec" : "review-standards", {
           objective: `Review frozen commit ${revisionSha} on the ${axis} axis.`,
-          allowed_read_paths: [...new Set([...changedPaths, ...planningPaths])],
+          allowed_read_paths: coordinator.packet.allowed_read_paths,
           allowed_write_paths: [],
           acceptance_criteria: ["Every finding cites a concrete source and evidence", "Return all P0-P3 findings for this axis"],
           context: {
@@ -96,13 +96,11 @@ export class ReviewService {
             revision_sha: revisionSha,
             axis,
             base_commit: baseCommit,
+            ...context,
             head_commit: revisionSha,
-            plan_id: run.plan_id ?? null,
-            revision: run.revision ?? null,
-            document_digest: documentDigest,
-            diff_digest: diffDigest,
-            test_evidence_digest: testEvidenceDigest,
-            review_strategy: revisionSha === frozenHead ? "integration_head" : "implementation_commit",
+            parent_dispatch_id: coordinator.dispatch_id,
+            parent_packet_digest: coordinator.packet_digest ?? null,
+            review_strategy: "integration_head",
             committed_diff: committedDiff,
             test_evidence: testEvidence,
           },
