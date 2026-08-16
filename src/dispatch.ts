@@ -428,6 +428,36 @@ export class DispatchService {
     return undefined;
   }
 
+  private activeIntegrationWorktree(runId: string): { worktree_id: string; path: string } | undefined {
+    const run = this.store.getRun(runId) as { mode?: string; plan_id?: string; revision?: string; repo_id: string };
+    if (run.mode !== "planned") {
+      return this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1")
+        .get(runId) as { worktree_id: string; path: string } | undefined;
+    }
+    if (!run.plan_id || !run.revision) return undefined;
+    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
+    if (!repository) return undefined;
+    const planRevision = `${run.plan_id}-${run.revision}`;
+    const expected = { branch: `plan/${run.plan_id}/${planRevision}`, path: join(repository.project_path, ".worktree", "plans", run.plan_id, planRevision) };
+    const exact = this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
+      .get(runId, expected.branch, expected.path) as { worktree_id: string; path: string } | undefined;
+    if (exact) return exact;
+
+    const short = runId.slice(-8).toLowerCase();
+    const legacy = { branch: `integration/${run.plan_id}/${short}`, path: join(repository.project_path, ".worktree", "integration", run.plan_id, short) };
+    const row = this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
+      .get(runId, legacy.branch, legacy.path) as { worktree_id: string; path: string } | undefined;
+    if (!row) return undefined;
+    const created = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='run.created' ORDER BY event_id LIMIT 1")
+      .get(runId) as { payload_json: string } | undefined;
+    const operation = this.store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.integration.create' AND state='completed'
+      AND json_extract(request_json,'$.branch')=? AND json_extract(request_json,'$.path')=?`).get(runId, legacy.branch, legacy.path);
+    try {
+      if (JSON.parse(created?.payload_json ?? "{}").mode === "planned" && operation) return row;
+    } catch { /* malformed legacy provenance is not ownership evidence */ }
+    return undefined;
+  }
+
   ensureGitPrepareDispatch(runId: string, target: "integration" | "implementation"): string {
     const phase = target === "integration" ? "prepare_worktrees" : "prepare_implementation_worktree";
     const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches
@@ -435,15 +465,15 @@ export class DispatchService {
       AND json_extract(packet_json,'$.context.phase')=?
       ORDER BY created_at DESC LIMIT 1`).get(runId, phase) as { dispatch_id: string } | undefined;
     if (existing) return existing.dispatch_id;
-    const run = this.store.getRun(runId) as { base_commit?: string };
+    const run = this.store.getRun(runId) as { base_commit?: string; mode?: string };
     return this.insert(runId, "git-operator", validatePacket({
       objective: target === "integration"
-        ? "Prepare the integration worktree for this run."
+        ? run.mode === "planned" ? "Verify the plan worktree prepared for this planned run." : "Prepare the integration worktree for this run."
         : "Prepare the implementation task worktree after the direct pre_write scope gate.",
       allowed_read_paths: [],
       allowed_write_paths: [],
       acceptance_criteria: target === "integration"
-        ? ["Register one active integration worktree owned by this run"]
+        ? [run.mode === "planned" ? "Register one active plan worktree owned by this run" : "Register one active integration worktree owned by this run"]
         : ["Register the active implementation task worktree owned by this run from the run base commit"],
       context: {
         stage: "git-operator",
@@ -457,12 +487,13 @@ export class DispatchService {
   private assertGitPrepareResult(runId: string, packet: DispatchPacket): void {
     const context = packet.context as { phase?: unknown; task_id?: unknown };
     if (context.phase === "prepare_worktrees") {
-      const worktree = this.store.db.prepare("SELECT 1 FROM worktrees WHERE run_id=? AND state='active' AND branch LIKE 'integration/%'").get(runId);
-      if (!worktree) throw new ValidationError("prepare_worktrees requires a registered active integration worktree owned by this run");
+      const worktree = this.activeIntegrationWorktree(runId);
+      if (!worktree) throw new ValidationError("prepare_worktrees requires a registered active integration worktree or plan worktree owned by this run");
     }
     if (context.phase === "prepare_implementation_worktree") {
       const taskId = typeof context.task_id === "string" ? context.task_id.toLowerCase() : "implementation";
-      const worktree = this.store.db.prepare("SELECT 1 FROM worktrees WHERE run_id=? AND state='active' AND branch LIKE ?").get(runId, `task/%/${taskId}`);
+      const worktree = this.store.db.prepare("SELECT 1 FROM worktrees WHERE run_id=? AND state='active' AND (branch LIKE ? OR branch LIKE ?)")
+        .get(runId, `task/%/${taskId}`, `task/%--${taskId}`);
       if (!worktree) throw new ValidationError("prepare_implementation_worktree requires a registered active implementation task worktree owned by this run");
     }
   }
@@ -505,7 +536,7 @@ export class DispatchService {
       catch { return []; }
     }));
     if (taskWorktreeIds.some((worktreeId) => !committedWorktrees.has(worktreeId))) return;
-    const integration = this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1").get(runId) as { worktree_id: string; path: string } | undefined;
+    const integration = this.activeIntegrationWorktree(runId);
     if (!integration) return;
     const mergeOperations = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.merge.task' AND state='completed' ORDER BY completed_at").all(runId) as Array<{ evidence_json?: string }>;
     const mergedWorktrees = new Set(mergeOperations.flatMap((item) => {
@@ -642,8 +673,7 @@ export class DispatchService {
       AND json_extract(packet_json,'$.context.phase')='finalize_integration'
       AND json_extract(packet_json,'$.context.barrier_id')=? LIMIT 1`).get(runId, barrier.barrier_id) as { dispatch_id: string } | undefined;
     if (existing) return existing.dispatch_id;
-    const integration = this.store.db.prepare("SELECT worktree_id FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1")
-      .get(runId) as { worktree_id: string } | undefined;
+    const integration = this.activeIntegrationWorktree(runId);
     if (!integration) throw new ValidationError("passed review requires an active integration worktree");
     const dispatchId = this.insert(runId, "git-operator", validatePacket({
       objective: `Merge reviewed integration commit ${barrier.revision_sha} into the target branch and clean up owned worktrees.`,
@@ -667,7 +697,7 @@ export class DispatchService {
     const run = this.store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string; plan_digest?: string; base_commit?: string };
     const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
     if (!repository) throw new ValidationError("review repository is not registered");
-    const integration = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1").get(runId) as { path: string } | undefined;
+    const integration = this.activeIntegrationWorktree(runId);
     if (!integration) return undefined;
     const integrationHead = execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     if (integrationHead !== revisionSha) return undefined;

@@ -6,6 +6,7 @@ import { ValidationError } from "./errors.js";
 import { triageRequest } from "./planning.js";
 import { AGENT_BUILD } from "./roles.js";
 import { assertReadablePath } from "./security.js";
+import { GitOrchestrator } from "./git-orchestrator.js";
 
 const clientPlatform = (): string => {
   const value = process.env.AI_TEAM_CLIENT_PLATFORM ?? process.env.AI_TEAM_PLATFORM ?? "codex";
@@ -117,6 +118,20 @@ export class WorkflowService {
     }
     this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
     const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}), clientPlatform: clientPlatform() });
+    if (input.mode === "planned") {
+      try {
+        await new GitOrchestrator(this.store).prepareIntegration(runId);
+      } catch (error) {
+        const cause = error instanceof Error ? error.message : String(error);
+        const retry = "Resolve the reported branch/worktree collision or reconcile the failed run, then start a new planned coding run.";
+        this.store.db.transaction(() => {
+          this.store.db.prepare("UPDATE runs SET state='failed',stage='git-operator',updated_at=? WHERE run_id=? AND state='active'")
+            .run(new Date().toISOString(), runId);
+          this.store.event(runId, "run.start_failed", { phase: "prepare_plan_worktree", cause, retry });
+        })();
+        throw new ValidationError("planned coding start failed to prepare its plan worktree; the run was marked failed", { run_id: runId, cause, retry });
+      }
+    }
     const dispatchId = this.dispatches.create(runId, "file-explorer", {
       objective: "Re-explore the repository at the implementation base. Read existing MEMORY.md and .ai-team/index/feature-navigation.md first, then return exact implementation and test scope plus project_context.",
       allowed_read_paths: ["."],

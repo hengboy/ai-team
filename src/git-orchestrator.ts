@@ -15,6 +15,29 @@ const safeSegment = (value: string): string => {
   return value;
 };
 
+const isPlannedRun = (run: any): boolean => run.mode === "planned" && typeof run.plan_id === "string" && typeof run.revision === "string";
+
+const worktreeNames = (root: string, run: any, runId: string, taskId?: string): { branch: string; path: string } => {
+  const plan = safeSegment(run.plan_id ?? `direct-${runId.slice(-8).toLowerCase()}`);
+  if (isPlannedRun(run)) {
+    const planRevision = safeSegment(`${plan}-${run.revision}`);
+    if (taskId === undefined) return { branch: `plan/${plan}/${planRevision}`, path: join(root, ".worktree", "plans", plan, planRevision) };
+    const task = safeSegment(taskId.toLowerCase());
+    const taskRevision = safeSegment(`${planRevision}--${task}`);
+    return { branch: `task/${plan}/${taskRevision}`, path: join(root, ".worktree", "tasks", plan, taskRevision) };
+  }
+  const short = safeSegment(runId.slice(-8).toLowerCase());
+  if (taskId === undefined) return { branch: `integration/${plan}/${short}`, path: join(root, ".worktree", "integration", plan, short) };
+  const task = safeSegment(taskId.toLowerCase());
+  return { branch: `task/${plan}/${short}/${task}`, path: join(root, ".worktree", "tasks", plan, short, task) };
+};
+
+const legacyIntegrationNames = (root: string, run: any, runId: string): { branch: string; path: string } => {
+  const plan = safeSegment(run.plan_id);
+  const short = safeSegment(runId.slice(-8).toLowerCase());
+  return { branch: `integration/${plan}/${short}`, path: join(root, ".worktree", "integration", plan, short) };
+};
+
 export class GitOrchestrator {
   constructor(readonly store: StateStore) {}
 
@@ -33,22 +56,45 @@ export class GitOrchestrator {
     return { root: repository.project_path, run };
   }
 
+  private activeIntegrationWorktree(runId: string, root: string, run: any): any | undefined {
+    if (!isPlannedRun(run)) {
+      return this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1").get(runId) as any;
+    }
+    const expected = worktreeNames(root, run, runId);
+    const exact = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
+      .get(runId, expected.branch, expected.path) as any;
+    if (exact) return exact;
+
+    const legacy = legacyIntegrationNames(root, run, runId);
+    const row = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
+      .get(runId, legacy.branch, legacy.path) as any;
+    if (!row) return undefined;
+    const created = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='run.created' ORDER BY event_id LIMIT 1")
+      .get(runId) as { payload_json: string } | undefined;
+    const operation = this.store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.integration.create' AND state='completed'
+      AND json_extract(request_json,'$.branch')=? AND json_extract(request_json,'$.path')=?`).get(runId, legacy.branch, legacy.path);
+    try {
+      if (JSON.parse(created?.payload_json ?? "{}").mode === "planned" && operation) return row;
+    } catch { /* malformed legacy provenance is not ownership evidence */ }
+    return undefined;
+  }
+
   async prepareTask(runId: string, taskId = "implementation", baseCommit?: string, dependsOn?: string, dispatchId?: string): Promise<PreparedWorktree> {
     this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
     if ((["bug", "feature"] as string[]).includes(run.mode)) new ScopeGate(this.store).assertPassed(runId, "pre_write");
-    const plan = safeSegment(run.plan_id ?? `direct-${runId.slice(-8).toLowerCase()}`);
-    const short = safeSegment(runId.slice(-8).toLowerCase());
-    const task = safeSegment(taskId.toLowerCase());
-    const branch = `task/${plan}/${short}/${task}`;
-    const path = join(root, ".worktree", "tasks", plan, short, task);
-    let base = baseCommit ?? run.base_commit;
+    const { branch, path } = worktreeNames(root, run, runId, taskId);
+    const integration = isPlannedRun(run) ? this.activeIntegrationWorktree(runId, root, run) : undefined;
+    if (isPlannedRun(run) && !integration) throw new ValidationError("planned Task requires an active plan worktree");
+    const integrationHead = integration ? await currentHead(integration.path) : undefined;
+    if (integrationHead && baseCommit && baseCommit !== integrationHead) throw new ValidationError("planned Task base must equal the current plan worktree HEAD");
+    let base = integrationHead ?? baseCommit ?? run.base_commit;
     if (dependsOn) {
       const dependency = this.worktree(runId, dependsOn);
       if (dependency.state !== "active") throw new ValidationError("dependent Task worktree is not active");
-      const integration = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1").get(runId) as any;
-      if (!integration) throw new ValidationError("dependent Task requires an active integration worktree");
-      base = await currentHead(integration.path);
+      const integrationWorktree = integration ?? this.activeIntegrationWorktree(runId, root, run);
+      if (!integrationWorktree) throw new ValidationError("dependent Task requires an active integration worktree");
+      base = await currentHead(integrationWorktree.path);
     }
     if (!/^[a-f0-9]{40}$/.test(base)) throw new ValidationError("worktree base must be a 40-character commit SHA");
     const key = `worktree:create:${runId}:${branch}:${base}`;
@@ -113,15 +159,13 @@ export class GitOrchestrator {
   async adoptCommit(runId: string, commit: string, taskId = "implementation", dispatchId?: string): Promise<PreparedWorktree> {
     this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
-    const base = run.base_commit as string;
+    const integration = isPlannedRun(run) ? this.activeIntegrationWorktree(runId, root, run) : undefined;
+    if (isPlannedRun(run) && !integration) throw new ValidationError("planned Task requires an active plan worktree");
+    const base = integration ? await currentHead(integration.path) : run.base_commit as string;
     if (!/^[a-f0-9]{40}$/.test(base) || !/^[a-f0-9]{40}$/.test(commit)) throw new ValidationError("managed commit adoption requires full base and commit SHAs");
     const revision = (await git(root, ["rev-list", "--parents", "-n", "1", commit])).stdout.split(" ");
-    if (revision.length !== 2 || revision[1] !== base) throw new ValidationError("managed adopt requires an existing direct-child commit of the run base");
-    const plan = safeSegment(run.plan_id ?? `direct-${runId.slice(-8).toLowerCase()}`);
-    const short = safeSegment(runId.slice(-8).toLowerCase());
-    const task = safeSegment(taskId.toLowerCase());
-    const branch = `task/${plan}/${short}/${task}`;
-    const path = join(root, ".worktree", "tasks", plan, short, task);
+    if (revision.length !== 2 || revision[1] !== base) throw new ValidationError("managed adopt requires an existing direct-child commit of the task base");
+    const { branch, path } = worktreeNames(root, run, runId, taskId);
     const existing = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=? AND state='active'").get(runId, branch) as any;
     if (existing) {
       if (await currentHead(existing.path) !== commit) throw new ValidationError("existing adopted worktree does not match requested commit");
@@ -172,17 +216,15 @@ export class GitOrchestrator {
   async prepareIntegration(runId: string, dispatchId?: string): Promise<PreparedWorktree> {
     this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
-    const plan = safeSegment(run.plan_id ?? `direct-${runId.slice(-8).toLowerCase()}`);
-    const short = runId.slice(-8).toLowerCase();
-    const branch = `integration/${plan}/${short}`;
-    const path = join(root, ".worktree", "integration", plan, short);
+    const { branch, path } = worktreeNames(root, run, runId);
     const base = run.base_commit;
-    const existing = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=?").get(runId, branch) as any;
+    const named = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=?").get(runId, branch) as any;
+    const existing = named ?? (isPlannedRun(run) ? this.activeIntegrationWorktree(runId, root, run) : undefined);
     const key = `integration:create:${runId}:${base}`;
     if (existing) {
-      const operation = this.store.beginOperation("git.integration.create", key, { branch, path, base }, runId);
+      const operation = this.store.beginOperation("git.integration.create", key, { branch: existing.branch, path: existing.path, base }, runId);
       if (operation.state !== "completed") throw new ValidationError("integration operation has unknown side effect; reconcile required");
-      return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: true };
+      return { worktree_id: existing.worktree_id, branch: existing.branch, path: existing.path, base_commit: base, reused: true };
     }
     const collision = this.store.db.prepare("SELECT run_id FROM worktrees WHERE branch=? OR path=?").get(branch, path) as any;
     if (collision) throw new ValidationError(`branch or worktree belongs to another run: ${collision.run_id}`);

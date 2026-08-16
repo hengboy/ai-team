@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { join } from "node:path";
 import { DispatchService } from "./dispatch.js";
 import { ValidationError } from "./errors.js";
 import { StateStore } from "./state.js";
@@ -41,16 +42,44 @@ export class ReviewService {
     if (!repository) throw new ValidationError("review repository is not registered");
     try { execFileSync("git", ["-C", repository.project_path, "cat-file", "-e", `${revisionSha}^{commit}`], { stdio: "ignore" }); }
     catch { throw new ValidationError("review revision commit does not exist", { revisionSha }); }
-    const integration = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1").get(runId) as { path: string } | undefined;
+    let worktreeKind = run.mode === "planned" ? "plan" : "integration";
+    let integration: { path: string } | undefined;
+    if (run.mode === "planned" && run.plan_id && run.revision) {
+      const planRevision = `${run.plan_id}-${run.revision}`;
+      const branch = `plan/${run.plan_id}/${planRevision}`;
+      const planPath = join(repository.project_path, ".worktree", "plans", run.plan_id, planRevision);
+      integration = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
+        .get(runId, branch, planPath) as { path: string } | undefined;
+      if (!integration) {
+        const short = runId.slice(-8).toLowerCase();
+        const legacyBranch = `integration/${run.plan_id}/${short}`;
+        const legacyPath = join(repository.project_path, ".worktree", "integration", run.plan_id, short);
+        const legacy = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
+          .get(runId, legacyBranch, legacyPath) as { path: string } | undefined;
+        const created = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='run.created' ORDER BY event_id LIMIT 1")
+          .get(runId) as { payload_json: string } | undefined;
+        const operation = this.store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.integration.create' AND state='completed'
+          AND json_extract(request_json,'$.branch')=? AND json_extract(request_json,'$.path')=?`).get(runId, legacyBranch, legacyPath);
+        try {
+          if (legacy && JSON.parse(created?.payload_json ?? "{}").mode === "planned" && operation) {
+            integration = legacy;
+            worktreeKind = "legacy integration";
+          }
+        } catch { /* malformed legacy provenance is not ownership evidence */ }
+      }
+    } else if (run.mode !== "planned") {
+      integration = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1")
+        .get(runId) as { path: string } | undefined;
+    }
     const test = this.store.db.prepare("SELECT state,packet_json FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; packet_json: string } | undefined;
     const testedCommit = test ? (JSON.parse(test.packet_json) as { context?: { implementation_commit?: string } }).context?.implementation_commit : undefined;
     if (test?.state !== "completed" || testedCommit !== revisionSha) {
       throw new ValidationError("review requires a completed independent test bound to the same integration commit", { revisionSha, testedCommit: testedCommit ?? null });
     }
-    if (!integration) throw new ValidationError("review requires a prepared active integration worktree");
+    if (!integration) throw new ValidationError(`review requires a prepared active ${worktreeKind} worktree`);
     const frozenHead = execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     if (revisionSha !== frozenHead) {
-      throw new ValidationError("review revision must equal the frozen integration HEAD", { revisionSha, integrationHead: frozenHead });
+      throw new ValidationError(`review revision must equal the frozen ${worktreeKind} HEAD`, { revisionSha, integrationHead: frozenHead });
     }
     const coordinator = (this.store.db.prepare("SELECT dispatch_id,state,packet_json,packet_digest FROM dispatches WHERE run_id=? AND role='code-reviewer' ORDER BY created_at DESC").all(runId) as Array<{ dispatch_id: string; state: string; packet_json: string; packet_digest?: string }>)
       .map((row) => ({ ...row, packet: JSON.parse(row.packet_json) as { allowed_read_paths: string[]; context: Record<string, unknown> } }))

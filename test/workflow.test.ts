@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -43,9 +43,11 @@ const openStore = async (): Promise<{ store: StateStore; home: string }> => {
 
 const REVIEW_HEAD = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 const REVIEW_COMMON_DIR = execFileSync("git", ["rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
+let formalRunSequence = 0;
 const createRun = (store: StateStore, mode = "feature"): string => {
   store.registerRepository("repo", path.resolve(REVIEW_COMMON_DIR), process.cwd());
-  return store.createRun({ repoId: "repo", profile: "coding", mode, baseCommit: REVIEW_HEAD });
+  const formal = mode === "planned" ? { planId: `review-plan-${++formalRunSequence}`, revision: "001" } : {};
+  return store.createRun({ repoId: "repo", profile: "coding", mode, baseCommit: REVIEW_HEAD, ...formal });
 };
 
 const result = (axis: "spec" | "standards", findings: ReviewResult["findings"] = []): ReviewResult => ({
@@ -54,10 +56,24 @@ const result = (axis: "spec" | "standards", findings: ReviewResult["findings"] =
   findings,
 });
 
-const completeTest = (store: StateStore, runId: string): void => {
+const completeTest = async (store: StateStore, runId: string, legacyPlanned = false): Promise<void> => {
+  const run = store.getRun(runId) as { mode: string; plan_id?: string; revision?: string };
   store.db.prepare("UPDATE worktrees SET state='removed' WHERE path=? AND state='active'").run(process.cwd());
+  let branch = `integration/test/${runId.slice(-12)}`;
+  let worktreePath = process.cwd();
+  if (run.mode === "planned" && run.plan_id && run.revision) {
+    const finalSegment = legacyPlanned ? runId.slice(-8).toLowerCase() : `${run.plan_id}-${run.revision}`;
+    branch = legacyPlanned ? `integration/${run.plan_id}/${finalSegment}` : `plan/${run.plan_id}/${finalSegment}`;
+    worktreePath = path.join(process.cwd(), ".worktree", legacyPlanned ? "integration" : "plans", run.plan_id, finalSegment);
+    await mkdir(path.dirname(worktreePath), { recursive: true });
+    await symlink(process.cwd(), worktreePath, "dir");
+    if (legacyPlanned) {
+      const operation = store.beginOperation("git.integration.create", `integration:create:${runId}:${REVIEW_HEAD}`, { branch, path: worktreePath, base: REVIEW_HEAD }, runId);
+      store.finishOperation(operation.operationId, { worktreeId: `worktree_${runId.slice(-12)}`, head: REVIEW_HEAD });
+    }
+  }
   store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
-    .run(`worktree_${runId.slice(-12)}`, runId, `integration/test/${runId.slice(-12)}`, process.cwd(), REVIEW_HEAD, new Date().toISOString());
+    .run(`worktree_${runId.slice(-12)}`, runId, branch, worktreePath, REVIEW_HEAD, new Date().toISOString());
   const dispatchId = new WorkflowService(store).dispatches.create(runId, "test", {
     objective: "independent verification", allowed_read_paths: ["package.json"], allowed_write_paths: [], acceptance_criteria: ["tests pass"], context: { implementation_commit: REVIEW_HEAD, changed_paths: ["package.json"] },
   });
@@ -66,6 +82,14 @@ const completeTest = (store: StateStore, runId: string): void => {
   const reviewPacket = new WorkflowService(store).dispatches.buildReviewPacket(runId);
   assert.ok(reviewPacket);
   new WorkflowService(store).dispatches.create(runId, "code-reviewer", reviewPacket);
+};
+
+const cleanupTestPlanWorktrees = async (store: StateStore): Promise<void> => {
+  const root = path.join(process.cwd(), ".worktree");
+  const rows = store.db.prepare("SELECT path FROM worktrees WHERE branch LIKE 'plan/%' OR branch LIKE 'integration/%'").all() as Array<{ path: string }>;
+  for (const row of rows) {
+    if (row.path.startsWith(`${root}${path.sep}`)) await rm(path.dirname(row.path), { recursive: true, force: true });
+  }
 };
 
 const completeReviewLeaf = (store: StateStore, runId: string, review: ReviewResult): void => {
@@ -85,7 +109,7 @@ test("direct and formal reviews require the correct axes and run once per frozen
   try {
     const reviews = new ReviewService(store);
     const directRun = createRun(store);
-    completeTest(store, directRun);
+    await completeTest(store, directRun);
     assert.throws(() => reviews.create(directRun, REVIEW_HEAD, true), /require direct review axes/);
     assert.throws(() => reviews.create(directRun, "0".repeat(40), false), /commit does not exist/);
     const direct = reviews.create(directRun, REVIEW_HEAD, false);
@@ -100,7 +124,7 @@ test("direct and formal reviews require the correct axes and run once per frozen
     assert.deepEqual(reviews.create(directRun, REVIEW_HEAD, false), { ...direct, reused: true });
 
     const formalRun = createRun(store, "planned");
-    completeTest(store, formalRun);
+    await completeTest(store, formalRun);
     assert.throws(() => reviews.create(formalRun, REVIEW_HEAD, false), /require formal review axes/);
     const formal = reviews.create(formalRun, REVIEW_HEAD, true);
     assert.deepEqual(formal.axes, ["spec", "standards"]);
@@ -112,6 +136,7 @@ test("direct and formal reviews require the correct axes and run once per frozen
     assert.equal(reviews.submit(formalRun, formal.barrier_id, result("spec")).state, "pending");
     assert.equal(submitReview(reviews, store, formalRun, formal.barrier_id, result("standards")).state, "passed");
   } finally {
+    await cleanupTestPlanWorktrees(store);
     store.close();
     await rm(home, { recursive: true, force: true });
   }
@@ -122,7 +147,7 @@ test("run resume rebuilds a completed formal barrier and creates one final Git O
   let reopened: StateStore | undefined;
   try {
     const runId = createRun(store, "planned");
-    completeTest(store, runId);
+    await completeTest(store, runId);
     const reviews = new ReviewService(store);
     const created = reviews.create(runId, REVIEW_HEAD, true);
     completeReviewLeaf(store, runId, result("spec"));
@@ -161,8 +186,40 @@ test("run resume rebuilds a completed formal barrier and creates one final Git O
     assert.equal(JSON.parse(finalDispatches[0]!.packet_json).context.barrier_id, created.barrier_id);
     assert.deepEqual(new ReviewService(reopened).create(runId, REVIEW_HEAD, true), { ...created, reused: true });
   } finally {
+    await cleanupTestPlanWorktrees(reopened ?? store);
     if (reopened) reopened.close();
     else store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("formal review accepts a provenance-bound legacy planned integration worktree", async () => {
+  const { store, home } = await openStore();
+  try {
+    const runId = createRun(store, "planned");
+    await completeTest(store, runId, true);
+    const barrier = new ReviewService(store).create(runId, REVIEW_HEAD, true);
+    assert.deepEqual(barrier.axes, ["spec", "standards"]);
+  } finally {
+    await cleanupTestPlanWorktrees(store);
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("formal review rejects a legacy planned integration worktree without provenance", async () => {
+  const { store, home } = await openStore();
+  try {
+    const runId = createRun(store, "planned");
+    await completeTest(store, runId, true);
+    store.db.prepare("DELETE FROM operations WHERE run_id=?").run(runId);
+    assert.throws(
+      () => new ReviewService(store).create(runId, REVIEW_HEAD, true),
+      /prepared active plan worktree/,
+    );
+  } finally {
+    await cleanupTestPlanWorktrees(store);
+    store.close();
     await rm(home, { recursive: true, force: true });
   }
 });
@@ -171,7 +228,7 @@ test("completed review leaf submissions automatically aggregate once", async () 
   const { store, home } = await openStore();
   try {
     const runId = createRun(store, "planned");
-    completeTest(store, runId);
+    await completeTest(store, runId);
     const reviews = new ReviewService(store);
     const barrier = reviews.create(runId, REVIEW_HEAD, true);
     const dispatches = new WorkflowService(store).dispatches;
@@ -204,6 +261,7 @@ test("completed review leaf submissions automatically aggregate once", async () 
       1,
     );
   } finally {
+    await cleanupTestPlanWorktrees(store);
     store.close();
     await rm(home, { recursive: true, force: true });
   }
@@ -442,6 +500,14 @@ test("coding start validates planned parameters, branch, clean worktree, and HEA
     assert.equal(run.revision, "001");
     assert.equal(run.target_branch, "main");
     assert.equal(run.base_commit, repository.head);
+    const planWorktree = store.db.prepare("SELECT run_id,branch,path,base_commit,state FROM worktrees WHERE run_id=?").get(started.run_id) as { run_id: string; branch: string; path: string; base_commit: string; state: string };
+    assert.deepEqual(planWorktree, {
+      run_id: started.run_id,
+      branch: "plan/plan/plan-001",
+      path: await realpath(path.join(repository.directory, ".worktree", "plans", "plan", "plan-001")),
+      base_commit: repository.head,
+      state: "active",
+    });
     const dispatch = store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(started.dispatch_id) as { packet_json: string };
     assert.equal(JSON.parse(dispatch.packet_json).context.implementation_base_commit, repository.head);
 
@@ -453,6 +519,29 @@ test("coding start validates planned parameters, branch, clean worktree, and HEA
     );
     const selected = await workflow.codingStart({ project: repository.directory, mode: "planned", planId: "plan", revision: "002" });
     assert.equal(store.getRun(selected.run_id).revision, "002");
+
+    const blockedPlan = "blocked-plan";
+    store.db.prepare(`INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at)
+      VALUES (?,?,?,?,?,?)`).run(blockedPlan, "001", identity.repoId, "ready", "main", new Date().toISOString());
+    const blockedBranch = `plan/${blockedPlan}/${blockedPlan}-001`;
+    await git(repository.directory, "branch", blockedBranch, repository.head);
+    let failedRunId = "";
+    await assert.rejects(
+      () => workflow.codingStart({ project: repository.directory, mode: "planned", planId: blockedPlan, revision: "001" }),
+      (error: unknown) => {
+        if (!(error instanceof ValidationError)) return false;
+        const details = error.details as { run_id: string; cause: string; retry: string };
+        failedRunId = details.run_id;
+        return /marked failed/.test(error.message) && /unowned branch already exists/.test(details.cause) && /start a new planned coding run/.test(details.retry);
+      },
+    );
+    assert.equal(store.getRun(failedRunId).state, "failed");
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=?").get(failedRunId) as { count: number }).count, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM run_events WHERE run_id=? AND type='run.start_failed'").get(failedRunId) as { count: number }).count, 1);
+    await git(repository.directory, "branch", "-D", blockedBranch);
+    const retried = await workflow.codingStart({ project: repository.directory, mode: "planned", planId: blockedPlan, revision: "001" });
+    assert.equal(store.getRun(retried.run_id).state, "active");
+    assert.notEqual(retried.run_id, failedRunId);
 
     store.db.prepare(`INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at)
       VALUES (?,?,?,?,?,?)`).run("wrong-branch", "001", identity.repoId, "ready", "release", new Date().toISOString());
@@ -504,6 +593,7 @@ test("bug and feature coding modes require a request and capture their Git basel
       assert.equal(run.request, request);
       assert.equal(run.target_branch, "main");
       assert.equal(run.base_commit, repository.head);
+      assert.equal((store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=?").get(runId) as { count: number }).count, 0);
     }
     await assert.rejects(
       () => workflow.codingStart({ project: repository.directory, mode: "bug", request: featureRequest }),

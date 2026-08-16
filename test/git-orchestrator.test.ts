@@ -138,6 +138,96 @@ test("prepareTask owns deterministic names and is idempotent per run", async () 
   }
 });
 
+test("planned runs use revision-scoped plan and task worktrees without run-short segments", async () => {
+  const fixture = await createFixture();
+  try {
+    const planId = "20260813-feature-abcd";
+    const runId = fixture.store.createRun({
+      repoId: (await repositoryIdentity(fixture.root)).repoId,
+      profile: "coding",
+      mode: "planned",
+      planId,
+      revision: "007",
+      baseCommit: await rawGit(fixture.root, ["rev-parse", "HEAD"]),
+      targetBranch: "main",
+    });
+    const plan = await fixture.orchestrator.prepareIntegration(runId);
+    const planRevision = `${planId}-007`;
+    assert.equal(plan.branch, `plan/${planId}/${planRevision}`);
+    assert.equal(plan.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktree", "plans", planId, planRevision))));
+    assert.equal(plan.branch.includes(runId.slice(-8).toLowerCase()), false);
+    fixture.store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_wrong_direct", runId, `integration/direct-${runId.slice(-8).toLowerCase()}/${runId.slice(-8).toLowerCase()}`, `/tmp/${runId}-wrong-direct`, plan.base_commit, "9999-12-31T23:59:59.999Z");
+
+    const first = await fixture.orchestrator.prepareTask(runId, "TASK-001");
+    assert.equal(first.branch, `task/${planId}/${planRevision}--task-001`);
+    assert.equal(first.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktree", "tasks", planId, `${planRevision}--task-001`))));
+    assert.equal(first.base_commit, await rawGit(plan.path, ["rev-parse", "HEAD"]));
+    await assert.rejects(
+      fixture.orchestrator.prepareTask(runId, "TASK-003", "a".repeat(40)),
+      /base must equal the current plan worktree HEAD/,
+    );
+
+    await writeFile(join(first.path, "task-one.txt"), "task one\n");
+    await fixture.orchestrator.commit(runId, first.worktree_id, "Complete TASK-001", ["task-one.txt"]);
+    const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, first.worktree_id);
+    const second = await fixture.orchestrator.prepareTask(runId, "TASK-002");
+    assert.equal(second.branch, `task/${planId}/${planRevision}--task-002`);
+    assert.equal(second.base_commit, merged);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("planned run recovery reuses a run-owned legacy integration worktree", async () => {
+  const fixture = await createFixture();
+  try {
+    const planId = "20260813-legacy-abcd";
+    const runId = fixture.store.createRun({
+      repoId: (await repositoryIdentity(fixture.root)).repoId,
+      profile: "coding",
+      mode: "planned",
+      planId,
+      revision: "003",
+      baseCommit: await rawGit(fixture.root, ["rev-parse", "HEAD"]),
+      targetBranch: "main",
+    });
+    fixture.store.db.prepare("UPDATE runs SET mode='implementation' WHERE run_id=?").run(runId);
+    const legacy = await fixture.orchestrator.prepareIntegration(runId);
+    fixture.store.db.prepare("UPDATE runs SET mode='planned' WHERE run_id=?").run(runId);
+
+    const recovered = await fixture.orchestrator.prepareIntegration(runId);
+    assert.deepEqual(recovered, { ...legacy, reused: true });
+    assert.equal(
+      (fixture.store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=? AND state='active'").get(runId) as { count: number }).count,
+      1,
+    );
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("planned run does not select a direct integration worktree without planned provenance", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun("20260813-direct-abcd");
+    const direct = await fixture.orchestrator.prepareIntegration(runId);
+    fixture.store.db.prepare("UPDATE runs SET mode='planned',revision='004' WHERE run_id=?").run(runId);
+
+    await assert.rejects(fixture.orchestrator.prepareIntegration(runId), /unknown side effect/);
+    assert.deepEqual(
+      fixture.store.db.prepare("SELECT run_id,branch,path FROM worktrees WHERE worktree_id=?").get(direct.worktree_id),
+      { run_id: runId, branch: direct.branch, path: direct.path },
+    );
+    assert.equal(
+      (fixture.store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=?").get(runId) as { count: number }).count,
+      1,
+    );
+  } finally {
+    await fixture.dispose();
+  }
+});
+
 test("managed adopt binds a direct-child commit and transfer changes only the registered owner", async () => {
   const fixture = await createFixture();
   try {

@@ -47,7 +47,10 @@ Planning creates an immutable revision under:
 
 Only a `ready` revision can enter planned coding. Coding always records the
 current target branch HEAD as its implementation base, blocks on a dirty target
-worktree, and uses task and integration worktrees under `.worktree/`.
+worktree, and uses managed worktrees under `.worktree/`. Planned coding creates
+one run-owned plan worktree named `<plan-id>-<revision>` at startup; split tasks
+use `<plan-id>-<revision>--<task-id>` and merge back into that plan worktree.
+Direct bug and feature runs retain their run-scoped integration and task names.
 
 Use these recovery commands after a client session ends:
 

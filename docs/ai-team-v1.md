@@ -187,22 +187,29 @@ Planning 调研报告写入：
 
 Git Operator 只允许本地 Git 操作：worktree、分支、提交、diff 冻结、merge、reconcile 和安全清理。禁止 push、PR、tag、发布、远程分支修改、rebase、squash、cherry-pick、amend、reset、clean 和 stash。
 
-Planning 不创建 worktree。Coding 使用 Planning 提交后的当前分支最新 `HEAD` 作为 `implementation_base_commit`，而不是使用旧的 `plan_commit`。初始分支和目录命名为：
+Planning 不创建 worktree。Coding 使用 Planning 提交后的当前分支最新 `HEAD` 作为 `implementation_base_commit`，而不是使用旧的 `plan_commit`。Planned coding 启动时创建并由当前 run 持有 plan worktree；revision 使用现有三位数字，`TASK-001` 在 Git/path final segment 中规范化为小写 `task-001`：
 
 ```text
-task/<plan-id>/<task-id>
-.worktree/tasks/<plan-id>/<task-id>/
+plan/<plan-id>/<plan-id>-<revision>
+.worktree/plans/<plan-id>/<plan-id>-<revision>/
 
-task/<plan-id>/implementation
-.worktree/tasks/<plan-id>/implementation/
-
-integration/<plan-id>/<run-short-id>
-.worktree/integration/<plan-id>/<run-short-id>/
+task/<plan-id>/<plan-id>-<revision>--<task-id>
+.worktree/tasks/<plan-id>/<plan-id>-<revision>--<task-id>/
 ```
 
-直接 Bug/feature 也使用独立 task worktree。无依赖且允许写入范围不重叠的 Task 可并行；有依赖的 Task 先合入 integration 分支，再从最新 integration commit 创建后续 Task。已存在且属于其他 run 或无法确认归属的分支/worktree/目录阻断，不复用、不覆盖。
+Direct Bug/feature 保持 run-scoped integration/task 结构：
 
-开发代理自测后，Git Operator 创建实现提交；每次修复创建独立修复提交，禁止 amend。最终通过非快进 merge commit 合入用户明确选择的目标分支。目标分支漂移时最多同步 3 次；冲突由 Coding 委派对应开发代理解决，目标是保留两端已确认行为。冲突后运行完整最终验证，不重新双轴评审。成功集成且工作区干净后删除 task/integration worktree；失败、暂停、`needs_decision` 或状态未知时保留。
+```text
+integration/<plan-or-direct-id>/<run-short-id>
+.worktree/integration/<plan-or-direct-id>/<run-short-id>/
+
+task/<plan-or-direct-id>/<run-short-id>/<task-id>
+.worktree/tasks/<plan-or-direct-id>/<run-short-id>/<task-id>/
+```
+
+拆分 Task 从 plan worktree 当前 HEAD 派生，完成后以非快进提交合回 plan worktree；plan 全部完成并通过验证与评审后，再合入 run 的 `target_branch`。直接 Bug/feature 也使用独立 task worktree。无依赖且允许写入范围不重叠的 Task 可并行；有依赖的 Task 先合入 plan/integration 分支，再从其最新 commit 创建后续 Task。已存在且属于其他 run 或无法确认归属的分支/worktree/目录阻断，不复用、不覆盖。
+
+开发代理自测后，Git Operator 创建实现提交；每次修复创建独立修复提交，禁止 amend。最终通过非快进 merge commit 合入用户明确选择的目标分支。目标分支漂移时最多同步 3 次；冲突由 Coding 委派对应开发代理解决，目标是保留两端已确认行为。冲突后运行完整最终验证，不重新双轴评审。成功集成且工作区干净后删除 task 及 plan/integration worktree；失败、暂停、`needs_decision` 或状态未知时保留。
 
 ## 8. 评审和验证
 

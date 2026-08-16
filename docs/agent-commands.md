@@ -6,7 +6,7 @@
 2. 领取调度，读取冻结提示词和 schema，然后提交严格结果。
 3. 按需创建其他角色调度，或创建唯一一个待用户处理的决策。
 4. `planning` 写入不可变修订，并且只沿合法状态边推进。
-5. `coding` 请求 Git Operator 准备归属明确的 worktree，并且只提交允许路径。
+5. `planned` coding 启动时创建归属当前 run 的 plan worktree，拆分 Task 从其当前 HEAD 派生并合回；direct coding 请求 Git Operator 准备 run-scoped worktree，并且只提交允许路径。
 6. `test` 在评审门禁前完成独立验证。
 7. Code Reviewer 对要求的冻结 Spec/Standards 结果各提交一次。
 8. `coding` 为每个 P0/P1 提供修改证据和验证证据并完成处理。

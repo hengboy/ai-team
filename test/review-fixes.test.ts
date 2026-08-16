@@ -162,6 +162,35 @@ test("direct Git prepare phases require registered run-owned worktrees and defer
   });
 });
 
+test("planned Git prepare ignores arbitrary direct integration worktrees", async () => {
+  await withStore(async (store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
+    const runId = store.createRun({
+      repoId,
+      profile: "coding",
+      mode: "planned",
+      planId: "20260816-identity-abcd",
+      revision: "001",
+      baseCommit: REVIEW_HEAD,
+      targetBranch: "main",
+    });
+    const dispatches = new DispatchService(store);
+    const prepareId = dispatches.ensureGitPrepareDispatch(runId, "integration");
+    dispatches.claim(runId, prepareId, "git-operator");
+    const result = completedResult(runId, prepareId, "git-operator", { operations: [{ command: "prepare", outcome: "completed" }] });
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_wrong_planned_integration", runId, "integration/direct/wrong", `/tmp/${runId}-wrong`, REVIEW_HEAD, new Date().toISOString());
+
+    await assert.rejects(dispatches.submitValue(runId, prepareId, "git-operator", result), /registered active integration worktree or plan worktree/);
+    const planId = "20260816-identity-abcd";
+    const planRevision = `${planId}-001`;
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_exact_planned", runId, `plan/${planId}/${planRevision}`, join(process.cwd(), ".worktree", "plans", planId, planRevision), REVIEW_HEAD, new Date().toISOString());
+    await dispatches.submitValue(runId, prepareId, "git-operator", result);
+  });
+});
+
 test("only File Explorer may receive broad read paths including ./**", async () => {
   await withStore((store) => {
     const runId = createRun(store);
