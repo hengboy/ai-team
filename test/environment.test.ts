@@ -253,6 +253,9 @@ test("planning and coding coordinate managed staging for every generated JSON", 
   assert.match(planning, /每个规划 JSON.*staging create.*staging write --input-stdin.*--staging-id/s);
   assert.match(planning, /planning-documents.*planning revision create/s);
   assert.match(planning, /planning revision validate.*pre-write.*安全重试/s);
+  assert.match(planning, /已确认的完整需求列表.*`confirm`.*`revise`.*choice 为 `confirm`.*才可开始写入 `spec\.md`/s);
+  assert.match(planning, /「拆分任务」.*「不拆分任务」.*推荐及理由.*`split`.*`no_split`/s);
+  assert.match(planning, /`taskId`、标题和摘要.*`approve`.*`revise`.*调整 task 列表.*再次请求确认/s);
   assert.match(planning, /`approve`.*`revise`.*resolved.*`approve`/s);
   assert.match(planning, /问题 1、.*问题 2、.*从 1 递增/s);
   assert.match(planning, /transition 到 `plan_ready`.*自动创建 \*\*Git Operator\*\* `dispatch`/s);
