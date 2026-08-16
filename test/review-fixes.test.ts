@@ -90,7 +90,8 @@ test("an exact File Explorer result creates one planning or coding dispatch and 
       const runId = createRun(store, profile);
       const dispatches = new DispatchService(store);
       const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
-      dispatches.claim(runId, explorerId, "file-explorer");
+      const claimed = dispatches.claim(runId, explorerId, "file-explorer");
+      assert.deepEqual(claimed.packet.allowed_read_paths, ["MEMORY.md", ".ai-team/index/feature-navigation.md", "."]);
       const resultPath = join(home, `${profile}-file-explorer.json`);
       await writeFile(resultPath, JSON.stringify(fileExplorerResult(runId, explorerId)));
 
@@ -121,6 +122,36 @@ test("an exact File Explorer result creates one planning or coding dispatch and 
         assert.equal(JSON.parse(prepare.packet_json).context.phase, "prepare_worktrees");
       }
     }
+  });
+});
+
+test("dispatch lifecycle support cancels, reissues, and supersedes with audited lineage", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store, "planning");
+    const dispatches = new DispatchService(store);
+    const original = dispatches.create(runId, "file-explorer", dispatchPacket(["src/dispatch.ts"]));
+    dispatches.claim(runId, original, "file-explorer");
+
+    const reissued = dispatches.reissue(runId, original, "file-explorer", "planning", "repair incomplete support dispatch");
+    assert.equal(reissued.action, "reissued");
+    assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(original) as { state: string }).state, "failed");
+    assert.equal((store.db.prepare("SELECT replacement_for FROM dispatches WHERE dispatch_id=?").get(reissued.dispatch_id) as { replacement_for: string }).replacement_for, original);
+    assert.deepEqual(dispatches.reissue(runId, original, "file-explorer", "planning", "repair incomplete support dispatch"), { ...reissued, reused: true });
+
+    const replacementPacket = dispatchPacket(["src/planning.ts"]);
+    const superseded = dispatches.supersede(runId, reissued.dispatch_id, "file-explorer", "planning", "correct authorized scope", replacementPacket);
+    assert.equal(superseded.action, "superseded");
+    assert.equal((store.db.prepare("SELECT replacement_for FROM dispatches WHERE dispatch_id=?").get(superseded.dispatch_id) as { replacement_for: string }).replacement_for, reissued.dispatch_id);
+    assert.deepEqual(JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(superseded.dispatch_id) as { packet_json: string }).packet_json).allowed_read_paths, [
+      "MEMORY.md", ".ai-team/index/feature-navigation.md", "src/planning.ts",
+    ]);
+
+    assert.deepEqual(dispatches.cancel(runId, superseded.dispatch_id, "file-explorer", "planning", "no longer required"), { action: "canceled", reused: false });
+    assert.deepEqual(dispatches.cancel(runId, superseded.dispatch_id, "file-explorer", "planning", "no longer required"), { action: "canceled", reused: true });
+    assert.deepEqual(
+      (store.db.prepare("SELECT type FROM run_events WHERE type LIKE 'dispatch.%ed' ORDER BY event_id").all() as Array<{ type: string }>).map(({ type }) => type),
+      ["dispatch.created", "dispatch.created", "dispatch.reissued", "dispatch.created", "dispatch.superseded", "dispatch.canceled"],
+    );
   });
 });
 

@@ -6,7 +6,7 @@ import { Command, Option } from "commander";
 import { checkDecisionInput, CONTRACT_DIGEST, DECISION_INPUT_SCHEMA, DECISION_INPUT_TEMPLATE } from "./contracts.js";
 import { validateCommand } from "./command-contract.js";
 import { EXIT, PACKAGE_VERSION, ROLES, STAGING_KINDS, STAGING_MAX_BYTES, type Role, type StagingKind } from "./constants.js";
-import { DispatchService } from "./dispatch.js";
+import { DispatchService, type DispatchPacket } from "./dispatch.js";
 import { EnvironmentService, PLATFORMS, type Platform } from "./environment.js";
 import { AiTeamError, ArgumentError, ValidationError } from "./errors.js";
 import { commitPlanningRevision, repositoryIdentity, worktreeStatus } from "./git.js";
@@ -240,10 +240,19 @@ const preflightPlanningRevision = async (
 ): Promise<{ path: string; digest: string; documents: RevisionDocuments }> => {
   assertRevisionDocuments(input.documents);
   if (input.runId) {
-    const run = store.getRun(input.runId) as { profile: string; repo_id: string; stage: string };
+    const run = store.getRun(input.runId) as { profile: string; repo_id: string; stage: string; state: string; plan_id?: string; revision?: string };
     if (run.profile !== "planning" || run.repo_id !== input.repoId) throw new ValidationError("planning revision does not belong to this run repository");
+    if (run.plan_id && (run.plan_id !== input.planId || run.revision !== input.revision)) {
+      throw new ValidationError("planning run is already bound to a different revision");
+    }
     assertRevisionCreateRunStage(input.documents, run.stage);
     if (hasTaskDocuments(input.documents)) store.assertTaskPreviewApproved(input.runId);
+    if (run.state !== "active") throw new ValidationError("planning revision requires an active planning run");
+    const transition = nextPlanState("draft", "plan_ready");
+    assertRevisionRunStage("draft", run.stage, transition);
+    const conflictingRun = store.db.prepare("SELECT run_id FROM runs WHERE repo_id=? AND profile='planning' AND plan_id=? AND revision=? AND state='active' AND run_id!=?")
+      .get(input.repoId, input.planId, input.revision, input.runId) as { run_id: string } | undefined;
+    if (conflictingRun) throw new ValidationError("planning revision already has another bound active run");
   } else if (hasTaskDocuments(input.documents)) {
     throw new ValidationError("planning revisions with task documents require --run-id for task preview approval");
   }
@@ -561,6 +570,25 @@ export const buildProgram = (): Command => {
   });
   const dispatchCommand = (name: string): Command => dispatch.command(name).requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").addOption(roleOption()).hook("preAction", (_command, action) => validateCommand("dispatch.identity", { runId: action.opts().runId, dispatchId: action.opts().dispatchId, role: action.opts().role }));
   dispatchCommand("claim").action(async (options) => output(await withStore((store) => new DispatchService(store).claim(options.runId, options.dispatchId, options.role))));
+  dispatchCommand("cancel").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).requiredOption("--reason <text>")
+    .action(async (options) => output(await withStore((store) => new DispatchService(store).cancel(options.runId, options.dispatchId, options.role, options.actorRole, options.reason))));
+  dispatchCommand("reissue").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).requiredOption("--reason <text>")
+    .action(async (options) => output(await withStore((store) => new DispatchService(store).reissue(options.runId, options.dispatchId, options.role, options.actorRole, options.reason))));
+  jsonOptions(dispatchCommand("supersede").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).requiredOption("--reason <text>"), "--packet-file")
+    .action(async (options) => {
+      const retention = await retentionHours();
+      output(await withStore(async (store) => {
+        const input = await loadJsonInput(store, {
+          file: options.packetFile, stagingId: options.stagingId, runId: options.runId,
+          role: options.actorRole, kind: "dispatch-packet",
+        }, retention);
+        try {
+          const result = new DispatchService(store).supersede(options.runId, options.dispatchId, options.role, options.actorRole, options.reason, input.value as DispatchPacket);
+          await input.consume();
+          return result;
+        } catch (error) { input.validationFailed(error); throw error; }
+      }));
+    });
   dispatchCommand("prompt").action(async (options) => output(await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role), { readonly: true }), { legacyRaw: true }));
   dispatchCommand("schema").action(async (options) => output(await withStore((store) => new DispatchService(store).schema(options.runId, options.dispatchId, options.role), { readonly: true })));
   dispatchCommand("template").action(async (options) => output(await withStore((store) => new DispatchService(store).template(options.runId, options.dispatchId, options.role), { readonly: true })));

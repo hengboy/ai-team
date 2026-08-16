@@ -39,6 +39,7 @@ interface ReviewBarrierRow {
 }
 
 const RENDERER_VERSION = "dispatch-renderer-v2";
+const EXPLORER_CONTEXT_PATHS = ["MEMORY.md", ".ai-team/index/feature-navigation.md"] as const;
 
 const promptFor = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
   `Role: ${role}`,
@@ -66,7 +67,9 @@ const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   }
   if (!(value.context && typeof value.context === "object" && !Array.isArray(value.context))) throw new ValidationError("dispatch packet context must be an object", ["/context"]);
   if (!(value.acceptance_criteria as string[]).length) throw new ValidationError("dispatch packet requires acceptance criteria", ["/acceptance_criteria"]);
-  const reads = value.allowed_read_paths as string[];
+  const reads = role === "file-explorer"
+    ? [...new Set([...EXPLORER_CONTEXT_PATHS, ...(value.allowed_read_paths as string[])])]
+    : value.allowed_read_paths as string[];
   const writes = value.allowed_write_paths as string[];
   for (const path of [...reads, ...writes]) {
     if (path !== "." && path !== "**") assertRelativePosixPath(path);
@@ -75,7 +78,7 @@ const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   for (const path of writes) assertWritablePath(path);
   const broad = reads.filter((path) => path === "**" || path === "." || path.endsWith("/**"));
   if (role !== "file-explorer" && broad.length) throw new ValidationError(`${role} requires exact allowed_read_paths`);
-  return value as unknown as DispatchPacket;
+  return { ...value, allowed_read_paths: reads } as unknown as DispatchPacket;
 };
 
 const validateReviewResult = (result: ReviewResult): void => {
@@ -254,6 +257,66 @@ export class DispatchService {
     const reused = row.state === "claimed";
     if (!reused) this.store.db.prepare("UPDATE dispatches SET state='claimed',claimed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), dispatchId);
     return { reused, packet: JSON.parse(row.packet_json) as DispatchPacket };
+  }
+
+  cancel(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): { action: "canceled"; reused: boolean } {
+    this.assertLifecycleActor(runId, actorRole, "dispatch cancel");
+    if (!reason.trim()) throw new ValidationError("dispatch cancellation requires a reason");
+    const row = this.get(runId, dispatchId, role) as { state: string };
+    const prior = this.store.db.prepare("SELECT 1 FROM run_events WHERE run_id=? AND type='dispatch.canceled' AND json_extract(payload_json,'$.dispatchId')=?")
+      .get(runId, dispatchId);
+    if (row.state === "failed" && prior) return { action: "canceled", reused: true };
+    if (!["pending", "claimed"].includes(row.state)) throw new ValidationError(`dispatch cannot be canceled from ${row.state}`);
+    this.store.db.transaction(() => {
+      this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?").run(new Date().toISOString(), dispatchId);
+      this.store.event(runId, "dispatch.canceled", { dispatchId, role, actor_role: actorRole, reason });
+    })();
+    return { action: "canceled", reused: false };
+  }
+
+  reissue(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): { action: "reissued"; dispatch_id: string; reused: boolean } {
+    const row = this.get(runId, dispatchId, role) as { state: string; packet_json: string };
+    return this.replaceDispatch(runId, dispatchId, role, actorRole, reason, "reissued", JSON.parse(row.packet_json) as DispatchPacket);
+  }
+
+  supersede(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string, packet: DispatchPacket): { action: "superseded"; dispatch_id: string; reused: boolean } {
+    return this.replaceDispatch(runId, dispatchId, role, actorRole, reason, "superseded", validatePacket(packet, role));
+  }
+
+  private assertLifecycleActor(runId: string, actorRole: Role, command: string): void {
+    const run = this.store.getRun(runId) as { profile: Role };
+    if (run.profile !== actorRole) throw new ValidationError(`${actorRole} cannot manage a ${run.profile} run dispatch`);
+    this.assertCommandAllowed(actorRole, command);
+  }
+
+  private replaceDispatch<Action extends "reissued" | "superseded">(
+    runId: string,
+    dispatchId: string,
+    role: Role,
+    actorRole: Role,
+    reason: string,
+    action: Action,
+    packet: DispatchPacket,
+  ): { action: Action; dispatch_id: string; reused: boolean } {
+    this.assertLifecycleActor(runId, actorRole, `dispatch ${action === "reissued" ? "reissue" : "supersede"}`);
+    if (!reason.trim()) throw new ValidationError(`dispatch ${action} requires a reason`);
+    const row = this.get(runId, dispatchId, role) as { state: string };
+    if (!["pending", "claimed", "failed"].includes(row.state)) throw new ValidationError(`dispatch cannot be ${action} from ${row.state}`);
+    assertExplorerAuthorization(this.store, runId, role, packet);
+    const packetJson = redact(stableJson(packet));
+    const existing = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
+      .get(runId, dispatchId) as { dispatch_id: string; packet_json: string } | undefined;
+    if (existing) {
+      if (existing.packet_json !== packetJson) throw new ValidationError("dispatch already has a different replacement");
+      return { action, dispatch_id: existing.dispatch_id, reused: true };
+    }
+    let replacementId = "";
+    this.store.db.transaction(() => {
+      this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?").run(new Date().toISOString(), dispatchId);
+      replacementId = this.insert(runId, role, packet, dispatchId);
+      this.store.event(runId, `dispatch.${action}`, { dispatchId, replacement_dispatch_id: replacementId, role, actor_role: actorRole, reason });
+    })();
+    return { action, dispatch_id: replacementId, reused: false };
   }
 
   prompt(runId: string, dispatchId: string, role: Role): string {

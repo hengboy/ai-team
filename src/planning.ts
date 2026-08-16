@@ -39,7 +39,7 @@ export const nextPlanState = (current: string, target: string): string => {
   if (!PLAN_STATES.includes(current as any) || !PLAN_STATES.includes(target as any)) throw new ValidationError("unknown planning state");
   if (terminal.has(current)) throw new ValidationError(`terminal revision cannot transition from ${current}`);
   const edges: Record<string, string[]> = {
-    draft: ["requirements_confirmed", "abandoned"],
+    draft: ["requirements_confirmed", "plan_ready", "abandoned"],
     requirements_confirmed: ["spec_ready", "abandoned"],
     spec_ready: ["plan_ready", "abandoned"],
     plan_ready: ["tasks_preview", "ready", "abandoned"],

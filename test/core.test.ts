@@ -99,6 +99,11 @@ test("result contract rejects role payload fields outside the role schema", () =
   if (!result.valid) assert.ok(result.errors.some(({ path, message }) => path === "/payload" && message === "must NOT have additional properties"));
 });
 
+test("task revisions can take the managed draft to plan_ready transition", () => {
+  assert.equal(nextPlanState("draft", "plan_ready"), "plan_ready");
+  assert.doesNotThrow(() => assertRevisionRunStage("draft", "tasks_preview", "plan_ready"));
+});
+
 test("state migration is recorded once and survives reopening", async () => {
   const home = await temporaryHome();
   let store = await StateStore.open(home);

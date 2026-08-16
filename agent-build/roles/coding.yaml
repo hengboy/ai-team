@@ -8,6 +8,9 @@ commands:
   - context validate
   - dispatch create
   - dispatch claim
+  - dispatch cancel
+  - dispatch reissue
+  - dispatch supersede
   - dispatch prompt
   - dispatch schema
   - dispatch template

@@ -166,7 +166,7 @@ test("planning revision creation enforces task preview approval and preserves re
   const repository = store.db.prepare("SELECT repo_id FROM runs WHERE run_id=?").get(first.run_id) as { repo_id: string };
   const makeRun = (): string => store.createRun({ repoId: repository.repo_id, profile: "planning", mode: "planned", request: "revision approval" });
   const prepare = async (runId: string, documents: unknown, stage: "plan_ready" | "tasks_preview", choice?: "approve" | "revise") => {
-    store.db.prepare("UPDATE runs SET stage=?,state=? WHERE run_id=?").run(stage, choice ? "active" : "needs_decision", runId);
+    store.db.prepare("UPDATE runs SET stage=?,state=? WHERE run_id=?").run(stage, stage === "tasks_preview" && !choice ? "needs_decision" : "active", runId);
     let decisionId: string | undefined;
     if (stage === "tasks_preview") {
       decisionId = store.createDecision(runId, "Approve this task preview?", approvalChoices, "approve", "task_preview");
@@ -230,6 +230,18 @@ test("planning revision creation enforces task preview approval and preserves re
   assert.equal((completedStore.db.prepare("SELECT count(*) AS count FROM revisions WHERE plan_id=?").get(pendingPlanId) as { count: number }).count, 1);
   completedStore.close();
 
+  const transitioned = json<{ state: string; dispatch_id: string }>(await cli(sandbox, [
+    "planning", "revision", "transition", "--project", sandbox.repo, "--plan-id", pendingPlanId,
+    "--revision", "001", "--to", "plan_ready",
+  ]));
+  assert.equal(transitioned.state, "plan_ready");
+  const transitionStore = await StateStore.open(sandbox.aiTeamHome);
+  assert.deepEqual(
+    transitionStore.db.prepare("SELECT role,state FROM dispatches WHERE dispatch_id=?").get(transitioned.dispatch_id),
+    { role: "git-operator", state: "pending" },
+  );
+  transitionStore.close();
+
   const documentsFile = join(sandbox.root, "task-documents.json");
   await writeFile(documentsFile, JSON.stringify(taskDocuments));
   const duplicate = await cli(sandbox, [
@@ -238,6 +250,56 @@ test("planning revision creation enforces task preview approval and preserves re
   ]);
   assert.notEqual(duplicate.status, 0);
   assert.match(duplicate.stderr, /revisions are immutable/);
+});
+
+test("CLI manages cancel, reissue, and supersede for a claimed support dispatch", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const requestFile = join(sandbox.root, "support-request.md");
+  await writeFile(requestFile, "Repair a support dispatch.\n");
+  const started = json<{ run_id: string; dispatch_id: string }>(await cli(sandbox, [
+    "planning", "start", "--project", sandbox.repo, "--request-file", requestFile,
+  ]));
+
+  json(await cli(sandbox, ["dispatch", "claim", "--run-id", started.run_id, "--dispatch-id", started.dispatch_id, "--role", "file-explorer"]));
+  const reissued = json<{ action: string; dispatch_id: string; reused: boolean }>(await cli(sandbox, [
+    "dispatch", "reissue", "--run-id", started.run_id, "--dispatch-id", started.dispatch_id,
+    "--role", "file-explorer", "--actor-role", "planning", "--reason", "repair claimed support dispatch",
+  ]));
+  assert.deepEqual({ action: reissued.action, reused: reissued.reused }, { action: "reissued", reused: false });
+
+  const replacementPacket = JSON.stringify({
+    objective: "Explore corrected support scope",
+    allowed_read_paths: ["src/planning.ts"],
+    allowed_write_paths: [],
+    acceptance_criteria: ["Return corrected project context"],
+    context: {},
+  });
+  const staging = json<{ stagingId: string }>(await cli(sandbox, [
+    "staging", "create", "--run-id", started.run_id, "--role", "planning", "--kind", "dispatch-packet",
+  ]));
+  json(await cliWithInput(sandbox, [
+    "staging", "write", "--run-id", started.run_id, "--role", "planning", "--staging-id", staging.stagingId, "--input-stdin",
+  ], replacementPacket));
+  const superseded = json<{ action: string; dispatch_id: string }>(await cli(sandbox, [
+    "dispatch", "supersede", "--run-id", started.run_id, "--dispatch-id", reissued.dispatch_id,
+    "--role", "file-explorer", "--actor-role", "planning", "--reason", "correct scope", "--staging-id", staging.stagingId,
+  ]));
+  assert.equal(superseded.action, "superseded");
+  assert.deepEqual(json(await cli(sandbox, [
+    "dispatch", "cancel", "--run-id", started.run_id, "--dispatch-id", superseded.dispatch_id,
+    "--role", "file-explorer", "--actor-role", "planning", "--reason", "support no longer required",
+  ])), { action: "canceled", reused: false });
+
+  const store = await StateStore.open(sandbox.aiTeamHome, { readonly: true });
+  assert.deepEqual(
+    store.db.prepare("SELECT dispatch_id,replacement_for,state FROM dispatches WHERE run_id=? ORDER BY created_at").all(started.run_id),
+    [
+      { dispatch_id: started.dispatch_id, replacement_for: null, state: "failed" },
+      { dispatch_id: reissued.dispatch_id, replacement_for: started.dispatch_id, state: "failed" },
+      { dispatch_id: superseded.dispatch_id, replacement_for: reissued.dispatch_id, state: "failed" },
+    ],
+  );
+  store.close();
 });
 
 test("CLI syntax errors use one JSON stderr object and exit code 5", async (t) => {

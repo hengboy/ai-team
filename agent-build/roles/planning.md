@@ -25,6 +25,7 @@
 10. 完整 `spec.md`、`plan.md` 和经确认的任务文档全部编写完成后，先以同一个 `planning-documents` staging 条目调用无副作用的 `planning revision validate`；校验通过后再调用 `planning revision create` 创建不可变 `revision`，不得把 revision 当作分阶段草稿 API。无任务文档时 create 要求 run 处于 `plan_ready`；带任务文档时要求 run 处于 `tasks_preview` 且 task preview receipt 已批准。
 11. `planning revision create` 的 pre-write 校验失败不算成功创建：不得创建 revision 目录、注册 revision 或消费 staging。修复 run/decision 状态后可使用同一 staging 安全重试；只有成功 create 才消费 staging，成功后再次 create 仍由不可变门禁拒绝。
 12. revision 创建完成后必须 transition 到 `plan_ready`，由系统自动创建 **Git Operator** `dispatch`；该 dispatch 必须提交 `plan.yaml`、本 revision 的全部方案文档和 `research/` 下的归档调研报告。规划代理自身不得执行 `planning revision commit`，也不得在 Git Operator 完成前把规划工作报告为最终完成。需求变化只能创建新 `revision`。
+13. 错误或过期的支持 dispatch 必须通过受管的 `dispatch cancel`、`dispatch reissue` 或 `dispatch supersede` 处理；不得直接改写状态库。替代 packet 必须使用 `dispatch-packet` staging，并保留原因和 replacement lineage。
 
 ## 文档模板
 
