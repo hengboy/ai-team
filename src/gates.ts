@@ -1,6 +1,7 @@
 import { ValidationError } from "./errors.js";
 import { StateStore } from "./state.js";
 import { sha256, stableJson } from "./utils.js";
+import { DispatchService } from "./dispatch.js";
 
 export const TRANSIENT_FAILURES = new Set(["network_timeout", "client_process", "temporary_resource"]);
 
@@ -26,14 +27,18 @@ export class ScopeGate {
     const digest = sha256(stableJson(normalized));
     const previous = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type LIKE 'scope.%' ORDER BY event_id").all(runId) as Array<{ payload_json: string }>;
     const existing = previous.map((row) => JSON.parse(row.payload_json) as { stage: ScopeGateStage; digest: string });
-    if (existing.some((item) => item.stage === stage)) throw new ValidationError(`scope gate already recorded: ${stage}`);
     if (existing.some((item) => item.digest !== digest)) {
       this.store.db.prepare("UPDATE runs SET state='frozen',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
       throw new ValidationError("direct scope changed; run frozen and Planning handoff required");
     }
+    if (existing.some((item) => item.stage === stage)) {
+      if (stage === "pre_write") new DispatchService(this.store).ensureGitPrepareDispatch(runId, "implementation");
+      return { digest, complete: stage === "pre_commit" };
+    }
     const order: ScopeGateStage[] = ["triage", "pre_write", "pre_commit"];
     if (existing.length !== order.indexOf(stage)) throw new ValidationError(`scope gate out of order: ${stage}`);
     this.store.event(runId, `scope.${stage}`, { stage, digest, paths: normalized });
+    if (stage === "pre_write") new DispatchService(this.store).ensureGitPrepareDispatch(runId, "implementation");
     return { digest, complete: stage === "pre_commit" };
   }
 

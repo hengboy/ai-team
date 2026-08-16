@@ -27,6 +27,9 @@
 - formal review barrier
 - review reconciliation
 - finalize_integration
+- requirement question numbering
+- phased worktree preparation
+- planning handoff
 
 ### 仓库约束
 - 要求 Node.js >=22.13.0，并必须通过 npm 验证脚本。
@@ -52,6 +55,8 @@
 - `skills/init-ai-team` 负责在目标 Git 项目中初始化并校验 AI Team 的可复用 Codex 工作流。
 - `src/dispatch.ts` 将已完成的评审叶子汇总到所属 barrier，并幂等创建唯一的 review resolution 或最终 Git Operator continuation。
 - `src/review.ts` 提供 barrier 幂等创建，以及按 barrier ID 或 run revision 查询状态。
+- `src/workflow.ts` 负责显式 direct mode 分诊一致性，并将 frozen coding run 原子关联到 planning run，保留原 task worktree 所有权。
+- `src/dispatch.ts` 负责 requirement 问题序号、分阶段 Git prepare、worktree 注册校验及 completed coordinator 的提交 continuation。
 
 ### 模块边界
 - `src/git-orchestrator.ts` 与 `src/git.ts` 负责 run-scoped Git 编排、clean worktree adopt/transfer，并将 task/worktree/integration 身份写入操作证据。
@@ -62,4 +67,6 @@
 - `skills/init-ai-team` 封装公共初始化和上下文校验命令，不改变 CLI 行为。
 - `test/*.test.ts` 包含单元测试、CLI 端到端测试、锁测试、契约测试和工作流回归测试。
 - `src/review.ts` 负责 formal review 绑定和公共状态查询，`src/dispatch.ts` 负责叶子汇总、恢复和 run 阶段推进。
+- `run handoff-to-planning` 只接受无 pending operation 的 frozen coding run；规划 revision 提交 ready 后恢复 source run，旧 pending/claimed dispatch 不得继续授权。
+- `run show` 仅公开协调所需的 run-owned worktree 元数据，不公开其他角色的原始 result 或 staging 内容。
 <!-- ai-team:project-context:end -->

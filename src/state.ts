@@ -254,6 +254,15 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "008-run-planning-handoff",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      const columns = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+      if (!columns.some((column) => column.name === "source_run_id")) db.exec("ALTER TABLE runs ADD COLUMN source_run_id TEXT REFERENCES runs(run_id);");
+      db.exec("CREATE UNIQUE INDEX IF NOT EXISTS one_planning_handoff_per_source ON runs(source_run_id) WHERE source_run_id IS NOT NULL;");
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
@@ -398,17 +407,18 @@ export class StateStore {
     templateDigest?: string;
     implementationBaseCommit?: string;
     planDigest?: string;
+    sourceRunId?: string;
   }): string {
     const runId = makeId("run");
     const now = new Date().toISOString();
     const implementationBaseCommit = input.implementationBaseCommit ?? input.baseCommit ?? null;
     this.db.prepare(`INSERT INTO runs(run_id, repo_id, profile, mode, state, stage, plan_id, revision, base_commit, target_branch, request,
-      client_platform, environment, contract_digest, role_manifest_digest, template_digest, implementation_base_commit, plan_digest, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'active', 'file-explorer', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      client_platform, environment, contract_digest, role_manifest_digest, template_digest, implementation_base_commit, plan_digest, source_run_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'active', 'file-explorer', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       runId, input.repoId, input.profile, input.mode, input.planId ?? null, input.revision ?? null, input.baseCommit ?? null,
       input.targetBranch ?? null, input.request ?? null, input.clientPlatform ?? "codex", input.environment ?? "balanced",
       input.contractDigest ?? CONTRACT_DIGEST, input.roleManifestDigest ?? ROLE_MANIFEST_DIGEST,
-      input.templateDigest ?? AGENT_BUILD.digest, implementationBaseCommit, input.planDigest ?? null, now, now,
+      input.templateDigest ?? AGENT_BUILD.digest, implementationBaseCommit, input.planDigest ?? null, input.sourceRunId ?? null, now, now,
     );
     this.event(runId, "run.created", input);
     return runId;

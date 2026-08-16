@@ -104,7 +104,7 @@ test("state migration is recorded once and survives reopening", async () => {
   try {
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }],
     );
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
@@ -115,7 +115,7 @@ test("state migration is recorded once and survives reopening", async () => {
     store = await StateStore.open(home);
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }],
     );
   } finally {
     store.close();
@@ -132,7 +132,7 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
     try {
       assert.equal(
         (reader.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count,
-        7,
+        8,
       );
       assert.throws(() => reader.db.prepare("UPDATE runs SET state='failed'").run(), /readonly|read-only/i);
     } finally {

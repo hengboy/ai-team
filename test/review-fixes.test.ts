@@ -8,6 +8,7 @@ import test from "node:test";
 import { validateCommand } from "../src/command-contract.js";
 import { checkDecisionInput, checkProjectContext, checkResultEnvelope, createResultTemplate, resultSchemaForRole, ROLE_PAYLOAD_SCHEMAS } from "../src/contracts.js";
 import { DispatchService, type DispatchPacket } from "../src/dispatch.js";
+import { ScopeGate } from "../src/gates.js";
 import { ResearchService } from "../src/research-service.js";
 import type { ResearchConclusion } from "../src/research.js";
 import { ReviewService, type ReviewResult } from "../src/review.js";
@@ -120,6 +121,44 @@ test("an exact File Explorer result creates one planning or coding dispatch and 
         assert.equal(JSON.parse(prepare.packet_json).context.phase, "prepare_worktrees");
       }
     }
+  });
+});
+
+test("direct Git prepare phases require registered run-owned worktrees and defer the task until pre_write", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    dispatches.claim(runId, explorerId, "file-explorer");
+    await dispatches.submitValue(runId, explorerId, "file-explorer", fileExplorerResult(runId, explorerId));
+
+    const integrationPrepare = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator'").get(runId) as { dispatch_id: string };
+    dispatches.claim(runId, integrationPrepare.dispatch_id, "git-operator");
+    const integrationResult = completedResult(runId, integrationPrepare.dispatch_id, "git-operator", {
+      operations: [{ command: "reported both worktrees", outcome: "not authoritative" }],
+    });
+    await assert.rejects(dispatches.submitValue(runId, integrationPrepare.dispatch_id, "git-operator", integrationResult), /registered active integration worktree/);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_phase_integration", runId, "integration/phase/test", `/tmp/${runId}-integration`, REVIEW_HEAD, new Date().toISOString());
+    await dispatches.submitValue(runId, integrationPrepare.dispatch_id, "git-operator", integrationResult);
+
+    const gate = new ScopeGate(store);
+    gate.check(runId, "triage", ["src/dispatch.ts"]);
+    gate.check(runId, "pre_write", ["src/dispatch.ts"]);
+    gate.check(runId, "pre_write", ["src/dispatch.ts"]);
+    const implementationRows = store.db.prepare(`SELECT dispatch_id FROM dispatches
+      WHERE run_id=? AND role='git-operator' AND json_extract(packet_json,'$.context.phase')='prepare_implementation_worktree'`).all(runId) as Array<{ dispatch_id: string }>;
+    assert.equal(implementationRows.length, 1);
+
+    const implementationId = implementationRows[0]!.dispatch_id;
+    dispatches.claim(runId, implementationId, "git-operator");
+    const implementationResult = completedResult(runId, implementationId, "git-operator", {
+      operations: [{ command: "reported task worktree", outcome: "not authoritative" }],
+    });
+    await assert.rejects(dispatches.submitValue(runId, implementationId, "git-operator", implementationResult), /registered active implementation task worktree/);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_phase_implementation", runId, "task/phase/test/implementation", `/tmp/${runId}-implementation`, REVIEW_HEAD, new Date().toISOString());
+    await dispatches.submitValue(runId, implementationId, "git-operator", implementationResult);
   });
 });
 
@@ -492,6 +531,48 @@ test("planning results advance one stage and create at most one matching decisio
     await dispatches.submit(runId, planningId, "planning", resultPath);
     assert.equal(store.getRun(runId).stage, "requirements");
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { count: number }).count, 1);
+    const firstDecision = store.db.prepare("SELECT decision_id,question,decision_type FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; question: string; decision_type: string };
+    assert.equal(firstDecision.question, `问题 1、${question}`);
+    assert.equal(firstDecision.decision_type, "requirement");
+    const secondPlanningId = dispatches.resolveDecision(runId, firstDecision.decision_id, "current");
+    dispatches.claim(runId, secondPlanningId, "planning");
+    const secondQuestion = "Which supported runtime is required?";
+    await dispatches.submitValue(runId, secondPlanningId, "planning", completedResult(runId, secondPlanningId, "planning", {
+      actions: ["clarify runtime"],
+      stage: "requirements",
+      pending_questions: [secondQuestion],
+      decision: {
+        question: secondQuestion,
+        choices: [
+          { id: "current", label: "Current", impact: "No compatibility work" },
+          { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
+        ],
+        recommendation: "current",
+      },
+    }));
+    assert.equal((store.db.prepare("SELECT question FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { question: string }).question, `问题 2、${secondQuestion}`);
+
+    const taskRun = createRun(store, "planning");
+    store.db.prepare("UPDATE runs SET stage='plan_ready' WHERE run_id=?").run(taskRun);
+    const taskPlanningId = dispatches.create(taskRun, "planning", dispatchPacket(), "planning");
+    dispatches.claim(taskRun, taskPlanningId, "planning");
+    const taskQuestion = "Should implementation be split into tasks?";
+    await dispatches.submitValue(taskRun, taskPlanningId, "planning", completedResult(taskRun, taskPlanningId, "planning", {
+      actions: ["confirm task split"],
+      stage: "tasks_preview",
+      pending_questions: [taskQuestion],
+      decision: {
+        question: taskQuestion,
+        choices: [
+          { id: "split", label: "Split", impact: "Creates task documents" },
+          { id: "single", label: "Single", impact: "Keeps one implementation unit" },
+        ],
+        recommendation: "single",
+      },
+    }));
+    const taskDecision = store.db.prepare("SELECT question,decision_type FROM decisions WHERE run_id=?").get(taskRun) as { question: string; decision_type: string };
+    assert.equal(taskDecision.question, taskQuestion);
+    assert.equal(taskDecision.decision_type, "workflow");
 
     const invalidRun = createRun(store, "planning");
     store.db.prepare("UPDATE runs SET stage='planning' WHERE run_id=?").run(invalidRun);
@@ -681,6 +762,57 @@ test("run resume recovers planning idempotently without crossing decisions or op
     assert.equal((failedResult.run as { state: string }).state, "failed");
     assert.deepEqual(store.db.prepare("SELECT COUNT(*) AS count FROM dispatches WHERE run_id=?").get(failedRun), failedBefore);
     assert.equal(failedResult.pending_dispatches.length, 0);
+  });
+});
+
+test("run resume creates one claimed coding continuation before Git commit dispatch", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+    const coordinatorPacket = {
+      ...dispatchPacket(["src/dispatch.ts", "test/review-fixes.test.ts"]),
+      context: { explorer_dispatch_id: explorerId },
+    };
+    const codingId = dispatches.create(runId, "coding", coordinatorPacket);
+    dispatches.claim(runId, codingId, "coding");
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_resume_commit", runId, "task/resume/implementation", `/tmp/${runId}-resume`, REVIEW_HEAD, new Date().toISOString());
+    const developerId = dispatches.create(runId, "backend-developer", {
+      ...coordinatorPacket,
+      allowed_write_paths: ["src/dispatch.ts"],
+      context: { explorer_dispatch_id: explorerId, worktree_id: "worktree_resume_commit" },
+    }, "coding", codingId);
+    dispatches.claim(runId, developerId, "backend-developer");
+    await dispatches.submitValue(runId, codingId, "coding", completedResult(runId, codingId, "coding", { actions: ["dispatch implementation"] }));
+    await dispatches.submitValue(runId, developerId, "backend-developer", completedResult(runId, developerId, "backend-developer", {
+      modified_paths: ["src/dispatch.ts"], self_tests: [{ command: "npm test", outcome: "passed" }],
+    }));
+    for (const stage of ["triage", "pre_write", "pre_commit"] as const) {
+      store.event(runId, `scope.${stage}`, { stage, digest: "stable-scope", paths: ["src/dispatch.ts"] });
+    }
+
+    assert.throws(() => dispatches.create(runId, "git-operator", dispatchPacket(), "coding", codingId), /coding dispatch must be claimed/);
+    const first = dispatches.resume(runId);
+    const second = dispatches.resume(runId);
+    assert.equal(first.pending_dispatches.length, 1);
+    assert.deepEqual(second.pending_dispatches, first.pending_dispatches);
+    const continuationId = first.pending_dispatches[0]!.dispatch_id;
+    const continuation = store.db.prepare("SELECT replacement_for,packet_json FROM dispatches WHERE dispatch_id=?").get(continuationId) as { replacement_for: string; packet_json: string };
+    assert.equal(continuation.replacement_for, codingId);
+    assert.equal(JSON.parse(continuation.packet_json).context.phase, "continue_commit");
+
+    dispatches.claim(runId, continuationId, "coding");
+    const gitId = dispatches.create(runId, "git-operator", {
+      objective: "Commit the resumed task worktree",
+      allowed_read_paths: ["src/dispatch.ts"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Commit the authorized task changes"],
+      context: { explorer_dispatch_id: explorerId, worktree_id: "worktree_resume_commit", phase: "commit_implementation" },
+    }, "coding", continuationId);
+    assert.match(gitId, /^dispatch_[0-9A-HJKMNP-TV-Z]{26}$/);
   });
 });
 

@@ -339,6 +339,7 @@ export const buildProgram = (): Command => {
       if (run.state !== "active") throw new ValidationError("planning run must be active before revision commit");
       const row = store.db.prepare("SELECT * FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?").get(repo.repoId, options.planId, options.revision) as { state: string; digest?: string; plan_commit?: string } | undefined;
       if (!row || !["plan_ready", "tasks_preview", "ready"].includes(row.state) || !row.digest) throw new ValidationError("planning revision is not ready to commit");
+      const revisionDigest = row.digest;
       assertRevisionRunStage(row.state, run.stage, "ready");
       const operationRequest: PlanningCommitRequest = {
         repo_id: repo.repoId,
@@ -411,6 +412,7 @@ export const buildProgram = (): Command => {
         store.db.prepare("UPDATE revisions SET state='ready',plan_commit=? WHERE repo_id=? AND plan_id=? AND revision=?").run(commit, repo.repoId, options.planId, options.revision);
         store.db.prepare("UPDATE runs SET stage='ready',updated_at=? WHERE run_id=?").run(new Date().toISOString(), options.runId);
         store.event(options.runId, "planning.revision_committed", { planId: options.planId, revision: options.revision, commit });
+        new WorkflowService(store).completePlanningHandoff(options.runId, options.planId, options.revision, revisionDigest, commit);
         store.finishOperation(operation.operationId, { state: "ready", plan_commit: commit });
       })();
       return { state: "ready", plan_commit: commit, operation_id: operation.operationId, reused: false };
@@ -449,7 +451,12 @@ export const buildProgram = (): Command => {
     });
 
   const run = program.command("run");
-  run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), review_barrier: new ReviewService(store).current(runId), events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId), decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId), dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId) }), { readonly: true })));
+  run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), review_barrier: new ReviewService(store).current(runId), events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId), decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId), dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId), worktrees: store.db.prepare("SELECT worktree_id,branch,path,base_commit,state,adopted_from_run_id FROM worktrees WHERE run_id=? ORDER BY created_at,worktree_id").all(runId) }), { readonly: true })));
+  requestOptions(run.command("handoff-to-planning").argument("<run-id>"))
+    .action(async (runId, options) => {
+      const request = await WorkflowService.requestFrom(options.requestFile, options.requestStdin);
+      output(await withStore((store) => new WorkflowService(store).handoffToPlanning(runId, request)));
+    });
   run.command("resume").argument("<run-id>").action(async (runId) => output(await withStore((store) => new DispatchService(store).resume(runId))));
   run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined; const dispatchId = new DispatchService(store).resolveDecision(options.runId, options.decisionId, options.choice, note); output({ status: "resolved", dispatch_id: dispatchId }); }));
 

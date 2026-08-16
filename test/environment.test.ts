@@ -252,6 +252,9 @@ test("planning and coding coordinate managed staging for every generated JSON", 
 
   assert.match(planning, /每个规划 JSON.*staging create.*staging write --input-stdin.*--staging-id/s);
   assert.match(planning, /planning-documents.*planning revision create/s);
+  assert.match(planning, /问题 1、.*问题 2、.*从 1 递增/s);
+  assert.match(planning, /transition 到 `plan_ready`.*自动创建 \*\*Git Operator\*\* `dispatch`/s);
+  assert.match(planning, /归档调研报告/);
   assert.match(coding, /每个调度、结果、决策和评审 JSON.*staging create.*staging write --input-stdin.*--staging-id/s);
   assert.match(coding, /要求下游角色遵循同一流程/);
 });

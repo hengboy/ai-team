@@ -490,11 +490,13 @@ test("bug and feature coding modes require a request and capture their Git basel
       /forbids plan-id and revision/,
     );
 
-    const bug = await workflow.codingStart({ project: repository.directory, mode: "bug", request: "Fix REQ-001" });
-    const feature = await workflow.codingStart({ project: repository.directory, mode: "feature", request: "Add AC-001" });
+    const bugRequest = "actual: command fails\nexpected: command succeeds\nevidence: failing CLI test";
+    const featureRequest = "goal: add command\nacceptance: exits zero\nscope: src/cli.ts\nmodule: cli";
+    const bug = await workflow.codingStart({ project: repository.directory, mode: "bug", request: bugRequest });
+    const feature = await workflow.codingStart({ project: repository.directory, mode: "feature", request: featureRequest });
     const cases: Array<[string, "bug" | "feature", string]> = [
-      [bug.run_id, "bug", "Fix REQ-001"],
-      [feature.run_id, "feature", "Add AC-001"],
+      [bug.run_id, "bug", bugRequest],
+      [feature.run_id, "feature", featureRequest],
     ];
     for (const [runId, mode, request] of cases) {
       const run = store.getRun(runId);
@@ -503,6 +505,51 @@ test("bug and feature coding modes require a request and capture their Git basel
       assert.equal(run.target_branch, "main");
       assert.equal(run.base_commit, repository.head);
     }
+    await assert.rejects(
+      () => workflow.codingStart({ project: repository.directory, mode: "bug", request: featureRequest }),
+      /does not match inferred feature; planning required/,
+    );
+    await assert.rejects(
+      () => workflow.codingStart({ project: repository.directory, mode: "feature", request: bugRequest }),
+      /does not match inferred bug; planning required/,
+    );
+  } finally {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+    await rm(repository.directory, { recursive: true, force: true });
+  }
+});
+
+test("frozen coding runs hand off to one linked planning run without transferring task worktrees", async () => {
+  const repository = await createRepository();
+  const { store, home } = await openStore();
+  try {
+    const workflow = new WorkflowService(store);
+    const started = await workflow.codingStart({
+      project: repository.directory,
+      mode: "bug",
+      request: "actual: scope drift\nexpected: planning reconciliation\nevidence: frozen run",
+    });
+    const now = new Date().toISOString();
+    store.db.prepare("UPDATE runs SET state='frozen' WHERE run_id=?").run(started.run_id);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_handoff", started.run_id, "task/direct/handoff/implementation", path.join(repository.directory, ".worktree", "handoff"), repository.head, now);
+
+    const first = workflow.handoffToPlanning(started.run_id, "Reconcile the frozen scope through Planning.");
+    const second = workflow.handoffToPlanning(started.run_id, "Reconcile the frozen scope through Planning.");
+    assert.equal(first.reused, false);
+    assert.equal(second.reused, true);
+    assert.equal(second.run_id, first.run_id);
+    assert.equal(store.getRun(first.run_id).source_run_id, started.run_id);
+    assert.equal((store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id='worktree_handoff'").get() as { run_id: string }).run_id, started.run_id);
+    assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(started.dispatch_id) as { state: string }).state, "failed");
+    assert.equal(workflow.completePlanningHandoff(first.run_id, "20260816-handoff-abcd", "001", "digest", "a".repeat(40)), started.run_id);
+    const resumed = store.getRun(started.run_id);
+    assert.equal(resumed.state, "active");
+    assert.equal(resumed.stage, "coding");
+    assert.equal(resumed.plan_id, "20260816-handoff-abcd");
+    assert.equal(resumed.revision, "001");
+    assert.equal((store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id='worktree_handoff'").get() as { run_id: string }).run_id, started.run_id);
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });

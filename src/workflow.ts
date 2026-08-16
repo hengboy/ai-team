@@ -33,6 +33,58 @@ export class WorkflowService {
     return { run_id: runId, dispatch_id: dispatchId };
   }
 
+  handoffToPlanning(sourceRunId: string, request: string): { run_id: string; dispatch_id: string; source_run_id: string; reused: boolean } {
+    if (!request.trim()) throw new ValidationError("planning handoff request cannot be empty");
+    return this.store.db.transaction(() => {
+      const source = this.store.getRun(sourceRunId) as { repo_id: string; profile: string; state: string; target_branch?: string; base_commit?: string };
+      if (source.profile !== "coding" || source.state !== "frozen") throw new ValidationError("planning handoff requires a frozen coding run");
+      const pendingOperation = this.store.db.prepare("SELECT operation_id FROM operations WHERE run_id=? AND state='pending'").get(sourceRunId) as { operation_id: string } | undefined;
+      if (pendingOperation) throw new ValidationError(`planning handoff requires operation reconciliation: ${pendingOperation.operation_id}`);
+      const worktrees = this.store.db.prepare("SELECT worktree_id,branch,path,base_commit,state FROM worktrees WHERE run_id=? AND state='active' ORDER BY created_at").all(sourceRunId) as Array<Record<string, unknown>>;
+      if (!worktrees.some((worktree) => String(worktree.branch).startsWith("task/"))) throw new ValidationError("planning handoff requires an active task worktree to preserve");
+      const existing = this.store.db.prepare("SELECT run_id FROM runs WHERE source_run_id=?").get(sourceRunId) as { run_id: string } | undefined;
+      if (existing) {
+        const dispatch = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? ORDER BY created_at LIMIT 1").get(existing.run_id) as { dispatch_id: string };
+        return { run_id: existing.run_id, dispatch_id: dispatch.dispatch_id, source_run_id: sourceRunId, reused: true };
+      }
+      const runId = this.store.createRun({
+        repoId: source.repo_id,
+        profile: "planning",
+        mode: "planned",
+        ...(source.target_branch ? { targetBranch: source.target_branch } : {}),
+        ...(source.base_commit ? { baseCommit: source.base_commit } : {}),
+        request,
+        clientPlatform: clientPlatform(),
+        sourceRunId,
+      });
+      const dispatchId = this.dispatches.create(runId, "file-explorer", {
+        objective: "Reconcile the frozen source run through Planning while preserving its managed task worktrees.",
+        allowed_read_paths: ["."],
+        allowed_write_paths: [],
+        acceptance_criteria: ["Produce a planning revision linked to the frozen source run", "Preserve every source worktree and its audit identity"],
+        context: { request, source_run_id: sourceRunId, preserved_worktrees: worktrees },
+      }, "planning");
+      const now = new Date().toISOString();
+      this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE run_id=? AND state IN ('pending','claimed')").run(now, sourceRunId);
+      this.store.event(sourceRunId, "run.planning_handoff_started", { planning_run_id: runId, preserved_worktree_ids: worktrees.map((worktree) => worktree.worktree_id) });
+      this.store.event(runId, "planning.source_run_linked", { source_run_id: sourceRunId, preserved_worktree_ids: worktrees.map((worktree) => worktree.worktree_id) });
+      return { run_id: runId, dispatch_id: dispatchId, source_run_id: sourceRunId, reused: false };
+    })();
+  }
+
+  completePlanningHandoff(planningRunId: string, planId: string, revision: string, planDigest: string, planCommit: string): string | undefined {
+    const planningRun = this.store.getRun(planningRunId) as { profile: string; source_run_id?: string };
+    if (planningRun.profile !== "planning" || !planningRun.source_run_id) return undefined;
+    const source = this.store.getRun(planningRun.source_run_id) as { profile: string; state: string };
+    if (source.profile !== "coding" || !["frozen", "active"].includes(source.state)) throw new ValidationError("planning handoff source is not a recoverable coding run");
+    if (source.state === "active") return planningRun.source_run_id;
+    this.store.db.prepare("UPDATE runs SET state='active',stage='coding',plan_id=?,revision=?,plan_digest=?,updated_at=? WHERE run_id=? AND state='frozen'")
+      .run(planId, revision, planDigest, new Date().toISOString(), planningRun.source_run_id);
+    this.store.event(planningRun.source_run_id, "run.planning_handoff_completed", { planning_run_id: planningRunId, plan_id: planId, revision, plan_commit: planCommit });
+    this.store.event(planningRunId, "planning.source_run_resumed", { source_run_id: planningRun.source_run_id });
+    return planningRun.source_run_id;
+  }
+
   async bindPlanningRevision(runId: string, project: string, planId: string, revision: string): Promise<void> {
     const repo = await repositoryIdentity(project);
     this.store.bindPlanningRevision(runId, repo.repoId, planId, revision);
@@ -60,6 +112,8 @@ export class WorkflowService {
     } else {
       if (input.planId || input.revision) throw new ValidationError(`${input.mode} mode forbids plan-id and revision`);
       if (!input.request?.trim()) throw new ValidationError(`${input.mode} mode requires request input`);
+      const inferred = triageRequest(input.request);
+      if (inferred !== input.mode) throw new ValidationError(`explicit ${input.mode} mode does not match inferred ${inferred}; planning required`);
     }
     this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
     const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}), clientPlatform: clientPlatform() });

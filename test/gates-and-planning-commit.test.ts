@@ -31,11 +31,22 @@ test("direct scope passes three matching gates and freezes on drift", async () =
     const gate = new ScopeGate(store);
     assert.equal(gate.check(run, "triage", ["src/**"]).complete, false);
     assert.equal(gate.check(run, "pre_write", ["src/**"]).complete, false);
-    assert.equal(gate.check(run, "pre_commit", ["src/**"]).complete, true);
+    assert.equal(gate.check(run, "pre_write", ["src/**"]).complete, false);
+    const prepares = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='git-operator'").all(run) as Array<{ packet_json: string }>;
+    assert.equal(prepares.length, 1);
+    assert.equal(JSON.parse(prepares[0]!.packet_json).context.phase, "prepare_implementation_worktree");
+    const completed = gate.check(run, "pre_commit", ["src/**"]);
+    assert.equal(completed.complete, true);
+    const eventCount = store.db.prepare("SELECT COUNT(*) AS count FROM run_events WHERE run_id=? AND type LIKE 'scope.%'").get(run) as { count: number };
+    assert.deepEqual(gate.check(run, "pre_commit", ["src/**"]), completed);
+    assert.equal((store.db.prepare("SELECT COUNT(*) AS count FROM run_events WHERE run_id=? AND type LIKE 'scope.%'").get(run) as { count: number }).count, eventCount.count);
     const drifted = store.createRun({ repoId: "repo", profile: "coding", mode: "bug" });
     gate.check(drifted, "triage", ["src/a.ts"]);
-    await assert.rejects(async () => gate.check(drifted, "pre_write", ["src/b.ts"]), /run frozen/);
+    await assert.rejects(async () => gate.check(drifted, "triage", ["src/b.ts"]), /run frozen/);
     assert.equal(store.getRun(drifted).state, "frozen");
+    const outOfOrder = store.createRun({ repoId: "repo", profile: "coding", mode: "feature" });
+    gate.check(outOfOrder, "triage", ["src/**"]);
+    await assert.rejects(async () => gate.check(outOfOrder, "pre_commit", ["src/**"]), /scope gate out of order: pre_commit/);
   } finally { store.close(); await rm(home, { recursive: true, force: true }); }
 });
 

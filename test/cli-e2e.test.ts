@@ -900,7 +900,8 @@ test("run show opens read-only while a writer lock is held and creates no backup
 test("direct coding rejects a dirty repository before creating a run and starts when clean", async (t) => {
   const sandbox = await makeSandbox(t);
   const requestFile = join(sandbox.root, "request.md");
-  await writeFile(requestFile, "Fix the reproducible CLI issue.\n");
+  const request = "actual: command fails\nexpected: command succeeds\nevidence: reproducible CLI test\n";
+  await writeFile(requestFile, request);
   const dirtyFile = join(sandbox.repo, "dirty.txt");
   await writeFile(dirtyFile, "uncommitted\n");
 
@@ -933,7 +934,7 @@ test("direct coding rejects a dirty repository before creating a run and starts 
   );
   assert.equal(shown.run.profile, "coding");
   assert.equal(shown.run.mode, "bug");
-  assert.equal(shown.run.request, "Fix the reproducible CLI issue.\n");
+  assert.equal(shown.run.request, request);
   assert.match(shown.run.base_commit, /^[a-f0-9]{40}$/);
 });
 
