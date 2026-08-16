@@ -271,6 +271,8 @@ test("planning remains coordinator while delegating claimed File Explorer dispat
     const extension = platform === "codex" ? "toml" : "md";
     const planning = files.get(`${platform}/agents/planning.${extension}`) ?? "";
     assert.match(planning, /协调动作.*不会把规划主代理切换成 `file-explorer`/s);
+    assert.match(planning, /dispatch claim\/prompt\/schema\/template\/validate\/submit.*`--role`.*目标 dispatch 的角色 `file-explorer`.*不得使用.*`planning`/s);
+    assert.match(planning, /ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role file-explorer/);
     assert.match(planning, /同一轮取得.*冻结 prompt、schema 和 template.*立即委派给真实的 \*\*File Explorer\*\*/s);
     assert.match(planning, /不得只汇报.*将要取得或委派.*便停止并等待用户推动/s);
   }
