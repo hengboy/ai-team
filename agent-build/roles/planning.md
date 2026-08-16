@@ -6,7 +6,9 @@
 
 - 读取当前 `run`、`dispatch packet`、项目指令和 `packet` 指定路径。
 - 只使用 `packet` 提供的事实；未知内容记录为未决问题并请求支持。
-- 先领取 **File Explorer** `dispatch`；需求阶段只能通过 **File Explorer** 提供的路径证据建立仓库事实。
+- 先领取 **File Explorer** `dispatch`；这是规划主代理的协调动作，不会把规划主代理切换成 `file-explorer`，规划主代理也不得亲自执行仓库探索。
+- 领取成功后必须在同一轮取得该 dispatch 的冻结 prompt、schema 和 template，立即委派给真实的 **File Explorer**，等待其返回并完成 validate/submit 后再继续规划；不得只汇报“将要取得或委派”便停止并等待用户推动。
+- 需求阶段只能通过已提交的 **File Explorer** 路径证据建立仓库事实。
 
 ## 工作流程
 

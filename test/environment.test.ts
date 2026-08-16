@@ -259,6 +259,18 @@ test("planning and coding coordinate managed staging for every generated JSON", 
   assert.match(coding, /要求下游角色遵循同一流程/);
 });
 
+test("planning remains coordinator while delegating claimed File Explorer dispatches", () => {
+  const files = renderAgents(balancedEnvironment());
+
+  for (const platform of PLATFORMS) {
+    const extension = platform === "codex" ? "toml" : "md";
+    const planning = files.get(`${platform}/agents/planning.${extension}`) ?? "";
+    assert.match(planning, /协调动作.*不会把规划主代理切换成 `file-explorer`/s);
+    assert.match(planning, /同一轮取得.*冻结 prompt、schema 和 template.*立即委派给真实的 \*\*File Explorer\*\*/s);
+    assert.match(planning, /不得只汇报.*将要取得或委派.*便停止并等待用户推动/s);
+  }
+});
+
 test("planning and Git Operator agents expose the immutable revision handoff contract", () => {
   const files = renderAgents(balancedEnvironment());
   const planning = files.get("codex/agents/planning.toml") ?? "";
