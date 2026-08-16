@@ -134,6 +134,112 @@ test("CLI JSON output is stable by default and exposes top-level fields only in 
   assert.equal(error.ok, false);
 });
 
+test("planning revision creation enforces task preview approval and preserves retry state", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const requestFile = join(sandbox.root, "planning-request.md");
+  await writeFile(requestFile, "Plan revision approval recovery.\n");
+  const first = json<{ run_id: string }>(await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]));
+
+  const spec = [
+    "# Spec", "## 背景", "背景", "## 目标", "目标", "## 非目标", "无", "## 用户场景", "场景",
+    "## 功能需求", "REQ-001", "## 验收标准", "AC-001", "## 数据与接口", "无", "## 兼容约束", "无",
+    "## 安全约束", "无", "## 错误与边界", "无", "## 迁移发布回滚", "回滚", "## 已确认偏好", "无",
+    "## 默认取舍", "无", "## 已关闭问题", "无", "## 未决问题", "无",
+  ].join("\n");
+  const plan = (coverage: string) => [
+    "# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", coverage,
+    "## 验证", "验证", "## 发布与回滚", "回滚",
+  ].join("\n");
+  const simpleDocuments = { spec, plan: plan("REQ-001 AC-001") };
+  const taskDocuments = {
+    spec,
+    plan: plan("REQ-001"),
+    tasks: "# Tasks\nAC-001\nTASK-001",
+    taskFiles: { "TASK-001": "# TASK-001\nREQ-001\nAC-001" },
+  };
+  const approvalChoices = [
+    { id: "approve", label: "Approve", impact: "Create task documents" },
+    { id: "revise", label: "Revise", impact: "Require another preview" },
+  ];
+
+  const store = await StateStore.open(sandbox.aiTeamHome);
+  const repository = store.db.prepare("SELECT repo_id FROM runs WHERE run_id=?").get(first.run_id) as { repo_id: string };
+  const makeRun = (): string => store.createRun({ repoId: repository.repo_id, profile: "planning", mode: "planned", request: "revision approval" });
+  const prepare = async (runId: string, documents: unknown, stage: "plan_ready" | "tasks_preview", choice?: "approve" | "revise") => {
+    store.db.prepare("UPDATE runs SET stage=?,state=? WHERE run_id=?").run(stage, choice ? "active" : "needs_decision", runId);
+    let decisionId: string | undefined;
+    if (stage === "tasks_preview") {
+      decisionId = store.createDecision(runId, "Approve this task preview?", approvalChoices, "approve", "task_preview");
+      if (choice) store.decide(runId, decisionId, choice);
+    }
+    const staging = await store.createStagingEntry({ runId, role: "planning", kind: "planning-documents", initialJson: JSON.stringify(documents) });
+    return { decisionId, stagingId: staging.stagingId };
+  };
+  const noTaskRun = makeRun();
+  const noTask = await prepare(noTaskRun, simpleDocuments, "plan_ready");
+  const pendingRun = makeRun();
+  const pending = await prepare(pendingRun, taskDocuments, "tasks_preview");
+  const reviseRun = makeRun();
+  const revise = await prepare(reviseRun, taskDocuments, "tasks_preview", "revise");
+  store.close();
+
+  const args = (command: "validate" | "create", planId: string, runId: string, stagingId: string) => [
+    "planning", "revision", command, "--project", sandbox.repo, "--plan-id", planId, "--revision", "001",
+    "--target-branch", "main", "--run-id", runId, "--staging-id", stagingId,
+  ];
+  const noTaskResult = json<{ path: string }>(await cli(sandbox, args("create", "20260816-no-task", noTaskRun, noTask.stagingId)));
+  assert.equal(noTaskResult.path, join(sandbox.repo, ".ai-team", "plans", "20260816-no-task", "revisions", "001"));
+
+  const pendingPlanId = "20260816-pending-task";
+  const pendingPath = join(sandbox.repo, ".ai-team", "plans", pendingPlanId, "revisions", "001");
+  const pendingValidation = await cli(sandbox, args("validate", pendingPlanId, pendingRun, pending.stagingId));
+  assert.notEqual(pendingValidation.status, 0);
+  assert.match(pendingValidation.stderr, /task preview decision must be resolved/);
+  const pendingCreate = await cli(sandbox, args("create", pendingPlanId, pendingRun, pending.stagingId));
+  assert.notEqual(pendingCreate.status, 0);
+  assert.match(pendingCreate.stderr, /task preview decision must be resolved/);
+  await assert.rejects(stat(pendingPath), { code: "ENOENT" });
+
+  const revisePlanId = "20260816-revise-task";
+  const reviseCreate = await cli(sandbox, args("create", revisePlanId, reviseRun, revise.stagingId));
+  assert.notEqual(reviseCreate.status, 0);
+  assert.match(reviseCreate.stderr, /task preview must be approved/);
+  await assert.rejects(stat(join(sandbox.repo, ".ai-team", "plans", revisePlanId, "revisions", "001")), { code: "ENOENT" });
+
+  const retryStore = await StateStore.open(sandbox.aiTeamHome);
+  assert.equal((retryStore.db.prepare("SELECT count(*) AS count FROM revisions WHERE plan_id IN (?,?)").get(pendingPlanId, revisePlanId) as { count: number }).count, 0);
+  assert.equal(retryStore.getStagingEntry(pending.stagingId).state, "draft");
+  assert.equal(retryStore.getStagingEntry(revise.stagingId).state, "draft");
+  retryStore.decide(pendingRun, pending.decisionId!, "approve");
+  retryStore.db.prepare("UPDATE runs SET state='active' WHERE run_id=?").run(pendingRun);
+  retryStore.close();
+
+  const validation = json<{ path: string; digest: string; valid: boolean }>(await cli(sandbox, args("validate", pendingPlanId, pendingRun, pending.stagingId)));
+  assert.equal(validation.valid, true);
+  await assert.rejects(stat(pendingPath), { code: "ENOENT" });
+  const validatedStore = await StateStore.open(sandbox.aiTeamHome);
+  assert.equal(validatedStore.getStagingEntry(pending.stagingId).state, "draft");
+  assert.equal((validatedStore.db.prepare("SELECT count(*) AS count FROM revisions WHERE plan_id=?").get(pendingPlanId) as { count: number }).count, 0);
+  validatedStore.close();
+
+  json(await cli(sandbox, args("create", pendingPlanId, pendingRun, pending.stagingId)));
+  assert.match(await readFile(join(pendingPath, "tasks.md"), "utf8"), /TASK-001/);
+  assert.match(await readFile(join(pendingPath, "tasks", "TASK-001.md"), "utf8"), /AC-001/);
+  const completedStore = await StateStore.open(sandbox.aiTeamHome);
+  assert.equal(completedStore.getStagingEntry(pending.stagingId).state, "consumed");
+  assert.equal((completedStore.db.prepare("SELECT count(*) AS count FROM revisions WHERE plan_id=?").get(pendingPlanId) as { count: number }).count, 1);
+  completedStore.close();
+
+  const documentsFile = join(sandbox.root, "task-documents.json");
+  await writeFile(documentsFile, JSON.stringify(taskDocuments));
+  const duplicate = await cli(sandbox, [
+    "planning", "revision", "create", "--project", sandbox.repo, "--plan-id", pendingPlanId, "--revision", "001",
+    "--target-branch", "main", "--run-id", pendingRun, "--documents-file", documentsFile,
+  ]);
+  assert.notEqual(duplicate.status, 0);
+  assert.match(duplicate.stderr, /revisions are immutable/);
+});
+
 test("CLI syntax errors use one JSON stderr object and exit code 5", async (t) => {
   const sandbox = await makeSandbox(t);
   const cases = [
@@ -502,7 +608,7 @@ test("planning revision commit rejects a claimed Git Operator dispatch for anoth
   const started = json<{ run_id: string }>(
     await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]),
   );
-  const planId = "20260814-guarded-abcd";
+  const planId = "20260814-guarded";
   const revision = "001";
   const foreignDispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAW";
   const databasePath = join(sandbox.aiTeamHome, "state", "state.sqlite");
@@ -519,10 +625,10 @@ test("planning revision commit rejects a claimed Git Operator dispatch for anoth
     "git-operator",
     JSON.stringify({
       objective: "Commit another planning revision",
-      allowed_read_paths: [".ai-team/plans/20260814-other-abcd/revisions/002"],
+      allowed_read_paths: [".ai-team/plans/20260814-other/revisions/002"],
       allowed_write_paths: [],
       acceptance_criteria: ["Commit the other revision"],
-      context: { plan_id: "20260814-other-abcd", revision: "002" },
+      context: { plan_id: "20260814-other", revision: "002" },
     }),
     "",
     "{}",
@@ -560,7 +666,7 @@ test("planning revision commit leaves a recoverable pending operation and blocks
   const started = json<{ run_id: string }>(
     await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]),
   );
-  const planId = "20260814-operation-abcd";
+  const planId = "20260814-operation";
   const revision = "001";
   const dispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAX";
   const digest = "b".repeat(64);
@@ -660,7 +766,7 @@ test("completed planning commit reconciliation converges state, validates owners
   const otherStarted = json<{ run_id: string }>(
     await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]),
   );
-  const planId = "20260814-reconciled-abcd";
+  const planId = "20260814-reconciled";
   const revision = "001";
   const dispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAZ";
   const otherDispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FB0";
@@ -761,7 +867,7 @@ test("planning revision commit completes its operation atomically and reuses the
   const started = json<{ run_id: string }>(
     await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]),
   );
-  const planId = "20260814-idempotent-abcd";
+  const planId = "20260814-idempotent";
   const revision = "001";
   const dispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAY";
   const digest = "c".repeat(64);
@@ -837,7 +943,7 @@ test("planning revision transition recovers plan-ready run from spec-ready revis
   const started = json<{ run_id: string }>(
     await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]),
   );
-  const planId = "20260814-recovery-abcd";
+  const planId = "20260814-recovery";
   const revision = "001";
   const databasePath = join(sandbox.aiTeamHome, "state", "state.sqlite");
   const database = new Database(databasePath);

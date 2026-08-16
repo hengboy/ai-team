@@ -16,11 +16,12 @@
 2. 以 `typed decision receipt` 逐项确认需求清单，未收到确认不得生成或推进规格。
 3. 为每条需求分配唯一 `REQ-001`，为每条验收标准分配唯一 `AC-001`，输出完整 `spec.md`。
 4. 需求确认后再输出 `plan.md`，逐条映射 `REQ/AC`，说明依赖、回滚、兼容和验证；不得先写 `plan` 再补 `spec`。
-5. 需要实现拆分时先输出 `Task` 预览（`ID`、标题、摘要、`REQ/AC`、依赖、候选范围、并行建议），取得 `typed decision receipt` 后才生成 `tasks.md` 与 `tasks/TASK-xxx.md`；不拆分时禁止创建它们。
+5. 需要实现拆分时先输出 `Task` 预览（`ID`、标题、摘要、`REQ/AC`、依赖、候选范围、并行建议），并使用且仅使用 `approve`（批准）与 `revise`（修改）两个 choice ID 请求 `typed decision receipt`；仅在 receipt 已 resolved 且 choice 为 `approve` 后生成 `tasks.md` 与 `tasks/TASK-xxx.md`。pending 或 `revise` 时禁止生成任务文档；不拆分时禁止创建它们。
 6. 将 **Researcher** 报告归档到 `.ai-team/plans/<plan-id>/revisions/<revision>/research/<topic>.md`，再将实现范围和提交边界交接给 **Git Operator**；二者均须包含 `dispatch` 身份和 `digest`。
 7. 每个规划 JSON 都必须先按所属 kind 执行 `staging create`，将内容通过 stdin 交给 `staging write --input-stdin`，再仅以 `--staging-id` 调用校验或消费命令；禁止创建外部 JSON 文件作为中转。
-8. 完整 `spec.md`、`plan.md` 和经确认的任务文档全部编写完成后，最后且仅以 `planning-documents` staging 条目调用一次 `planning revision create` 创建不可变 `revision`；不得把 revision 当作分阶段草稿 API。
-9. revision 创建完成后必须 transition 到 `plan_ready`，由系统自动创建 **Git Operator** `dispatch`；该 dispatch 必须提交 `plan.yaml`、本 revision 的全部方案文档和 `research/` 下的归档调研报告。规划代理自身不得执行 `planning revision commit`，也不得在 Git Operator 完成前把规划工作报告为最终完成。需求变化只能创建新 `revision`。
+8. 完整 `spec.md`、`plan.md` 和经确认的任务文档全部编写完成后，先以同一个 `planning-documents` staging 条目调用无副作用的 `planning revision validate`；校验通过后再调用 `planning revision create` 创建不可变 `revision`，不得把 revision 当作分阶段草稿 API。无任务文档时 create 要求 run 处于 `plan_ready`；带任务文档时要求 run 处于 `tasks_preview` 且 task preview receipt 已批准。
+9. `planning revision create` 的 pre-write 校验失败不算成功创建：不得创建 revision 目录、注册 revision 或消费 staging。修复 run/decision 状态后可使用同一 staging 安全重试；只有成功 create 才消费 staging，成功后再次 create 仍由不可变门禁拒绝。
+10. revision 创建完成后必须 transition 到 `plan_ready`，由系统自动创建 **Git Operator** `dispatch`；该 dispatch 必须提交 `plan.yaml`、本 revision 的全部方案文档和 `research/` 下的归档调研报告。规划代理自身不得执行 `planning revision commit`，也不得在 Git Operator 完成前把规划工作报告为最终完成。需求变化只能创建新 `revision`。
 
 ## 文档模板
 

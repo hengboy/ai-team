@@ -13,7 +13,7 @@ import { commitPlanningRevision, repositoryIdentity, worktreeStatus } from "./gi
 import { GitOrchestrator } from "./git-orchestrator.js";
 import { ScopeGate } from "./gates.js";
 import { runnableTaskBatches, validateTaskPreview, type TaskDefinition } from "./tasks.js";
-import { assertRevisionRunStage, writeRevision, nextPlanState, type RevisionDocuments } from "./planning.js";
+import { assertRevisionCreateRunStage, assertRevisionDocuments, assertRevisionRunStage, hasTaskDocuments, preflightRevision, writeRevision, nextPlanState, type RevisionDocuments } from "./planning.js";
 import { initializeProject } from "./project.js";
 import { updateProjectContext, validateProjectContext } from "./context.js";
 import { ReviewService, type FindingResolution, type ReviewResult } from "./review.js";
@@ -187,6 +187,7 @@ interface JsonInput {
   dispatchId?: string | null;
   role?: Role;
   kind: StagingKind;
+  readOnly?: boolean;
 }
 
 interface LoadedJson {
@@ -216,9 +217,9 @@ const loadJsonInput = async (store: StateStore, input: JsonInput, retentionHours
   };
   const stagingId = input.stagingId!;
   let loaded;
-  try { loaded = await store.readStagingEntry(stagingId, binding); }
+  try { loaded = input.readOnly ? await store.inspectStagingEntry(stagingId, binding) : await store.readStagingEntry(stagingId, binding); }
   catch (error) {
-    try { store.recordStagingValidationFailure(stagingId, binding, error); } catch { /* do not mask the validation error */ }
+    if (!input.readOnly) try { store.recordStagingValidationFailure(stagingId, binding, error); } catch { /* do not mask the validation error */ }
     throw error;
   }
   return {
@@ -232,6 +233,23 @@ const loadJsonInput = async (store: StateStore, input: JsonInput, retentionHours
 
 const jsonOptions = (command: Command, fileFlag: string): Command => command.option(`${fileFlag} <file>`).option("--staging-id <id>");
 const retentionHours = (): Promise<number> => new EnvironmentService().stagingRetentionHours();
+
+const preflightPlanningRevision = async (
+  store: StateStore,
+  input: { project: string; repoId: string; planId: string; revision: string; supersedes?: string; runId?: string; documents: unknown },
+): Promise<{ path: string; digest: string; documents: RevisionDocuments }> => {
+  assertRevisionDocuments(input.documents);
+  if (input.runId) {
+    const run = store.getRun(input.runId) as { profile: string; repo_id: string; stage: string };
+    if (run.profile !== "planning" || run.repo_id !== input.repoId) throw new ValidationError("planning revision does not belong to this run repository");
+    assertRevisionCreateRunStage(input.documents, run.stage);
+    if (hasTaskDocuments(input.documents)) store.assertTaskPreviewApproved(input.runId);
+  } else if (hasTaskDocuments(input.documents)) {
+    throw new ValidationError("planning revisions with task documents require --run-id for task preview approval");
+  }
+  const result = await preflightRevision(input.project, input.planId, input.revision, input.documents, input.supersedes);
+  return { ...result, documents: input.documents };
+};
 
 const requestOptions = (command: Command): Command => command.option("--request-file <file>").option("--request-stdin");
 
@@ -280,18 +298,29 @@ export const buildProgram = (): Command => {
     output(await withStore((store) => new WorkflowService(store).planningStart(options.project, request)));
   });
   const revision = planning.command("revision");
+  jsonOptions(revision.command("validate").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--target-branch <branch>").option("--supersedes <nnn>").option("--run-id <id>"), "--documents-file").action(async (options) => {
+    const repo = await repositoryIdentity(options.project);
+    const retention = await retentionHours();
+    output(await withStore(async (store) => {
+      const input = await loadJsonInput(store, { file: options.documentsFile, stagingId: options.stagingId, runId: options.runId, role: "planning", kind: "planning-documents", readOnly: true }, retention);
+      const result = await preflightPlanningRevision(store, {
+        project: options.project, repoId: repo.repoId, planId: options.planId, revision: options.revision,
+        supersedes: options.supersedes, runId: options.runId, documents: input.value,
+      });
+      return { path: result.path, digest: result.digest, valid: true };
+    }, { readonly: true }));
+  });
   jsonOptions(revision.command("create").requiredOption("--project <path>").requiredOption("--plan-id <id>").requiredOption("--revision <nnn>").requiredOption("--target-branch <branch>").option("--supersedes <nnn>").option("--run-id <id>"), "--documents-file").action(async (options) => {
     const repo = await repositoryIdentity(options.project);
     const retention = await retentionHours();
     output(await withStore(async (store) => {
       const input = await loadJsonInput(store, { file: options.documentsFile, stagingId: options.stagingId, runId: options.runId, role: "planning", kind: "planning-documents" }, retention);
       try {
-      if (options.runId) {
-        const run = store.getRun(options.runId) as { profile: string; repo_id: string; stage: string };
-        if (run.profile !== "planning" || run.repo_id !== repo.repoId) throw new ValidationError("planning revision does not belong to this run repository");
-        assertRevisionRunStage("draft", run.stage);
-      }
-      const docs = input.value as RevisionDocuments;
+      const checked = await preflightPlanningRevision(store, {
+        project: options.project, repoId: repo.repoId, planId: options.planId, revision: options.revision,
+        supersedes: options.supersedes, runId: options.runId, documents: input.value,
+      });
+      const docs = checked.documents;
       const result = await writeRevision(options.project, options.planId, options.revision, options.targetBranch, docs, options.supersedes);
       store.registerRepository(repo.repoId, repo.commonDir, repo.root);
       store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,supersedes,created_at) VALUES (?,?,?,'draft',?,?,?,?)")

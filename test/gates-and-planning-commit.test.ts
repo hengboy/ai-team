@@ -58,14 +58,14 @@ test("planning commit stages only the immutable revision and includes trailers",
     await rawGit(root, ["config", "user.email", "ai-team@example.test"]);
     await writeFile(join(root, "README.md"), "base\n");
     await rawGit(root, ["add", "README.md"]); await rawGit(root, ["commit", "-m", "base"]);
-    const revision = join(root, ".ai-team", "plans", "20260813-demo-abcd", "revisions", "001");
+    const revision = join(root, ".ai-team", "plans", "20260813-demo", "revisions", "001");
     await mkdir(revision, { recursive: true }); await writeFile(join(revision, "spec.md"), "spec\n");
     await writeFile(join(root, "user.txt"), "do not commit\n");
-    const commit = await commitPlanningRevision(root, "20260813-demo-abcd", "001", "a".repeat(64));
+    const commit = await commitPlanningRevision(root, "20260813-demo", "001", "a".repeat(64));
     assert.match(commit, /^[a-f0-9]{40}$/);
-    assert.equal(await rawGit(root, ["show", "--format=", "--name-only", commit]), ".ai-team/plans/20260813-demo-abcd/revisions/001/spec.md");
+    assert.equal(await rawGit(root, ["show", "--format=", "--name-only", commit]), ".ai-team/plans/20260813-demo/revisions/001/spec.md");
     const body = await rawGit(root, ["show", "-s", "--format=%B", commit]);
-    assert.match(body, /AI-Team-Plan: 20260813-demo-abcd/);
+    assert.match(body, /AI-Team-Plan: 20260813-demo/);
     assert.match(body, /AI-Team-Revision: 001/);
     assert.match(body, /AI-Team-Digest: a{64}/);
     assert.match((await rawGit(root, ["status", "--porcelain"])), /\?\? user.txt/);

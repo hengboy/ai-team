@@ -252,6 +252,8 @@ test("planning and coding coordinate managed staging for every generated JSON", 
 
   assert.match(planning, /每个规划 JSON.*staging create.*staging write --input-stdin.*--staging-id/s);
   assert.match(planning, /planning-documents.*planning revision create/s);
+  assert.match(planning, /planning revision validate.*pre-write.*安全重试/s);
+  assert.match(planning, /`approve`.*`revise`.*resolved.*`approve`/s);
   assert.match(planning, /问题 1、.*问题 2、.*从 1 递增/s);
   assert.match(planning, /transition 到 `plan_ready`.*自动创建 \*\*Git Operator\*\* `dispatch`/s);
   assert.match(planning, /归档调研报告/);
@@ -277,7 +279,7 @@ test("planning and Git Operator agents expose the immutable revision handoff con
   const gitOperator = files.get("codex/agents/git-operator.toml") ?? "";
 
   assert.match(planning, /完整.*spec.*plan/);
-  assert.match(planning, /最后.*planning revision create/);
+  assert.match(planning, /先.*planning revision validate.*再.*planning revision create/s);
   assert.match(planning, /规划代理自身不得执行 `planning revision commit`/);
   assert.match(gitOperator, /`planning revision commit`/);
   assert.match(gitOperator, /ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>/);

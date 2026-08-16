@@ -428,7 +428,7 @@ test("project init requires confirmation before appending to a dirty .gitignore"
 
 test("revision writing enforces coverage, frontmatter, and immutability", async () => {
   const project = await temporaryDirectory();
-  const planId = "20260813-workflow-abcd";
+  const planId = "20260813-workflow";
   const specDocument = ["# Spec", "## 背景", "背景", "## 目标", "目标", "## 非目标", "无", "## 用户场景", "场景", "## 功能需求", "REQ-001", "## 验收标准", "AC-001", "## 数据与接口", "无", "## 兼容约束", "macOS", "## 安全约束", "本地", "## 错误与边界", "失败", "## 迁移发布回滚", "回滚", "## 已确认偏好", "中文", "## 默认取舍", "默认", "## 已关闭问题", "无", "## 未决问题", "none"].join("\n");
   const planDocument = ["# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", "REQ-001", "## 验证", "验证", "## 发布与回滚", "回滚"].join("\n");
   try {
@@ -461,8 +461,17 @@ test("revision writing enforces coverage, frontmatter, and immutability", async 
       tasks: "# Tasks\nAC-001",
     }, "000");
     const spec = await readFile(path.join(written.path, "spec.md"), "utf8");
-    assert.match(spec, /^---\nplan_id: 20260813-workflow-abcd\nrevision: "001"\ntarget_branch: main\nsupersedes: "000"\n---\n\n# Spec/);
+    assert.match(spec, /^---\nplan_id: 20260813-workflow\nrevision: "001"\ntarget_branch: main\nsupersedes: "000"\n---\n\n# Spec/);
     assert.match(written.digest, /^[a-f0-9]{64}$/);
+
+    await assert.rejects(
+      () => writeRevision(project, "20260813-workflow-abcd", "002", "main", {
+        spec: specDocument,
+        plan: planDocument,
+        tasks: "# Tasks\nAC-001",
+      }),
+      /invalid plan id/,
+    );
 
     await assert.rejects(
       () => writeRevision(project, planId, "001", "main", { spec: "REQ-002", plan: "REQ-002" }),
@@ -633,11 +642,11 @@ test("frozen coding runs hand off to one linked planning run without transferrin
     assert.equal(store.getRun(first.run_id).source_run_id, started.run_id);
     assert.equal((store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id='worktree_handoff'").get() as { run_id: string }).run_id, started.run_id);
     assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(started.dispatch_id) as { state: string }).state, "failed");
-    assert.equal(workflow.completePlanningHandoff(first.run_id, "20260816-handoff-abcd", "001", "digest", "a".repeat(40)), started.run_id);
+    assert.equal(workflow.completePlanningHandoff(first.run_id, "20260816-handoff", "001", "digest", "a".repeat(40)), started.run_id);
     const resumed = store.getRun(started.run_id);
     assert.equal(resumed.state, "active");
     assert.equal(resumed.stage, "coding");
-    assert.equal(resumed.plan_id, "20260816-handoff-abcd");
+    assert.equal(resumed.plan_id, "20260816-handoff");
     assert.equal(resumed.revision, "001");
     assert.equal((store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id='worktree_handoff'").get() as { run_id: string }).run_id, started.run_id);
   } finally {
@@ -655,20 +664,20 @@ test("automatic coding triage prioritizes one ready revision and otherwise class
     const identity = await repositoryIdentity(repository.directory);
     store.registerRepository(identity.repoId, identity.commonDir, identity.root);
     store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
-      .run("20260814-auto-abcd", "001", identity.repoId, "ready", "main", new Date().toISOString());
+      .run("20260814-auto", "001", identity.repoId, "ready", "main", new Date().toISOString());
     const planned = await workflow.codingStartAuto(repository.directory, "actual: broken\nexpected: works\nevidence: failing test");
     assert.equal(planned.triage, "planned");
-    assert.equal(store.getRun(planned.run_id!).plan_id, "20260814-auto-abcd");
+    assert.equal(store.getRun(planned.run_id!).plan_id, "20260814-auto");
 
     store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
-      .run("20260814-explicit-abcd", "001", identity.repoId, "ready", "main", new Date(Date.now() + 1).toISOString());
+      .run("20260814-explicit", "001", identity.repoId, "ready", "main", new Date(Date.now() + 1).toISOString());
     await assert.rejects(
       workflow.codingStartAuto(repository.directory, "actual: broken\nexpected: works\nevidence: failing test"),
       /multiple ready revisions; specify a plan/,
     );
-    const explicit = await workflow.codingStartAuto(repository.directory, undefined, "20260814-explicit-abcd", "001");
+    const explicit = await workflow.codingStartAuto(repository.directory, undefined, "20260814-explicit", "001");
     assert.equal(explicit.triage, "planned");
-    assert.equal(store.getRun(explicit.run_id!).plan_id, "20260814-explicit-abcd");
+    assert.equal(store.getRun(explicit.run_id!).plan_id, "20260814-explicit");
 
     store.db.prepare("UPDATE revisions SET state='implemented' WHERE repo_id=?").run(identity.repoId);
     const bug = await workflow.codingStartAuto(repository.directory, "actual: broken\nexpected: works\nevidence: failing test");

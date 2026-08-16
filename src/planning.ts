@@ -57,6 +57,9 @@ export interface RevisionDocuments {
   taskFiles?: Record<string, string>;
 }
 
+export const hasTaskDocuments = (docs: RevisionDocuments): boolean =>
+  docs.tasks !== undefined || docs.taskFiles !== undefined;
+
 const pointer = (value: string): string => value.replace(/~/g, "~0").replace(/\//g, "~1");
 
 export function assertRevisionDocuments(value: unknown): asserts value is RevisionDocuments {
@@ -87,7 +90,7 @@ export function assertRevisionDocuments(value: unknown): asserts value is Revisi
 }
 
 export const REVISION_RUN_STAGES: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  draft: ["plan_ready"],
+  draft: ["plan_ready", "tasks_preview"],
   requirements_confirmed: ["plan_ready"],
   spec_ready: ["plan_ready"],
   plan_ready: ["plan_ready", "tasks_preview"],
@@ -106,8 +109,16 @@ export const assertRevisionRunStage = (revisionState: string, runStage: string, 
   }
 };
 
-export const writeRevision = async (project: string, planId: string, revision: string, targetBranch: string, docs: RevisionDocuments, supersedes?: string): Promise<{ path: string; digest: string }> => {
-  if (!/^\d{8}-[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{4}$/.test(planId)) throw new ValidationError("invalid plan id");
+export const assertRevisionCreateRunStage = (docs: RevisionDocuments, runStage: string): void => {
+  const requiredStage = hasTaskDocuments(docs) ? "tasks_preview" : "plan_ready";
+  if (runStage !== requiredStage) {
+    throw new ValidationError(`planning revision ${hasTaskDocuments(docs) ? "with task documents" : "without task documents"} requires run stage ${requiredStage}`);
+  }
+  assertRevisionRunStage("draft", runStage);
+};
+
+export const preflightRevision = async (project: string, planId: string, revision: string, docs: RevisionDocuments, supersedes?: string): Promise<{ path: string; digest: string }> => {
+  if (!/^(?!.*-[a-f0-9]{4}$)\d{8}-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(planId)) throw new ValidationError("invalid plan id");
   if (!/^\d{3}$/.test(revision)) throw new ValidationError("invalid revision");
   if (supersedes && !/^\d{3}$/.test(supersedes)) throw new ValidationError("invalid superseded revision");
   assertRevisionDocuments(docs);
@@ -117,6 +128,18 @@ export const writeRevision = async (project: string, planId: string, revision: s
   assertSections(docs.spec, SPEC_SECTIONS, "spec.md");
   assertSections(docs.plan, PLAN_SECTIONS, "plan.md");
   assertCoverage(docs.spec, [docs.plan, docs.tasks ?? "", ...Object.values(docs.taskFiles ?? {})]);
+  for (const taskId of Object.keys(docs.taskFiles ?? {})) {
+    if (!/^TASK-\d{3}$/.test(taskId)) throw new ValidationError(`invalid task id: ${taskId}`);
+  }
+  return {
+    path: revisionPath,
+    digest: sha256([docs.spec, docs.plan, docs.tasks ?? "", ...Object.values(docs.taskFiles ?? {})].join("\n")),
+  };
+};
+
+export const writeRevision = async (project: string, planId: string, revision: string, targetBranch: string, docs: RevisionDocuments, supersedes?: string): Promise<{ path: string; digest: string }> => {
+  const preflight = await preflightRevision(project, planId, revision, docs, supersedes);
+  const revisionPath = preflight.path;
   const planRoot = join(project, ".ai-team", "plans", planId);
   let createdPlanMetadata = false;
   try {
@@ -129,13 +152,11 @@ export const writeRevision = async (project: string, planId: string, revision: s
     if (docs.taskFiles) {
       await mkdir(join(revisionPath, "tasks"));
       for (const [taskId, content] of Object.entries(docs.taskFiles)) {
-        if (!/^TASK-\d{3}$/.test(taskId)) throw new ValidationError(`invalid task id: ${taskId}`);
         await writeFile(join(revisionPath, "tasks", `${taskId}.md`), wrap(content));
       }
     }
-    const digest = sha256([docs.spec, docs.plan, docs.tasks ?? "", ...Object.values(docs.taskFiles ?? {})].join("\n"));
     try { await readFile(join(planRoot, "plan.yaml")); } catch { await writeFile(join(planRoot, "plan.yaml"), YAML.stringify({ plan_id: planId, active_revision: revision })); createdPlanMetadata = true; }
-    return { path: revisionPath, digest };
+    return preflight;
   } catch (error) {
     await rm(revisionPath, { recursive: true, force: true });
     if (createdPlanMetadata) await rm(join(planRoot, "plan.yaml"), { force: true });

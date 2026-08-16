@@ -170,7 +170,7 @@ test("planned Git prepare ignores arbitrary direct integration worktrees", async
       repoId,
       profile: "coding",
       mode: "planned",
-      planId: "20260816-identity-abcd",
+      planId: "20260816-identity",
       revision: "001",
       baseCommit: REVIEW_HEAD,
       targetBranch: "main",
@@ -183,7 +183,7 @@ test("planned Git prepare ignores arbitrary direct integration worktrees", async
       .run("worktree_wrong_planned_integration", runId, "integration/direct/wrong", `/tmp/${runId}-wrong`, REVIEW_HEAD, new Date().toISOString());
 
     await assert.rejects(dispatches.submitValue(runId, prepareId, "git-operator", result), /registered active integration worktree or plan worktree/);
-    const planId = "20260816-identity-abcd";
+    const planId = "20260816-identity";
     const planRevision = `${planId}-001`;
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
       .run("worktree_exact_planned", runId, `plan/${planId}/${planRevision}`, join(process.cwd(), ".worktrees", "plans", planId, planRevision), REVIEW_HEAD, new Date().toISOString());
@@ -476,13 +476,13 @@ test("planned research is archived with its revision while direct coding researc
       /planned research requires the run to bind plan_id and revision/,
     );
 
-    const planningRun = createRun(store, "planning", { planId: "20260813-api-abcd", revision: "001" });
+    const planningRun = createRun(store, "planning", { planId: "20260813-api", revision: "001" });
     const planning = await research.archive(planningRun, project, "API support", [conclusion]);
     assert.equal(planning.path, join(
       project,
       ".ai-team",
       "plans",
-      "20260813-api-abcd",
+      "20260813-api",
       "revisions",
       "001",
       "research",
@@ -490,9 +490,9 @@ test("planned research is archived with its revision while direct coding researc
     ));
     assert.match(await readFile(planning.path, "utf8"), /Source level: official/);
 
-    const codingRun = createRun(store, "coding", { planId: "20260813-api-abcd", revision: "001" });
+    const codingRun = createRun(store, "coding", { planId: "20260813-api", revision: "001" });
     const coding = await research.archive(codingRun, project, "API support", [conclusion]);
-    assert.equal(coding.path, join(project, ".ai-team", "plans", "20260813-api-abcd", "revisions", "001", "research", "api-support.md"));
+    assert.equal(coding.path, join(project, ".ai-team", "plans", "20260813-api", "revisions", "001", "research", "api-support.md"));
     assert.equal(coding.path.startsWith(join(project, ".ai-team", "plans")), true);
     assert.match(await readFile(coding.path, "utf8"), /# Research: API support/);
   });
@@ -502,25 +502,25 @@ test("planning revision binding and Git Operator dispatch enforce run ownership"
   await withStore((store) => {
     const runId = createRun(store, "planning");
     assert.throws(
-      () => store.bindPlanningRevision(runId, "another-repository", "20260814-plan-abcd", "001"),
+      () => store.bindPlanningRevision(runId, "another-repository", "20260814-plan", "001"),
       /does not belong/,
     );
-    store.bindPlanningRevision(runId, "repo-review-fixture", "20260814-plan-abcd", "001");
-    assert.equal(store.getRun(runId).plan_id, "20260814-plan-abcd");
+    store.bindPlanningRevision(runId, "repo-review-fixture", "20260814-plan", "001");
+    assert.equal(store.getRun(runId).plan_id, "20260814-plan");
     store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
-      .run("20260814-plan-abcd", "001", "repo-review-fixture", "plan_ready", "main", new Date().toISOString());
+      .run("20260814-plan", "001", "repo-review-fixture", "plan_ready", "main", new Date().toISOString());
     const dispatches = new DispatchService(store);
     const packet = {
       objective: "Commit the immutable planning revision",
-      allowed_read_paths: [".ai-team/plans/20260814-plan-abcd/revisions/001"],
+      allowed_read_paths: [".ai-team/plans/20260814-plan/revisions/001"],
       allowed_write_paths: [],
       acceptance_criteria: ["Only planning files are committed"],
-      context: { plan_id: "20260814-plan-abcd", revision: "001" },
+      context: { plan_id: "20260814-plan", revision: "001" },
     };
     const unrelatedId = dispatches.createPlanningCommit(runId, packet);
     store.db.prepare("UPDATE dispatches SET packet_json=? WHERE dispatch_id=?").run(JSON.stringify({
       ...packet,
-      context: { plan_id: "20260814-other-abcd", revision: "002" },
+      context: { plan_id: "20260814-other", revision: "002" },
     }), unrelatedId);
     const dispatchId = dispatches.createPlanningCommit(runId, packet);
     assert.notEqual(dispatchId, unrelatedId);
@@ -593,15 +593,15 @@ test("planning results advance one stage and create at most one matching decisio
       decision: {
         question: taskQuestion,
         choices: [
-          { id: "split", label: "Split", impact: "Creates task documents" },
-          { id: "single", label: "Single", impact: "Keeps one implementation unit" },
+          { id: "approve", label: "Approve", impact: "Creates the previewed task documents" },
+          { id: "revise", label: "Revise", impact: "Requires another task preview" },
         ],
-        recommendation: "single",
+        recommendation: "approve",
       },
     }));
     const taskDecision = store.db.prepare("SELECT question,decision_type FROM decisions WHERE run_id=?").get(taskRun) as { question: string; decision_type: string };
     assert.equal(taskDecision.question, taskQuestion);
-    assert.equal(taskDecision.decision_type, "workflow");
+    assert.equal(taskDecision.decision_type, "task_preview");
 
     const invalidRun = createRun(store, "planning");
     store.db.prepare("UPDATE runs SET stage='planning' WHERE run_id=?").run(invalidRun);

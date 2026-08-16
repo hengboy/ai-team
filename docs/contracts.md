@@ -8,7 +8,7 @@ fields are rejected.
 
 | Field | Format |
 | --- | --- |
-| `plan_id` | `YYYYMMDD-<ascii-slug>-<4 hex>` |
+| `plan_id` | `YYYYMMDD-<ascii-slug>`; slug must not end with four hexadecimal digits |
 | `revision` | three digits |
 | `task_id` | `TASK-<three digits>` |
 | `run_id` | `run_<ULID>` |

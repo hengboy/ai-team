@@ -10,6 +10,7 @@ import { DispatchService, type DispatchPacket } from "../src/dispatch.js";
 import { ValidationError } from "../src/errors.js";
 import { assertCoverage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, triage, validateCoverage } from "../src/planning.js";
 import { StateStore } from "../src/state.js";
+import { makePlanId } from "../src/utils.js";
 
 const RUN_ID = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const DISPATCH_ID = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -241,7 +242,7 @@ test("migration 004 preserves legacy revisions and scopes identical revisions by
     store.registerRepository("repo-a", "/tmp/repo-a.git", "/tmp/repo-a");
     store.registerRepository("repo-b", "/tmp/repo-b.git", "/tmp/repo-b");
     store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
-      .run("20260814-shared-abcd", "001", "repo-a", "ready", "main", "2026-08-14T00:00:00.000Z");
+      .run("20260814-shared", "001", "repo-a", "ready", "main", "2026-08-14T00:00:00.000Z");
     store.close();
 
     const database = new Database(join(home, "state", "state.sqlite"));
@@ -261,9 +262,9 @@ test("migration 004 preserves legacy revisions and scopes identical revisions by
 
     store = await StateStore.open(home);
     store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
-      .run("20260814-shared-abcd", "001", "repo-b", "draft", "develop", "2026-08-14T00:01:00.000Z");
+      .run("20260814-shared", "001", "repo-b", "draft", "develop", "2026-08-14T00:01:00.000Z");
     const rows = store.db.prepare("SELECT repo_id,state,target_branch FROM revisions WHERE plan_id=? AND revision=? ORDER BY repo_id")
-      .all("20260814-shared-abcd", "001");
+      .all("20260814-shared", "001");
     assert.deepEqual(rows, [
       { repo_id: "repo-a", state: "ready", target_branch: "main" },
       { repo_id: "repo-b", state: "draft", target_branch: "develop" },
@@ -497,6 +498,9 @@ test("planning states allow only declared forward transitions", () => {
 });
 
 test("planning revision commit has one exact generated command contract", () => {
+  assert.deepEqual(COMMAND_SYNTAX["planning revision validate"], [
+    "ai-team planning revision validate --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> (--documents-file <file> | --run-id <run-id> --staging-id <staging-id>) [--supersedes <revision>]",
+  ]);
   assert.deepEqual(COMMAND_SYNTAX["planning revision commit"], [
     "ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>",
   ]);
@@ -515,7 +519,15 @@ test("environment explanation and diff commands have exact public contracts", ()
   assert.equal(COMMAND_PARAMETER_TYPES.platform, "enum; codex, claude, or opencode");
 });
 
+test("plan identifiers omit the random hex suffix", () => {
+  assert.equal(makePlanId("Plan Identifier", new Date("2026-08-16T04:00:00.000Z")), "20260816-plan-identifier");
+  assert.throws(() => makePlanId("Plan abcd"), /must not end with four hexadecimal digits/);
+  assert.equal(COMMAND_PARAMETER_TYPES["plan-id"], "string; eight decimal digits followed by a lowercase slug that does not end with four hexadecimal digits");
+  assert.equal(COMMAND_CONTRACT_BASE.identifiers.plan_id, "^(?!.*-[a-f0-9]{4}$)[0-9]{8}-[a-z0-9]+(?:-[a-z0-9]+)*$");
+});
+
 test("revision state permits only compatible planning run stages, including plan-ready recovery", () => {
+  assert.doesNotThrow(() => assertRevisionRunStage("draft", "tasks_preview"));
   assert.doesNotThrow(() => assertRevisionRunStage("spec_ready", "plan_ready", "plan_ready"));
   assert.doesNotThrow(() => assertRevisionRunStage("plan_ready", "tasks_preview", "tasks_preview"));
   assert.throws(
@@ -529,7 +541,7 @@ test("revision state permits only compatible planning run stages, including plan
 });
 
 test("triage prioritizes an existing plan, recognizes evidenced bugs, and gates fast-path features", () => {
-  assert.equal(triage({ planId: "20260813-core-abcd", actual: "broken", expected: "works", evidence: "trace" }), "planned");
+  assert.equal(triage({ planId: "20260813-core", actual: "broken", expected: "works", evidence: "trace" }), "planned");
   assert.equal(triage({ actual: "broken", expected: "works", evidence: "trace" }), "bug");
   assert.equal(
     triage({ singleGoal: true, closedAcceptance: true, exhaustiveScope: true, singleModule: true, sensitive: false }),

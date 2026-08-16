@@ -499,6 +499,14 @@ export class StateStore {
     this.event(runId, "decision.resolved", { decisionId, choice });
   }
 
+  assertTaskPreviewApproved(runId: string): void {
+    const decision = this.db.prepare(`SELECT status,choice FROM decisions
+      WHERE run_id=? AND decision_type='task_preview' ORDER BY created_at DESC,decision_id DESC LIMIT 1`)
+      .get(runId) as { status: string; choice?: string } | undefined;
+    if (!decision || decision.status !== "resolved") throw new ValidationError("task preview decision must be resolved before revision creation");
+    if (decision.choice !== "approve") throw new ValidationError("task preview must be approved before revision creation");
+  }
+
   private stagingRow(stagingId: string): StagingEntryRow {
     const row = this.db.prepare("SELECT * FROM staging_entries WHERE staging_id=?").get(stagingId) as StagingEntryRow | undefined;
     if (!row) throw new ValidationError(`unknown staging entry: ${stagingId}`);
@@ -659,6 +667,18 @@ export class StateStore {
       this.stagingPath(row),
       this.stagingIdentity(row),
     );
+    if (content.digest !== row.content_sha256 || content.bytes !== row.content_bytes) {
+      throw new ValidationError("staging content does not match persisted metadata");
+    }
+    return { entry: this.stagingMetadata(row), value: content.value };
+  }
+
+  async inspectStagingEntry(stagingId: string, binding: StagingBinding = {}): Promise<{ entry: StagingEntry; value: unknown }> {
+    const row = this.stagingRow(stagingId);
+    this.assertStagingBinding(row, binding);
+    if (row.state === "expired" || row.expires_at <= new Date().toISOString()) throw new ValidationError(`staging entry has expired: ${stagingId}`);
+    if (row.state !== "draft" && row.state !== "ready") throw new ValidationError(`staging entry is not readable: ${row.state}`);
+    const content = await readManagedJsonFile(this.paths.staging, this.stagingPath(row), this.stagingIdentity(row));
     if (content.digest !== row.content_sha256 || content.bytes !== row.content_bytes) {
       throw new ValidationError("staging content does not match persisted metadata");
     }

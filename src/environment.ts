@@ -218,7 +218,7 @@ export interface AgentRenderInput { role: Role; model: ModelConfig; environment:
   role: "enum; one of the 12 manifest role IDs",
   mode: "enum; planned, bug, or feature",
   "platform-list": "comma-separated enum; codex, claude, or opencode",
-  "plan-id": "string; eight decimal digits, lowercase slug, and four lowercase hex digits",
+  "plan-id": "string; eight decimal digits followed by a lowercase slug that does not end with four hexadecimal digits",
   revision: "string; exactly three decimal digits",
   "task-id": "string; TASK- followed by three decimal digits",
   "run-id": "string; run_ followed by a 26-character Crockford ULID",

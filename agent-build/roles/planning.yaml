@@ -5,6 +5,7 @@ staging: { owned_entries: [planning-documents, planning-tasks, dispatch-packet, 
 delegates: [file-explorer, researcher]
 commands:
   - planning start
+  - planning revision validate
   - planning revision create
   - planning revision transition
   - planning tasks validate

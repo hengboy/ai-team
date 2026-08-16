@@ -767,6 +767,12 @@ export class DispatchService {
       throw new ValidationError(`planning stage ${payload.stage} cannot have pending questions`);
     }
     const needsDecision = payload.pending_questions.length === 1;
+    if (needsDecision && payload.stage === "tasks_preview") {
+      const choices = payload.decision?.choices.map(({ id }) => id).sort();
+      if (!choices || choices.length !== 2 || choices[0] !== "approve" || choices[1] !== "revise") {
+        throw new ValidationError("task preview decision choices must be approve and revise");
+      }
+    }
     this.store.db.prepare("UPDATE runs SET stage=?,state=?,updated_at=? WHERE run_id=?")
       .run(payload.stage, needsDecision ? "needs_decision" : "active", new Date().toISOString(), runId);
     this.store.event(runId, "planning.stage_changed", { stage: payload.stage });
@@ -776,7 +782,8 @@ export class DispatchService {
       const question = requirementQuestion
         ? `问题 ${((this.store.db.prepare("SELECT COUNT(*) AS count FROM decisions WHERE run_id=? AND decision_type='requirement'").get(runId) as { count: number }).count) + 1}、${payload.decision.question.replace(/^问题\s*\d+、\s*/, "")}`
         : payload.decision.question;
-      this.store.createDecision(runId, question, payload.decision.choices, payload.decision.recommendation, requirementQuestion ? "requirement" : "workflow", result.dispatch_id);
+      const decisionType = requirementQuestion ? "requirement" : payload.stage === "tasks_preview" ? "task_preview" : "workflow";
+      this.store.createDecision(runId, question, payload.decision.choices, payload.decision.recommendation, decisionType, result.dispatch_id);
     } else if (payload.stage !== "ready") {
       this.continuePlanning(runId);
     }

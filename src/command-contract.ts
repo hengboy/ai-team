@@ -17,7 +17,7 @@ const IDS = {
   runId: /^run_[0-9A-HJKMNP-TV-Z]{26}$/,
   dispatchId: /^dispatch_[0-9A-HJKMNP-TV-Z]{26}$/,
   stagingId: /^staging_[0-9A-HJKMNP-TV-Z]{26}$/,
-  planId: /^\d{8}-[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{4}$/,
+  planId: /^(?!.*-[a-f0-9]{4}$)\d{8}-[a-z0-9]+(?:-[a-z0-9]+)*$/,
   revision: /^\d{3}$/,
   commit: /^[a-f0-9]{40}$/,
 } as const;
@@ -32,7 +32,7 @@ export const COMMAND_PARAMETER_TYPES = Object.freeze({
   platform: "enum; codex, claude, or opencode",
   mode: "enum; planned, bug, or feature",
   "platform-list": "comma-separated enum; codex, claude, or opencode",
-  "plan-id": "string; eight decimal digits, lowercase slug, and four lowercase hex digits",
+  "plan-id": "string; eight decimal digits followed by a lowercase slug that does not end with four hexadecimal digits",
   revision: "string; exactly three decimal digits",
   "task-id": "string; TASK- followed by three decimal digits",
   "run-id": "string; run_ followed by a 26-character Crockford ULID",
@@ -55,6 +55,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "context update": ["ai-team context update --project <path> (--context-file <json> | --run-id <run-id> --staging-id <staging-id>)"],
   "context validate": ["ai-team context validate --project <path>"],
   "planning revision create": ["ai-team planning revision create --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> (--documents-file <file> | --run-id <run-id> --staging-id <staging-id>) [--supersedes <revision>]"],
+  "planning revision validate": ["ai-team planning revision validate --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> (--documents-file <file> | --run-id <run-id> --staging-id <staging-id>) [--supersedes <revision>]"],
   "planning revision transition": ["ai-team planning revision transition --project <path> --plan-id <plan-id> --revision <revision> --to <state> [--plan-commit <commit>]"],
   "planning revision commit": ["ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>"],
   "planning tasks validate": ["ai-team planning tasks validate (--file <json> | --run-id <run-id> --staging-id <staging-id>) [--preview]"],
@@ -118,6 +119,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
 const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>> = Object.freeze({
   "context update": ["ai-team context update --project <path> --run-id <run-id> --staging-id <staging-id>"],
   "planning revision create": ["ai-team planning revision create --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> --run-id <run-id> --staging-id <staging-id> [--supersedes <revision>]"],
+  "planning revision validate": ["ai-team planning revision validate --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> --run-id <run-id> --staging-id <staging-id> [--supersedes <revision>]"],
   "planning tasks validate": ["ai-team planning tasks validate --run-id <run-id> --staging-id <staging-id> [--preview]"],
   "dispatch create": ["ai-team dispatch create --run-id <run-id> --role <role> --actor-role <role> [--actor-dispatch-id <dispatch-id>] --staging-id <staging-id>"],
   "dispatch validate": ["ai-team dispatch validate --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --staging-id <staging-id>"],
@@ -130,7 +132,7 @@ const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>
 });
 
 const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
-const AGENT_COMMANDS = ["context update", "context validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
+const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */
 export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.freeze({
@@ -147,7 +149,7 @@ export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.
 export const COMMAND_CONTRACT_BASE = {
   schema_version: SCHEMA_VERSION,
   identifiers: {
-    plan_id: "^[0-9]{8}-[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{4}$",
+    plan_id: "^(?!.*-[a-f0-9]{4}$)[0-9]{8}-[a-z0-9]+(?:-[a-z0-9]+)*$",
     revision: "^[0-9]{3}$",
     task_id: "^TASK-[0-9]{3}$",
     run_id: "^run_[0-9A-HJKMNP-TV-Z]{26}$",

@@ -141,7 +141,7 @@ test("prepareTask owns deterministic names and is idempotent per run", async () 
 test("planned runs use revision-scoped plan and task worktrees without run-short segments", async () => {
   const fixture = await createFixture();
   try {
-    const planId = "20260813-feature-abcd";
+    const planId = "20260813-feature";
     const runId = fixture.store.createRun({
       repoId: (await repositoryIdentity(fixture.root)).repoId,
       profile: "coding",
@@ -182,7 +182,7 @@ test("planned runs use revision-scoped plan and task worktrees without run-short
 test("planned run recovery reuses a run-owned legacy integration worktree", async () => {
   const fixture = await createFixture();
   try {
-    const planId = "20260813-legacy-abcd";
+    const planId = "20260813-legacy";
     const runId = fixture.store.createRun({
       repoId: (await repositoryIdentity(fixture.root)).repoId,
       profile: "coding",
@@ -210,7 +210,7 @@ test("planned run recovery reuses a run-owned legacy integration worktree", asyn
 test("planned run does not select a direct integration worktree without planned provenance", async () => {
   const fixture = await createFixture();
   try {
-    const runId = fixture.createRun("20260813-direct-abcd");
+    const runId = fixture.createRun("20260813-direct");
     const direct = await fixture.orchestrator.prepareIntegration(runId);
     fixture.store.db.prepare("UPDATE runs SET mode='planned',revision='004' WHERE run_id=?").run(runId);
 

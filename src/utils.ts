@@ -32,8 +32,9 @@ export const makePlanId = (slug: string, now = new Date()): string => {
     .replace(/^-|-$/g, "")
     .slice(0, 40);
   if (!normalized) throw new ValidationError("plan slug must contain ASCII letters or digits");
+  if (/-[a-f0-9]{4}$/.test(normalized)) throw new ValidationError("plan slug must not end with four hexadecimal digits");
   const date = now.toISOString().slice(0, 10).replaceAll("-", "");
-  return `${date}-${normalized}-${randomBytes(2).toString("hex")}`;
+  return `${date}-${normalized}`;
 };
 
 export const assertRelativePosixPath = (value: string): string => {

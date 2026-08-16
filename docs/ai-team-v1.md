@@ -154,7 +154,7 @@ completed | retryable_failure | needs_decision | failed
 MEMORY.md
 ```
 
-`plan_id` 格式为 `YYYYMMDD-<slug>-<4char>`；revision 为三位递增数字；Task 为 `TASK-001`；run 和 dispatch 使用 `run_<ULID>`、`dispatch_<ULID>`。
+`plan_id` 格式为 `YYYYMMDD-<slug>`，slug 不得以四位十六进制字符结尾；revision 为三位递增数字；Task 为 `TASK-001`；run 和 dispatch 使用 `run_<ULID>`、`dispatch_<ULID>`。
 
 文档使用 YAML frontmatter + 固定 Markdown 章节。正文默认中文，机器字段、ID、路径和命令使用 ASCII。`spec.md` 使用 `REQ-001` 和 `AC-001`；`plan.md` 与 Task 必须覆盖所有 REQ/AC，CLI 校验无遗漏、无未知引用。规划文件的 `plan_commit` 不写入自身提交，Git Operator 在提交后写入 SQLite；提交 trailer 包含 plan/revision/digest。
 

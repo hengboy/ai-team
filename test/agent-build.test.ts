@@ -50,6 +50,7 @@ test("agent-build loading applies the role schema instead of only checking schem
 
 test("role manifests reserve revision creation for planning and revision commit for Git Operator", () => {
   const build = loadAgentBuildSync(sourceRoot);
+  assert.ok(build.roles.planning.commands.includes("planning revision validate"));
   assert.ok(build.roles.planning.commands.includes("planning revision create"));
   assert.ok(!build.roles.planning.commands.includes("planning revision commit"));
   assert.ok(build.roles["git-operator"].commands.includes("planning revision commit"));
