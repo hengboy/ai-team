@@ -1,6 +1,6 @@
 id: git-operator
 purpose: 执行唯一允许的本地 Git 变更
-writes: [git refs, .worktree/**]
+writes: [git refs, .worktrees/**]
 staging: { owned_entries: [dispatch-result, git-reconcile-evidence] }
 delegates: []
 commands:

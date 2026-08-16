@@ -438,13 +438,13 @@ export class DispatchService {
     const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
     if (!repository) return undefined;
     const planRevision = `${run.plan_id}-${run.revision}`;
-    const expected = { branch: `plan/${run.plan_id}/${planRevision}`, path: join(repository.project_path, ".worktree", "plans", run.plan_id, planRevision) };
+    const expected = { branch: `plan/${run.plan_id}/${planRevision}`, path: join(repository.project_path, ".worktrees", "plans", run.plan_id, planRevision) };
     const exact = this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
       .get(runId, expected.branch, expected.path) as { worktree_id: string; path: string } | undefined;
     if (exact) return exact;
 
     const short = runId.slice(-8).toLowerCase();
-    const legacy = { branch: `integration/${run.plan_id}/${short}`, path: join(repository.project_path, ".worktree", "integration", run.plan_id, short) };
+    const legacy = { branch: `integration/${run.plan_id}/${short}`, path: join(repository.project_path, ".worktrees", "integration", run.plan_id, short) };
     const row = this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
       .get(runId, legacy.branch, legacy.path) as { worktree_id: string; path: string } | undefined;
     if (!row) return undefined;

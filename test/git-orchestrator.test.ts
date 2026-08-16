@@ -111,7 +111,7 @@ test("prepareTask owns deterministic names and is idempotent per run", async () 
     const suffix = runId.slice(-8).toLowerCase();
     const prepared = await fixture.orchestrator.prepareTask(runId, "API-Fix");
     assert.equal(prepared.branch, `task/20260813-feature.alpha/${suffix}/api-fix`);
-    assert.equal(prepared.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktree", "tasks", "20260813-feature.alpha", suffix, "api-fix"))));
+    assert.equal(prepared.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktrees", "tasks", "20260813-feature.alpha", suffix, "api-fix"))));
     assert.match(prepared.worktree_id, /^worktree_[a-f0-9]{24}$/);
     assert.equal(prepared.reused, false);
 
@@ -154,14 +154,14 @@ test("planned runs use revision-scoped plan and task worktrees without run-short
     const plan = await fixture.orchestrator.prepareIntegration(runId);
     const planRevision = `${planId}-007`;
     assert.equal(plan.branch, `plan/${planId}/${planRevision}`);
-    assert.equal(plan.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktree", "plans", planId, planRevision))));
+    assert.equal(plan.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktrees", "plans", planId, planRevision))));
     assert.equal(plan.branch.includes(runId.slice(-8).toLowerCase()), false);
     fixture.store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
       .run("worktree_wrong_direct", runId, `integration/direct-${runId.slice(-8).toLowerCase()}/${runId.slice(-8).toLowerCase()}`, `/tmp/${runId}-wrong-direct`, plan.base_commit, "9999-12-31T23:59:59.999Z");
 
     const first = await fixture.orchestrator.prepareTask(runId, "TASK-001");
     assert.equal(first.branch, `task/${planId}/${planRevision}--task-001`);
-    assert.equal(first.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktree", "tasks", planId, `${planRevision}--task-001`))));
+    assert.equal(first.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktrees", "tasks", planId, `${planRevision}--task-001`))));
     assert.equal(first.base_commit, await rawGit(plan.path, ["rev-parse", "HEAD"]));
     await assert.rejects(
       fixture.orchestrator.prepareTask(runId, "TASK-003", "a".repeat(40)),
@@ -234,7 +234,7 @@ test("managed adopt binds a direct-child commit and transfer changes only the re
     const sourceRun = fixture.createRun("20260813-recovery.alpha");
     const targetRun = fixture.createRun("20260813-recovery.alpha");
     const base = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
-    const path = join(fixture.root, ".worktree", "tasks", "legacy", "implementation");
+    const path = join(fixture.root, ".worktrees", "tasks", "legacy", "implementation");
     const branch = "task/legacy/implementation";
     await mkdir(join(path, ".."), { recursive: true });
     await rawGit(fixture.root, ["worktree", "add", "-b", branch, path, base]);

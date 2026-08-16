@@ -222,9 +222,9 @@ test("init creates project metadata, context skeletons, and documented ignore en
 
   assert.equal(initialized.project, await realpath(sandbox.repo));
   assert.equal(initialized.gitignoreDirty, false);
-  assert.deepEqual(initialized.additions, ["/.worktree/", "/.ai-team/runtime/"]);
-  assert.equal(initialized.patch, "+/.worktree/\n+/.ai-team/runtime/");
-  assert.equal(await readFile(join(sandbox.repo, ".gitignore"), "utf8"), "/.worktree/\n/.ai-team/runtime/\n");
+  assert.deepEqual(initialized.additions, ["/.worktrees/", "/.ai-team/runtime/"]);
+  assert.equal(initialized.patch, "+/.worktrees/\n+/.ai-team/runtime/");
+  assert.equal(await readFile(join(sandbox.repo, ".gitignore"), "utf8"), "/.worktrees/\n/.ai-team/runtime/\n");
   const project = await readFile(join(sandbox.repo, ".ai-team", "project.yaml"), "utf8");
   assert.match(project, /schema_version: 1/);
   assert.match(project, /repo_id:/);
@@ -919,8 +919,8 @@ test("direct coding rejects a dirty repository before creating a run and starts 
   assert.equal(runCount.count, 0);
 
   await unlink(dirtyFile);
-  await mkdir(join(sandbox.repo, ".worktree", "runtime"), { recursive: true });
-  await writeFile(join(sandbox.repo, ".worktree", "runtime", "owned.txt"), "owned worktree state\n");
+  await mkdir(join(sandbox.repo, ".worktrees", "runtime"), { recursive: true });
+  await writeFile(join(sandbox.repo, ".worktrees", "runtime", "owned.txt"), "owned worktree state\n");
   const started = json<{ run_id: string; dispatch_id: string }>(
     await cli(sandbox, [
       "coding", "start",

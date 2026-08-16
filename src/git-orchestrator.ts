@@ -21,21 +21,21 @@ const worktreeNames = (root: string, run: any, runId: string, taskId?: string): 
   const plan = safeSegment(run.plan_id ?? `direct-${runId.slice(-8).toLowerCase()}`);
   if (isPlannedRun(run)) {
     const planRevision = safeSegment(`${plan}-${run.revision}`);
-    if (taskId === undefined) return { branch: `plan/${plan}/${planRevision}`, path: join(root, ".worktree", "plans", plan, planRevision) };
+    if (taskId === undefined) return { branch: `plan/${plan}/${planRevision}`, path: join(root, ".worktrees", "plans", plan, planRevision) };
     const task = safeSegment(taskId.toLowerCase());
     const taskRevision = safeSegment(`${planRevision}--${task}`);
-    return { branch: `task/${plan}/${taskRevision}`, path: join(root, ".worktree", "tasks", plan, taskRevision) };
+    return { branch: `task/${plan}/${taskRevision}`, path: join(root, ".worktrees", "tasks", plan, taskRevision) };
   }
   const short = safeSegment(runId.slice(-8).toLowerCase());
-  if (taskId === undefined) return { branch: `integration/${plan}/${short}`, path: join(root, ".worktree", "integration", plan, short) };
+  if (taskId === undefined) return { branch: `integration/${plan}/${short}`, path: join(root, ".worktrees", "integration", plan, short) };
   const task = safeSegment(taskId.toLowerCase());
-  return { branch: `task/${plan}/${short}/${task}`, path: join(root, ".worktree", "tasks", plan, short, task) };
+  return { branch: `task/${plan}/${short}/${task}`, path: join(root, ".worktrees", "tasks", plan, short, task) };
 };
 
 const legacyIntegrationNames = (root: string, run: any, runId: string): { branch: string; path: string } => {
   const plan = safeSegment(run.plan_id);
   const short = safeSegment(runId.slice(-8).toLowerCase());
-  return { branch: `integration/${plan}/${short}`, path: join(root, ".worktree", "integration", plan, short) };
+  return { branch: `integration/${plan}/${short}`, path: join(root, ".worktrees", "integration", plan, short) };
 };
 
 export class GitOrchestrator {
@@ -124,7 +124,7 @@ export class GitOrchestrator {
     const { root, run } = this.repositoryForRun(runId);
     const canonical = await realpath(path);
     const relativePath = toPosix(relative(root, canonical));
-    if (!relativePath.startsWith(".worktree/")) throw new ValidationError(`refusing to adopt worktree outside managed root: ${canonical}`);
+    if (!relativePath.startsWith(".worktrees/")) throw new ValidationError(`refusing to adopt worktree outside managed root: ${canonical}`);
     if (!(await worktreeStatus(canonical)).clean) throw new ValidationError("only a clean worktree can be adopted");
     const actualBranch = await currentBranch(canonical);
     if (actualBranch !== branch) throw new ValidationError("adopted worktree branch does not match", { expected: branch, actual: actualBranch });
@@ -200,7 +200,7 @@ export class GitOrchestrator {
     if (sourceRun.repo_id !== run.repo_id) throw new ValidationError("worktree transfer requires runs from the same repository");
     const canonical = await realpath(row.path);
     const relativePath = toPosix(relative(root, canonical));
-    if (!relativePath.startsWith(".worktree/") || !(await worktreeStatus(canonical)).clean) throw new ValidationError("only a clean managed worktree can be transferred");
+    if (!relativePath.startsWith(".worktrees/") || !(await worktreeStatus(canonical)).clean) throw new ValidationError("only a clean managed worktree can be transferred");
     const key = `worktree:transfer:${row.run_id}:${runId}:${worktreeId}`;
     const operation = this.store.beginOperation("git.worktree.transfer", key, { worktree_id: worktreeId, from_run_id: row.run_id, to_run_id: runId }, runId);
     if (operation.reused && operation.state !== "completed") throw new ValidationError("transfer operation has unknown side effect; reconcile required");
@@ -295,7 +295,7 @@ export class GitOrchestrator {
     const { root, run } = this.repositoryForRun(runId);
     const integration = this.worktree(runId, integrationId);
     const targetStatus = await worktreeStatus(root);
-    const unmanagedUntracked = targetStatus.untracked.filter((path) => path !== ".worktree/" && !path.startsWith(".worktree/"));
+    const unmanagedUntracked = targetStatus.untracked.filter((path) => path !== ".worktrees/" && !path.startsWith(".worktrees/"));
     if (targetStatus.staged.length || targetStatus.unstaged.length || unmanagedUntracked.length) {
       throw new ValidationError("target worktree must be clean before integration", { ...targetStatus, untracked: unmanagedUntracked });
     }
@@ -379,7 +379,7 @@ export class GitOrchestrator {
       if (!(await worktreeStatus(row.path)).clean) throw new ValidationError(`worktree is dirty and cannot be removed: ${row.path}`);
       const canonical = await realpath(row.path);
       const relativePath = toPosix(relative(root, canonical));
-      if (!relativePath.startsWith(".worktree/")) throw new ValidationError(`refusing to remove worktree outside managed root: ${canonical}`);
+      if (!relativePath.startsWith(".worktrees/")) throw new ValidationError(`refusing to remove worktree outside managed root: ${canonical}`);
       const operation = this.store.beginOperation("git.cleanup", `cleanup:${runId}:${row.worktree_id}`, { worktreeId: row.worktree_id, path: canonical, branch: row.branch }, runId);
       if (operation.reused && operation.state !== "completed") throw new ValidationError("cleanup side effect is unknown; reconcile required");
       if (operation.reused) { this.store.db.prepare("UPDATE worktrees SET state='removed' WHERE worktree_id=?").run(row.worktree_id); removed.push(canonical); continue; }

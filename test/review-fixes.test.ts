@@ -186,7 +186,7 @@ test("planned Git prepare ignores arbitrary direct integration worktrees", async
     const planId = "20260816-identity-abcd";
     const planRevision = `${planId}-001`;
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
-      .run("worktree_exact_planned", runId, `plan/${planId}/${planRevision}`, join(process.cwd(), ".worktree", "plans", planId, planRevision), REVIEW_HEAD, new Date().toISOString());
+      .run("worktree_exact_planned", runId, `plan/${planId}/${planRevision}`, join(process.cwd(), ".worktrees", "plans", planId, planRevision), REVIEW_HEAD, new Date().toISOString());
     await dispatches.submitValue(runId, prepareId, "git-operator", result);
   });
 });
@@ -1161,7 +1161,7 @@ test("implementation dependencies and commit gate test creation and freeze the c
     const codingId = dispatches.create(runId, "coding", dispatchPacket());
     dispatches.claim(runId, codingId, "coding");
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
-      .run("worktree_defect_regression", runId, "task/regression", `${process.cwd()}/.worktree/defect-regression`, REVIEW_HEAD, new Date().toISOString());
+      .run("worktree_defect_regression", runId, "task/regression", `${process.cwd()}/.worktrees/defect-regression`, REVIEW_HEAD, new Date().toISOString());
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
       .run("worktree_defect_integration", runId, "integration/regression", process.cwd(), REVIEW_HEAD, new Date().toISOString());
     const changedPaths = ["src/dispatch.ts", "src/state.ts", "src/contracts.ts", "src/cli.ts", "src/review.ts", "test/review-fixes.test.ts"];

@@ -5,7 +5,7 @@ import { ValidationError } from "./errors.js";
 import { git, repositoryIdentity } from "./git.js";
 import { initializeProjectContext, planProjectContextInitialization, type ContextInitPlan } from "./context.js";
 
-const IGNORE_ENTRIES = ["/.worktree/", "/.ai-team/runtime/"] as const;
+const IGNORE_ENTRIES = ["/.worktrees/", "/.ai-team/runtime/"] as const;
 
 export interface InitPlan {
   project: string;

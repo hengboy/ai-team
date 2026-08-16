@@ -64,7 +64,7 @@ const completeTest = async (store: StateStore, runId: string, legacyPlanned = fa
   if (run.mode === "planned" && run.plan_id && run.revision) {
     const finalSegment = legacyPlanned ? runId.slice(-8).toLowerCase() : `${run.plan_id}-${run.revision}`;
     branch = legacyPlanned ? `integration/${run.plan_id}/${finalSegment}` : `plan/${run.plan_id}/${finalSegment}`;
-    worktreePath = path.join(process.cwd(), ".worktree", legacyPlanned ? "integration" : "plans", run.plan_id, finalSegment);
+    worktreePath = path.join(process.cwd(), ".worktrees", legacyPlanned ? "integration" : "plans", run.plan_id, finalSegment);
     await mkdir(path.dirname(worktreePath), { recursive: true });
     await symlink(process.cwd(), worktreePath, "dir");
     if (legacyPlanned) {
@@ -85,7 +85,7 @@ const completeTest = async (store: StateStore, runId: string, legacyPlanned = fa
 };
 
 const cleanupTestPlanWorktrees = async (store: StateStore): Promise<void> => {
-  const root = path.join(process.cwd(), ".worktree");
+  const root = path.join(process.cwd(), ".worktrees");
   const rows = store.db.prepare("SELECT path FROM worktrees WHERE branch LIKE 'plan/%' OR branch LIKE 'integration/%'").all() as Array<{ path: string }>;
   for (const row of rows) {
     if (row.path.startsWith(`${root}${path.sep}`)) await rm(path.dirname(row.path), { recursive: true, force: true });
@@ -383,13 +383,13 @@ test("project init is Git-only, idempotent, and appends the context rule once", 
     await assert.rejects(() => initializeProject(repository.directory), /confirmation required/);
     const first = await initializeProject(repository.directory, true);
     const second = await initializeProject(repository.directory);
-    assert.deepEqual(first.additions, ["/.worktree/", "/.ai-team/runtime/"]);
+    assert.deepEqual(first.additions, ["/.worktrees/", "/.ai-team/runtime/"]);
     assert.deepEqual(second.additions, []);
     const agents = await readFile(agentsPath, "utf8");
     assert.match(agents, /入口、职责或模块边界变化时/);
     assert.equal(agents.match(/入口、职责或模块边界变化时/g)?.length, 1);
     const ignore = await readFile(path.join(repository.directory, ".gitignore"), "utf8");
-    assert.equal(ignore.match(/^\/\.worktree\/$/gm)?.length, 1);
+    assert.equal(ignore.match(/^\/\.worktrees\/$/gm)?.length, 1);
     assert.equal(ignore.match(/^\/\.ai-team\/runtime\/$/gm)?.length, 1);
     await stat(path.join(repository.directory, ".ai-team", "project.yaml"));
     await stat(path.join(repository.directory, ".ai-team", "standards"));
@@ -411,7 +411,7 @@ test("project init requires confirmation before appending to a dirty .gitignore"
     await writeFile(path.join(repository.directory, ".gitignore"), "dist/\ncoverage/\n");
     const plan = await planProjectInit(repository.directory);
     assert.equal(plan.gitignoreDirty, true);
-    assert.deepEqual(plan.additions, ["/.worktree/", "/.ai-team/runtime/"]);
+    assert.deepEqual(plan.additions, ["/.worktrees/", "/.ai-team/runtime/"]);
     await assert.rejects(() => initializeProject(repository.directory), /confirmation required/);
     assert.equal(await readFile(path.join(repository.directory, ".gitignore"), "utf8"), "dist/\ncoverage/\n");
     await assert.rejects(() => stat(path.join(repository.directory, ".ai-team")));
@@ -419,7 +419,7 @@ test("project init requires confirmation before appending to a dirty .gitignore"
     await initializeProject(repository.directory, true);
     assert.equal(
       await readFile(path.join(repository.directory, ".gitignore"), "utf8"),
-      "dist/\ncoverage/\n/.worktree/\n/.ai-team/runtime/\n",
+      "dist/\ncoverage/\n/.worktrees/\n/.ai-team/runtime/\n",
     );
   } finally {
     await rm(repository.directory, { recursive: true, force: true });
@@ -504,7 +504,7 @@ test("coding start validates planned parameters, branch, clean worktree, and HEA
     assert.deepEqual(planWorktree, {
       run_id: started.run_id,
       branch: "plan/plan/plan-001",
-      path: await realpath(path.join(repository.directory, ".worktree", "plans", "plan", "plan-001")),
+      path: await realpath(path.join(repository.directory, ".worktrees", "plans", "plan", "plan-001")),
       base_commit: repository.head,
       state: "active",
     });
@@ -623,7 +623,7 @@ test("frozen coding runs hand off to one linked planning run without transferrin
     const now = new Date().toISOString();
     store.db.prepare("UPDATE runs SET state='frozen' WHERE run_id=?").run(started.run_id);
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
-      .run("worktree_handoff", started.run_id, "task/direct/handoff/implementation", path.join(repository.directory, ".worktree", "handoff"), repository.head, now);
+      .run("worktree_handoff", started.run_id, "task/direct/handoff/implementation", path.join(repository.directory, ".worktrees", "handoff"), repository.head, now);
 
     const first = workflow.handoffToPlanning(started.run_id, "Reconcile the frozen scope through Planning.");
     const second = workflow.handoffToPlanning(started.run_id, "Reconcile the frozen scope through Planning.");

@@ -47,13 +47,13 @@ export class ReviewService {
     if (run.mode === "planned" && run.plan_id && run.revision) {
       const planRevision = `${run.plan_id}-${run.revision}`;
       const branch = `plan/${run.plan_id}/${planRevision}`;
-      const planPath = join(repository.project_path, ".worktree", "plans", run.plan_id, planRevision);
+      const planPath = join(repository.project_path, ".worktrees", "plans", run.plan_id, planRevision);
       integration = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
         .get(runId, branch, planPath) as { path: string } | undefined;
       if (!integration) {
         const short = runId.slice(-8).toLowerCase();
         const legacyBranch = `integration/${run.plan_id}/${short}`;
-        const legacyPath = join(repository.project_path, ".worktree", "integration", run.plan_id, short);
+        const legacyPath = join(repository.project_path, ".worktrees", "integration", run.plan_id, short);
         const legacy = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
           .get(runId, legacyBranch, legacyPath) as { path: string } | undefined;
         const created = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='run.created' ORDER BY event_id LIMIT 1")

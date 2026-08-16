@@ -161,7 +161,7 @@ MEMORY.md
 `ai-team init` 要求目标路径是 Git 仓库，幂等创建 `.ai-team` 结构，并在根 `.gitignore` 加入：
 
 ```gitignore
-/.worktree/
+/.worktrees/
 /.ai-team/runtime/
 ```
 
@@ -191,20 +191,20 @@ Planning 不创建 worktree。Coding 使用 Planning 提交后的当前分支最
 
 ```text
 plan/<plan-id>/<plan-id>-<revision>
-.worktree/plans/<plan-id>/<plan-id>-<revision>/
+.worktrees/plans/<plan-id>/<plan-id>-<revision>/
 
 task/<plan-id>/<plan-id>-<revision>--<task-id>
-.worktree/tasks/<plan-id>/<plan-id>-<revision>--<task-id>/
+.worktrees/tasks/<plan-id>/<plan-id>-<revision>--<task-id>/
 ```
 
 Direct Bug/feature 保持 run-scoped integration/task 结构：
 
 ```text
 integration/<plan-or-direct-id>/<run-short-id>
-.worktree/integration/<plan-or-direct-id>/<run-short-id>/
+.worktrees/integration/<plan-or-direct-id>/<run-short-id>/
 
 task/<plan-or-direct-id>/<run-short-id>/<task-id>
-.worktree/tasks/<plan-or-direct-id>/<run-short-id>/<task-id>/
+.worktrees/tasks/<plan-or-direct-id>/<run-short-id>/<task-id>/
 ```
 
 拆分 Task 从 plan worktree 当前 HEAD 派生，完成后以非快进提交合回 plan worktree；plan 全部完成并通过验证与评审后，再合入 run 的 `target_branch`。直接 Bug/feature 也使用独立 task worktree。无依赖且允许写入范围不重叠的 Task 可并行；有依赖的 Task 先合入 plan/integration 分支，再从其最新 commit 创建后续 Task。已存在且属于其他 run 或无法确认归属的分支/worktree/目录阻断，不复用、不覆盖。
@@ -452,7 +452,7 @@ OpenCode 文件必须以 YAML frontmatter 开头，使客户端能解析角色�
 - Planning 与 Coding 均可按需调度 Researcher，但 Researcher 不搜索仓库。
 - packet、冻结 prompt、result template 至少保留到 run 结束。
 - 角色删除/重命名的备份、摘要匹配和阻断规则。
-- task、integration 分支和 `.worktree` 的精确命名及最新基线。
+- task、integration 分支和 `.worktrees` 的精确命名及最新基线。
 - Environment Operator 不得由普通 Coding run 切换环境。
 
 除用户后续明确修订外，以上内容是 AI Team v1 的实现事实来源。
