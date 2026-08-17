@@ -292,6 +292,42 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "010-cancelable-staging-entries",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      db.exec(`
+        CREATE TABLE staging_entries_v10 (
+          staging_id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          dispatch_id TEXT REFERENCES dispatches(dispatch_id) ON DELETE CASCADE,
+          role TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind IN ('project-context','planning-documents','planning-tasks','dispatch-packet','dispatch-result','decision','git-reconcile-evidence','research-conclusions','review-result','review-resolution')),
+          state TEXT NOT NULL CHECK(state IN ('draft','ready','consumed','canceled','cleanup_pending','expired')),
+          content_sha256 TEXT,
+          content_bytes INTEGER,
+          file_dev TEXT,
+          file_ino TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          consumed_at TEXT,
+          cleanup_attempted_at TEXT,
+          cleanup_error TEXT,
+          sequence_no INTEGER
+        );
+        INSERT INTO staging_entries_v10 SELECT
+          staging_id,run_id,dispatch_id,role,kind,state,content_sha256,content_bytes,file_dev,file_ino,
+          created_at,updated_at,expires_at,consumed_at,cleanup_attempted_at,cleanup_error,sequence_no
+          FROM staging_entries;
+        DROP TABLE staging_entries;
+        ALTER TABLE staging_entries_v10 RENAME TO staging_entries;
+        CREATE INDEX staging_entries_expiry ON staging_entries(state, expires_at);
+        CREATE INDEX staging_entries_run ON staging_entries(run_id, created_at);
+        CREATE UNIQUE INDEX staging_entries_run_sequence ON staging_entries(run_id, sequence_no);
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
@@ -647,6 +683,19 @@ export class StateStore {
       error: redact(error instanceof Error ? error.message : String(error)).slice(0, 1000),
       cause: validationCause(error),
     });
+  }
+
+  cancelStagingEntry(stagingId: string, binding: StagingBinding, reason: string): StagingEntry {
+    if (!reason.trim()) throw new ValidationError("staging cancellation requires a reason");
+    const row = this.stagingRow(stagingId);
+    this.assertStagingBinding(row, binding);
+    if (row.state === "canceled") return this.stagingMetadata(row);
+    if (row.state !== "draft" && row.state !== "ready") throw new ValidationError(`staging entry cannot be canceled from ${row.state}`);
+    const timestamp = new Date().toISOString();
+    this.db.prepare("UPDATE staging_entries SET state='canceled',consumed_at=?,updated_at=? WHERE staging_id=?")
+      .run(timestamp, timestamp, stagingId);
+    this.event(row.run_id, "staging.canceled", { stagingId, dispatchId: row.dispatch_id, role: row.role, kind: row.kind, reason });
+    return this.getStagingEntry(stagingId);
   }
 
   async createStagingEntry(input: {

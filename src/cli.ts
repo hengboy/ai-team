@@ -624,6 +624,9 @@ export const buildProgram = (): Command => {
     const result = await store.readStagingEntry(options.stagingId, { runId: options.runId, role: options.role });
     return { entry: result.entry, content: result.value };
   })));
+  staging.command("cancel").requiredOption("--run-id <id>").addOption(roleOption()).requiredOption("--staging-id <id>").requiredOption("--reason <text>").action(async (options) => {
+    output(await withStore((store) => store.cancelStagingEntry(options.stagingId, { runId: options.runId, role: options.role }, options.reason)));
+  });
   staging.command("cleanup").option("--expired").option("--run-id <id>").option("--staging-id <id>").option("--all").action(async (options) => {
     const explicit = Boolean(options.runId || options.stagingId);
     if (Boolean(options.expired) === explicit || explicit && !options.all || options.stagingId && !options.runId) {

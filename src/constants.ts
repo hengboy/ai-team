@@ -87,7 +87,7 @@ export const STAGING_KINDS = [
   "review-resolution",
 ] as const;
 
-export const STAGING_STATES = ["draft", "ready", "consumed", "cleanup_pending", "expired"] as const;
+export const STAGING_STATES = ["draft", "ready", "consumed", "canceled", "cleanup_pending", "expired"] as const;
 export const STAGING_MAX_BYTES = 2 * 1024 * 1024;
 export const STAGING_DEFAULT_RETENTION_HOURS = 168;
 export const STAGING_OPPORTUNISTIC_CLEANUP_LIMIT = 100;

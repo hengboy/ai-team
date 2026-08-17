@@ -113,6 +113,72 @@ const cleanupTestPlanWorktrees = async (store: StateStore): Promise<void> => {
   }
 };
 
+const prepareCompletedImplementation = async (store: StateStore): Promise<{
+  runId: string;
+  coordinatorDispatchId: string;
+  developerDispatchId: string;
+  worktreeId: string;
+  worktreePath: string;
+}> => {
+  const runId = createRun(store, "planned");
+  const run = store.getRun(runId) as { plan_id: string; revision: string };
+  store.db.prepare("UPDATE runs SET plan_digest=? WHERE run_id=?").run("plan-digest-fixture", runId);
+  const worktreeId = `worktree_${runId.slice(-12)}`;
+  const worktreePath = path.join(process.cwd(), ".worktrees", "plans", run.plan_id, `${run.plan_id}-${run.revision}`);
+  await mkdir(path.dirname(worktreePath), { recursive: true });
+  await symlink(process.cwd(), worktreePath, "dir");
+  store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+    .run(worktreeId, runId, `plan/${run.plan_id}/${run.plan_id}-${run.revision}`, worktreePath, REVIEW_HEAD, new Date().toISOString());
+
+  const dispatches = new WorkflowService(store).dispatches;
+  const authorizedPaths = ["src/dispatch.ts", "test/workflow.test.ts", "package.json"];
+  const explorerDispatchId = dispatches.create(runId, "file-explorer", {
+    objective: "authorize implementation fixture",
+    allowed_read_paths: ["."],
+    allowed_write_paths: [],
+    acceptance_criteria: ["authorize exact paths"],
+    context: {},
+  });
+  store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?").run(JSON.stringify({
+    ...createResultTemplate(runId, explorerDispatchId, "file-explorer"),
+    payload: {
+      allowed_read_paths: authorizedPaths,
+      entry_points: ["src/dispatch.ts"],
+      test_commands: ["npm test"],
+      project_context: { project_shape: "fixture", memory: { domain_terms: [], repository_constraints: [], responsibilities: [], module_boundaries: [] }, navigation: [], maintenance: { status: "current", paths: [] } },
+    },
+  }), new Date().toISOString(), explorerDispatchId);
+
+  const coordinatorDispatchId = dispatches.create(runId, "coding", {
+    objective: "coordinate implementation fixture",
+    allowed_read_paths: authorizedPaths,
+    allowed_write_paths: [],
+    acceptance_criteria: ["dispatch frontend implementation"],
+    context: { explorer_dispatch_id: explorerDispatchId, worktree_id: worktreeId },
+  });
+  dispatches.claim(runId, coordinatorDispatchId, "coding");
+  const developerDispatchId = dispatches.create(runId, "frontend-developer", {
+    objective: "complete frontend implementation fixture",
+    allowed_read_paths: authorizedPaths,
+    allowed_write_paths: ["src/dispatch.ts"],
+    acceptance_criteria: ["report modified paths"],
+    context: { explorer_dispatch_id: explorerDispatchId, worktree_id: worktreeId },
+  }, "coding", coordinatorDispatchId);
+
+  await dispatches.submitValue(runId, coordinatorDispatchId, "coding", {
+    ...createResultTemplate(runId, coordinatorDispatchId, "coding"),
+    summary: "coordination completed first",
+    payload: { actions: ["frontend dispatched"] },
+  });
+  dispatches.claim(runId, developerDispatchId, "frontend-developer");
+  await dispatches.submitValue(runId, developerDispatchId, "frontend-developer", {
+    ...createResultTemplate(runId, developerDispatchId, "frontend-developer"),
+    summary: "frontend completed second",
+    payload: { modified_paths: ["src/dispatch.ts"], self_tests: [{ command: "npm test", outcome: "passed" }] },
+  });
+  return { runId, coordinatorDispatchId, developerDispatchId, worktreeId, worktreePath };
+};
+
 const completeReviewLeaf = (store: StateStore, runId: string, review: ReviewResult): void => {
   const role = review.axis === "spec" ? "review-spec" : "review-standards";
   const row = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role=? ORDER BY created_at DESC LIMIT 1").get(runId, role) as { dispatch_id: string };
@@ -210,6 +276,90 @@ test("run resume rebuilds a completed formal barrier and creates one final Git O
     await cleanupTestPlanWorktrees(reopened ?? store);
     if (reopened) reopened.close();
     else store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("completed implementation enters Test when Coding finishes before frontend", async () => {
+  const { store, home } = await openStore();
+  try {
+    const fixture = await prepareCompletedImplementation(store);
+    const tests = store.db.prepare("SELECT dispatch_id,packet_json,state FROM dispatches WHERE run_id=? AND role='test'").all(fixture.runId) as Array<{ dispatch_id: string; packet_json: string; state: string }>;
+    assert.equal(tests.length, 1);
+    assert.equal(tests[0]!.state, "pending");
+    const context = JSON.parse(tests[0]!.packet_json).context;
+    assert.equal(context.implementation_dispatch_id, fixture.developerDispatchId);
+    assert.equal(context.implementation_committed, false);
+    assert.equal(context.worktree_id, fixture.worktreeId);
+    assert.equal(context.worktree_path, fixture.worktreePath);
+    assert.deepEqual(context.test_commands, [
+      "npm run test -- src/components/AiRoutingGateway/AiRoutingGateway.test.tsx",
+      "npm run test",
+      "npm run lint",
+      "npm run build",
+    ]);
+  } finally {
+    await cleanupTestPlanWorktrees(store);
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("run resume creates one continue_testing replacement with inherited evidence and cancels orphan staging", async () => {
+  const { store, home } = await openStore();
+  try {
+    const fixture = await prepareCompletedImplementation(store);
+    store.db.prepare("DELETE FROM dispatches WHERE run_id=? AND role='test'").run(fixture.runId);
+    store.db.prepare("UPDATE runs SET stage='coding' WHERE run_id=?").run(fixture.runId);
+    const staging = await store.createStagingEntry({ runId: fixture.runId, dispatchId: fixture.coordinatorDispatchId, role: "coding", kind: "dispatch-packet" });
+    await store.writeStagingEntry(staging.stagingId, JSON.stringify({ objective: "stale test packet" }), {
+      runId: fixture.runId, dispatchId: fixture.coordinatorDispatchId, role: "coding", kind: "dispatch-packet",
+    });
+
+    const dispatches = new WorkflowService(store).dispatches;
+    const first = dispatches.resume(fixture.runId);
+    const second = dispatches.resume(fixture.runId);
+    assert.equal(first.pending_dispatches.length, 1);
+    assert.equal(second.pending_dispatches.length, 1);
+    const replacementId = first.pending_dispatches[0]!.dispatch_id;
+    assert.equal(second.pending_dispatches[0]!.dispatch_id, replacementId);
+    const replacement = store.db.prepare("SELECT replacement_for,packet_json FROM dispatches WHERE dispatch_id=?").get(replacementId) as { replacement_for: string; packet_json: string };
+    assert.equal(replacement.replacement_for, fixture.coordinatorDispatchId);
+    const packet = JSON.parse(replacement.packet_json);
+    assert.equal(packet.context.phase, "continue_testing");
+    assert.equal(packet.context.plan_id, (store.getRun(fixture.runId) as { plan_id: string }).plan_id);
+    assert.equal(packet.context.revision, "001");
+    assert.equal(packet.context.plan_digest, "plan-digest-fixture");
+    assert.equal(packet.context.worktree_id, fixture.worktreeId);
+    assert.equal(packet.context.worktree_path, fixture.worktreePath);
+    assert.equal(packet.context.implementation_dispatch_id, fixture.developerDispatchId);
+    assert.match(packet.context.implementation_artifact.artifact_id, /^artifact_/);
+    assert.equal(store.getStagingEntry(staging.stagingId).state, "canceled");
+
+    dispatches.claim(fixture.runId, replacementId, "coding");
+    assert.throws(() => dispatches.create(fixture.runId, "frontend-developer", packet, "coding", replacementId), /only delegate to Test/);
+    const testContext = {
+      ...packet.context,
+      stage: "test",
+      coordinator_dispatch_id: replacementId,
+      integration_worktree_id: packet.context.worktree_id,
+    };
+    const testDispatchId = dispatches.create(fixture.runId, "test", {
+      objective: "independently verify the frozen implementation",
+      allowed_read_paths: packet.allowed_read_paths,
+      allowed_write_paths: [],
+      acceptance_criteria: ["run every frozen test command"],
+      context: testContext,
+    }, "coding", replacementId);
+    assert.match(testDispatchId, /^dispatch_/);
+    const resumed = dispatches.resume(fixture.runId);
+    assert.equal((resumed.run as { stage: string }).stage, "test");
+    assert.equal(resumed.pending_dispatches.filter(({ role }) => role === "test").length, 1);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='coding' AND json_extract(packet_json,'$.context.phase')='continue_testing'").get(fixture.runId) as { count: number }).count, 1);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='test'").get(fixture.runId) as { count: number }).count, 1);
+  } finally {
+    await cleanupTestPlanWorktrees(store);
+    store.close();
     await rm(home, { recursive: true, force: true });
   }
 });

@@ -85,6 +85,30 @@ interface ReviewBarrierRow {
 
 const RENDERER_VERSION = "dispatch-renderer-v5";
 const EXPLORER_CONTEXT_PATHS = ["MEMORY.md", ".ai-team/index/feature-navigation.md"] as const;
+const IMPLEMENTATION_TEST_COMMANDS = [
+  "npm run test -- src/components/AiRoutingGateway/AiRoutingGateway.test.tsx",
+  "npm run test",
+  "npm run lint",
+  "npm run build",
+] as const;
+
+interface ImplementationSnapshot {
+  coordinatorDispatchId: string;
+  explorerDispatchId: string | null;
+  authorizedPaths: string[];
+  developerDispatchIds: string[];
+  implementationDispatchId: string;
+  implementationArtifact: { artifact_id: string; digest: string };
+  implementationArtifacts: Array<{ dispatch_id: string; artifact_id: string; digest: string }>;
+  implementationCommit: string;
+  implementationCommitted: boolean;
+  changedPaths: string[];
+  worktreeId: string;
+  worktreePath: string;
+  planId: string | null;
+  revision: string | null;
+  planDigest: string | null;
+}
 
 const promptLines = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string[] => [
   `Role: ${role}`,
@@ -174,13 +198,22 @@ export class DispatchService {
     const actor = actorRole ?? run.profile;
     const reviewerActor = run.profile === "coding" && actor === "code-reviewer" && (role === "code-reviewer" || role === "review-spec" || role === "review-standards");
     if (actorRole && actorRole !== run.profile && !reviewerActor) throw new ValidationError(`${actorRole} cannot act for ${run.profile} run`);
-    if (actorDispatchId) this.assertClaimed(runId, actorDispatchId, actor);
+    let actorPacket: DispatchPacket | undefined;
+    if (actorDispatchId) {
+      this.assertClaimed(runId, actorDispatchId, actor);
+      const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role=?")
+        .get(runId, actorDispatchId, actor) as { packet_json: string };
+      actorPacket = JSON.parse(row.packet_json) as DispatchPacket;
+    }
     this.assertCommandAllowed(actor, "dispatch create");
     const definition = ROLE_MANIFEST[actor];
     if (role !== actor && !definition.delegates.includes(role)) {
       throw new ValidationError(`${actor} cannot delegate to ${role}`);
     }
     const validated = validatePacket(packet, role);
+    if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "continue_testing") {
+      this.assertContinueTestingDelegation(actorDispatchId!, role, actorPacket, validated);
+    }
     if (role === "file-explorer") {
       const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get((this.store.getRun(runId) as { repo_id: string }).repo_id) as { project_path: string } | undefined;
       const missing = repository ? EXPLORER_CONTEXT_PATHS.filter((path) => !existsSync(join(repository.project_path, path))) : [...EXPLORER_CONTEXT_PATHS];
@@ -196,7 +229,25 @@ export class DispatchService {
       const plannedPlanWorktree = (this.store.getRun(runId) as { mode?: string }).mode === "planned" && worktree?.branch.startsWith("plan/");
       if (!worktree?.branch.startsWith("task/") && !plannedPlanWorktree) throw new ValidationError(`${role} dispatch requires a prepared active implementation worktree`, ["/context/worktree_id"]);
     }
-    return this.insert(runId, role, validated);
+    const dispatchId = this.insert(runId, role, validated);
+    if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "continue_testing") this.changeStage(runId, "test", dispatchId);
+    return dispatchId;
+  }
+
+  private assertContinueTestingDelegation(actorDispatchId: string, role: Role, coordinator: DispatchPacket, packet: DispatchPacket): void {
+    if (role !== "test") throw new ValidationError("continue_testing Coding dispatch can only delegate to Test");
+    const expected = coordinator.context as Record<string, unknown>;
+    const actual = packet.context as Record<string, unknown>;
+    const inherited = [
+      "explorer_dispatch_id", "plan_id", "revision", "plan_digest", "worktree_id", "worktree_path",
+      "implementation_dispatch_id", "implementation_artifact", "implementation_commit", "implementation_committed", "test_commands",
+    ];
+    const mismatch = inherited.filter((key) => stableJson(actual[key]) !== stableJson(expected[key]));
+    if (actual.coordinator_dispatch_id !== actorDispatchId) mismatch.push("coordinator_dispatch_id");
+    if (mismatch.length) throw new ValidationError("continue_testing Test packet must preserve its frozen implementation evidence", mismatch.map((key) => `/context/${key}`));
+    if (stableJson(actual.test_commands) !== stableJson(IMPLEMENTATION_TEST_COMMANDS)) {
+      throw new ValidationError("continue_testing Test packet requires the frozen test commands", ["/context/test_commands"]);
+    }
   }
 
   createPlanningCommit(runId: string, packet: DispatchPacket): string {
@@ -813,55 +864,129 @@ export class DispatchService {
     }, "git-operator"));
   }
 
-  private advanceImplementation(runId: string): void {
-    const coordinator = this.store.db.prepare("SELECT state FROM dispatches WHERE run_id=? AND role='coding' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string } | undefined;
-    const developers = this.store.db.prepare(`SELECT d.state,d.result_json,d.packet_json FROM dispatches d
+  private implementationSnapshot(runId: string): ImplementationSnapshot | undefined {
+    const run = this.store.getRun(runId) as { mode?: string; plan_id?: string; revision?: string; plan_digest?: string };
+    const coordinator = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='coding' AND state='completed' ORDER BY completed_at DESC,created_at DESC LIMIT 1")
+      .get(runId) as { dispatch_id: string; packet_json: string } | undefined;
+    const developers = this.store.db.prepare(`SELECT d.dispatch_id,d.state,d.result_json,d.packet_json,d.completed_at FROM dispatches d
       WHERE d.run_id=? AND d.role IN ('frontend-developer','backend-developer')
-      AND NOT EXISTS (SELECT 1 FROM dispatches successor WHERE successor.replacement_for=d.dispatch_id)`).all(runId) as Array<{ state: string; result_json?: string; packet_json: string }>;
-    if (coordinator?.state !== "completed" || !developers.length || developers.some((item) => item.state !== "completed")) return;
+      AND NOT EXISTS (SELECT 1 FROM dispatches successor WHERE successor.replacement_for=d.dispatch_id)`).all(runId) as Array<{ dispatch_id: string; state: string; result_json?: string; packet_json: string; completed_at?: string }>;
+    if (!coordinator || !developers.length || developers.some((item) => item.state !== "completed")) return undefined;
     const developerWorktreeIds = developers.map((item) => {
       try { return (JSON.parse(item.packet_json) as { context?: { worktree_id?: string } }).context?.worktree_id; }
       catch { return undefined; }
     });
-    if (developerWorktreeIds.some((value) => !value)) return;
+    if (developerWorktreeIds.some((value) => !value)) return undefined;
     const taskWorktreeIds = [...new Set(developerWorktreeIds as string[])];
+    const integration = this.activeIntegrationWorktree(runId);
+    if (!integration) return undefined;
+    const usesPlanWorktreeDirectly = run.mode === "planned" && taskWorktreeIds.length === 1 && taskWorktreeIds[0] === integration.worktree_id;
     const commitOperations = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.commit' AND state='completed'").all(runId) as Array<{ evidence_json?: string }>;
     const committedWorktrees = new Set(commitOperations.flatMap((item) => {
       try { const evidence = JSON.parse(item.evidence_json ?? "{}"); return typeof evidence.worktree_id === "string" ? [evidence.worktree_id] : []; }
       catch { return []; }
     }));
-    if (taskWorktreeIds.some((worktreeId) => !committedWorktrees.has(worktreeId))) return;
-    const integration = this.activeIntegrationWorktree(runId);
-    if (!integration) return;
+    if (!usesPlanWorktreeDirectly && taskWorktreeIds.some((worktreeId) => !committedWorktrees.has(worktreeId))) return undefined;
     const mergeOperations = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.merge.task' AND state='completed' ORDER BY completed_at").all(runId) as Array<{ evidence_json?: string }>;
     const mergedWorktrees = new Set(mergeOperations.flatMap((item) => {
       try { const evidence = JSON.parse(item.evidence_json ?? "{}"); return typeof evidence.task_worktree_id === "string" ? [evidence.task_worktree_id] : []; }
       catch { return []; }
     }));
-    const usesPlanWorktreeDirectly = taskWorktreeIds.length === 1 && taskWorktreeIds[0] === integration.worktree_id;
     if (!usesPlanWorktreeDirectly && taskWorktreeIds.some((worktreeId) => !mergedWorktrees.has(worktreeId))) {
       this.ensureIntegrationDispatch(runId, taskWorktreeIds, integration.worktree_id);
-      return;
+      return undefined;
     }
     const implementation = this.completedImplementationOperation(runId);
-    if (!implementation || usesPlanWorktreeDirectly && implementation.kind !== "git.commit" || !usesPlanWorktreeDirectly && implementation.kind !== "git.merge.task") return;
+    if (usesPlanWorktreeDirectly && implementation && implementation.kind !== "git.commit" || !usesPlanWorktreeDirectly && implementation?.kind !== "git.merge.task") return undefined;
     const integrationHead = execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-    if (implementation.commit !== integrationHead) return;
-    const existing = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND role='test' AND state!='failed'").get(runId);
-    if (existing) return;
+    if (implementation && implementation.commit !== integrationHead) return undefined;
     const modified = developers.flatMap((item) => {
       try { return (JSON.parse(item.result_json ?? "{}") as { payload?: { modified_paths?: string[] } }).payload?.modified_paths ?? []; }
       catch { return []; }
     });
-    const paths = [...new Set([...implementation.paths, ...modified, "package.json"])] as string[];
-    const dispatchId = this.insert(runId, "test", validatePacket({
-      objective: `Independently verify implementation commit ${implementation.commit}.`,
-      allowed_read_paths: paths,
+    const changedPaths = [...new Set([...(implementation?.paths ?? []), ...modified, "package.json"])] as string[];
+    const coordinatorPacket = JSON.parse(coordinator.packet_json) as DispatchPacket;
+    const inheritedExplorerId = (coordinatorPacket.context as { explorer_dispatch_id?: unknown }).explorer_dispatch_id;
+    const explorer = (typeof inheritedExplorerId === "string"
+      ? this.store.db.prepare("SELECT dispatch_id,result_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='file-explorer' AND state='completed'").get(runId, inheritedExplorerId)
+      : this.store.db.prepare("SELECT dispatch_id,result_json FROM dispatches WHERE run_id=? AND role='file-explorer' AND state='completed' ORDER BY completed_at DESC,created_at DESC LIMIT 1").get(runId)) as { dispatch_id: string; result_json?: string } | undefined;
+    const authorizedPaths = explorer?.result_json
+      ? (JSON.parse(explorer.result_json) as ResultEnvelope).payload.allowed_read_paths
+      : [...new Set([...developers.flatMap((developer) => (JSON.parse(developer.packet_json) as DispatchPacket).allowed_read_paths), "package.json"])];
+    if (!Array.isArray(authorizedPaths) || authorizedPaths.some((path) => typeof path !== "string")) return undefined;
+    if (!explorer && (this.store.getRun(runId) as { mode?: string }).mode === "planned") return undefined;
+    const authorized = new Set(authorizedPaths as string[]);
+    if (changedPaths.some((path) => !authorized.has(path))) throw new ValidationError("implementation paths are not authorized by Explorer evidence");
+    const implementationArtifacts = developers.map((developer) => {
+      const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result' ORDER BY created_at DESC LIMIT 1")
+        .get(runId, developer.dispatch_id) as { artifact_id: string; sha256: string } | undefined;
+      return artifact ? { dispatch_id: developer.dispatch_id, artifact_id: artifact.artifact_id, digest: artifact.sha256 } : undefined;
+    });
+    if (implementationArtifacts.some((artifact) => !artifact)) return undefined;
+    const primary = [...developers].sort((left, right) => (right.completed_at ?? "").localeCompare(left.completed_at ?? ""))[0]!;
+    const primaryArtifact = implementationArtifacts[developers.indexOf(primary)]!;
+    return {
+      coordinatorDispatchId: coordinator.dispatch_id,
+      explorerDispatchId: explorer?.dispatch_id ?? null,
+      authorizedPaths: authorizedPaths as string[],
+      developerDispatchIds: developers.map(({ dispatch_id }) => dispatch_id),
+      implementationDispatchId: primary.dispatch_id,
+      implementationArtifact: { artifact_id: primaryArtifact!.artifact_id, digest: primaryArtifact!.digest },
+      implementationArtifacts: implementationArtifacts as ImplementationSnapshot["implementationArtifacts"],
+      implementationCommit: implementation?.commit ?? integrationHead,
+      implementationCommitted: Boolean(implementation),
+      changedPaths,
+      worktreeId: integration.worktree_id,
+      worktreePath: integration.path,
+      planId: run.plan_id ?? null,
+      revision: run.revision ?? null,
+      planDigest: run.plan_digest ?? null,
+    };
+  }
+
+  private testPacket(snapshot: ImplementationSnapshot, coordinatorDispatchId?: string): DispatchPacket {
+    return validatePacket({
+      objective: `Independently verify implementation commit ${snapshot.implementationCommit}.`,
+      allowed_read_paths: snapshot.authorizedPaths,
       allowed_write_paths: [],
-      acceptance_criteria: ["Run task tests, build, static checks, and regressions", "Bind evidence to the implementation commit"],
-      context: { stage: "test", implementation_commit: implementation.commit, integration_worktree_id: integration.worktree_id, changed_paths: paths },
-    }, "test"));
+      acceptance_criteria: ["Run every frozen test command", "Bind evidence to the implementation commit"],
+      context: {
+        stage: "test",
+        ...(snapshot.explorerDispatchId ? { explorer_dispatch_id: snapshot.explorerDispatchId } : {}),
+        plan_id: snapshot.planId,
+        revision: snapshot.revision,
+        plan_digest: snapshot.planDigest,
+        worktree_id: snapshot.worktreeId,
+        worktree_path: snapshot.worktreePath,
+        integration_worktree_id: snapshot.worktreeId,
+        implementation_dispatch_id: snapshot.implementationDispatchId,
+        implementation_artifact: snapshot.implementationArtifact,
+        implementation_artifacts: snapshot.implementationArtifacts,
+        implementation_commit: snapshot.implementationCommit,
+        implementation_committed: snapshot.implementationCommitted,
+        changed_paths: snapshot.changedPaths,
+        test_commands: [...IMPLEMENTATION_TEST_COMMANDS],
+        ...(coordinatorDispatchId ? { coordinator_dispatch_id: coordinatorDispatchId } : {}),
+      },
+    }, "test");
+  }
+
+  private createTestDispatch(runId: string, snapshot: ImplementationSnapshot, coordinatorDispatchId?: string): string {
+    const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='test' AND state!='failed' ORDER BY created_at DESC LIMIT 1")
+      .get(runId) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
+    const dispatchId = this.insert(runId, "test", this.testPacket(snapshot, coordinatorDispatchId));
     this.changeStage(runId, "test", dispatchId);
+    return dispatchId;
+  }
+
+  private advanceImplementation(runId: string): void {
+    const snapshot = this.implementationSnapshot(runId);
+    if (!snapshot) return;
+    const existing = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND role='test' AND state!='failed'").get(runId);
+    if (existing) return;
+    const dispatchId = this.createTestDispatch(runId, snapshot);
+    this.store.event(runId, "test.dispatch_created", { dispatchId, implementation_dispatch_id: snapshot.implementationDispatchId, implementation_artifact_id: snapshot.implementationArtifact.artifact_id });
   }
 
   private advanceReview(runId: string, result: ResultEnvelope): void {
@@ -1347,6 +1472,56 @@ export class DispatchService {
     return dispatchId;
   }
 
+  private ensureContinueTestingContinuation(runId: string): string | undefined {
+    const run = this.store.getRun(runId) as { profile: string; state: string };
+    if (run.profile !== "coding" || run.state !== "active") return undefined;
+    const test = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='test' AND state!='failed' ORDER BY created_at DESC LIMIT 1")
+      .get(runId) as { dispatch_id: string } | undefined;
+    if (test) return test.dispatch_id;
+    const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='coding'
+      AND json_extract(packet_json,'$.context.phase')='continue_testing' AND state IN ('pending','claimed','completed')
+      ORDER BY created_at DESC LIMIT 1`).get(runId) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
+    const snapshot = this.implementationSnapshot(runId);
+    if (!snapshot) return undefined;
+    const packet = validatePacket({
+      objective: "Continue the completed implementation by dispatching its frozen independent Test packet. Do not repeat implementation work.",
+      allowed_read_paths: snapshot.authorizedPaths,
+      allowed_write_paths: [],
+      acceptance_criteria: ["Dispatch exactly one Test role", "Do not modify implementation", "Preserve the frozen plan, worktree, implementation artifact, and test commands"],
+      context: {
+        stage: "coding",
+        phase: "continue_testing",
+        ...(snapshot.explorerDispatchId ? { explorer_dispatch_id: snapshot.explorerDispatchId } : {}),
+        coordinator_dispatch_id: snapshot.coordinatorDispatchId,
+        developer_dispatch_ids: snapshot.developerDispatchIds,
+        plan_id: snapshot.planId,
+        revision: snapshot.revision,
+        plan_digest: snapshot.planDigest,
+        worktree_id: snapshot.worktreeId,
+        worktree_path: snapshot.worktreePath,
+        implementation_dispatch_id: snapshot.implementationDispatchId,
+        implementation_artifact: snapshot.implementationArtifact,
+        implementation_artifacts: snapshot.implementationArtifacts,
+        implementation_commit: snapshot.implementationCommit,
+        implementation_committed: snapshot.implementationCommitted,
+        changed_paths: snapshot.changedPaths,
+        test_commands: [...IMPLEMENTATION_TEST_COMMANDS],
+        permitted_delegate_role: "test",
+      },
+    }, "coding");
+    assertExplorerAuthorization(this.store, runId, "coding", packet);
+    const dispatchId = this.insert(runId, "coding", packet, snapshot.coordinatorDispatchId);
+    const orphanedStaging = this.store.db.prepare(`SELECT staging_id FROM staging_entries
+      WHERE run_id=? AND dispatch_id=? AND kind='dispatch-packet' AND state IN ('draft','ready')`).all(runId, snapshot.coordinatorDispatchId) as Array<{ staging_id: string }>;
+    for (const entry of orphanedStaging) {
+      this.store.cancelStagingEntry(entry.staging_id, { runId, dispatchId: snapshot.coordinatorDispatchId, role: "coding", kind: "dispatch-packet" }, `superseded by ${dispatchId}`);
+    }
+    this.store.event(runId, "coding.continue_testing_created", { dispatchId, replacement_for: snapshot.coordinatorDispatchId, canceled_staging_ids: orphanedStaging.map(({ staging_id }) => staging_id) });
+    this.changeStage(runId, "coding", dispatchId);
+    return dispatchId;
+  }
+
   resume(runId: string): RunResumeResult {
     this.store.db.transaction(() => {
       let run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
@@ -1370,6 +1545,9 @@ export class DispatchService {
         return;
       }
       if (!retryableDispatch) {
+        const pendingTest = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='test' AND state IN ('pending','claimed') ORDER BY created_at DESC LIMIT 1")
+          .get(runId) as { dispatch_id: string } | undefined;
+        if (pendingTest && run.stage !== "test") this.changeStage(runId, "test", pendingTest.dispatch_id);
         const pendingDispatch = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId);
         if (pendingDispatch) return;
       }
@@ -1398,7 +1576,10 @@ export class DispatchService {
       }
       if (run.state !== "active" && run.state !== "needs_decision") return;
       if (run.profile === "planning" && run.stage !== "ready" && run.stage !== "file-explorer") this.continuePlanning(runId);
-      if (run.profile === "coding" && run.state === "active") this.ensureCodingCommitContinuation(runId);
+      if (run.profile === "coding" && run.state === "active") {
+        const commitContinuation = this.ensureCodingCommitContinuation(runId);
+        if (!commitContinuation) this.ensureContinueTestingContinuation(runId);
+      }
     })();
     const resumedRun = this.store.getRun(runId) as Record<string, unknown> & { profile: Role; state: string };
     const blockedRetryable = resumedRun.state === "retryable_failure"
