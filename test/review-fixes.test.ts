@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +10,7 @@ import { validateCommand } from "../src/command-contract.js";
 import { checkDecisionInput, checkProjectContext, checkResultEnvelope, createResultTemplate, resultSchemaForRole, ROLE_PAYLOAD_SCHEMAS } from "../src/contracts.js";
 import { DispatchService, type DispatchPacket } from "../src/dispatch.js";
 import { ScopeGate } from "../src/gates.js";
+import { GitOrchestrator } from "../src/git-orchestrator.js";
 import { ResearchService } from "../src/research-service.js";
 import type { ResearchConclusion } from "../src/research.js";
 import { ReviewService, type ReviewResult } from "../src/review.js";
@@ -17,6 +18,7 @@ import { StateStore } from "../src/state.js";
 
 const temporaryDirectory = async (): Promise<string> => mkdtemp(join(tmpdir(), "ai-team-review-fixes-"));
 const REVIEW_HEAD = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const REVIEW_BASE = execFileSync("git", ["rev-parse", "HEAD^"], { encoding: "utf8" }).trim();
 const REVIEW_COMMON_DIR = execFileSync("git", ["rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
 
 const withStore = async (callback: (store: StateStore, home: string) => Promise<void> | void): Promise<void> => {
@@ -456,11 +458,12 @@ test("project context and context command contracts reject unsafe paths and iden
 test("review findings without a concrete location or impact are rejected", async () => {
   await withStore((store) => {
     const runId = createRun(store);
+    store.db.prepare("UPDATE runs SET base_commit=? WHERE run_id=?").run(REVIEW_BASE, runId);
     const dispatches = new DispatchService(store);
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
       .run(`worktree_integration_${runId.slice(-8)}`, runId, `integration/review/${runId.slice(-8)}`, process.cwd(), REVIEW_HEAD, new Date().toISOString());
     const testId = dispatches.create(runId, "test", {
-      ...dispatchPacket(), context: { implementation_commit: REVIEW_HEAD, changed_paths: ["src/dispatch.ts"] },
+      ...dispatchPacket(), context: { implementation_commit: REVIEW_HEAD, implementation_committed: true, changed_paths: ["src/dispatch.ts"] },
     });
     store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
       .run(JSON.stringify(completedResult(runId, testId, "test", { checks: [{ command: "npm test", outcome: "passed" }] })), new Date().toISOString(), testId);
@@ -982,6 +985,8 @@ test("run resume recovers planning idempotently without crossing decisions or op
     const explorerRun = createRun(store, "planning");
     const explorerBlocked = dispatches.resume(explorerRun);
     assert.equal((explorerBlocked.run as { stage: string }).stage, "file-explorer");
+    assert.equal((explorerBlocked.run as { state: string }).state, "needs_decision");
+    assert.equal(explorerBlocked.pending_decision?.decision_type, "active_run_recovery");
     assert.equal(explorerBlocked.pending_dispatches.length, 0);
 
     const failedRun = createRun(store, "planning");
@@ -1042,6 +1047,146 @@ test("run resume creates one claimed coding continuation before Git commit dispa
       context: { explorer_dispatch_id: explorerId, worktree_id: "worktree_resume_commit", phase: "commit_implementation" },
     }, "coding", continuationId);
     assert.match(gitId, /^dispatch_[0-9A-HJKMNP-TV-Z]{26}$/);
+  });
+});
+
+test("pre_commit_then_refreeze dispatches Git from the real dirty diff and refreezes post-commit evidence", async () => {
+  await withStore(async (store) => {
+    const repository = await temporaryDirectory();
+    try {
+      execFileSync("git", ["init", "-b", "main"], { cwd: repository });
+      execFileSync("git", ["config", "user.name", "AI Team Tests"], { cwd: repository });
+      execFileSync("git", ["config", "user.email", "ai-team-tests@example.invalid"], { cwd: repository });
+      await mkdir(join(repository, ".ai-team", "index"), { recursive: true });
+      await mkdir(join(repository, "src", "components", "AiRoutingGateway"), { recursive: true });
+      await writeFile(join(repository, "MEMORY.md"), "# fixture\n");
+      await writeFile(join(repository, ".ai-team", "index", "feature-navigation.md"), "# fixture\n");
+      await writeFile(join(repository, "src", "components", "AiRoutingGateway", "index.tsx"), "export const gateway = 1;\n");
+      await writeFile(join(repository, "src", "components", "AiRoutingGateway", "AiRoutingGateway.test.tsx"), "export const tested = true;\n");
+      await writeFile(join(repository, "src", "i18n.ts"), "export const locale = 'en';\n");
+      await writeFile(join(repository, "package.json"), "{\"name\":\"fixture\"}\n");
+      execFileSync("git", ["add", "."], { cwd: repository });
+      execFileSync("git", ["commit", "-m", "fixture base"], { cwd: repository });
+      const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8" }).trim();
+      const planId = "pre-commit-refreeze";
+      const revision = "001";
+      const worktreePath = join(repository, ".worktrees", "plans", planId, `${planId}-${revision}`);
+      await mkdir(join(repository, ".worktrees", "plans", planId), { recursive: true });
+      execFileSync("git", ["worktree", "add", "-b", `plan/${planId}/${planId}-${revision}`, worktreePath, baseCommit], { cwd: repository });
+
+      store.registerRepository("repo-pre-commit-refreeze", join(repository, ".git"), repository);
+      const runId = store.createRun({ repoId: "repo-pre-commit-refreeze", profile: "coding", mode: "planned", request: "refreeze", planId, revision, baseCommit });
+      store.db.prepare("UPDATE runs SET plan_digest=? WHERE run_id=?").run("plan-digest-refreeze", runId);
+      const worktreeId = "worktree_pre_commit_refreeze";
+      store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+        .run(worktreeId, runId, `plan/${planId}/${planId}-${revision}`, worktreePath, baseCommit, new Date().toISOString());
+      const allowedPaths = [
+        "src/components/AiRoutingGateway/index.tsx",
+        "src/components/AiRoutingGateway/AiRoutingGateway.test.tsx",
+        "src/i18n.ts",
+      ];
+      const dispatches = new DispatchService(store);
+      const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+      store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?").run(JSON.stringify({
+        ...fileExplorerResult(runId, explorerId),
+        payload: { ...fileExplorerResult(runId, explorerId).payload, allowed_read_paths: allowedPaths },
+      }), new Date().toISOString(), explorerId);
+      const codingId = dispatches.create(runId, "coding", {
+        ...dispatchPacket(allowedPaths), context: { explorer_dispatch_id: explorerId, worktree_id: worktreeId },
+      });
+      dispatches.claim(runId, codingId, "coding");
+      const developerId = dispatches.create(runId, "frontend-developer", {
+        ...dispatchPacket(allowedPaths),
+        allowed_write_paths: allowedPaths,
+        context: { explorer_dispatch_id: explorerId, worktree_id: worktreeId },
+      }, "coding", codingId);
+      await dispatches.submitValue(runId, codingId, "coding", completedResult(runId, codingId, "coding", { actions: ["implemented"] }));
+      dispatches.claim(runId, developerId, "frontend-developer");
+      await writeFile(join(worktreePath, allowedPaths[0]!), "export const gateway = 2;\n");
+      await dispatches.submitValue(runId, developerId, "frontend-developer", completedResult(runId, developerId, "frontend-developer", {
+        modified_paths: [...allowedPaths, "package.json"], self_tests: [{ command: "npm test", outcome: "passed" }],
+      }));
+      const implementationArtifact = store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE dispatch_id=?").get(developerId) as { artifact_id: string; sha256: string };
+
+      const preCommitTestId = dispatches.create(runId, "test", {
+        ...dispatchPacket(allowedPaths),
+        context: { implementation_commit: baseCommit, implementation_committed: false, changed_paths: [...allowedPaths, "package.json"] },
+      });
+      dispatches.claim(runId, preCommitTestId, "test");
+      await dispatches.submitValue(runId, preCommitTestId, "test", completedResult(runId, preCommitTestId, "test", {
+        checks: [{ command: "npm test", outcome: "passed" }],
+      }));
+      assert.equal(dispatches.buildReviewPacket(runId), undefined);
+      assert.throws(() => new ReviewService(store).create(runId, baseCommit, true), /review requires/);
+
+      const reviewerId = dispatches.create(runId, "code-reviewer", {
+        ...dispatchPacket([]),
+        context: { implementation_commit: baseCommit, revision_sha: baseCommit, changed_paths: [], committed_diff: "" },
+      });
+      dispatches.claim(runId, reviewerId, "code-reviewer");
+      await dispatches.submitValue(runId, reviewerId, "code-reviewer", {
+        ...createResultTemplate(runId, reviewerId, "code-reviewer"),
+        status: "needs_decision",
+        summary: "Commit before refreezing review",
+        verification: [],
+        decisions_needed: [{
+          question: "How should review continue?",
+          choices: [
+            { id: "pre_commit_then_refreeze", label: "Commit then refreeze", impact: "Bind review to a real commit" },
+            { id: "abort", label: "Abort", impact: "Stop review without committing" },
+          ],
+          recommendation: "pre_commit_then_refreeze",
+          type: "review_refreeze",
+        }],
+        payload: {},
+      });
+      const decision = store.db.prepare("SELECT decision_id FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string };
+      const gitDispatchId = dispatches.resolveDecision(runId, decision.decision_id, "pre_commit_then_refreeze");
+      assert.equal(dispatches.resolveDecision(runId, decision.decision_id, "pre_commit_then_refreeze"), gitDispatchId);
+      const gitRow = store.db.prepare("SELECT role,packet_json FROM dispatches WHERE dispatch_id=?").get(gitDispatchId) as { role: string; packet_json: string };
+      const gitPacket = JSON.parse(gitRow.packet_json);
+      assert.equal(gitRow.role, "git-operator");
+      assert.equal(gitPacket.context.phase, "pre_commit_implementation");
+      assert.deepEqual(gitPacket.context.changed_paths, [allowedPaths[0]]);
+      assert.equal(gitPacket.context.changed_paths.includes("package.json"), false);
+      assert.deepEqual(gitPacket.allowed_write_paths, allowedPaths);
+      assert.equal(gitPacket.context.plan_id, planId);
+      assert.equal(gitPacket.context.revision, revision);
+      assert.equal(gitPacket.context.plan_digest, "plan-digest-refreeze");
+      assert.equal(gitPacket.context.worktree_id, worktreeId);
+      assert.equal(gitPacket.context.explorer_dispatch_id, explorerId);
+      assert.deepEqual(gitPacket.context.implementation_artifact, { artifact_id: implementationArtifact.artifact_id, digest: implementationArtifact.sha256 });
+      assert.deepEqual(dispatches.resume(runId).pending_dispatches.map(({ dispatch_id }) => dispatch_id), [gitDispatchId]);
+
+      dispatches.claim(runId, gitDispatchId, "git-operator");
+      const committed = await new GitOrchestrator(store).commit(runId, worktreeId, "Commit implementation", allowedPaths, gitDispatchId);
+      await dispatches.submitValue(runId, gitDispatchId, "git-operator", completedResult(runId, gitDispatchId, "git-operator", {
+        operations: [{ command: "git commit", outcome: committed.commit }],
+      }));
+      const tests = store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at").all(runId) as Array<{ dispatch_id: string; packet_json: string }>;
+      assert.equal(tests.length, 2);
+      const postCommitTest = tests[1]!;
+      const postCommitPacket = JSON.parse(postCommitTest.packet_json);
+      assert.equal(postCommitPacket.context.implementation_commit, committed.commit);
+      assert.equal(postCommitPacket.context.implementation_committed, true);
+      assert.deepEqual(postCommitPacket.context.changed_paths, [allowedPaths[0]]);
+      assert.deepEqual(postCommitPacket.context.test_commands, [
+        "npm run test -- src/components/AiRoutingGateway/AiRoutingGateway.test.tsx",
+        "npm run test",
+        "npm run lint",
+        "npm run build",
+      ]);
+      dispatches.claim(runId, postCommitTest.dispatch_id, "test");
+      await dispatches.submitValue(runId, postCommitTest.dispatch_id, "test", completedResult(runId, postCommitTest.dispatch_id, "test", {
+        checks: postCommitPacket.context.test_commands.map((command: string) => ({ command, outcome: "passed" })),
+      }));
+      const postCommitReview = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='code-reviewer' ORDER BY created_at DESC LIMIT 1").get(runId) as { packet_json: string };
+      assert.equal(JSON.parse(postCommitReview.packet_json).context.revision_sha, committed.commit);
+      const barrier = new ReviewService(store).create(runId, committed.commit, true);
+      assert.deepEqual(barrier.axes, ["spec", "standards"]);
+    } finally {
+      await rm(repository, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1378,11 +1523,12 @@ test("coding decisions are created from results and resolution atomically resume
 test("reissue rebuilds the review packet once and returns the same successor on retry", async () => {
   await withStore(async (store) => {
     const runId = createRun(store);
+    store.db.prepare("UPDATE runs SET base_commit=? WHERE run_id=?").run(REVIEW_BASE, runId);
     const dispatches = new DispatchService(store);
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
       .run("worktree_reissue_integration", runId, "integration/reissue", process.cwd(), REVIEW_HEAD, new Date().toISOString());
     const testId = dispatches.create(runId, "test", {
-      ...dispatchPacket(), context: { implementation_commit: REVIEW_HEAD, changed_paths: ["src/dispatch.ts"] },
+      ...dispatchPacket(), context: { implementation_commit: REVIEW_HEAD, implementation_committed: true, changed_paths: ["src/dispatch.ts"] },
     });
     store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
       .run(JSON.stringify(completedResult(runId, testId, "test", { checks: [{ command: "npm test", outcome: "passed" }] })), new Date().toISOString(), testId);

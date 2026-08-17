@@ -28,7 +28,7 @@ const completeStandardsReview = (store: StateStore, runId: string, summary = "pa
 const completeFrozenTest = (store: StateStore, runId: string, commit: string, completedAt = new Date().toISOString()): void => {
   const dispatches = new DispatchService(store);
   const testDispatch = dispatches.create(runId, "test", {
-    objective: "Verify frozen integration", allowed_read_paths: ["README.md"], allowed_write_paths: [], acceptance_criteria: ["passes"], context: { implementation_commit: commit, changed_paths: ["README.md"] },
+    objective: "Verify frozen integration", allowed_read_paths: ["README.md"], allowed_write_paths: [], acceptance_criteria: ["passes"], context: { implementation_commit: commit, implementation_committed: true, changed_paths: ["README.md"] },
   });
   fixtureCompleteTest(store, runId, testDispatch, completedAt);
   const packet = dispatches.buildReviewPacket(runId);

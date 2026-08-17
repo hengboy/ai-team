@@ -289,6 +289,21 @@ export class GitOrchestrator {
     const worktree = this.worktree(runId, worktreeId);
     const changed = (await git(worktree.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3));
     if (!changed.length) throw new ValidationError("implementation has no changes to commit");
+    if (dispatchId) {
+      const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+        .get(runId, dispatchId) as { packet_json: string };
+      const packet = JSON.parse(row.packet_json) as { allowed_write_paths?: string[]; context?: { phase?: string; worktree_id?: string; changed_paths?: string[] } };
+      if (packet.context?.phase === "pre_commit_implementation") {
+        if (packet.context.worktree_id !== worktreeId) throw new ValidationError("pre-commit dispatch does not match the requested worktree");
+        const frozenScopes = [...new Set(packet.allowed_write_paths ?? [])].sort();
+        if (JSON.stringify([...new Set(allowedScopes)].sort()) !== JSON.stringify(frozenScopes)) {
+          throw new ValidationError("pre-commit scopes do not match the frozen developer write paths");
+        }
+        if (JSON.stringify([...new Set(changed)].sort()) !== JSON.stringify([...(packet.context.changed_paths ?? [])].sort())) {
+          throw new ValidationError("real dirty diff changed after the pre-commit dispatch was frozen");
+        }
+      }
+    }
     for (const path of changed) {
       assertWritablePath(path);
       if (!pathMatchesScope(path, allowedScopes)) throw new ValidationError(`changed path is outside allowed scope: ${path}`);

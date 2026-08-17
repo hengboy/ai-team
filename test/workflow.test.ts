@@ -63,6 +63,7 @@ const openStore = async (): Promise<{ store: StateStore; home: string }> => {
 };
 
 const REVIEW_HEAD = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const REVIEW_BASE = execFileSync("git", ["rev-parse", "HEAD^"], { encoding: "utf8" }).trim();
 const REVIEW_COMMON_DIR = execFileSync("git", ["rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
 let formalRunSequence = 0;
 const createRun = (store: StateStore, mode = "feature"): string => {
@@ -79,6 +80,7 @@ const result = (axis: "spec" | "standards", findings: ReviewResult["findings"] =
 
 const completeTest = async (store: StateStore, runId: string, legacyPlanned = false): Promise<void> => {
   const run = store.getRun(runId) as { mode: string; plan_id?: string; revision?: string };
+  store.db.prepare("UPDATE runs SET base_commit=? WHERE run_id=?").run(REVIEW_BASE, runId);
   store.db.prepare("UPDATE worktrees SET state='removed' WHERE path=? AND state='active'").run(process.cwd());
   let branch = `integration/test/${runId.slice(-12)}`;
   let worktreePath = process.cwd();
@@ -96,7 +98,7 @@ const completeTest = async (store: StateStore, runId: string, legacyPlanned = fa
   store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
     .run(`worktree_${runId.slice(-12)}`, runId, branch, worktreePath, REVIEW_HEAD, new Date().toISOString());
   const dispatchId = new WorkflowService(store).dispatches.create(runId, "test", {
-    objective: "independent verification", allowed_read_paths: ["package.json"], allowed_write_paths: [], acceptance_criteria: ["tests pass"], context: { implementation_commit: REVIEW_HEAD, changed_paths: ["package.json"] },
+    objective: "independent verification", allowed_read_paths: ["package.json"], allowed_write_paths: [], acceptance_criteria: ["tests pass"], context: { implementation_commit: REVIEW_HEAD, implementation_committed: true, changed_paths: ["package.json"] },
   });
   store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
     .run(JSON.stringify({ ...createResultTemplate(runId, dispatchId, "test"), summary: "tests passed", verification: [{ command: "npm test", outcome: "passed" }], payload: { checks: [{ command: "npm test", outcome: "passed" }] } }), new Date().toISOString(), dispatchId);
@@ -280,24 +282,13 @@ test("run resume rebuilds a completed formal barrier and creates one final Git O
   }
 });
 
-test("completed implementation enters Test when Coding finishes before frontend", async () => {
+test("completed but uncommitted implementation does not enter Test", async () => {
   const { store, home } = await openStore();
   try {
     const fixture = await prepareCompletedImplementation(store);
     const tests = store.db.prepare("SELECT dispatch_id,packet_json,state FROM dispatches WHERE run_id=? AND role='test'").all(fixture.runId) as Array<{ dispatch_id: string; packet_json: string; state: string }>;
-    assert.equal(tests.length, 1);
-    assert.equal(tests[0]!.state, "pending");
-    const context = JSON.parse(tests[0]!.packet_json).context;
-    assert.equal(context.implementation_dispatch_id, fixture.developerDispatchId);
-    assert.equal(context.implementation_committed, false);
-    assert.equal(context.worktree_id, fixture.worktreeId);
-    assert.equal(context.worktree_path, fixture.worktreePath);
-    assert.deepEqual(context.test_commands, [
-      "npm run test -- src/components/AiRoutingGateway/AiRoutingGateway.test.tsx",
-      "npm run test",
-      "npm run lint",
-      "npm run build",
-    ]);
+    assert.equal(tests.length, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='code-reviewer'").get(fixture.runId) as { count: number }).count, 0);
   } finally {
     await cleanupTestPlanWorktrees(store);
     store.close();
@@ -311,6 +302,8 @@ test("run resume creates one continue_testing replacement with inherited evidenc
     const fixture = await prepareCompletedImplementation(store);
     store.db.prepare("DELETE FROM dispatches WHERE run_id=? AND role='test'").run(fixture.runId);
     store.db.prepare("UPDATE runs SET stage='coding' WHERE run_id=?").run(fixture.runId);
+    const commit = store.beginOperation("git.commit", `commit:${fixture.runId}:fixture`, { paths: ["src/dispatch.ts"] }, fixture.runId);
+    store.finishOperation(commit.operationId, { commit: REVIEW_HEAD, paths: ["src/dispatch.ts"], worktree_id: fixture.worktreeId });
     const staging = await store.createStagingEntry({ runId: fixture.runId, dispatchId: fixture.coordinatorDispatchId, role: "coding", kind: "dispatch-packet" });
     await store.writeStagingEntry(staging.stagingId, JSON.stringify({ objective: "stale test packet" }), {
       runId: fixture.runId, dispatchId: fixture.coordinatorDispatchId, role: "coding", kind: "dispatch-packet",
