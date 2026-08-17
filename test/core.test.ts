@@ -49,7 +49,7 @@ test("result templates carry dispatch identity and become valid with completion 
   assert.equal(template.status, "completed");
   assert.deepEqual(checkResultEnvelope(template), {
     valid: false,
-    errors: [{ path: "/summary", message: "must NOT have fewer than 1 characters" }],
+    errors: [{ path: "/summary", pointer: "/summary", field: "summary", constraint: "minLength", message: "must NOT have fewer than 1 characters" }],
   });
 
   assert.deepEqual(checkResultEnvelope(validResult()), { valid: true, value: validResult() });
@@ -60,7 +60,7 @@ test("result contract rejects completed results without evidence and failed resu
   completed.verification = [];
   assert.deepEqual(checkResultEnvelope(completed), {
     valid: false,
-    errors: [{ path: "/verification", message: "completed results require verification evidence" }],
+    errors: [{ path: "/verification", pointer: "/verification", field: "verification", constraint: "minItems", message: "completed results require verification evidence" }],
   });
 
   const failed = { ...validResult(), status: "failed", verification: [] };
@@ -87,7 +87,7 @@ test("result contract rejects unknown fields, malformed identifiers, and unsuppo
 
   assert.equal(result.valid, false);
   if (!result.valid) {
-    assert.ok(result.errors.some(({ path, message }) => path === "/" && message === "must NOT have additional properties"));
+    assert.ok(result.errors.some(({ path, field, constraint, message }) => path === "/unexpected" && field === "unexpected" && constraint === "additionalProperties" && message === "must NOT have additional properties"));
     assert.ok(result.errors.some(({ path }) => path === "/run_id"));
     assert.ok(result.errors.some(({ path }) => path === "/role"));
   }
@@ -96,7 +96,7 @@ test("result contract rejects unknown fields, malformed identifiers, and unsuppo
 test("result contract rejects role payload fields outside the role schema", () => {
   const result = checkResultEnvelope({ ...validResult(), payload: { modified_paths: [], self_tests: [], arbitrary: true } });
   assert.equal(result.valid, false);
-  if (!result.valid) assert.ok(result.errors.some(({ path, message }) => path === "/payload" && message === "must NOT have additional properties"));
+  if (!result.valid) assert.ok(result.errors.some(({ path, field, constraint, message }) => path === "/payload/arbitrary" && field === "arbitrary" && constraint === "additionalProperties" && message === "must NOT have additional properties"));
 });
 
 test("task revisions can take the managed draft to plan_ready transition", () => {
@@ -510,6 +510,13 @@ test("planning revision commit has one exact generated command contract", () => 
     "ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>",
   ]);
   assert.deepEqual(commandContractFor(["planning revision commit"]).syntax, COMMAND_SYNTAX["planning revision commit"]);
+});
+
+test("dispatch reconciliation has one exact generated command contract", () => {
+  assert.deepEqual(COMMAND_SYNTAX["dispatch reconcile"], [
+    "ai-team dispatch reconcile --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text>",
+  ]);
+  assert.deepEqual(commandContractFor(["dispatch reconcile"]).syntax, COMMAND_SYNTAX["dispatch reconcile"]);
 });
 
 test("environment explanation and diff commands have exact public contracts", () => {

@@ -24,6 +24,15 @@ export interface ResultEnvelope {
   side_effect_state?: "none" | "completed" | "unknown";
 }
 
+export interface ValidationDetail {
+  /** Backward-compatible JSON pointer alias. */
+  path: string;
+  pointer: string;
+  field: string;
+  constraint: string;
+  message: string;
+}
+
 export interface ProjectContext {
   project_shape: string;
   memory: {
@@ -183,17 +192,37 @@ export const checkProjectContext = (value: unknown): { valid: true; value: Proje
   return { valid: true, value };
 };
 
-export const formatSchemaErrors = (errors: ErrorObject[] | null | undefined): Array<{ path: string; message: string }> =>
+const pointerField = (pointer: string): string => {
+  if (pointer === "/") return "$";
+  return pointer.slice(pointer.lastIndexOf("/") + 1).replaceAll("~1", "/").replaceAll("~0", "~");
+};
+
+const validationDetail = (pointer: string, constraint: string, message: string): ValidationDetail => ({
+  path: pointer,
+  pointer,
+  field: pointerField(pointer),
+  constraint,
+  message,
+});
+
+const prefixValidationDetail = (prefix: string, error: ValidationDetail): ValidationDetail => {
+  const pointer = `${prefix}${error.pointer === "/" ? "" : error.pointer}`;
+  return { ...error, path: pointer, pointer, field: pointerField(pointer) };
+};
+
+export const formatSchemaErrors = (errors: ErrorObject[] | null | undefined): ValidationDetail[] =>
   (errors ?? []).map((error) => {
     const missing = error.keyword === "required" ? (error.params as { missingProperty?: string }).missingProperty : undefined;
-    const path = missing ? `${error.instancePath}/${missing}` : error.instancePath || "/";
-    return { path, message: error.message ?? "invalid value" };
+    const additional = error.keyword === "additionalProperties" ? (error.params as { additionalProperty?: string }).additionalProperty : undefined;
+    const property = missing ?? additional;
+    const pointer = property ? `${error.instancePath}/${property.replaceAll("~", "~0").replaceAll("/", "~1")}` : error.instancePath || "/";
+    return validationDetail(pointer, error.keyword, error.message ?? "invalid value");
   });
 
-export const checkDecisionInput = (value: unknown): { valid: true; value: TypedDecisionInput } | { valid: false; errors: Array<{ path: string; message: string }> } => {
+export const checkDecisionInput = (value: unknown): { valid: true; value: TypedDecisionInput } | { valid: false; errors: ValidationDetail[] } => {
   if (!validateDecisionInput(value)) return { valid: false, errors: formatSchemaErrors(validateDecisionInput.errors) };
   const ids = value.choices.map((choice) => choice.id);
-  if (new Set(ids).size !== ids.length) return { valid: false, errors: [{ path: "/choices", message: "choice ids must be unique" }] };
+  if (new Set(ids).size !== ids.length) return { valid: false, errors: [validationDetail("/choices", "uniqueItems", "choice ids must be unique")] };
   return { valid: true, value };
 };
 
@@ -207,29 +236,29 @@ export const DECISION_INPUT_TEMPLATE: TypedDecisionInput = {
   type: "workflow",
 };
 
-export const checkResultEnvelope = (value: unknown): { valid: true; value: ResultEnvelope } | { valid: false; errors: Array<{ path: string; message: string }> } => {
+export const checkResultEnvelope = (value: unknown): { valid: true; value: ResultEnvelope } | { valid: false; errors: ValidationDetail[] } => {
   if (!validateResult(value)) return { valid: false, errors: formatSchemaErrors(validateResult.errors) };
   const envelope = value as ResultEnvelope;
   if (envelope.status === "needs_decision") {
     if (envelope.decisions_needed.length !== 1) {
-      return { valid: false, errors: [{ path: "/decisions_needed", message: "needs_decision requires exactly one typed decision" }] };
+      return { valid: false, errors: [validationDetail("/decisions_needed", "minItems/maxItems", "needs_decision requires exactly one typed decision")] };
     }
     const decision = checkDecisionInput(envelope.decisions_needed[0]);
-    if (!decision.valid) return { valid: false, errors: decision.errors.map((error) => ({ ...error, path: `/decisions_needed/0${error.path === "/" ? "" : error.path}` })) };
+    if (!decision.valid) return { valid: false, errors: decision.errors.map((error) => prefixValidationDetail("/decisions_needed/0", error)) };
     if (envelope.role === "planning") {
       const payloadDecision = (envelope.payload as { decision?: unknown }).decision;
       if (stableJson(payloadDecision) !== stableJson(decision.value)) {
-        return { valid: false, errors: [{ path: "/payload/decision", message: "planning decision must match decisions_needed[0]" }] };
+        return { valid: false, errors: [validationDetail("/payload/decision", "const", "planning decision must match decisions_needed[0]")] };
       }
     }
   }
   if (envelope.status === "completed" && envelope.verification.length === 0) {
-    return { valid: false, errors: [{ path: "/verification", message: "completed results require verification evidence" }] };
+    return { valid: false, errors: [validationDetail("/verification", "minItems", "completed results require verification evidence")] };
   }
   const payloadValidator = validateRolePayload[envelope.role];
   const requiresPayload = envelope.status === "completed" || envelope.role === "planning" && envelope.status === "needs_decision";
   if (requiresPayload && !payloadValidator(envelope.payload)) {
-    return { valid: false, errors: formatSchemaErrors(payloadValidator.errors).map((error) => ({ ...error, path: `/payload${error.path === "/" ? "" : error.path}` })) };
+    return { valid: false, errors: formatSchemaErrors(payloadValidator.errors).map((error) => prefixValidationDetail("/payload", error)) };
   }
   if (envelope.status === "completed" && envelope.role === "file-explorer") {
     const payload = envelope.payload as { allowed_read_paths: string[]; project_context: ProjectContext };
@@ -238,19 +267,19 @@ export const checkResultEnvelope = (value: unknown): { valid: true; value: Resul
     const missingContextPaths = requiredContextPaths.filter((path) => !authorized.has(path));
     const missingEntryPaths = payload.project_context.navigation.flatMap((entry) => entry.entry_paths.filter((path) => !authorized.has(path)));
     if (missingContextPaths.length || missingEntryPaths.length) {
-      return { valid: false, errors: [{ path: "/payload/allowed_read_paths", message: `project context paths are not authorized: ${[...missingContextPaths, ...missingEntryPaths].join(", ")}` }] };
+      return { valid: false, errors: [validationDetail("/payload/allowed_read_paths", "authorization", `project context paths are not authorized: ${[...missingContextPaths, ...missingEntryPaths].join(", ")}`)] };
     }
   }
   if (requiresPayload && envelope.role === "planning") {
     const payload = envelope.payload as { pending_questions: string[]; decision: { question: string } | null };
     if (envelope.status === "needs_decision" && payload.pending_questions.length !== 1) {
-      return { valid: false, errors: [{ path: "/payload/pending_questions", message: "needs_decision requires one pending question" }] };
+      return { valid: false, errors: [validationDetail("/payload/pending_questions", "minItems", "needs_decision requires one pending question")] };
     }
     if (payload.pending_questions.length === 1 && payload.decision?.question !== payload.pending_questions[0]) {
-      return { valid: false, errors: [{ path: "/payload/decision", message: "must match the single pending question" }] };
+      return { valid: false, errors: [validationDetail("/payload/decision", "const", "must match the single pending question")] };
     }
     if (payload.pending_questions.length === 0 && payload.decision !== null) {
-      return { valid: false, errors: [{ path: "/payload/decision", message: "must be null without a pending question" }] };
+      return { valid: false, errors: [validationDetail("/payload/decision", "const", "must be null without a pending question")] };
     }
   }
   return { valid: true, value: envelope };

@@ -25,7 +25,21 @@ export interface RunResumeResult {
   pending_decision: Record<string, unknown> | null;
   pending_operations: Array<{ operation_id: string; kind: string; state: string }>;
   last_event: Record<string, unknown> | null;
+  recovery: {
+    state: "action_required";
+    dispatch_id: string;
+    side_effect_state: "completed" | "unknown";
+    next_command: string | null;
+  } | null;
 }
+
+type ReplacementAction = "reissued" | "superseded" | "reconciled";
+type ReplacementResult<Action extends ReplacementAction> = {
+  action: Action;
+  dispatch_id: string;
+  replacement_for: string;
+  reused: boolean;
+};
 
 interface ReviewBarrierRow {
   barrier_id: string;
@@ -274,13 +288,52 @@ export class DispatchService {
     return { action: "canceled", reused: false };
   }
 
-  reissue(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): { action: "reissued"; dispatch_id: string; reused: boolean } {
+  reissue(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): ReplacementResult<"reissued"> {
     const row = this.get(runId, dispatchId, role) as { state: string; packet_json: string };
     return this.replaceDispatch(runId, dispatchId, role, actorRole, reason, "reissued", JSON.parse(row.packet_json) as DispatchPacket);
   }
 
-  supersede(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string, packet: DispatchPacket): { action: "superseded"; dispatch_id: string; reused: boolean } {
+  supersede(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string, packet: DispatchPacket): ReplacementResult<"superseded"> {
     return this.replaceDispatch(runId, dispatchId, role, actorRole, reason, "superseded", validatePacket(packet, role));
+  }
+
+  reconcile(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): ReplacementResult<"reconciled"> {
+    this.assertLifecycleActor(runId, actorRole, "dispatch reconcile");
+    if (!reason.trim()) throw new ValidationError("dispatch reconciliation requires a reason");
+    const row = this.get(runId, dispatchId, role) as {
+      state: string;
+      role: Role;
+      packet_json: string;
+      packet_digest?: string;
+      result_json?: string;
+      replacement_for?: string;
+    };
+    const prior = this.store.db.prepare("SELECT 1 FROM run_events WHERE run_id=? AND type='dispatch.reconciled' AND json_extract(payload_json,'$.dispatchId')=?")
+      .get(runId, dispatchId);
+    if (prior) {
+      const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
+        .get(runId, dispatchId) as { dispatch_id: string } | undefined;
+      if (!existing) throw new ValidationError("reconciled dispatch is missing its replacement");
+      return { action: "reconciled", dispatch_id: existing.dispatch_id, replacement_for: dispatchId, reused: true };
+    }
+    if (row.state !== "retryable_failure") throw new ValidationError(`dispatch cannot be reconciled from ${row.state}`);
+    let result: { status?: string; side_effect_state?: string };
+    try { result = JSON.parse(row.result_json ?? ""); }
+    catch { throw new ValidationError("dispatch reconciliation requires a valid retryable result envelope"); }
+    if (result.status !== "retryable_failure" || result.side_effect_state !== "completed") {
+      throw new ValidationError("dispatch reconciliation requires confirmed completed side effects", [
+        { path: "/side_effect_state", pointer: "/side_effect_state", field: "side_effect_state", constraint: "const", message: "must equal completed" },
+      ]);
+    }
+    let replacementId = "";
+    this.store.db.transaction(() => {
+      this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
+        .run(new Date().toISOString(), dispatchId);
+      this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+      replacementId = this.recoveryReplacement(runId, { dispatch_id: dispatchId, ...row });
+      this.store.event(runId, "dispatch.reconciled", { dispatchId, replacement_dispatch_id: replacementId, role, actor_role: actorRole, reason, side_effect_state: "completed" });
+    })();
+    return { action: "reconciled", dispatch_id: replacementId, replacement_for: dispatchId, reused: false };
   }
 
   private assertLifecycleActor(runId: string, actorRole: Role, command: string): void {
@@ -297,26 +350,29 @@ export class DispatchService {
     reason: string,
     action: Action,
     packet: DispatchPacket,
-  ): { action: Action; dispatch_id: string; reused: boolean } {
+  ): ReplacementResult<Action> {
     this.assertLifecycleActor(runId, actorRole, `dispatch ${action === "reissued" ? "reissue" : "supersede"}`);
     if (!reason.trim()) throw new ValidationError(`dispatch ${action} requires a reason`);
     const row = this.get(runId, dispatchId, role) as { state: string };
-    if (!["pending", "claimed", "failed"].includes(row.state)) throw new ValidationError(`dispatch cannot be ${action} from ${row.state}`);
+    if (!["pending", "claimed", "failed", "retryable_failure"].includes(row.state)) throw new ValidationError(`dispatch cannot be ${action} from ${row.state}`);
     assertExplorerAuthorization(this.store, runId, role, packet);
     const packetJson = redact(stableJson(packet));
     const existing = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
       .get(runId, dispatchId) as { dispatch_id: string; packet_json: string } | undefined;
     if (existing) {
       if (existing.packet_json !== packetJson) throw new ValidationError("dispatch already has a different replacement");
-      return { action, dispatch_id: existing.dispatch_id, reused: true };
+      return { action, dispatch_id: existing.dispatch_id, replacement_for: dispatchId, reused: true };
     }
     let replacementId = "";
     this.store.db.transaction(() => {
       this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?").run(new Date().toISOString(), dispatchId);
+      if (row.state === "retryable_failure") {
+        this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+      }
       replacementId = this.insert(runId, role, packet, dispatchId);
       this.store.event(runId, `dispatch.${action}`, { dispatchId, replacement_dispatch_id: replacementId, role, actor_role: actorRole, reason });
     })();
-    return { action, dispatch_id: replacementId, reused: false };
+    return { action, dispatch_id: replacementId, replacement_for: dispatchId, reused: false };
   }
 
   prompt(runId: string, dispatchId: string, role: Role): string {
@@ -1058,12 +1114,34 @@ export class DispatchService {
       if (run.profile === "planning" && run.stage !== "ready" && run.stage !== "file-explorer") this.continuePlanning(runId);
       if (run.profile === "coding" && run.state === "active") this.ensureCodingCommitContinuation(runId);
     })();
+    const resumedRun = this.store.getRun(runId) as Record<string, unknown> & { profile: Role; state: string };
+    const blockedRetryable = resumedRun.state === "retryable_failure"
+      ? this.store.db.prepare("SELECT dispatch_id,role,result_json FROM dispatches WHERE run_id=? AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1")
+        .get(runId) as { dispatch_id: string; role: Role; result_json?: string } | undefined
+      : undefined;
+    let recovery: RunResumeResult["recovery"] = null;
+    if (blockedRetryable?.result_json) {
+      try {
+        const result = JSON.parse(blockedRetryable.result_json) as { side_effect_state?: "completed" | "unknown" };
+        if (result.side_effect_state === "completed" || result.side_effect_state === "unknown") {
+          recovery = {
+            state: "action_required",
+            dispatch_id: blockedRetryable.dispatch_id,
+            side_effect_state: result.side_effect_state,
+            next_command: result.side_effect_state === "completed"
+              ? `ai-team dispatch reconcile --run-id ${runId} --dispatch-id ${blockedRetryable.dispatch_id} --role ${blockedRetryable.role} --actor-role ${resumedRun.profile} --reason "reconcile confirmed completed side effect"`
+              : null,
+          };
+        }
+      } catch { /* corrupt legacy results remain diagnostic-only */ }
+    }
     return {
-      run: this.store.getRun(runId),
+      run: resumedRun,
       pending_dispatches: this.store.db.prepare("SELECT dispatch_id,role,state FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").all(runId) as RunResumeResult["pending_dispatches"],
       pending_decision: (this.store.db.prepare("SELECT * FROM decisions WHERE run_id=? AND status='pending'").get(runId) as Record<string, unknown> | undefined) ?? null,
       pending_operations: this.store.db.prepare("SELECT operation_id,kind,state FROM operations WHERE run_id=? AND state='pending'").all(runId) as RunResumeResult["pending_operations"],
       last_event: (this.store.db.prepare("SELECT type,payload_json,created_at FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT 1").get(runId) as Record<string, unknown> | undefined) ?? null,
+      recovery,
     };
   }
 

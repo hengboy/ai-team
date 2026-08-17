@@ -54,6 +54,8 @@ test("role manifests reserve revision creation for planning and revision commit 
   assert.ok(build.roles.planning.commands.includes("planning revision create"));
   assert.ok(!build.roles.planning.commands.includes("planning revision commit"));
   assert.ok(build.roles["git-operator"].commands.includes("planning revision commit"));
+  assert.ok(build.roles.planning.commands.includes("dispatch reconcile"));
+  assert.ok(build.roles.coding.commands.includes("dispatch reconcile"));
 });
 
 test("role manifests declare staging ownership separately from project writes", () => {

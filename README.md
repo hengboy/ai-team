@@ -58,7 +58,12 @@ Use these recovery commands after a client session ends:
 ai-team run show <run-id>
 ai-team run resume <run-id>
 ai-team run decide --run-id <run-id> --decision-id <decision-id> --choice <choice-id>
+ai-team dispatch reconcile --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text>
 ```
+
+When a retryable result reports confirmed completed side effects, `run resume`
+returns the exact `dispatch reconcile` command that creates an audited replacement
+without discarding the original dispatch lineage or verification evidence.
 
 ## Environment Management
 

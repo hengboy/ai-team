@@ -10,6 +10,7 @@ commands:
   - dispatch claim
   - dispatch cancel
   - dispatch reissue
+  - dispatch reconcile
   - dispatch supersede
   - dispatch prompt
   - dispatch schema

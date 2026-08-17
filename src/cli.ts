@@ -574,6 +574,8 @@ export const buildProgram = (): Command => {
     .action(async (options) => output(await withStore((store) => new DispatchService(store).cancel(options.runId, options.dispatchId, options.role, options.actorRole, options.reason))));
   dispatchCommand("reissue").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).requiredOption("--reason <text>")
     .action(async (options) => output(await withStore((store) => new DispatchService(store).reissue(options.runId, options.dispatchId, options.role, options.actorRole, options.reason))));
+  dispatchCommand("reconcile").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).requiredOption("--reason <text>")
+    .action(async (options) => output(await withStore((store) => new DispatchService(store).reconcile(options.runId, options.dispatchId, options.role, options.actorRole, options.reason))));
   jsonOptions(dispatchCommand("supersede").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).requiredOption("--reason <text>"), "--packet-file")
     .action(async (options) => {
       const retention = await retentionHours();

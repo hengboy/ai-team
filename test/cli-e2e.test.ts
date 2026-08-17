@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import Database from "better-sqlite3";
 import test from "node:test";
+import { createResultTemplate } from "../src/contracts.js";
+import { DispatchService } from "../src/dispatch.js";
 import { StateStore } from "../src/state.js";
 
 const execFileAsync = promisify(execFile);
@@ -300,6 +302,78 @@ test("CLI manages cancel, reissue, and supersede for a claimed support dispatch"
     ],
   );
   store.close();
+});
+
+test("CLI resume returns and executes managed reconciliation for confirmed side effects", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const store = await StateStore.open(sandbox.aiTeamHome);
+  store.registerRepository("repo-cli-reconcile", join(sandbox.repo, ".git"), sandbox.repo);
+  const runId = store.createRun({ repoId: "repo-cli-reconcile", profile: "planning", mode: "planned", request: "reconcile retryable dispatch" });
+  const dispatches = new DispatchService(store);
+  const dispatchId = dispatches.create(runId, "file-explorer", {
+    objective: "Inspect recovery state",
+    allowed_read_paths: ["."],
+    allowed_write_paths: [],
+    acceptance_criteria: ["Return recovery evidence"],
+    context: {},
+  });
+  dispatches.claim(runId, dispatchId, "file-explorer");
+  await dispatches.submitValue(runId, dispatchId, "file-explorer", {
+    ...createResultTemplate(runId, dispatchId, "file-explorer"),
+    status: "retryable_failure",
+    summary: "Client disconnected after completing the side effect",
+    verification: [{ command: "git status", outcome: "completed side effect confirmed" }],
+    payload: {},
+    failure_class: "client_disconnect",
+    side_effect_state: "completed",
+  });
+  store.close();
+
+  const resumed = json<{ recovery: { next_command: string } }>(await cli(sandbox, ["run", "resume", runId]));
+  assert.equal(
+    resumed.recovery.next_command,
+    `ai-team dispatch reconcile --run-id ${runId} --dispatch-id ${dispatchId} --role file-explorer --actor-role planning --reason "reconcile confirmed completed side effect"`,
+  );
+  const reconciled = json<{ action: string; dispatch_id: string; replacement_for: string; reused: boolean }>(await cli(sandbox, [
+    "dispatch", "reconcile", "--run-id", runId, "--dispatch-id", dispatchId,
+    "--role", "file-explorer", "--actor-role", "planning", "--reason", "confirmed completed side effect",
+  ]));
+  assert.deepEqual(
+    { action: reconciled.action, replacement_for: reconciled.replacement_for, reused: reconciled.reused },
+    { action: "reconciled", replacement_for: dispatchId, reused: false },
+  );
+});
+
+test("Git Operator result validation reports pointer, field, and constraint", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const store = await StateStore.open(sandbox.aiTeamHome);
+  store.registerRepository("repo-cli-envelope", join(sandbox.repo, ".git"), sandbox.repo);
+  const runId = store.createRun({ repoId: "repo-cli-envelope", profile: "coding", mode: "feature", request: "validate Git Operator result" });
+  const dispatchId = new DispatchService(store).create(runId, "git-operator", {
+    objective: "Prepare managed worktrees",
+    allowed_read_paths: [],
+    allowed_write_paths: [],
+    acceptance_criteria: ["Return operation evidence"],
+    context: {},
+  });
+  store.close();
+
+  json(await cli(sandbox, ["dispatch", "claim", "--run-id", runId, "--dispatch-id", dispatchId, "--role", "git-operator"]));
+  const resultFile = join(sandbox.root, "invalid-git-result.json");
+  await writeFile(resultFile, JSON.stringify({
+    ...createResultTemplate(runId, dispatchId, "git-operator"),
+    summary: "Prepared worktrees",
+    verification: [{ command: "git status", outcome: "passed" }],
+    payload: {},
+  }));
+  const submitted = await cli(sandbox, [
+    "dispatch", "submit", "--run-id", runId, "--dispatch-id", dispatchId,
+    "--role", "git-operator", "--result-file", resultFile,
+  ]);
+  assert.equal(submitted.status, 2);
+  const failure = JSON.parse(submitted.stderr) as { error: string; details: Array<Record<string, unknown>> };
+  assert.equal(failure.error, "result envelope is invalid");
+  assert.ok(failure.details.some((detail) => detail.pointer === "/payload/operations" && detail.field === "operations" && detail.constraint === "required"));
 });
 
 test("CLI syntax errors use one JSON stderr object and exit code 5", async (t) => {

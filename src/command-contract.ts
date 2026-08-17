@@ -68,6 +68,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "dispatch claim": ["ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
   "dispatch cancel": ["ai-team dispatch cancel --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text>"],
   "dispatch reissue": ["ai-team dispatch reissue --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text>"],
+  "dispatch reconcile": ["ai-team dispatch reconcile --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text>"],
   "dispatch supersede": ["ai-team dispatch supersede --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text> (--packet-file <json> | --staging-id <staging-id>)"],
   "dispatch prompt": ["ai-team dispatch prompt --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
   "dispatch schema": ["ai-team dispatch schema --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
@@ -136,7 +137,7 @@ const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>
 });
 
 const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
-const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
+const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */
 export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.freeze({

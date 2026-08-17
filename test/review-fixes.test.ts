@@ -955,6 +955,74 @@ test("run resume repairs a stale planning retryable failure without crossing blo
   });
 });
 
+test("confirmed retryable side effects reconcile through an idempotent replacement lineage", async () => {
+  await withStore(async (store) => {
+    const dispatches = new DispatchService(store);
+    const makeRetryable = async (sideEffectState: "completed" | "unknown") => {
+      const runId = createRun(store, "planning");
+      const dispatchId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+      dispatches.claim(runId, dispatchId, "file-explorer");
+      await dispatches.submitValue(runId, dispatchId, "file-explorer", {
+        ...fileExplorerResult(runId, dispatchId),
+        status: "retryable_failure",
+        verification: [{ command: "git status", outcome: "side effect completed before timeout" }],
+        payload: {},
+        failure_class: "client_disconnect",
+        side_effect_state: sideEffectState,
+      });
+      return { runId, dispatchId };
+    };
+
+    const confirmed = await makeRetryable("completed");
+    const resumed = dispatches.resume(confirmed.runId);
+    assert.deepEqual(resumed.recovery, {
+      state: "action_required",
+      dispatch_id: confirmed.dispatchId,
+      side_effect_state: "completed",
+      next_command: `ai-team dispatch reconcile --run-id ${confirmed.runId} --dispatch-id ${confirmed.dispatchId} --role file-explorer --actor-role planning --reason "reconcile confirmed completed side effect"`,
+    });
+
+    const reconciled = dispatches.reconcile(confirmed.runId, confirmed.dispatchId, "file-explorer", "planning", "confirmed side effect is durable");
+    assert.deepEqual(reconciled, {
+      action: "reconciled",
+      dispatch_id: reconciled.dispatch_id,
+      replacement_for: confirmed.dispatchId,
+      reused: false,
+    });
+    assert.deepEqual(dispatches.reconcile(confirmed.runId, confirmed.dispatchId, "file-explorer", "planning", "confirmed side effect is durable"), { ...reconciled, reused: true });
+    assert.equal(store.getRun(confirmed.runId).state, "active");
+    assert.deepEqual(
+      store.db.prepare("SELECT state,replacement_for FROM dispatches WHERE dispatch_id=?").get(reconciled.dispatch_id),
+      { state: "pending", replacement_for: confirmed.dispatchId },
+    );
+    const recoveryPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(reconciled.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(recoveryPacket.context.recovery.replacement_for, confirmed.dispatchId);
+    assert.deepEqual(recoveryPacket.context.recovery.completed_verification, [{ command: "git status", outcome: "side effect completed before timeout" }]);
+
+    const unknown = await makeRetryable("unknown");
+    assert.equal(dispatches.resume(unknown.runId).recovery?.next_command, null);
+    assert.throws(
+      () => dispatches.reconcile(unknown.runId, unknown.dispatchId, "file-explorer", "planning", "cannot confirm side effect"),
+      /requires confirmed completed side effects/,
+    );
+    const reissued = dispatches.reissue(unknown.runId, unknown.dispatchId, "file-explorer", "planning", "replace after external investigation");
+    assert.equal(reissued.replacement_for, unknown.dispatchId);
+    assert.equal(store.getRun(unknown.runId).state, "active");
+
+    const supersededSource = await makeRetryable("completed");
+    const superseded = dispatches.supersede(
+      supersededSource.runId,
+      supersededSource.dispatchId,
+      "file-explorer",
+      "planning",
+      "replace with corrected scope",
+      dispatchPacket(["src/planning.ts"]),
+    );
+    assert.equal(superseded.replacement_for, supersededSource.dispatchId);
+    assert.equal(store.getRun(supersededSource.runId).state, "active");
+  });
+});
+
 test("retryable frontend recovery preserves the claimed coordinator and creates a linked replacement", async () => {
   await withStore(async (store) => {
     const runId = createRun(store);
