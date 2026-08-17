@@ -288,6 +288,8 @@ test("planning and Git Operator agents expose the immutable revision handoff con
   assert.match(planning, /规划代理自身不得执行 `planning revision commit`/);
   assert.match(gitOperator, /`planning revision commit`/);
   assert.match(gitOperator, /ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>/);
+  assert.match(gitOperator, /生成 `git commit --message` 的提交消息时使用 `\$git-commit` 技能/);
+  assert.match(gitOperator, /不得自行发明其他格式或绕过 CLI 执行提交/);
 });
 
 test("generated agents keep screenshots in the owning plan directory", () => {
