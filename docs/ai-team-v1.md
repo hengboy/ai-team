@@ -165,7 +165,9 @@ MEMORY.md
 /.ai-team/runtime/
 ```
 
-同时幂等创建根 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md`。已有 `AGENTS.md` 或 `CLAUDE.md` 时追加一条上下文维护规则，但不创建不存在的指令文件。任何将被修改的上下文、指令或 `.gitignore` 文件存在未提交内容时，显示诊断并要求用户以 `--yes` 确认；不覆盖用户内容或规划目录冲突文件。
+同时幂等创建根 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md` 的上下文骨架。已有 `AGENTS.md` 或 `CLAUDE.md` 时追加一条上下文维护规则，但不创建不存在的指令文件。任何将被修改的上下文、指令或 `.gitignore` 文件存在未提交内容时，显示诊断并要求用户以 `--yes` 确认；不覆盖用户内容或规划目录冲突文件。
+
+`setup-ai-team` 技能在初始化前委派 File Explorer 只读探索目标仓库，并在 `init` 成功后将本次结构化 `payload.project_context` 通过 `ai-team context update` 写入。导航必须来自已确认的功能、模块边界和真实入口路径；不得仅凭目录名或 manifest 猜测。没有可证实入口的空仓库可以保留空导航，但不得虚构条目。只有 update 成功且随后 validate 返回有效、无需维护时，完整设置流程才算完成。
 
 File Explorer 在代码搜索前读取已有 MEMORY 和导航索引，并返回严格的 `payload.project_context`。开发角色只通过 `ai-team context update` 合并领域术语、仓库约束、职责、模块边界和真实入口路径；结构重复、绝对/越界/敏感/不存在路径会阻断写入。入口、职责或模块边界变化时必须同轮更新并运行 `ai-team context validate`。
 

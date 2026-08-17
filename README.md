@@ -28,10 +28,16 @@ to an existing `AGENTS.md` or `CLAUDE.md` without creating either file. If any
 existing target context or instruction file is modified, inspect the JSON
 diagnostic and repeat with `--yes`.
 
-Use `ai-team context update --project <path> --context-file <json>` for the
-structured File Explorer result, and `ai-team context validate --project <path>`
-to inspect sections, real navigation paths, instruction rules, and pending
-maintenance.
+The bundled `setup-ai-team` skill completes initialization by delegating a
+read-only inspection to File Explorer, then passing its structured result to
+`ai-team context update`. This fills `MEMORY.md` and the feature navigation with
+the target repository's actual responsibilities, module boundaries, and entry
+paths instead of leaving only the initial skeleton.
+
+Use `ai-team context update --project <path> --context-file <json>` for a
+structured File Explorer result when maintaining context directly, and
+`ai-team context validate --project <path>` to inspect sections, real navigation
+paths, instruction rules, and pending maintenance.
 
 ## Workflow
 

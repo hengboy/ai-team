@@ -57,7 +57,7 @@
 - `src/environment.ts` 负责解析环境模型，并解释整对象 default/override 来源和环境间语义差异。
 - `scripts/verify-packed-install.ts` 负责在隔离 consumer 中验证真实 npm tarball。
 - `src/security.ts` 与 `src/state.ts` 负责 staging 文件系统安全、run 内序号分配、可读文件名迁移、生命周期元数据、保留和清理。
-- `skills/setup-ai-team` 负责在目标 Git 项目中初始化并校验 AI Team 的可复用 Codex 工作流。
+- `skills/setup-ai-team` 负责在目标 Git 项目中初始化 AI Team，委派 File Explorer 基于仓库证据生成结构化项目上下文，并写入、校验真实功能导航。
 - `skills/switch-ai-team-env` 负责预检并切换 AI Team 全局环境配置的可复用 Codex 工作流。
 - `src/dispatch.ts` 将已完成的评审叶子汇总到所属 barrier，并幂等创建唯一的 review resolution 或最终 Git Operator continuation。
 - `src/review.ts` 提供 barrier 幂等创建，以及按 barrier ID 或 run revision 查询状态。
@@ -72,7 +72,7 @@
 - `src/environment.ts` 与 `agent-build/roles` 负责受管角色生成、能力定义及只读环境查询。
 - `src/cli.ts` 为受管 JSON 命令提供 file、`--staging-id` 与 `--input-stdin` 输入；新 dispatch prompt 固定走显式 staging，planning commit 会关闭遗留 Planning dispatch。
 - `src/dispatch.ts` 以 v4 renderer 生成显式 staging prompt，并按历史 renderer/digest 恢复旧 dispatch；claim bundle 与 submit continuation 保持只读投影。
-- `skills/setup-ai-team` 封装公共初始化和上下文校验命令，`skills/switch-ai-team-env` 封装公共环境切换和状态命令；两者均不改变 CLI 行为。
+- `skills/setup-ai-team` 封装公共初始化命令、File Explorer 上下文采集、`context update` 与校验，`skills/switch-ai-team-env` 封装公共环境切换和状态命令；两者均不改变 CLI 行为。
 - `test/*.test.ts` 包含单元测试、CLI 端到端测试、锁测试、契约测试和工作流回归测试。
 - `src/review.ts` 负责 formal review 绑定和公共状态查询，`src/dispatch.ts` 负责叶子汇总、恢复和 run 阶段推进。
 - `run handoff-to-planning` 只接受无 pending operation 的 frozen coding run；规划 revision 提交 ready 后恢复 source run，旧 pending/claimed dispatch 不得继续授权。
