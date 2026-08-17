@@ -73,7 +73,7 @@ const json = <T>(result: CommandResult): T => {
   return envelope.data;
 };
 
-const makeSandbox = async (t: test.TestContext): Promise<Sandbox> => {
+const makeSandbox = async (t: test.TestContext, initialize = true): Promise<Sandbox> => {
   const root = await mkdtemp(join(tmpdir(), "ai-team-cli-e2e-"));
   const sandbox: Sandbox = {
     root,
@@ -98,6 +98,11 @@ const makeSandbox = async (t: test.TestContext): Promise<Sandbox> => {
   await writeFile(join(sandbox.repo, "README.md"), "# fixture\n");
   assert.equal((await git(sandbox, ["add", "README.md"])).status, 0);
   assert.equal((await git(sandbox, ["commit", "-m", "fixture"])).status, 0);
+  if (initialize) {
+    json(await cli(sandbox, ["init", sandbox.repo, "--yes"]));
+    assert.equal((await git(sandbox, ["add", "--", ".gitignore", ".ai-team", "MEMORY.md"])).status, 0);
+    assert.equal((await git(sandbox, ["commit", "-m", "initialize project context"])).status, 0);
+  }
   return sandbox;
 };
 
@@ -358,6 +363,7 @@ test("CLI manages cancel, reissue, and supersede for a claimed support dispatch"
 
 test("CLI resume returns and executes managed reconciliation for confirmed side effects", async (t) => {
   const sandbox = await makeSandbox(t);
+  json(await cli(sandbox, ["init", sandbox.repo, "--yes"]));
   const store = await StateStore.open(sandbox.aiTeamHome);
   store.registerRepository("repo-cli-reconcile", join(sandbox.repo, ".git"), sandbox.repo);
   const runId = store.createRun({ repoId: "repo-cli-reconcile", profile: "planning", mode: "planned", request: "reconcile retryable dispatch" });
@@ -494,6 +500,61 @@ test("decision commands expose a template and return field-level errors for empt
   assert.deepEqual(error.details.map((item) => item.path).sort(), ["/choices", "/question"]);
 });
 
+test("independent task split decisions have one legal plan_ready continuation", async (t) => {
+  const sandbox = await makeSandbox(t);
+  json(await cli(sandbox, ["init", sandbox.repo, "--yes"]));
+  const createPlanningRun = async (): Promise<{ runId: string; dispatchId: string }> => {
+    const store = await StateStore.open(sandbox.aiTeamHome);
+    store.registerRepository("repo-task-split", join(sandbox.repo, ".git"), sandbox.repo);
+    const runId = store.createRun({ repoId: "repo-task-split", profile: "planning", mode: "planned", request: "split decision" });
+    store.db.prepare("UPDATE runs SET stage='plan_ready' WHERE run_id=?").run(runId);
+    const service = new DispatchService(store);
+    const dispatchId = service.create(runId, "planning", {
+      objective: "request task split", allowed_read_paths: ["README.md"], allowed_write_paths: [], acceptance_criteria: ["record decision"], context: {},
+    }, "planning");
+    service.claim(runId, dispatchId, "planning");
+    store.close();
+    return { runId, dispatchId };
+  };
+  const decision = {
+    question: "Split implementation into tasks?",
+    choices: [
+      { id: "split", label: "Split", impact: "Preview task documents" },
+      { id: "no_split", label: "Do not split", impact: "Create the revision without tasks" },
+    ],
+    recommendation: "no_split",
+    type: "task_split",
+  };
+
+  const noSplit = await createPlanningRun();
+  const noSplitCreated = json<{ decision_id: string }>(await cliWithInput(sandbox, [
+    "decision", "create", "--run-id", noSplit.runId, "--dispatch-id", noSplit.dispatchId, "--input-stdin",
+  ], JSON.stringify(decision)));
+  const noSplitResolved = json<{ dispatch_id: string }>(await cli(sandbox, [
+    "run", "decide", "--run-id", noSplit.runId, "--decision-id", noSplitCreated.decision_id, "--choice", "no_split",
+  ]));
+  assert.equal(noSplitResolved.dispatch_id, noSplit.dispatchId);
+  const noSplitShow = json<{ run: { state: string; stage: string }; dispatches: Array<{ role: string; state: string }> }>(await cli(sandbox, ["run", "show", noSplit.runId]));
+  assert.equal(noSplitShow.run.state, "active");
+  assert.equal(noSplitShow.run.stage, "plan_ready");
+  assert.equal(noSplitShow.dispatches.filter(({ role, state }) => role === "planning" && ["pending", "claimed", "failed"].includes(state)).length, 0);
+
+  const split = await createPlanningRun();
+  const splitCreated = json<{ decision_id: string }>(await cliWithInput(sandbox, [
+    "decision", "create", "--run-id", split.runId, "--dispatch-id", split.dispatchId, "--input-stdin",
+  ], JSON.stringify(decision)));
+  const splitResolved = json<{ dispatch_id: string }>(await cli(sandbox, [
+    "run", "decide", "--run-id", split.runId, "--decision-id", splitCreated.decision_id, "--choice", "split",
+  ]));
+  assert.notEqual(splitResolved.dispatch_id, split.dispatchId);
+  const splitShow = json<{ run: { state: string; stage: string }; dispatches: Array<{ dispatch_id: string; role: string; state: string }> }>(await cli(sandbox, ["run", "show", split.runId]));
+  assert.equal(splitShow.run.state, "active");
+  assert.equal(splitShow.run.stage, "plan_ready");
+  assert.deepEqual(splitShow.dispatches.filter(({ role, state }) => role === "planning" && ["pending", "claimed"].includes(state)).map(({ dispatch_id, role, state }) => ({ dispatch_id, role, state })), [
+    { dispatch_id: splitResolved.dispatch_id, role: "planning", state: "pending" },
+  ]);
+});
+
 test("CLI entrypoint executes through a symlinked path", async (t) => {
   const sandbox = await makeSandbox(t);
   const linkedCli = join(sandbox.root, "linked cli.js");
@@ -505,7 +566,7 @@ test("CLI entrypoint executes through a symlinked path", async (t) => {
 });
 
 test("init creates project metadata, context skeletons, and documented ignore entries", async (t) => {
-  const sandbox = await makeSandbox(t);
+  const sandbox = await makeSandbox(t, false);
 
   const initialized = json<{
     project: string;
@@ -821,6 +882,7 @@ test("direct stdin submit is state-equivalent to explicit staging", async (t) =>
 
 test("dispatch bundle and stdin submit preserve frozen assets, retry state, and continuation", async (t) => {
   const sandbox = await makeSandbox(t);
+  json(await cli(sandbox, ["init", sandbox.repo, "--yes"]));
   const requestFile = join(sandbox.root, "request.md");
   await writeFile(requestFile, "Exercise the simplified dispatch path.\n");
   const started = json<{ run_id: string; dispatch_id: string }>(await cli(sandbox, [
@@ -841,7 +903,7 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
   assert.equal(bundle.prompt, json(await cli(sandbox, ["dispatch", "prompt", ...identity])));
   assert.deepEqual(bundle.schema, json(await cli(sandbox, ["dispatch", "schema", ...identity])));
   assert.deepEqual(bundle.template, json(await cli(sandbox, ["dispatch", "template", ...identity])));
-  assert.equal(bundle.renderer_version, "dispatch-renderer-v3");
+  assert.equal(bundle.renderer_version, "dispatch-renderer-v4");
   for (const digest of Object.values(bundle.digests)) assert.match(digest, /^[a-f0-9]{64}$/);
 
   const result = {
@@ -879,6 +941,13 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
   assert.match(schemaError.details.staging_id, /^staging_/);
   assert.equal(schemaError.details.state, "ready");
   assert.ok(schemaError.details.cause);
+  const schemaCause = schemaError.details.cause as { issues: Array<{ pointer: string; constraint: string; suggestion: string }> };
+  assert.ok(schemaCause.issues.some((issue) => issue.pointer.startsWith("/") && issue.constraint && issue.suggestion.includes("Correct")));
+  const failureStore = await StateStore.open(sandbox.aiTeamHome, { readonly: true });
+  const failureEvent = failureStore.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='staging.validation_failed' ORDER BY event_id DESC LIMIT 1").get(started.run_id) as { payload_json: string };
+  failureStore.close();
+  const eventCause = JSON.parse(failureEvent.payload_json).cause as { issues: Array<{ pointer: string; constraint: string; suggestion: string }> };
+  assert.ok(eventCause.issues.some((issue) => issue.pointer.startsWith("/") && issue.constraint && issue.suggestion));
 
   const wrongIdentity = { ...result, run_id: "run_01ARZ3NDEKTSV4RRFFQ69G5FAV" };
   const rewritten = json<{ state: string }>(await cliWithInput(sandbox, [
@@ -1298,6 +1367,7 @@ test("completed planning commit reconciliation converges state, validates owners
   const revision = "001";
   const dispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAZ";
   const otherDispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FB0";
+  const stalePlanningId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FB1";
   const digest = "d".repeat(64);
   const confirmedCommit = "e".repeat(40);
   const databasePath = join(sandbox.aiTeamHome, "state", "state.sqlite");
@@ -1318,6 +1388,9 @@ test("completed planning commit reconciliation converges state, validates owners
   });
   insertDispatch.run(dispatchId, started.run_id, "git-operator", packet, "", "{}", "{}", new Date().toISOString(), new Date().toISOString());
   insertDispatch.run(otherDispatchId, otherStarted.run_id, "git-operator", packet, "", "{}", "{}", new Date().toISOString(), new Date().toISOString());
+  insertDispatch.run(stalePlanningId, started.run_id, "planning", JSON.stringify({
+    objective: "stale split continuation", allowed_read_paths: ["README.md"], allowed_write_paths: [], acceptance_criteria: ["close on ready"], context: { stage: "plan_ready" },
+  }), "", "{}", "{}", new Date().toISOString(), new Date().toISOString());
   database.close();
 
   const commitArgs = [
@@ -1366,6 +1439,10 @@ test("completed planning commit reconciliation converges state, validates owners
   ];
   const reconciled = json<{ operation_id: string; state: string; plan_commit: string; reused: boolean }>(await cli(sandbox, reconcileArgs));
   assert.deepEqual(reconciled, { operation_id: operation.operation_id, state: "completed", plan_commit: confirmedCommit, reused: false });
+  const staleDatabase = new Database(databasePath, { readonly: true });
+  assert.equal((staleDatabase.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(stalePlanningId) as { state: string }).state, "completed");
+  assert.equal((staleDatabase.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='planning' AND state IN ('pending','claimed','needs_decision')").get(started.run_id) as { count: number }).count, 0);
+  staleDatabase.close();
   const repeated = json<{ operation_id: string; state: string; plan_commit: string; reused: boolean }>(await cli(sandbox, reconcileArgs));
   assert.deepEqual(repeated, { ...reconciled, reused: true });
 

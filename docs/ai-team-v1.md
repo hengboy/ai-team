@@ -280,7 +280,7 @@ ai-team git status --run-id <id>
 
 参数必须通过单一 typed command contract 校验。每个 dispatch 提供精确的只读 packet、冻结 prompt、schema 和已预填 result template。字段包含类型、required、枚举、格式、数量约束和空值语义；禁止未知字段。所有路径为仓库相对 POSIX 路径，时间为 RFC 3339 UTC，commit 为 40 位 SHA，ID 使用 CLI 生成值。
 
-主 Agent 必须原样传递 CLI 生成的冻结 prompt；不得改写任务目标、范围、验收标准或返回字段。packet、冻结 prompt、result template 和结果 artifact 至少保留到 run 结束供恢复和审计；不保存模型思考内容。结果提交失败时使用 `dispatch validate` 返回 JSON Pointer 级错误，修复后再 submit。
+主 Agent 必须原样传递 CLI 生成的冻结 prompt；不得改写任务目标、范围、验收标准或返回字段。新 dispatch 的冻结 prompt 统一要求 `staging create/write`，再以同一 `--staging-id` 调用 validate/submit；历史 v3 prompt 仅按原 digest 用于旧 run 恢复。packet、冻结 prompt、result template 和结果 artifact 至少保留到 run 结束供恢复和审计；不保存模型思考内容。结果提交失败时使用 `dispatch validate` 返回 JSON Pointer、constraint 和修复建议，修复后再 submit。
 
 ### 9.3 结果信封
 
@@ -313,7 +313,17 @@ ai-team git status --run-id <id>
 ai-team run decide --run-id <id> --decision-id <id> --choice <choice-id> [--note-file <file>]
 ```
 
-旧 decision、未知 choice、无法唯一映射的“确认”均拒绝或继续澄清。需求清单确认、拆分颗粒度、分支迁移和冲突选择使用同一协议。
+旧 decision、未知 choice、无法唯一映射的“确认”均拒绝或继续澄清。功能澄清使用带编号的 `requirement`；完整需求最终确认使用不编号的 `requirements_final(confirm/revise)`；任务拆分只在 `plan_ready` 使用 `task_split(split/no_split)`。`no_split` 和 task preview `approve` 解析后直接进入 revision create，不创建多余 Planning dispatch。
+
+```text
+requirements --requirements_final(confirm)--> requirements_confirmed
+requirements_confirmed --> spec_ready --> plan_ready
+plan_ready --task_split(no_split)--> revision create --> Git Operator --> ready
+plan_ready --task_split(split)--> tasks_preview --approve--> revision create --> Git Operator --> ready
+```
+
+Git Operator 将 revision 推进 `ready` 时会关闭该 run 遗留的 Planning
+`pending`、`claimed` 或 `needs_decision` dispatch，避免重复 `ready -> ready`。
 
 ## 10. 状态库、恢复和并发
 
@@ -323,7 +333,7 @@ ai-team run decide --run-id <id> --decision-id <id> --choice <choice-id> [--note
 
 代理 JSON 使用 `${AI_TEAM_HOME}/state/staging/<run-id>/<staging-id>.json` 的受管生命周期。根目录和 run 目录为 `0700`，文件为 `0600`；CLI 校验 UID、regular file、单 hardlink、真实路径、mode 和文件身份，并以同目录临时文件、文件 `fsync`、原子替换和目录同步发布不超过 2 MiB 的合法 JSON。`staging_entries` 只保存绑定、状态、SHA-256、大小和时间，不保存 JSON 原文，也不提升 `STATE_SCHEMA_EPOCH`。
 
-默认 `staging.retention_hours` 为 168。业务失败保留内容；业务持久化后才消费，删除失败标记 `cleanup_pending`。`staging cleanup --expired` 完整清理过期项，指定 run/id 的清理必须显式 `--all`。升级时先发布兼容旧文件参数和 `--staging-id` 的 CLI，再生成或安装新版代理；不扫描、迁移或删除历史 `$TMPDIR/opencode` 文件。
+默认 `staging.retention_hours` 为 168。`planning-documents` 创建时写入 `{ "spec": "", "plan": "" }` 骨架。业务失败保留内容；`staging.validation_failed` 事件与 CLI receipt 保存结构化 cause，不保存原始 JSON；业务持久化后才消费，删除失败标记 `cleanup_pending`。`staging cleanup --expired` 完整清理过期项，指定 run/id 的清理必须显式 `--all`。升级时先发布兼容旧文件参数和 `--staging-id` 的 CLI，再生成或安装新版代理；不扫描、迁移或删除历史 `$TMPDIR/opencode` 文件。
 
 所有副作用先写 operation，再执行，再写完成证据。重复 submit、重复 claim、重复 Git 操作使用幂等键；副作用明确未发生时可重试，明确已完成时复用，状态未知时阻断并 reconcile。网络超时、客户端进程异常和临时资源错误最多重试 2 次；认证、权限、配置、非法 schema 和未知副作用不自动重试、不换模型、不换平台。
 

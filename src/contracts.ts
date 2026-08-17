@@ -308,14 +308,19 @@ export const checkResultEnvelope = (value: unknown): { valid: true; value: Resul
     }
   }
   if (requiresPayload && envelope.role === "planning") {
-    const payload = envelope.payload as { pending_questions: string[]; decision: { question: string } | null };
-    if (envelope.status === "needs_decision" && payload.pending_questions.length !== 1) {
-      return { valid: false, errors: [validationDetail("/payload/pending_questions", "minItems", "needs_decision requires one pending question")] };
+    const payload = envelope.payload as { pending_questions: string[]; decision: { question: string; choices: Array<{ id: string }> } | null };
+    const choiceIds = payload.decision?.choices.map(({ id }) => id).sort() ?? [];
+    const nonFunctionalDecision = choiceIds.join(",") === "confirm,revise" || choiceIds.join(",") === "no_split,split";
+    if (envelope.status === "needs_decision" && !payload.decision) {
+      return { valid: false, errors: [validationDetail("/payload/decision", "required", "needs_decision requires one typed decision")] };
+    }
+    if (envelope.status === "needs_decision" && !nonFunctionalDecision && payload.pending_questions.length !== 1) {
+      return { valid: false, errors: [validationDetail("/payload/pending_questions", "minItems", "a functional needs_decision requires one pending question")] };
     }
     if (payload.pending_questions.length === 1 && payload.decision?.question !== payload.pending_questions[0]) {
       return { valid: false, errors: [validationDetail("/payload/decision", "const", "must match the single pending question")] };
     }
-    if (payload.pending_questions.length === 0 && payload.decision !== null) {
+    if (payload.pending_questions.length === 0 && payload.decision !== null && !nonFunctionalDecision) {
       return { valid: false, errors: [validationDetail("/payload/decision", "const", "must be null without a pending question")] };
     }
   }

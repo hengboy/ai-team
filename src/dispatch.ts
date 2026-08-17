@@ -1,5 +1,6 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Role } from "./constants.js";
 import { checkDecisionInput, checkResultEnvelope, createResultTemplate, resultSchemaForRole, type ResultEnvelope } from "./contracts.js";
@@ -82,7 +83,7 @@ interface ReviewBarrierRow {
   standards_dispatch_id?: string;
 }
 
-const RENDERER_VERSION = "dispatch-renderer-v3";
+const RENDERER_VERSION = "dispatch-renderer-v4";
 const EXPLORER_CONTEXT_PATHS = ["MEMORY.md", ".ai-team/index/feature-navigation.md"] as const;
 
 const promptLines = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string[] => [
@@ -99,9 +100,14 @@ const promptForV2 = (runId: string, dispatchId: string, role: Role, packet: Disp
   ...promptLines(runId, dispatchId, role, packet),
   "Return only the frozen result envelope and role payload schema.",
 ].join("\n");
-const promptFor = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
+const promptForV3 = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
   ...promptLines(runId, dispatchId, role, packet),
   "Build the frozen result envelope from the template and schema, then submit it exactly once with dispatch submit --input-stdin.",
+  "Return the CLI submission receipt containing submission and continuation; do not return an unsubmitted envelope.",
+].join("\n");
+const promptFor = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
+  ...promptLines(runId, dispatchId, role, packet),
+  "Create a dispatch-result staging entry, write the frozen result envelope to it with staging write --input-stdin, validate it, then submit it exactly once with dispatch submit --staging-id <staging-id>.",
   "Return the CLI submission receipt containing submission and continuation; do not return an unsubmitted envelope.",
 ].join("\n");
 
@@ -174,6 +180,13 @@ export class DispatchService {
       throw new ValidationError(`${actor} cannot delegate to ${role}`);
     }
     const validated = validatePacket(packet, role);
+    if (role === "file-explorer") {
+      const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get((this.store.getRun(runId) as { repo_id: string }).repo_id) as { project_path: string } | undefined;
+      const missing = repository ? EXPLORER_CONTEXT_PATHS.filter((path) => !existsSync(join(repository.project_path, path))) : [...EXPLORER_CONTEXT_PATHS];
+      if (missing.length) throw new ValidationError("File Explorer packet requires initialized project context", missing.map((path) => ({
+        path: `/${path}`, pointer: `/${path}`, constraint: "exists", message: `${path} does not exist`, suggestion: `Run ai-team init ${repository?.project_path ?? "<project>"} --yes, then retry the run start.`,
+      })));
+    }
     assertExplorerAuthorization(this.store, runId, role, validated);
     if (actorRole === "coding" && (role === "frontend-developer" || role === "backend-developer")) {
       const worktreeId = (validated.context as { worktree_id?: unknown }).worktree_id;
@@ -443,7 +456,7 @@ export class DispatchService {
 
   prompt(runId: string, dispatchId: string, role: Role): string {
     const row = this.get(runId, dispatchId, role);
-    const renderer = row.renderer_version === RENDERER_VERSION ? promptFor : promptForV2;
+    const renderer = row.renderer_version === RENDERER_VERSION ? promptFor : row.renderer_version === "dispatch-renderer-v3" ? promptForV3 : promptForV2;
     const rendered = renderer(runId, dispatchId, role, JSON.parse(row.packet_json) as DispatchPacket);
     if (row.prompt_digest && row.prompt_digest !== sha256(rendered)) throw new ValidationError("dispatch prompt digest mismatch; frozen asset is corrupted");
     return rendered;
@@ -607,12 +620,25 @@ export class DispatchService {
       const next = run.profile === "planning" ? "planning" : "coding";
       const existing = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND role=? AND state IN ('pending','claimed')").get(runId, next);
       if (existing) return;
+      const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'")
+        .get(runId, result.dispatch_id) as { artifact_id: string; sha256: string } | undefined;
+      if (!artifact) throw new ValidationError("completed File Explorer result artifact is missing");
       const dispatchId = this.create(runId, next, {
         objective: next === "planning" ? "Produce the complete requirements checklist and identify one highest-priority pending question." : "Create an implementation plan from the exact File Explorer scope and dispatch the implementation roles.",
         allowed_read_paths: (result.payload.allowed_read_paths as string[] | undefined) ?? [],
         allowed_write_paths: [],
         acceptance_criteria: ["Return structured evidence", "Request support for unknown paths"],
-        context: { stage: next },
+        context: {
+          stage: next,
+          explorer_dispatch_id: result.dispatch_id,
+          explorer_result: {
+            findings: result.findings,
+            payload: result.payload,
+            artifact_id: artifact.artifact_id,
+            digest: artifact.sha256,
+            project_context: result.payload.project_context,
+          },
+        },
       }, run.profile as Role);
       if (next === "coding") this.ensureGitPrepareDispatch(runId, "integration");
       this.changeStage(runId, next, dispatchId);
@@ -1007,10 +1033,19 @@ export class DispatchService {
       if (!revision) throw new ValidationError("bound planning revision not found");
       assertRevisionRunStage(revision.state, payload.stage);
     }
-    if (payload.pending_questions.length && payload.stage !== "requirements" && payload.stage !== "tasks_preview") {
+    if (payload.pending_questions.length && !["requirements", "plan_ready", "tasks_preview"].includes(payload.stage)) {
       throw new ValidationError(`planning stage ${payload.stage} cannot have pending questions`);
     }
-    const needsDecision = payload.pending_questions.length === 1;
+    const needsDecision = payload.decision !== null;
+    const choiceIds = payload.decision?.choices.map(({ id }) => id).sort() ?? [];
+    const finalConfirmation = payload.stage === "requirements" && choiceIds.length === 2 && choiceIds[0] === "confirm" && choiceIds[1] === "revise";
+    const taskSplit = payload.stage === "plan_ready" && choiceIds.length === 2 && choiceIds[0] === "no_split" && choiceIds[1] === "split";
+    if ((finalConfirmation || taskSplit) && payload.pending_questions.length) {
+      throw new ValidationError(`${finalConfirmation ? "requirements_final" : "task_split"} decision must not use functional pending_questions`);
+    }
+    if (needsDecision && payload.stage === "plan_ready" && !taskSplit) {
+      throw new ValidationError("plan_ready decision choices must be split and no_split");
+    }
     if (needsDecision && payload.stage === "tasks_preview") {
       const choices = payload.decision?.choices.map(({ id }) => id).sort();
       if (!choices || choices.length !== 2 || choices[0] !== "approve" || choices[1] !== "revise") {
@@ -1022,11 +1057,11 @@ export class DispatchService {
     this.store.event(runId, "planning.stage_changed", { stage: payload.stage });
     if (needsDecision) {
       if (!payload.decision) throw new ValidationError("planning pending question requires one matching decision");
-      const requirementQuestion = payload.stage === "requirements";
+      const requirementQuestion = payload.stage === "requirements" && !finalConfirmation;
       const question = requirementQuestion
         ? `问题 ${((this.store.db.prepare("SELECT COUNT(*) AS count FROM decisions WHERE run_id=? AND decision_type='requirement'").get(runId) as { count: number }).count) + 1}、${payload.decision.question.replace(/^问题\s*\d+、\s*/, "")}`
         : payload.decision.question;
-      const decisionType = requirementQuestion ? "requirement" : payload.stage === "tasks_preview" ? "task_preview" : "workflow";
+      const decisionType = requirementQuestion ? "requirement" : finalConfirmation ? "requirements_final" : taskSplit ? "task_split" : payload.stage === "tasks_preview" ? "task_preview" : "workflow";
       this.store.createDecision(runId, question, payload.decision.choices, payload.decision.recommendation, decisionType, result.dispatch_id);
     } else if (payload.stage !== "ready") {
       this.continuePlanning(runId);
@@ -1051,10 +1086,13 @@ export class DispatchService {
   resolvePlanningDecision(runId: string, decisionId: string, choice: string, note?: string): string {
     const run = this.store.getRun(runId) as { profile: string };
     if (run.profile !== "planning") throw new ValidationError("only planning runs can resolve planning decisions");
-    const existing = this.store.db.prepare("SELECT status,choice,receipt_json FROM decisions WHERE run_id=? AND decision_id=?").get(runId, decisionId) as { status: string; choice?: string; receipt_json?: string } | undefined;
+    const existing = this.store.db.prepare("SELECT status,choice,receipt_json,decision_type,dispatch_id FROM decisions WHERE run_id=? AND decision_id=?").get(runId, decisionId) as { status: string; choice?: string; receipt_json?: string; decision_type: string; dispatch_id?: string } | undefined;
     if (existing?.status === "resolved") {
       const receipt = JSON.parse(existing.receipt_json ?? "{}") as { successor_dispatch_id?: string };
       if (existing.choice === choice && receipt.successor_dispatch_id) return receipt.successor_dispatch_id;
+      if (existing.choice === choice && ((existing.decision_type === "task_split" && choice === "no_split") || (existing.decision_type === "task_preview" && choice === "approve"))) {
+        return existing.dispatch_id ?? "";
+      }
       throw new ValidationError("decision is unknown, stale, or already resolved");
     }
     let dispatchId = "";
@@ -1065,11 +1103,15 @@ export class DispatchService {
       )`)
         .run(new Date().toISOString(), runId);
       this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
-      dispatchId = this.continuePlanning(runId);
+      const terminalDecision = existing?.decision_type === "task_split" && choice === "no_split"
+        || existing?.decision_type === "task_preview" && choice === "approve";
+      dispatchId = terminalDecision
+        ? existing?.dispatch_id ?? ""
+        : this.continuePlanning(runId);
       const successor = this.store.db.prepare("SELECT packet_digest FROM dispatches WHERE dispatch_id=?").get(dispatchId) as { packet_digest?: string };
       const receipt = this.store.db.prepare("SELECT receipt_json FROM decisions WHERE decision_id=?").get(decisionId) as { receipt_json: string };
       this.store.db.prepare("UPDATE decisions SET receipt_json=? WHERE decision_id=?")
-        .run(stableJson({ ...JSON.parse(receipt.receipt_json), successor_dispatch_id: dispatchId, successor_packet_digest: successor.packet_digest ?? null }), decisionId);
+        .run(stableJson({ ...JSON.parse(receipt.receipt_json), successor_dispatch_id: terminalDecision ? null : dispatchId, successor_packet_digest: terminalDecision ? null : successor?.packet_digest ?? null }), decisionId);
     })();
     return dispatchId;
   }

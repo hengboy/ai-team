@@ -8,7 +8,7 @@ import { validateCommand } from "./command-contract.js";
 import { EXIT, PACKAGE_VERSION, ROLES, STAGING_KINDS, STAGING_MAX_BYTES, type Role, type StagingKind } from "./constants.js";
 import { DispatchService, type DispatchPacket } from "./dispatch.js";
 import { EnvironmentService, PLATFORMS, type Platform } from "./environment.js";
-import { AiTeamError, ArgumentError, ValidationError } from "./errors.js";
+import { AiTeamError, ArgumentError, ValidationError, validationCause } from "./errors.js";
 import { commitPlanningRevision, repositoryIdentity, worktreeStatus } from "./git.js";
 import { GitOrchestrator } from "./git-orchestrator.js";
 import { ScopeGate } from "./gates.js";
@@ -149,9 +149,12 @@ const reconcilePlanningCommit = (
     if (state === "completed") {
       store.db.prepare("UPDATE revisions SET state='ready',plan_commit=? WHERE repo_id=? AND plan_id=? AND revision=?")
         .run(planCommit, request.repo_id, request.plan_id, request.revision);
+      const closedPlanning = store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND role='planning' AND state IN ('pending','claimed','needs_decision')")
+        .run(new Date().toISOString(), runId).changes;
       store.db.prepare("UPDATE runs SET stage='ready',state='active',updated_at=? WHERE run_id=?")
         .run(new Date().toISOString(), runId);
       store.event(runId, "planning.revision_committed", { planId: request.plan_id, revision: request.revision, commit: planCommit, reconciled: true, operationId: operation.operation_id });
+      if (closedPlanning) store.event(runId, "planning.stale_dispatches_closed", { count: closedPlanning, reason: "revision_reconciled" });
       store.finishOperation(operation.operation_id, normalized);
     } else {
       store.reconcileOperation(operation.operation_id, "not_applied", normalized);
@@ -217,7 +220,7 @@ const throwStagingFailure = (store: StateStore, entry: StagingEntry, error: unkn
   const current = store.getStagingEntry(entry.stagingId);
   const failure = error instanceof AiTeamError ? error : new ValidationError(error instanceof Error ? error.message : String(error));
   throw new AiTeamError(failure.message, failure.code, {
-    cause: failure.details ?? null,
+    cause: validationCause(failure),
     staging_id: current.stagingId,
     state: current.state,
   });
@@ -521,8 +524,10 @@ export const buildProgram = (): Command => {
       }
       store.db.transaction(() => {
         store.db.prepare("UPDATE revisions SET state='ready',plan_commit=? WHERE repo_id=? AND plan_id=? AND revision=?").run(commit, repo.repoId, options.planId, options.revision);
+        const closedPlanning = store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND role='planning' AND state IN ('pending','claimed','needs_decision')").run(new Date().toISOString(), options.runId).changes;
         store.db.prepare("UPDATE runs SET stage='ready',updated_at=? WHERE run_id=?").run(new Date().toISOString(), options.runId);
         store.event(options.runId, "planning.revision_committed", { planId: options.planId, revision: options.revision, commit });
+        if (closedPlanning) store.event(options.runId, "planning.stale_dispatches_closed", { count: closedPlanning, reason: "revision_committed" });
         new WorkflowService(store).completePlanningHandoff(options.runId, options.planId, options.revision, revisionDigest, commit);
         store.finishOperation(operation.operationId, { state: "ready", plan_commit: commit });
       })();
@@ -754,7 +759,21 @@ export const buildProgram = (): Command => {
         const checked = checkDecisionInput(input.value);
         if (!checked.valid) throw new ValidationError("decision input is invalid", checked.errors);
         const value = checked.value;
+        let taskSplit = false;
+        if (run.profile === "planning" && value.type === "task_split") {
+          const current = store.getRun(options.runId) as { stage: string; state: string };
+          const ids = value.choices.map(({ id }) => id).sort();
+          if (current.stage !== "plan_ready" || current.state !== "active") throw new ValidationError("task_split decision requires an active plan_ready run");
+          if (ids.length !== 2 || ids[0] !== "no_split" || ids[1] !== "split") throw new ValidationError("task_split decision choices must be split and no_split");
+          const dispatch = store.db.prepare("SELECT state,role FROM dispatches WHERE run_id=? AND dispatch_id=?").get(options.runId, options.dispatchId) as { state: string; role: string } | undefined;
+          if (!dispatch || dispatch.role !== "planning" || !["claimed", "completed"].includes(dispatch.state)) throw new ValidationError("task_split decision requires a claimed or completed planning dispatch");
+          taskSplit = true;
+        }
         const result = { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation, value.type ?? "workflow", options.dispatchId) };
+        if (taskSplit) {
+          store.db.prepare("UPDATE dispatches SET state='needs_decision',completed_at=NULL WHERE dispatch_id=?").run(options.dispatchId);
+          store.db.prepare("UPDATE runs SET state='needs_decision',updated_at=? WHERE run_id=?").run(new Date().toISOString(), options.runId);
+        }
         return withStagingResult(result, await input.consume());
       } catch (error) { input.validationFailed(error); }
     }));

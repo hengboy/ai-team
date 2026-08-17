@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Umzug } from "umzug";
 import lockfile from "proper-lockfile";
 import { getHomePaths, type HomePaths } from "./home.js";
-import { ValidationError } from "./errors.js";
+import { ValidationError, validationCause } from "./errors.js";
 import { makeId, redact, sha256, stableJson } from "./utils.js";
 import { CONTRACT_DIGEST } from "./contracts.js";
 import { checkDecisionInput } from "./contracts.js";
@@ -645,6 +645,7 @@ export class StateStore {
     this.event(row.run_id, "staging.validation_failed", {
       stagingId,
       error: redact(error instanceof Error ? error.message : String(error)).slice(0, 1000),
+      cause: validationCause(error),
     });
   }
 
@@ -681,7 +682,8 @@ export class StateStore {
     const runDirectory = stagingRunDirectory(this.paths.staging, input.runId);
     await ensureManagedDirectory(this.paths.staging, runDirectory);
     const path = stagingFilePath(this.paths.staging, input.runId, sequence.sequence_no, input.kind, input.role);
-    const content = await writeManagedJsonFile(this.paths.staging, path, input.initialJson ?? "null");
+    const defaultJson = input.kind === "planning-documents" ? '{"spec":"","plan":""}' : "null";
+    const content = await writeManagedJsonFile(this.paths.staging, path, input.initialJson ?? defaultJson);
     const timestamp = now.toISOString();
     const expiresAt = new Date(now.getTime() + retentionHours * 60 * 60 * 1000).toISOString();
     try {

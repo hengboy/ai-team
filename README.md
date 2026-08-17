@@ -107,7 +107,7 @@ submits the result through stdin:
 
 ```sh
 ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --bundle
-ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --input-stdin
+ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --staging-id <staging-id>
 ```
 
 The bundle includes packet, prompt, schema, template, their digests, and the
@@ -141,10 +141,10 @@ the contract and role-manifest digests used to detect drift.
 
 Agent-produced JSON is stored under
 `${AI_TEAM_HOME:-~/.config/ai-team}/state/staging/<run-id>/` and is managed only
-through the CLI. Normal consumers accept JSON directly with `--input-stdin`;
-the CLI internally creates and writes a managed entry before running the same
-business validation and consumption path. The explicit commands remain the
-recovery and diagnostic path:
+through the CLI. Agent dispatch results use an explicit entry: create a
+`dispatch-result`, write it with `--input-stdin`, then pass the same
+`--staging-id` to validate and submit. Other consumers retain direct stdin for
+compatibility. The explicit commands are also the recovery and diagnostic path:
 
 ```sh
 ai-team staging create --run-id <id> --role <role> --kind <kind> [--dispatch-id <id>]
@@ -164,6 +164,10 @@ their business result before deleting the staged file. Failed input or business
 validation returns the retained `staging_id` and state for correction through
 the existing `--staging-id` path. Failed deletion is recorded as
 `cleanup_pending` for retry.
+
+Creating `planning-documents` initializes a discoverable
+`{"spec":"","plan":""}` skeleton. Validation failures return and audit a
+structured cause with JSON pointer, constraint, and repair suggestion.
 
 Because review staging ownership is axis-specific, `review submit --input-stdin`
 also requires `--role review-spec` or `--role review-standards`. File and

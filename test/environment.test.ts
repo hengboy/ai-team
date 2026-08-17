@@ -263,8 +263,8 @@ test("planning and coding distinguish owned JSON from delegated submit responsib
   const planning = files.get("claude/agents/planning.md") ?? "";
   const coding = files.get("claude/agents/coding.md") ?? "";
 
-  assert.match(planning, /每个规划 JSON.*--input-stdin.*自动创建、写入、校验.*--staging-id/s);
-  assert.match(planning, /planning revision create --input-stdin.*完整 preflight/s);
+  assert.match(planning, /每个规划 JSON.*staging create.*staging write --input-stdin.*--staging-id/s);
+  assert.match(planning, /planning-documents.*--staging-id.*planning revision create/s);
   assert.match(planning, /planning revision validate.*诊断.*失败重试/s);
   assert.match(planning, /已确认的完整需求列表.*`confirm`.*`revise`.*choice 为 `confirm`.*才可开始写入 `spec\.md`/s);
   assert.match(planning, /「拆分任务」.*「不拆分任务」.*推荐及理由.*`split`.*`no_split`/s);
@@ -273,9 +273,9 @@ test("planning and coding distinguish owned JSON from delegated submit responsib
   assert.match(planning, /问题 1、.*问题 2、.*从 1 递增/s);
   assert.match(planning, /transition 到 `plan_ready`.*自动创建 \*\*Git Operator\*\* `dispatch`/s);
   assert.match(planning, /归档调研报告/);
-  assert.match(planning, /由 \*\*File Explorer\*\* 自行.*dispatch submit --input-stdin.*submission.*continuation/s);
+  assert.match(planning, /由 \*\*File Explorer\*\* 自行创建并写入.*--staging-id.*dispatch submit.*submission.*continuation/s);
   assert.match(planning, /submission\.state=submitted.*不得创建新 staging 或重复 submit/s);
-  assert.match(coding, /每个被委派角色自行.*--input-stdin.*submission.*continuation/s);
+  assert.match(coding, /每个被委派角色自行创建并写入.*--staging-id.*dispatch submit.*submission.*continuation/s);
   assert.match(coding, /submission\.state=submitted.*不得创建新 staging 或重复 submit/s);
 });
 

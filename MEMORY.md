@@ -32,6 +32,9 @@
 - phased worktree preparation
 - planning handoff
 - plan worktree
+- requirements_final
+- task_split
+- structured validation cause
 
 ### 仓库约束
 - 要求 Node.js >=22.13.0，并必须通过 npm 验证脚本。
@@ -59,7 +62,7 @@
 - `src/dispatch.ts` 将已完成的评审叶子汇总到所属 barrier，并幂等创建唯一的 review resolution 或最终 Git Operator continuation。
 - `src/review.ts` 提供 barrier 幂等创建，以及按 barrier ID 或 run revision 查询状态。
 - `src/workflow.ts` 负责显式 direct mode 分诊一致性，并将 frozen coding run 原子关联到 planning run，保留原 task worktree 所有权。
-- `src/dispatch.ts` 负责 requirement 问题序号、分阶段 Git prepare、worktree 注册校验及 completed coordinator 的提交 continuation。
+- `src/dispatch.ts` 负责区分 requirement 编号问题、requirements_final 与 task_split，冻结 File Explorer 结果证据，并管理无 stale Planning dispatch 的 continuation。
 - `src/dispatch.ts` 负责 delegated role 自提交回执、renderer 版本冻结，以及 `verify_existing` 驱动的受审计 `no_change` 规划终态。
 
 ### 模块边界
@@ -67,8 +70,8 @@
 - `src/review.ts` 仅评审已通过独立测试的 planned plan HEAD 或 direct integration HEAD，并验证 code-reviewer packet 的 revision、文档、diff、testedCommit 与 evidence digest 绑定。
 - `src/context.ts` 仅以 `.ai-team/index/feature-navigation.md` 为权威导航路径，并负责 schema/renderer 版本记录及旧格式迁移。
 - `src/environment.ts` 与 `agent-build/roles` 负责受管角色生成、能力定义及只读环境查询。
-- `src/cli.ts` 为 13 个受管 JSON 命令统一提供 file、`--staging-id` 与 `--input-stdin` 三种互斥输入；stdin 复用原 staging 生命周期，失败保留可重试条目。
-- `src/dispatch.ts` 保持原状态转换，并提供 claim bundle 与 submit 后的只读 continuation 投影；独立资产、validate 和 run 查询仍作为诊断路径。
+- `src/cli.ts` 为受管 JSON 命令提供 file、`--staging-id` 与 `--input-stdin` 输入；新 dispatch prompt 固定走显式 staging，planning commit 会关闭遗留 Planning dispatch。
+- `src/dispatch.ts` 以 v4 renderer 生成显式 staging prompt，并按历史 renderer/digest 恢复旧 dispatch；claim bundle 与 submit continuation 保持只读投影。
 - `skills/setup-ai-team` 封装公共初始化和上下文校验命令，`skills/switch-ai-team-env` 封装公共环境切换和状态命令；两者均不改变 CLI 行为。
 - `test/*.test.ts` 包含单元测试、CLI 端到端测试、锁测试、契约测试和工作流回归测试。
 - `src/review.ts` 负责 formal review 绑定和公共状态查询，`src/dispatch.ts` 负责叶子汇总、恢复和 run 阶段推进。

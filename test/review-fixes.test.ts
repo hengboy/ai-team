@@ -115,6 +115,13 @@ test("an exact File Explorer result creates one planning or coding dispatch and 
         "src/dispatch.ts",
         "test/review-fixes.test.ts",
       ]);
+      const downstreamContext = JSON.parse(generated[0]?.packet_json ?? "{}").context;
+      assert.equal(downstreamContext.explorer_dispatch_id, explorerId);
+      assert.deepEqual(downstreamContext.explorer_result.findings, []);
+      assert.match(downstreamContext.explorer_result.artifact_id, /^artifact_/);
+      assert.equal(downstreamContext.explorer_result.digest, first.submission.digest);
+      assert.deepEqual(downstreamContext.explorer_result.project_context, projectContext());
+      assert.deepEqual(downstreamContext.explorer_result.payload, fileExplorerResult(runId, explorerId).payload);
 
       const duplicate = await dispatches.submit(runId, explorerId, "file-explorer", resultPath);
       assert.equal(duplicate.reused, true);
@@ -692,6 +699,36 @@ test("planning results advance one stage and create at most one matching decisio
       "claimed",
     );
     assert.equal(store.getRun(invalidRun).stage, "planning");
+  });
+});
+
+test("requirements final confirmation is typed without a functional question number", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store, "planning");
+    store.db.prepare("UPDATE runs SET stage='requirements' WHERE run_id=?").run(runId);
+    const dispatches = new DispatchService(store);
+    const dispatchId = dispatches.create(runId, "planning", dispatchPacket(), "planning");
+    dispatches.claim(runId, dispatchId, "planning");
+    const decision = {
+      question: "Confirm the complete requirements list?",
+      choices: [
+        { id: "confirm", label: "Confirm", impact: "Proceed to specification" },
+        { id: "revise", label: "Revise", impact: "Return to requirements" },
+      ],
+      recommendation: "confirm",
+    };
+    await dispatches.submitValue(runId, dispatchId, "planning", {
+      ...completedResult(runId, dispatchId, "planning", {
+        actions: ["request final confirmation"], stage: "requirements", pending_questions: [], decision,
+      }),
+      status: "needs_decision",
+      decisions_needed: [decision],
+    });
+    assert.deepEqual(
+      store.db.prepare("SELECT question,decision_type FROM decisions WHERE run_id=?").get(runId),
+      { question: decision.question, decision_type: "requirements_final" },
+    );
+    assert.doesNotMatch((store.db.prepare("SELECT question FROM decisions WHERE run_id=?").get(runId) as { question: string }).question, /^问题 \d+、/);
   });
 });
 

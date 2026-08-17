@@ -68,21 +68,24 @@ export function assertRevisionDocuments(value: unknown): asserts value is Revisi
   }
   const documents = value as Record<string, unknown>;
   const allowed = new Set(["spec", "plan", "tasks", "taskFiles"]);
-  const errors: Array<{ path: string; message: string }> = Object.keys(documents)
+  const errors: Array<{ path: string; pointer?: string; constraint?: string; message: string; suggestion?: string }> = Object.keys(documents)
     .filter((key) => !allowed.has(key))
-    .map((key) => ({ path: `/${pointer(key)}`, message: "unknown field" }));
+    .map((key) => ({ path: `/${pointer(key)}`, pointer: `/${pointer(key)}`, constraint: "additionalProperties", message: "unknown field", suggestion: "Use the planning-documents fields spec, plan, tasks, and taskFiles." }));
   for (const field of ["spec", "plan"] as const) {
-    if (typeof documents[field] !== "string") errors.push({ path: `/${field}`, message: "must be a string" });
+    if (typeof documents[field] !== "string") errors.push({ path: `/${field}`, pointer: `/${field}`, constraint: "type", message: "must be a string", suggestion: `Set ${field} to the complete Markdown document.` });
   }
   if (documents.tasks !== undefined && typeof documents.tasks !== "string") {
-    errors.push({ path: "/tasks", message: "must be a string" });
+    errors.push({ path: "/tasks", pointer: "/tasks", constraint: "type", message: "must be a string", suggestion: "Set tasks to the complete tasks.md Markdown document." });
   }
   if (documents.taskFiles !== undefined) {
     if (!documents.taskFiles || typeof documents.taskFiles !== "object" || Array.isArray(documents.taskFiles)) {
       errors.push({ path: "/taskFiles", message: "must be an object" });
     } else {
       for (const [name, document] of Object.entries(documents.taskFiles)) {
-        if (typeof document !== "string") errors.push({ path: `/taskFiles/${pointer(name)}`, message: "must be a string" });
+        if (typeof document !== "string") {
+          const path = `/taskFiles/${pointer(name)}`;
+          errors.push({ path, pointer: path, constraint: "type", message: "must be a string", suggestion: "Set each taskFiles value to a complete task Markdown document." });
+        }
       }
     }
   }

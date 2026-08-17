@@ -261,8 +261,9 @@ test("migration 009 renames legacy staging files and continues their run sequenc
     assert.equal((await stat(current)).mode & 0o777, 0o600);
     await assert.rejects(stat(legacy), { code: "ENOENT" });
 
-    await store.createStagingEntry({ runId, role: "planning", kind: "planning-documents" });
+    const planningDocuments = await store.createStagingEntry({ runId, role: "planning", kind: "planning-documents" });
     assert.equal((await stat(stagingFilePath(store.paths.staging, runId, 2, "planning-documents", "planning"))).mode & 0o777, 0o600);
+    assert.deepEqual((await store.inspectStagingEntry(planningDocuments.stagingId)).value, { spec: "", plan: "" });
   } finally {
     store?.close();
     await rm(home, { recursive: true, force: true });
@@ -491,7 +492,7 @@ test("dispatch claim bundle returns the same frozen assets and digests idempoten
     assert.deepEqual(first.template, dispatches.template(runId, dispatchId, "backend-developer"));
     assert.deepEqual(Object.keys(first.digests).sort(), ["packet", "prompt", "schema", "template"]);
     for (const digest of Object.values(first.digests)) assert.match(digest, /^[a-f0-9]{64}$/);
-    assert.equal(first.renderer_version, "dispatch-renderer-v3");
+    assert.equal(first.renderer_version, "dispatch-renderer-v4");
 
     const second = dispatches.claimBundle(runId, dispatchId, "backend-developer");
     assert.deepEqual(second, { ...first, reused: true });
@@ -619,19 +620,27 @@ test("dispatch validation is a claimed active-run preflight with no state change
 test("revision documents reject missing, unknown, and non-string fields with JSON paths", () => {
   assert.throws(
     () => assertRevisionDocuments({}),
-    (error: unknown) => error instanceof ValidationError
-      && assert.deepEqual(error.details, [
+    (error: unknown) => {
+      if (!(error instanceof ValidationError)) return false;
+      const details = error.details as Array<{ path: string; pointer: string; constraint: string; message: string; suggestion: string }>;
+      assert.deepEqual(details.map(({ path, message }) => ({ path, message })), [
         { path: "/spec", message: "must be a string" },
         { path: "/plan", message: "must be a string" },
-      ]) === undefined,
+      ]);
+      return details.every(({ path, pointer, constraint, suggestion }) => pointer === path && constraint === "type" && suggestion.length > 0);
+    },
   );
   assert.throws(
     () => assertRevisionDocuments({ spec: "spec", plan: "plan", extra: true, taskFiles: { "TASK-001.md": 1 } }),
-    (error: unknown) => error instanceof ValidationError
-      && assert.deepEqual(error.details, [
+    (error: unknown) => {
+      if (!(error instanceof ValidationError)) return false;
+      const details = error.details as Array<{ path: string; pointer: string; constraint: string; message: string; suggestion: string }>;
+      assert.deepEqual(details.map(({ path, message }) => ({ path, message })), [
         { path: "/extra", message: "unknown field" },
         { path: "/taskFiles/TASK-001.md", message: "must be a string" },
-      ]) === undefined,
+      ]);
+      return details.every(({ path, pointer, constraint, suggestion }) => pointer === path && constraint.length > 0 && suggestion.length > 0);
+    },
   );
 });
 

@@ -8,6 +8,8 @@ import test from "node:test";
 import { CONTEXT_RULE, atomicReplaceFiles, initializeProjectContext, updateProjectContext, validateProjectContext } from "../src/context.js";
 import { initializeProject } from "../src/project.js";
 import { ValidationError } from "../src/errors.js";
+import { DispatchService } from "../src/dispatch.js";
+import { StateStore } from "../src/state.js";
 
 const exec = promisify(execFile);
 
@@ -54,6 +56,21 @@ test("context initialization is idempotent and preserves existing instructions",
   assert.match(instructions, /`plan_id`/);
   await assert.rejects(stat(join(root, "CLAUDE.md")));
   assert.equal((await validateProjectContext(root)).valid, true);
+});
+
+test("File Explorer packet generation rejects missing project context with an init remedy", async (t) => {
+  const root = await repository();
+  const home = await mkdtemp(join(tmpdir(), "ai-team-context-state-"));
+  t.after(() => Promise.all([rm(root, { recursive: true, force: true }), rm(home, { recursive: true, force: true })]));
+  const store = await StateStore.open(home);
+  t.after(() => store.close());
+  store.registerRepository("repo-context-missing", join(root, ".git"), root);
+  const runId = store.createRun({ repoId: "repo-context-missing", profile: "planning", mode: "planned", request: "inspect" });
+  assert.throws(() => new DispatchService(store).create(runId, "file-explorer", {
+    objective: "inspect", allowed_read_paths: ["."], allowed_write_paths: [], acceptance_criteria: ["report"], context: {},
+  }), (error: unknown) => error instanceof ValidationError
+    && /initialized project context/.test(error.message)
+    && JSON.stringify(error.details).includes("ai-team init"));
 });
 
 test("context initialization migrates the legacy navigation path and MEMORY reference", async (t) => {

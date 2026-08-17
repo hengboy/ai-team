@@ -36,6 +36,13 @@ const createRepository = async (): Promise<{ directory: string; head: string }> 
   return { directory, head: await git(directory, "rev-parse", "HEAD") };
 };
 
+const initializeRepositoryContext = async (repository: { directory: string; head: string }): Promise<void> => {
+  await initializeProject(repository.directory, true);
+  await git(repository.directory, "add", "--", ".gitignore", ".ai-team", "MEMORY.md");
+  await git(repository.directory, "commit", "-m", "initialize project context");
+  repository.head = await git(repository.directory, "rev-parse", "HEAD");
+};
+
 const openStore = async (): Promise<{ store: StateStore; home: string }> => {
   const home = await temporaryDirectory();
   return { store: await StateStore.open(home), home };
@@ -441,7 +448,7 @@ test("revision writing enforces coverage, frontmatter, and immutability", async 
     await assert.rejects(
       () => writeRevision(project, planId, "001", "main", {} as never),
       (error: unknown) => error instanceof ValidationError
-        && assert.deepEqual(error.details, [
+        && assert.deepEqual((error.details as Array<{ path: string; message: string }>).map(({ path, message }) => ({ path, message })), [
           { path: "/spec", message: "must be a string" },
           { path: "/plan", message: "must be a string" },
         ]) === undefined,
@@ -485,6 +492,7 @@ test("revision writing enforces coverage, frontmatter, and immutability", async 
 
 test("coding start validates planned parameters, branch, clean worktree, and HEAD baseline", async () => {
   const repository = await createRepository();
+  await initializeRepositoryContext(repository);
   const { store, home } = await openStore();
   try {
     const workflow = new WorkflowService(store);
@@ -574,6 +582,7 @@ test("coding start validates planned parameters, branch, clean worktree, and HEA
 
 test("bug and feature coding modes require a request and capture their Git baseline", async () => {
   const repository = await createRepository();
+  await initializeRepositoryContext(repository);
   const { store, home } = await openStore();
   try {
     const workflow = new WorkflowService(store);
@@ -621,6 +630,7 @@ test("bug and feature coding modes require a request and capture their Git basel
 
 test("frozen coding runs hand off to one linked planning run without transferring task worktrees", async () => {
   const repository = await createRepository();
+  await initializeRepositoryContext(repository);
   const { store, home } = await openStore();
   try {
     const workflow = new WorkflowService(store);
@@ -658,6 +668,7 @@ test("frozen coding runs hand off to one linked planning run without transferrin
 
 test("automatic coding triage prioritizes one ready revision and otherwise classifies evidence", async () => {
   const repository = await createRepository();
+  await initializeRepositoryContext(repository);
   const { store, home } = await openStore();
   try {
     const workflow = new WorkflowService(store);

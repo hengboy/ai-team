@@ -53,7 +53,11 @@ strict payload schema. Every review finding includes a source, file, line,
 evidence, impact, and recommendation. Successful dispatch submission advances
 the durable run stage once; failure statuses do not create a successor.
 
-The File Explorer payload includes strict `project_context` data. Navigation
+The File Explorer payload includes strict `project_context` data. Its submitted
+findings, payload, artifact ID, digest, and project context are frozen into the
+next Planning or Coding packet, so downstream agents do not repeat discovery. Navigation
 entries contain `feature`, `keywords`, repository-relative `entry_paths`, and
 `module_boundary`; the CLI rejects missing, sensitive, absolute, escaping, and
-symbolic-link paths before updating project context files.
+symbolic-link paths before updating project context files. File Explorer packet
+creation also rejects a missing `MEMORY.md` or canonical navigation file with
+an actionable initialization command.

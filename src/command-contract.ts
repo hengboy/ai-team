@@ -129,7 +129,7 @@ const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>
   "dispatch claim": ["ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --bundle"],
   "dispatch supersede": ["ai-team dispatch supersede --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text> --input-stdin"],
   "dispatch validate": ["ai-team dispatch validate --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --staging-id <staging-id>"],
-  "dispatch submit": ["ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --input-stdin"],
+  "dispatch submit": ["ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --staging-id <staging-id>"],
   "decision create": ["ai-team decision create --run-id <run-id> --dispatch-id <dispatch-id> --input-stdin"],
   "review submit": ["ai-team review submit --run-id <run-id> --barrier-id <opaque-id> --role <role> --input-stdin"],
   "review resolve": ["ai-team review resolve --run-id <run-id> --barrier-id <opaque-id> --input-stdin"],

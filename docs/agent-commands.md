@@ -37,7 +37,7 @@ MEMORY 条目、模块边界、导航条目和维护状态。开发代理通过 
 
 条目从 `draft` 进入 `ready`，业务持久化成功后进入 `consumed`。`draft` 和
 `ready` 可以重写。validate 和 Task preview 不消费条目；输入无效或业务命令失败时，
-系统记录不含原文的 `staging.validation_failed` 事件，并保留条目供修正。删除失败
+系统记录不含原文的 `staging.validation_failed` 事件，其中保留 JSON pointer、constraint 和修复建议，并保留条目供修正。删除失败
 时进入 `cleanup_pending`，到期时进入 `expired`。
 
 ```text
