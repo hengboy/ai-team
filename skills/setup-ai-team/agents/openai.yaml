@@ -1,0 +1,4 @@
+interface:
+  display_name: "设置 AI Team"
+  short_description: "在 Git 项目中初始化并验证 AI Team"
+  default_prompt: "使用 $setup-ai-team 在我指定的 Git 项目中设置 AI Team，并验证项目上下文。"

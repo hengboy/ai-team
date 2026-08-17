@@ -1,0 +1,4 @@
+interface:
+  display_name: "切换 AI Team 环境"
+  short_description: "预检差异并安全切换 AI Team 的全局环境配置"
+  default_prompt: "使用 $switch-ai-team-env 检查变更并切换到我指定的 AI Team 环境。"

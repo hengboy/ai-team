@@ -1,9 +1,9 @@
 ---
-name: init-ai-team
-description: 在目标 Git 仓库中初始化 AI Team，并验证生成的项目上下文。当用户要求为本地项目设置、引导、初始化或重新初始化 ai-team，包括运行 ai-team init、创建 .ai-team 项目文件，或验证生成的 MEMORY.md 和功能导航上下文时使用。
+name: setup-ai-team
+description: 在目标 Git 仓库中设置、初始化或重新初始化 AI Team，并验证生成的项目上下文。当用户要求 setup ai-team、运行 ai-team init、创建 .ai-team 项目文件，或验证生成的 MEMORY.md 和功能导航上下文时使用。
 ---
 
-# 初始化 AI Team
+# 设置 AI Team
 
 使用已安装的 `ai-team` CLI 初始化用户指定的 Git 项目，保留覆盖确认边界，并验证生成的项目上下文。
 
