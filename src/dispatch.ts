@@ -139,7 +139,7 @@ const promptForV3 = (runId: string, dispatchId: string, role: Role, packet: Disp
 ].join("\n");
 const promptFor = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
   ...promptLines(runId, dispatchId, role, packet),
-  "Create a dispatch-result staging entry, write the frozen result envelope to it with staging write --input-stdin, validate it, then submit it exactly once with dispatch submit --staging-id <staging-id>.",
+  "Create a dispatch-result staging entry, write the frozen result envelope with staging write --run-id <run-id> --role <role> --staging-id <staging-id> --input-stdin, validate it, then submit it exactly once with dispatch submit --staging-id <staging-id>.",
   "Return the CLI submission receipt containing submission and continuation; do not return an unsubmitted envelope.",
   "Do not claim a workflow action in the final output unless it is recorded by the returned artifact, decision, or run event.",
 ].join("\n");
@@ -437,7 +437,7 @@ export class DispatchService {
     return this.replaceDispatch(runId, dispatchId, role, actorRole, reason, "superseded", validatePacket(packet, role));
   }
 
-  reconcile(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): ReplacementResult<"reconciled"> {
+  reconcile(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): ReplacementResult<"reconciled"> & { resumed_finalization?: boolean } {
     this.assertLifecycleActor(runId, actorRole, "dispatch reconcile");
     if (!reason.trim()) throw new ValidationError("dispatch reconciliation requires a reason");
     const row = this.get(runId, dispatchId, role) as {
@@ -453,8 +453,20 @@ export class DispatchService {
     if (prior) {
       const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
         .get(runId, dispatchId) as { dispatch_id: string } | undefined;
+      const resumed = this.store.db.prepare("SELECT 1 FROM run_events WHERE run_id=? AND type='dispatch.reconciled' AND json_extract(payload_json,'$.dispatchId')=? AND json_extract(payload_json,'$.resumed_finalization')=1")
+        .get(runId, dispatchId);
+      if (!existing && resumed) return { action: "reconciled", dispatch_id: dispatchId, replacement_for: dispatchId, reused: true, resumed_finalization: true };
       if (!existing) throw new ValidationError("reconciled dispatch is missing its replacement");
       return { action: "reconciled", dispatch_id: existing.dispatch_id, replacement_for: dispatchId, reused: true };
+    }
+    const run = this.store.getRun(runId) as { state: string };
+    if (row.state === "claimed" && run.state === "completed") {
+      this.verifyFinalization(runId, dispatchId, true);
+      this.store.db.transaction(() => {
+        this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+        this.store.event(runId, "dispatch.reconciled", { dispatchId, role, actor_role: actorRole, reason, verified_side_effects: true, resumed_finalization: true });
+      })();
+      return { action: "reconciled", dispatch_id: dispatchId, replacement_for: dispatchId, reused: false, resumed_finalization: true };
     }
     if (row.state !== "retryable_failure") throw new ValidationError(`dispatch cannot be reconciled from ${row.state}`);
     let result: { status?: string; side_effect_state?: string };
@@ -474,6 +486,97 @@ export class DispatchService {
       this.store.event(runId, "dispatch.reconciled", { dispatchId, replacement_dispatch_id: replacementId, role, actor_role: actorRole, reason, side_effect_state: "completed" });
     })();
     return { action: "reconciled", dispatch_id: replacementId, replacement_for: dispatchId, reused: false };
+  }
+
+  finalizationContext(runId: string, dispatchId: string, requiredState: "claimed" | "completed" = "claimed"): {
+    barrier_id: string;
+    revision_sha: string;
+    integration_worktree_id: string;
+  } {
+    const row = this.store.db.prepare("SELECT role,state,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=?")
+      .get(runId, dispatchId) as { role: string; state: string; packet_json: string } | undefined;
+    if (!row || row.role !== "git-operator" || row.state !== requiredState) throw new ValidationError(`final Git Operator dispatch must be ${requiredState}`);
+    const context = (JSON.parse(row.packet_json) as DispatchPacket).context as Record<string, unknown>;
+    if (context.phase !== "finalize_integration"
+      || typeof context.barrier_id !== "string"
+      || typeof context.revision_sha !== "string"
+      || typeof context.integration_worktree_id !== "string") {
+      throw new ValidationError("Git Operator dispatch is not a bound finalize integration dispatch");
+    }
+    return {
+      barrier_id: context.barrier_id,
+      revision_sha: context.revision_sha,
+      integration_worktree_id: context.integration_worktree_id,
+    };
+  }
+
+  assertFinalizingCleanup(runId: string, dispatchId: string): void {
+    const context = this.finalizationContext(runId, dispatchId);
+    const barrier = this.store.db.prepare("SELECT state,revision_sha FROM review_barriers WHERE run_id=? AND barrier_id=?")
+      .get(runId, context.barrier_id) as { state: string; revision_sha: string } | undefined;
+    if (!barrier || !["passed", "resolved"].includes(barrier.state) || barrier.revision_sha !== context.revision_sha) {
+      throw new ValidationError("finalization review barrier is not passed for the requested revision");
+    }
+    const operation = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.integrate' AND state='completed' ORDER BY completed_at DESC LIMIT 1")
+      .get(runId) as { evidence_json?: string } | undefined;
+    const evidence = JSON.parse(operation?.evidence_json ?? "{}") as Record<string, unknown>;
+    if (!operation || !/^[a-f0-9]{40}$/.test(String(evidence.commit ?? "")) || evidence.integration_head && evidence.integration_head !== context.revision_sha) {
+      throw new ValidationError("finalization cleanup requires a completed integration side effect for the reviewed revision");
+    }
+  }
+
+  verifyFinalization(runId: string, dispatchId: string, allowClaimed = false): Record<string, unknown> {
+    const dispatch = this.store.db.prepare("SELECT state FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+      .get(runId, dispatchId) as { state: string } | undefined;
+    const requiredState = allowClaimed ? "claimed" : "completed";
+    if (!dispatch || dispatch.state !== requiredState) throw new ValidationError(`final Git Operator dispatch must be ${requiredState}`);
+    const context = this.finalizationContext(runId, dispatchId, requiredState);
+    const run = this.store.getRun(runId) as { repo_id: string; target_branch: string };
+    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
+    if (!repository) throw new ValidationError("run repository is not registered");
+    const barrier = this.store.db.prepare("SELECT state,revision_sha FROM review_barriers WHERE run_id=? AND barrier_id=?")
+      .get(runId, context.barrier_id) as { state: string; revision_sha: string } | undefined;
+    if (!barrier || !["passed", "resolved"].includes(barrier.state) || barrier.revision_sha !== context.revision_sha) {
+      throw new ValidationError("finalization barrier and revision binding could not be verified");
+    }
+    const operation = this.store.db.prepare("SELECT operation_id,request_json,evidence_json FROM operations WHERE run_id=? AND kind='git.integrate' AND state='completed' ORDER BY completed_at DESC LIMIT 1")
+      .get(runId) as { operation_id: string; request_json: string; evidence_json?: string } | undefined;
+    if (!operation) throw new ValidationError("completed integration operation was not found");
+    const request = JSON.parse(operation.request_json) as Record<string, unknown>;
+    const evidence = JSON.parse(operation.evidence_json ?? "{}") as Record<string, unknown>;
+    const targetHead = execFileSync("git", ["-C", repository.project_path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const targetBranch = execFileSync("git", ["-C", repository.project_path, "branch", "--show-current"], { encoding: "utf8" }).trim();
+    const parents = execFileSync("git", ["-C", repository.project_path, "rev-list", "--parents", "-n", "1", targetHead], { encoding: "utf8" }).trim().split(" ");
+    if (targetBranch !== run.target_branch || evidence.commit !== targetHead || parents.length !== 3 || parents[2] !== context.revision_sha) {
+      throw new ValidationError("target HEAD and merge parents do not match the finalized revision");
+    }
+    if (evidence.target_parent && evidence.target_parent !== parents[1]) throw new ValidationError("integration target parent does not match recorded evidence");
+    if (evidence.integration_head && evidence.integration_head !== context.revision_sha) throw new ValidationError("integration revision does not match recorded evidence");
+    if (evidence.barrier_id && evidence.barrier_id !== context.barrier_id) throw new ValidationError("integration barrier does not match recorded evidence");
+    if (request.integration_worktree_id && request.integration_worktree_id !== context.integration_worktree_id) throw new ValidationError("integration worktree lineage does not match final dispatch");
+    const worktrees = this.store.db.prepare("SELECT worktree_id,path,branch,state FROM worktrees WHERE run_id=?").all(runId) as Array<{ worktree_id: string; path: string; branch: string; state: string }>;
+    const listed = execFileSync("git", ["-C", repository.project_path, "worktree", "list", "--porcelain"], { encoding: "utf8" });
+    for (const worktree of worktrees) {
+      const cleanup = this.store.db.prepare(`SELECT state FROM operations WHERE run_id=? AND kind='git.cleanup'
+        AND json_extract(request_json,'$.worktreeId')=? ORDER BY created_at DESC LIMIT 1`).get(runId, worktree.worktree_id) as { state: string } | undefined;
+      let branchExists = false;
+      try {
+        execFileSync("git", ["-C", repository.project_path, "show-ref", "--verify", `refs/heads/${worktree.branch}`], { stdio: "ignore" });
+        branchExists = true;
+      } catch { /* absent branch is required cleanup evidence */ }
+      if (worktree.state !== "removed" || cleanup?.state !== "completed" || listed.includes(`worktree ${worktree.path}`) || branchExists) {
+        throw new ValidationError("finalization worktree cleanup could not be verified", { worktree_id: worktree.worktree_id });
+      }
+    }
+    return {
+      operation_id: operation.operation_id,
+      target_head: targetHead,
+      merge_parents: parents.slice(1),
+      barrier_id: context.barrier_id,
+      revision_sha: context.revision_sha,
+      integration_worktree_id: context.integration_worktree_id,
+      worktree_cleanup: worktrees.map(({ worktree_id }) => worktree_id),
+    };
   }
 
   private assertLifecycleActor(runId: string, actorRole: Role, command: string): void {
@@ -611,6 +714,8 @@ export class DispatchService {
     const result = this.validateValue(runId, dispatchId, role, value);
     if (role === "git-operator" && result.status === "completed") {
       this.assertGitPrepareResult(runId, JSON.parse(row.packet_json) as DispatchPacket);
+      const context = (JSON.parse(row.packet_json) as DispatchPacket).context;
+      if (context.phase === "finalize_integration") this.verifyFinalization(runId, dispatchId, true);
     }
     if (role === "test" && result.status === "completed") {
       const packet = JSON.parse(row.packet_json) as DispatchPacket;
@@ -728,6 +833,14 @@ export class DispatchService {
       if (context.phase === "cancel_cleanup") {
         this.store.db.prepare("UPDATE runs SET state='canceled',stage='canceled',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
         this.store.event(runId, "run.canceled", { cleanup_dispatch_id: result.dispatch_id, reconciliation: context.reconciliation ?? null });
+        return;
+      }
+      if (context.phase === "finalize_integration") {
+        const unfinished = this.store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')")
+          .get(runId) as { count: number };
+        if (unfinished.count) throw new ValidationError("run cannot complete while dispatches remain pending or claimed");
+        this.store.db.prepare("UPDATE runs SET state='completed',stage='completed',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+        this.store.event(runId, "run.completed", { final_dispatch_id: result.dispatch_id });
         return;
       }
     }

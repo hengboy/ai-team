@@ -345,6 +345,16 @@ export class GitOrchestrator {
   async integrateTarget(runId: string, integrationId: string, dispatchId?: string): Promise<string> {
     this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
+    const dispatchFinalContext = dispatchId ? new DispatchService(this.store).finalizationContext(runId, dispatchId) : undefined;
+    if (dispatchFinalContext) {
+      const completed = this.store.db.prepare("SELECT evidence_json FROM operations WHERE idempotency_key=? AND state='completed'")
+        .get(`integrate:${runId}:${run.target_branch}:${dispatchFinalContext.revision_sha}`) as { evidence_json?: string } | undefined;
+      if (completed) {
+        const evidence = JSON.parse(completed.evidence_json ?? "{}") as { commit?: string };
+        if (!evidence.commit || await currentHead(root) !== evidence.commit) throw new ValidationError("completed integration no longer matches target HEAD; reconcile required");
+        return evidence.commit;
+      }
+    }
     const integration = this.worktree(runId, integrationId);
     const targetStatus = await worktreeStatus(root);
     const unmanagedUntracked = targetStatus.untracked.filter((path) => path !== ".worktrees/" && !path.startsWith(".worktrees/"));
@@ -377,14 +387,32 @@ export class GitOrchestrator {
     }
     const integrationHead = await currentHead(integration.path);
     new (await import("./review.js")).ReviewService(this.store).assertGate(runId, integrationHead);
-    const operation = this.store.beginOperation("git.integrate", `integrate:${runId}:${run.target_branch}:${integrationHead}`, { integration: integration.branch }, runId);
+    const finalContext = dispatchFinalContext;
+    if (finalContext && (finalContext.revision_sha !== integrationHead || finalContext.integration_worktree_id !== integrationId)) {
+      throw new ValidationError("final Git Operator dispatch does not match the integration worktree HEAD");
+    }
+    const operation = this.store.beginOperation("git.integrate", `integrate:${runId}:${run.target_branch}:${integrationHead}`, {
+      integration: integration.branch,
+      integration_worktree_id: integrationId,
+      revision_sha: integrationHead,
+      barrier_id: finalContext?.barrier_id ?? null,
+      target_parent: current,
+    }, runId);
     if (operation.reused) {
       if (operation.state !== "completed") throw new ValidationError("integration side effect is unknown; reconcile required");
-      return currentHead(root);
+      const recorded = this.store.db.prepare("SELECT evidence_json FROM operations WHERE operation_id=?").get(operation.operationId) as { evidence_json?: string };
+      const evidence = JSON.parse(recorded.evidence_json ?? "{}") as { commit?: string };
+      if (!evidence.commit || await currentHead(root) !== evidence.commit) throw new ValidationError("completed integration no longer matches target HEAD; reconcile required");
+      return evidence.commit;
     }
     const commit = await mergeNoFastForward(root, integration.branch, `Integrate AI Team run ${runId}`);
-    this.store.finishOperation(operation.operationId, { commit });
-    this.store.db.prepare("UPDATE runs SET state='completed',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+    this.store.finishOperation(operation.operationId, {
+      commit,
+      target_parent: current,
+      integration_head: integrationHead,
+      barrier_id: finalContext?.barrier_id ?? null,
+      integration_worktree_id: integrationId,
+    });
     return commit;
   }
 
@@ -424,7 +452,12 @@ export class GitOrchestrator {
   async cleanup(runId: string, dispatchId?: string): Promise<string[]> {
     this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
-    if (run.state !== "completed" && !(run.state === "active" && run.stage === "canceling")) throw new ValidationError("worktrees are retained unless the run completed or entered managed cancellation");
+    if (run.state === "active" && run.stage !== "canceling") {
+      if (!dispatchId) throw new ValidationError("active run cleanup requires its final Git Operator dispatch");
+      new DispatchService(this.store).assertFinalizingCleanup(runId, dispatchId);
+    } else if (run.state !== "completed" && !(run.state === "active" && run.stage === "canceling")) {
+      throw new ValidationError("worktrees are retained unless final integration completed or the run entered managed cancellation");
+    }
     const rows = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND state='active' ORDER BY length(path) DESC").all(runId) as any[];
     const removed: string[] = [];
     for (const row of rows) {

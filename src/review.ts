@@ -9,7 +9,35 @@ export type Severity = "P0" | "P1" | "P2" | "P3";
 export interface ReviewFinding { finding_id: string; severity: Severity; title: string; source: string; source_file: string; source_line: number; evidence: string; impact: string; recommendation: string; }
 export interface ReviewResult { axis: "spec" | "standards"; summary: string; findings: ReviewFinding[]; }
 export interface FindingResolution { finding_id: string; change_evidence: string; verification_evidence: string; }
-export interface ReviewCreateResult { barrier_id: string; axes: string[]; reused: boolean; }
+export interface ReviewCreateResult { barrier_id: string; axes: string[]; spec_dispatch_id: string | null; standards_dispatch_id: string; reused: boolean; }
+
+export const REVIEW_FINDING_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["finding_id", "severity", "title", "source", "source_file", "source_line", "evidence", "impact", "recommendation"],
+  properties: {
+    finding_id: { type: "string", pattern: "^FIND-[A-Z]+-[0-9]{3}$", description: "FIND-<AXIS>-<NNN>" },
+    severity: { enum: ["P0", "P1", "P2", "P3"] },
+    title: { type: "string", minLength: 1 },
+    source: { type: "string", minLength: 1 },
+    source_file: { type: "string", minLength: 1 },
+    source_line: { type: "integer", minimum: 1 },
+    evidence: { type: "string", minLength: 1 },
+    impact: { type: "string", minLength: 1 },
+    recommendation: { type: "string", minLength: 1 },
+  },
+} as const;
+
+export const REVIEW_RESULT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["axis", "summary", "findings"],
+  properties: {
+    axis: { enum: ["spec", "standards"] },
+    summary: { type: "string", minLength: 1 },
+    findings: { type: "array", items: REVIEW_FINDING_SCHEMA },
+  },
+} as const;
 
 const validateFindings = (result: ReviewResult): void => {
   if (!result.summary || !Array.isArray(result.findings)) throw new ValidationError("review result requires summary and findings");
@@ -31,12 +59,13 @@ export class ReviewService {
     const requiredFormal = run.mode === "planned";
     if (formal !== requiredFormal) throw new ValidationError(`${run.mode} runs require ${requiredFormal ? "formal" : "direct"} review axes`);
     if (!/^[a-f0-9]{40}$/.test(revisionSha)) throw new ValidationError("review revision must be a 40-character commit SHA");
-    const existing = this.store.db.prepare("SELECT barrier_id,formal,axes_json FROM review_barriers WHERE run_id=? AND revision_sha=?")
-      .get(runId, revisionSha) as { barrier_id: string; formal: number; axes_json?: string } | undefined;
+    const existing = this.store.db.prepare("SELECT barrier_id,formal,axes_json,spec_dispatch_id,standards_dispatch_id FROM review_barriers WHERE run_id=? AND revision_sha=?")
+      .get(runId, revisionSha) as { barrier_id: string; formal: number; axes_json?: string; spec_dispatch_id?: string; standards_dispatch_id?: string } | undefined;
     if (existing) {
       if (Boolean(existing.formal) !== formal) throw new ValidationError("existing review barrier has different axes");
       const existingAxes = existing.axes_json ? JSON.parse(existing.axes_json) as string[] : formal ? ["spec", "standards"] : ["standards"];
-      return { barrier_id: existing.barrier_id, axes: existingAxes, reused: true };
+      if (!existing.standards_dispatch_id) throw new ValidationError("existing review barrier is missing its standards dispatch");
+      return { barrier_id: existing.barrier_id, axes: existingAxes, spec_dispatch_id: existing.spec_dispatch_id ?? null, standards_dispatch_id: existing.standards_dispatch_id, reused: true };
     }
     const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
     if (!repository) throw new ValidationError("review repository is not registered");
@@ -150,8 +179,31 @@ export class ReviewService {
       }
     });
     create();
-    const row = this.store.db.prepare("SELECT barrier_id FROM review_barriers WHERE run_id=? AND revision_sha=?").get(runId, revisionSha) as { barrier_id: string };
-    return { barrier_id: row.barrier_id, axes: [...axes], reused };
+    const row = this.store.db.prepare("SELECT barrier_id,spec_dispatch_id,standards_dispatch_id FROM review_barriers WHERE run_id=? AND revision_sha=?").get(runId, revisionSha) as { barrier_id: string; spec_dispatch_id?: string; standards_dispatch_id?: string };
+    if (!row.standards_dispatch_id) throw new ValidationError("review barrier is missing its standards dispatch");
+    return { barrier_id: row.barrier_id, axes: [...axes], spec_dispatch_id: row.spec_dispatch_id ?? null, standards_dispatch_id: row.standards_dispatch_id, reused };
+  }
+
+  async submitValue(runId: string, barrierId: string, result: ReviewResult): Promise<Record<string, unknown>> {
+    validateFindings(result);
+    const role = result.axis === "spec" ? "review-spec" : "review-standards";
+    const leaf = (this.store.db.prepare("SELECT dispatch_id,state,packet_json FROM dispatches WHERE run_id=? AND role=? ORDER BY created_at DESC").all(runId, role) as Array<{ dispatch_id: string; state: string; packet_json: string }>)
+      .find((item) => (JSON.parse(item.packet_json) as { context?: { barrier_id?: string } }).context?.barrier_id === barrierId);
+    if (!leaf) throw new ValidationError(`${result.axis} review leaf dispatch was not found`);
+    let dispatchSubmission: Record<string, unknown> | null = null;
+    if (leaf.state === "claimed") {
+      const dispatches = new DispatchService(this.store);
+      const envelope = dispatches.template(runId, leaf.dispatch_id, role);
+      dispatchSubmission = await dispatches.submitValue(runId, leaf.dispatch_id, role, {
+        ...envelope,
+        summary: result.summary,
+        findings: result.findings,
+        verification: [{ command: "review submit", outcome: "completed" }],
+        payload: { finding_ids: result.findings.map(({ finding_id }) => finding_id) },
+      }) as unknown as Record<string, unknown>;
+    }
+    const aggregate = this.submit(runId, barrierId, result);
+    return { dispatch_id: leaf.dispatch_id, dispatch_submission: dispatchSubmission, ...aggregate };
   }
 
   submit(runId: string, barrierId: string, result: ReviewResult): { state: string; blocking: ReviewFinding[] } {

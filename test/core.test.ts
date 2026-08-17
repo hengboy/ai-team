@@ -705,9 +705,14 @@ test("planning revision commit has one exact generated command contract", () => 
 
 test("dispatch reconciliation has one exact generated command contract", () => {
   assert.deepEqual(COMMAND_SYNTAX["dispatch reconcile"], [
-    "ai-team dispatch reconcile --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text>",
+    "ai-team dispatch reconcile --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text> [--staging-id <staging-id>]",
   ]);
   assert.deepEqual(commandContractFor(["dispatch reconcile"]).syntax, COMMAND_SYNTAX["dispatch reconcile"]);
+});
+
+test("review schema has one exact generated command contract", () => {
+  assert.deepEqual(COMMAND_SYNTAX["review schema"], ["ai-team review schema"]);
+  assert.deepEqual(commandContractFor(["review schema"]).syntax, COMMAND_SYNTAX["review schema"]);
 });
 
 test("environment explanation and diff commands have exact public contracts", () => {

@@ -49,8 +49,10 @@ conversation or chain of thought. It is retained with the packet, schema,
 template, and result artifact for run recovery and audit.
 
 Every dispatch schema replaces the generic payload with the selected role's
-strict payload schema. Every review finding includes a source, file, line,
-evidence, impact, and recommendation. Successful dispatch submission advances
+strict payload schema. Review finding IDs use `FIND-<AXIS>-<NNN>`; every finding
+requires `finding_id`, `severity`, `title`, `source`, `source_file`, `source_line`,
+`evidence`, `impact`, and `recommendation`. `ai-team review schema` exposes the
+machine-readable contract. Successful dispatch submission advances
 the durable run stage once; failure statuses do not create a successor.
 
 The File Explorer payload includes strict `project_context` data. Its submitted

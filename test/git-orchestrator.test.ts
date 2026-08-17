@@ -336,17 +336,54 @@ test("integration uses no-ff merges and cleanup removes owned worktrees", async 
     assert.equal(packet.context.test_evidence.status, "completed");
     completeStandardsReview(fixture.store, runId);
     reviews.submit(runId, barrier.barrier_id, { axis: "standards", summary: "passed", findings: [] });
-    const targetCommit = await fixture.orchestrator.integrateTarget(runId, integration.worktree_id);
+    fixture.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=? WHERE run_id=? AND role='code-reviewer'")
+      .run(new Date().toISOString(), runId);
+    const dispatches = new DispatchService(fixture.store);
+    const finalDispatch = fixture.store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator'
+      AND json_extract(packet_json,'$.context.phase')='finalize_integration'`).get(runId) as { dispatch_id: string };
+    dispatches.claim(runId, finalDispatch.dispatch_id, "git-operator");
+    const targetCommit = await fixture.orchestrator.integrateTarget(runId, integration.worktree_id, finalDispatch.dispatch_id);
     assert.equal((await rawGit(fixture.root, ["rev-list", "--parents", "-n", "1", targetCommit])).split(" ").length, 3);
-    assert.equal(fixture.store.getRun(runId).state, "completed");
+    assert.equal(fixture.store.getRun(runId).state, "active");
 
-    const removed = await fixture.orchestrator.cleanup(runId);
+    const finalResult = {
+      ...dispatches.template(runId, finalDispatch.dispatch_id, "git-operator"),
+      summary: "integration and cleanup completed",
+      verification: [{ command: "git rev-list", outcome: "merge verified" }],
+      payload: { operations: [{ command: "git integrate", outcome: targetCommit }] },
+    };
+    await assert.rejects(
+      dispatches.submitValue(runId, finalDispatch.dispatch_id, "git-operator", finalResult),
+      /worktree cleanup could not be verified/,
+    );
+
+    const removed = await fixture.orchestrator.cleanup(runId, finalDispatch.dispatch_id);
     assert.deepEqual(new Set(removed), new Set([task.path, integration.path]));
     await assert.rejects(lstat(task.path), { code: "ENOENT" });
     await assert.rejects(lstat(integration.path), { code: "ENOENT" });
     const states = fixture.store.db.prepare("SELECT state FROM worktrees WHERE run_id=?").all(runId) as Array<{ state: string }>;
     assert.ok(states.length > 0);
     assert.ok(states.every(({ state }) => state === "removed"));
+    fixture.store.db.prepare("UPDATE runs SET state='completed' WHERE run_id=?").run(runId);
+    const reconciled = dispatches.reconcile(runId, finalDispatch.dispatch_id, "git-operator", "coding", "verified legacy finalization side effects");
+    assert.equal(reconciled.resumed_finalization, true);
+    assert.equal(fixture.store.getRun(runId).state, "active");
+    assert.deepEqual(
+      dispatches.reconcile(runId, finalDispatch.dispatch_id, "git-operator", "coding", "verified legacy finalization side effects"),
+      { ...reconciled, reused: true },
+    );
+    assert.equal(await fixture.orchestrator.integrateTarget(runId, integration.worktree_id, finalDispatch.dispatch_id), targetCommit);
+    assert.equal(await rawGit(fixture.root, ["rev-parse", "HEAD"]), targetCommit);
+    assert.equal(
+      (fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.integrate'").get(runId) as { count: number }).count,
+      1,
+    );
+    await dispatches.submitValue(runId, finalDispatch.dispatch_id, "git-operator", finalResult);
+    assert.equal(fixture.store.getRun(runId).state, "completed");
+    assert.equal(
+      (fixture.store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId) as { count: number }).count,
+      0,
+    );
   } finally {
     await fixture.dispose();
   }

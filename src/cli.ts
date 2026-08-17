@@ -16,7 +16,7 @@ import { runnableTaskBatches, validateTaskPreview, type TaskDefinition } from ".
 import { assertRevisionCreateRunStage, assertRevisionDocuments, assertRevisionRunStage, hasTaskDocuments, preflightRevision, writeRevision, nextPlanState, type RevisionDocuments } from "./planning.js";
 import { initializeProject } from "./project.js";
 import { updateProjectContext, validateProjectContext } from "./context.js";
-import { ReviewService, type FindingResolution, type ReviewResult } from "./review.js";
+import { REVIEW_RESULT_SCHEMA, ReviewService, type FindingResolution, type ReviewResult } from "./review.js";
 import { ResearchService } from "./research-service.js";
 import type { ResearchConclusion } from "./research.js";
 import { ROLE_MANIFEST_DIGEST } from "./roles.js";
@@ -662,8 +662,21 @@ export const buildProgram = (): Command => {
     .action(async (options) => output(await withStore((store) => new DispatchService(store).cancel(options.runId, options.dispatchId, options.role, options.actorRole, options.reason))));
   dispatchCommand("reissue").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).requiredOption("--reason <text>")
     .action(async (options) => output(await withStore((store) => new DispatchService(store).reissue(options.runId, options.dispatchId, options.role, options.actorRole, options.reason))));
-  dispatchCommand("reconcile").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).requiredOption("--reason <text>")
-    .action(async (options) => output(await withStore((store) => new DispatchService(store).reconcile(options.runId, options.dispatchId, options.role, options.actorRole, options.reason))));
+  dispatchCommand("reconcile").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).requiredOption("--reason <text>").option("--staging-id <id>")
+    .action(async (options) => {
+      const retention = await retentionHours();
+      output(await withStore(async (store) => {
+        const service = new DispatchService(store);
+        const reconciliation = service.reconcile(options.runId, options.dispatchId, options.role, options.actorRole, options.reason);
+        if (!options.stagingId) return reconciliation;
+        if (!reconciliation.resumed_finalization) throw new ValidationError("--staging-id is only valid for verified finalization reconciliation");
+        const input = await loadJsonInput(store, { stagingId: options.stagingId, runId: options.runId, dispatchId: options.dispatchId, role: options.role, kind: "dispatch-result" }, retention);
+        try {
+          const submission = await service.submitValue(options.runId, options.dispatchId, options.role, input.value);
+          return { reconciliation, submission, staging: await input.consume() };
+        } catch (error) { input.validationFailed(error); }
+      }));
+    });
   jsonOptions(dispatchCommand("supersede").addOption(new Option("--actor-role <role>").choices([...ROLES]).makeOptionMandatory()).requiredOption("--reason <text>"), "--packet-file")
     .action(async (options) => {
       const retention = await retentionHours();
@@ -805,6 +818,7 @@ export const buildProgram = (): Command => {
   });
 
   const review = program.command("review");
+  review.command("schema").action(() => output(REVIEW_RESULT_SCHEMA));
   review.command("create").requiredOption("--run-id <id>").requiredOption("--revision-sha <sha>").option("--formal").action(async (options) => { validateCommand("review.create", { runId: options.runId, revisionSha: options.revisionSha, formal: options.formal }); output(await withStore((store) => new ReviewService(store).create(options.runId, options.revisionSha, options.formal))); });
   jsonOptions(review.command("submit").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>").addOption(new Option("--role <role>").choices(["review-spec", "review-standards"])), "--result-file").action(async (options) => {
     const retention = await retentionHours();
@@ -820,7 +834,7 @@ export const buildProgram = (): Command => {
         const role: Role = value.axis === "spec" ? "review-spec" : "review-standards";
         if (options.role && options.role !== role) throw new ValidationError("review role does not match result axis");
         if (input.entry && input.entry.role !== role) throw new ValidationError("review staging role does not match result axis");
-        const result = new ReviewService(store).submit(options.runId, options.barrierId, value);
+        const result = await new ReviewService(store).submitValue(options.runId, options.barrierId, value);
         return withStagingResult(result, await input.consume({ role }));
       } catch (error) { input.validationFailed(error); }
     }));

@@ -12,7 +12,7 @@ import { repositoryIdentity } from "../src/git.js";
 import { assertCoverage, validateCoverage, writeRevision } from "../src/planning.js";
 import { initializeProject, planProjectInit } from "../src/project.js";
 import { validateResearchConclusions, type ResearchConclusion } from "../src/research.js";
-import { ReviewService, type ReviewResult } from "../src/review.js";
+import { REVIEW_RESULT_SCHEMA, ReviewService, type ReviewResult } from "../src/review.js";
 import { StateStore } from "../src/state.js";
 import { WorkflowService } from "../src/workflow.js";
 import { GitOrchestrator } from "../src/git-orchestrator.js";
@@ -203,6 +203,8 @@ test("direct and formal reviews require the correct axes and run once per frozen
     assert.throws(() => reviews.create(directRun, "0".repeat(40), false), /commit does not exist/);
     const direct = reviews.create(directRun, REVIEW_HEAD, false);
     assert.deepEqual(direct.axes, ["standards"]);
+    assert.equal(direct.spec_dispatch_id, null);
+    assert.match(direct.standards_dispatch_id, /^dispatch_/);
     assert.deepEqual(
       (store.db.prepare("SELECT role FROM dispatches WHERE run_id=? AND role LIKE 'review-%' ORDER BY role").all(directRun) as Array<{ role: string }>).map(({ role }) => role),
       ["review-standards"],
@@ -217,6 +219,8 @@ test("direct and formal reviews require the correct axes and run once per frozen
     assert.throws(() => reviews.create(formalRun, REVIEW_HEAD, false), /require formal review axes/);
     const formal = reviews.create(formalRun, REVIEW_HEAD, true);
     assert.deepEqual(formal.axes, ["spec", "standards"]);
+    assert.match(formal.spec_dispatch_id!, /^dispatch_/);
+    assert.match(formal.standards_dispatch_id, /^dispatch_/);
     assert.deepEqual(
       (store.db.prepare("SELECT role FROM dispatches WHERE run_id=? AND role LIKE 'review-%' ORDER BY role").all(formalRun) as Array<{ role: string }>).map(({ role }) => role),
       ["review-spec", "review-standards"],
@@ -226,6 +230,31 @@ test("direct and formal reviews require the correct axes and run once per frozen
     assert.equal(submitReview(reviews, store, formalRun, formal.barrier_id, result("standards")).state, "passed");
   } finally {
     await cleanupTestPlanWorktrees(store);
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("review submit owns leaf result registration and publishes the finding schema", async () => {
+  const { store, home } = await openStore();
+  try {
+    assert.equal(REVIEW_RESULT_SCHEMA.properties.findings.items.properties.finding_id.description, "FIND-<AXIS>-<NNN>");
+    assert.deepEqual(REVIEW_RESULT_SCHEMA.properties.findings.items.required, [
+      "finding_id", "severity", "title", "source", "source_file", "source_line", "evidence", "impact", "recommendation",
+    ]);
+    const runId = createRun(store);
+    await completeTest(store, runId);
+    const reviews = new ReviewService(store);
+    const created = reviews.create(runId, REVIEW_HEAD, false);
+    new WorkflowService(store).dispatches.claim(runId, created.standards_dispatch_id, "review-standards");
+    const submitted = await reviews.submitValue(runId, created.barrier_id, result("standards"));
+    assert.equal(submitted.dispatch_id, created.standards_dispatch_id);
+    assert.equal(submitted.state, "passed");
+    assert.equal(
+      (store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(created.standards_dispatch_id) as { state: string }).state,
+      "completed",
+    );
+  } finally {
     store.close();
     await rm(home, { recursive: true, force: true });
   }
