@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { checkResultEnvelope, createResultTemplate } from "../src/contracts.js";
+import { ROLES } from "../src/constants.js";
 import { COMMAND_CONTRACT_BASE, COMMAND_PARAMETER_TYPES, COMMAND_SYNTAX, commandContractFor } from "../src/command-contract.js";
 import { DispatchService, type DispatchPacket } from "../src/dispatch.js";
 import { ValidationError } from "../src/errors.js";
@@ -41,19 +42,23 @@ const validResult = (runId = RUN_ID, dispatchId = DISPATCH_ID) => ({
   payload: { modified_paths: ["src/example.ts"], self_tests: [{ command: "npm test", outcome: "passed" }] },
 });
 
-test("result templates carry dispatch identity and become valid with completion evidence", () => {
+test("result templates carry dispatch identity and satisfy their frozen role schema", () => {
   const template = createResultTemplate(RUN_ID, DISPATCH_ID, "backend-developer");
 
   assert.equal(template.run_id, RUN_ID);
   assert.equal(template.dispatch_id, DISPATCH_ID);
   assert.equal(template.role, "backend-developer");
   assert.equal(template.status, "completed");
-  assert.deepEqual(checkResultEnvelope(template), {
-    valid: false,
-    errors: [{ path: "/summary", pointer: "/summary", field: "summary", constraint: "minLength", message: "must NOT have fewer than 1 characters" }],
-  });
+  assert.deepEqual(checkResultEnvelope(template), { valid: true, value: template });
 
   assert.deepEqual(checkResultEnvelope(validResult()), { valid: true, value: validResult() });
+});
+
+test("every dispatch template validates against its frozen role schema on first render", () => {
+  for (const role of ROLES) {
+    const template = createResultTemplate(RUN_ID, DISPATCH_ID, role);
+    assert.deepEqual(checkResultEnvelope(template), { valid: true, value: template }, role);
+  }
 });
 
 test("result contract rejects completed results without evidence and failed results without failure metadata", () => {
@@ -492,7 +497,7 @@ test("dispatch claim bundle returns the same frozen assets and digests idempoten
     assert.deepEqual(first.template, dispatches.template(runId, dispatchId, "backend-developer"));
     assert.deepEqual(Object.keys(first.digests).sort(), ["packet", "prompt", "schema", "template"]);
     for (const digest of Object.values(first.digests)) assert.match(digest, /^[a-f0-9]{64}$/);
-    assert.equal(first.renderer_version, "dispatch-renderer-v4");
+    assert.equal(first.renderer_version, "dispatch-renderer-v5");
 
     const second = dispatches.claimBundle(runId, dispatchId, "backend-developer");
     assert.deepEqual(second, { ...first, reused: true });

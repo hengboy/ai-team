@@ -142,6 +142,12 @@ test("planned runs use revision-scoped plan and task worktrees without run-short
   const fixture = await createFixture();
   try {
     const planId = "20260813-feature";
+    const taskRoot = join(fixture.root, ".ai-team", "plans", planId, "revisions", "007", "tasks");
+    await mkdir(taskRoot, { recursive: true });
+    await writeFile(join(taskRoot, "TASK-001.md"), "# TASK-001\n");
+    await writeFile(join(taskRoot, "TASK-002.md"), "# TASK-002\n");
+    await rawGit(fixture.root, ["add", ".ai-team"]);
+    await rawGit(fixture.root, ["commit", "-m", "Freeze split tasks"]);
     const runId = fixture.store.createRun({
       repoId: (await repositoryIdentity(fixture.root)).repoId,
       profile: "coding",
@@ -164,7 +170,7 @@ test("planned runs use revision-scoped plan and task worktrees without run-short
     assert.equal(first.path, await import("node:fs/promises").then(({ realpath }) => realpath(join(fixture.root, ".worktrees", "tasks", planId, `${planRevision}--task-001`))));
     assert.equal(first.base_commit, await rawGit(plan.path, ["rev-parse", "HEAD"]));
     await assert.rejects(
-      fixture.orchestrator.prepareTask(runId, "TASK-003", "a".repeat(40)),
+      fixture.orchestrator.prepareTask(runId, "TASK-002", "a".repeat(40)),
       /base must equal the current plan worktree HEAD/,
     );
 
@@ -174,6 +180,26 @@ test("planned runs use revision-scoped plan and task worktrees without run-short
     const second = await fixture.orchestrator.prepareTask(runId, "TASK-002");
     assert.equal(second.branch, `task/${planId}/${planRevision}--task-002`);
     assert.equal(second.base_commit, merged);
+    assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=? AND branch LIKE 'task/%'").get(runId) as { count: number }).count, 2);
+    const statuses = await fixture.orchestrator.status(runId);
+    const planStatus = statuses.find(({ type }) => type === "plan");
+    assert.deepEqual(planStatus && {
+      type: planStatus.type,
+      owner: planStatus.owner,
+      branch: planStatus.branch,
+      base: planStatus.base_commit,
+      head: planStatus.head,
+      state: planStatus.state,
+      clean: planStatus.clean,
+    }, {
+      type: "plan",
+      owner: planId,
+      branch: `plan/${planId}/${planRevision}`,
+      base: plan.base_commit,
+      head: merged,
+      state: "active",
+      clean: true,
+    });
   } finally {
     await fixture.dispose();
   }

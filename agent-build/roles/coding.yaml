@@ -29,6 +29,7 @@ commands:
   - review status
   - run show
   - run resume
+  - run cancel
   - run decide
   - git status
 discovery: false

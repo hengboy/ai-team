@@ -37,7 +37,7 @@ export interface RunResumeResult {
 export interface DispatchContinuation {
   run_state: string;
   run_stage: string;
-  pending_dispatches: Array<{ dispatch_id: string; role: string; state: string }>;
+  pending_dispatches: Array<{ dispatch_id: string; role: string; state: string; depends_on: string[] }>;
   pending_decision: Record<string, unknown> | null;
 }
 
@@ -83,7 +83,7 @@ interface ReviewBarrierRow {
   standards_dispatch_id?: string;
 }
 
-const RENDERER_VERSION = "dispatch-renderer-v4";
+const RENDERER_VERSION = "dispatch-renderer-v5";
 const EXPLORER_CONTEXT_PATHS = ["MEMORY.md", ".ai-team/index/feature-navigation.md"] as const;
 
 const promptLines = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string[] => [
@@ -109,6 +109,7 @@ const promptFor = (runId: string, dispatchId: string, role: Role, packet: Dispat
   ...promptLines(runId, dispatchId, role, packet),
   "Create a dispatch-result staging entry, write the frozen result envelope to it with staging write --input-stdin, validate it, then submit it exactly once with dispatch submit --staging-id <staging-id>.",
   "Return the CLI submission receipt containing submission and continuation; do not return an unsubmitted envelope.",
+  "Do not claim a workflow action in the final output unless it is recorded by the returned artifact, decision, or run event.",
 ].join("\n");
 
 const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
@@ -192,7 +193,8 @@ export class DispatchService {
       const worktreeId = (validated.context as { worktree_id?: unknown }).worktree_id;
       if (typeof worktreeId !== "string" || !worktreeId) throw new ValidationError(`${role} dispatch requires context.worktree_id`, ["/context/worktree_id"]);
       const worktree = this.store.db.prepare("SELECT branch FROM worktrees WHERE worktree_id=? AND run_id=? AND state='active'").get(worktreeId, runId) as { branch: string } | undefined;
-      if (!worktree?.branch.startsWith("task/")) throw new ValidationError(`${role} dispatch requires a prepared active task worktree`, ["/context/worktree_id"]);
+      const plannedPlanWorktree = (this.store.getRun(runId) as { mode?: string }).mode === "planned" && worktree?.branch.startsWith("plan/");
+      if (!worktree?.branch.startsWith("task/") && !plannedPlanWorktree) throw new ValidationError(`${role} dispatch requires a prepared active implementation worktree`, ["/context/worktree_id"]);
     }
     return this.insert(runId, role, validated);
   }
@@ -604,22 +606,35 @@ export class DispatchService {
 
   continuation(runId: string): DispatchContinuation {
     const run = this.store.getRun(runId) as { state: string; stage: string };
+    const pending = this.store.db.prepare("SELECT dispatch_id,role,state,packet_json,replacement_for FROM dispatches WHERE run_id=? AND state IN ('pending','claimed') ORDER BY created_at,dispatch_id")
+      .all(runId) as Array<{ dispatch_id: string; role: string; state: string; packet_json: string; replacement_for?: string }>;
     return {
       run_state: run.state,
       run_stage: run.stage,
-      pending_dispatches: this.store.db.prepare("SELECT dispatch_id,role,state FROM dispatches WHERE run_id=? AND state IN ('pending','claimed') ORDER BY created_at,dispatch_id")
-        .all(runId) as DispatchContinuation["pending_dispatches"],
+      pending_dispatches: pending.map(({ packet_json, replacement_for, ...dispatch }) => {
+        const context = (JSON.parse(packet_json) as DispatchPacket).context;
+        const dependencies = Object.entries(context)
+          .filter(([key, value]) => key.endsWith("_dispatch_id") && typeof value === "string")
+          .map(([, value]) => value as string);
+        if (replacement_for) dependencies.push(replacement_for);
+        return { ...dispatch, depends_on: [...new Set(dependencies)] };
+      }),
       pending_decision: (this.store.db.prepare("SELECT * FROM decisions WHERE run_id=? AND status='pending' ORDER BY created_at,decision_id LIMIT 1")
         .get(runId) as Record<string, unknown> | undefined) ?? null,
     };
   }
 
   private advanceRun(runId: string, role: Role, result: ResultEnvelope): void {
-    const run = this.store.getRun(runId) as { profile: string };
+    const run = this.store.getRun(runId) as { profile: string; mode?: string };
     if (role === "file-explorer") {
       const next = run.profile === "planning" ? "planning" : "coding";
       const existing = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND role=? AND state IN ('pending','claimed')").get(runId, next);
       if (existing) return;
+      if (next === "coding" && run.mode === "planned") {
+        const dispatchId = this.ensureGitPrepareDispatch(runId, "integration", result.dispatch_id);
+        this.changeStage(runId, "git-operator", dispatchId);
+        return;
+      }
       const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'")
         .get(runId, result.dispatch_id) as { artifact_id: string; sha256: string } | undefined;
       if (!artifact) throw new ValidationError("completed File Explorer result artifact is missing");
@@ -640,9 +655,22 @@ export class DispatchService {
           },
         },
       }, run.profile as Role);
-      if (next === "coding") this.ensureGitPrepareDispatch(runId, "integration");
+      if (next === "coding") this.ensureGitPrepareDispatch(runId, "integration", result.dispatch_id);
       this.changeStage(runId, next, dispatchId);
       return;
+    }
+    if (role === "git-operator") {
+      const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string } | undefined;
+      const context = row ? (JSON.parse(row.packet_json) as DispatchPacket).context as { phase?: unknown; explorer_dispatch_id?: unknown } : {};
+      if (run.mode === "planned" && context.phase === "prepare_worktrees") {
+        if (typeof context.explorer_dispatch_id === "string") this.createPlannedCodingDispatch(runId, context.explorer_dispatch_id, result.dispatch_id);
+        return;
+      }
+      if (context.phase === "cancel_cleanup") {
+        this.store.db.prepare("UPDATE runs SET state='canceled',stage='canceled',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+        this.store.event(runId, "run.canceled", { cleanup_dispatch_id: result.dispatch_id });
+        return;
+      }
     }
     if (["coding", "frontend-developer", "backend-developer", "git-operator"].includes(role)) {
       this.advanceImplementation(runId);
@@ -697,7 +725,34 @@ export class DispatchService {
     return undefined;
   }
 
-  ensureGitPrepareDispatch(runId: string, target: "integration" | "implementation"): string {
+  private createPlannedCodingDispatch(runId: string, explorerDispatchId: string | undefined, gitDispatchId: string): string {
+    const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='coding' AND state IN ('pending','claimed','completed') ORDER BY created_at DESC LIMIT 1").get(runId) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
+    const explorer = explorerDispatchId
+      ? this.store.db.prepare("SELECT result_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='file-explorer' AND state='completed'").get(runId, explorerDispatchId) as { result_json?: string } | undefined
+      : undefined;
+    if (!explorer?.result_json) throw new ValidationError("planned Coding dispatch requires its completed Explorer dependency");
+    const result = JSON.parse(explorer.result_json) as ResultEnvelope;
+    const worktree = this.activeIntegrationWorktree(runId);
+    if (!worktree) throw new ValidationError("planned Coding dispatch requires the verified plan worktree");
+    const dispatchId = this.create(runId, "coding", {
+      objective: "Create an implementation plan from the exact File Explorer scope and dispatch the implementation roles.",
+      allowed_read_paths: (result.payload.allowed_read_paths as string[] | undefined) ?? [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Use the verified run-owned plan worktree", "Create Task worktrees only for a frozen plan with multiple explicit TASK files"],
+      context: {
+        stage: "coding",
+        explorer_dispatch_id: explorerDispatchId,
+        git_operator_dispatch_id: gitDispatchId,
+        worktree_id: worktree.worktree_id,
+        plan_worktree_path: worktree.path,
+      },
+    }, "coding");
+    this.changeStage(runId, "coding", dispatchId);
+    return dispatchId;
+  }
+
+  ensureGitPrepareDispatch(runId: string, target: "integration" | "implementation", explorerDispatchId?: string): string {
     const phase = target === "integration" ? "prepare_worktrees" : "prepare_implementation_worktree";
     const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches
       WHERE run_id=? AND role='git-operator' AND state IN ('pending','claimed','completed')
@@ -712,12 +767,13 @@ export class DispatchService {
       allowed_read_paths: [],
       allowed_write_paths: [],
       acceptance_criteria: target === "integration"
-        ? [run.mode === "planned" ? "Register one active plan worktree owned by this run" : "Register one active integration worktree owned by this run"]
+        ? [run.mode === "planned" ? "Verify the active plan worktree already owned by this run" : "Register one active integration worktree owned by this run"]
         : ["Register the active implementation task worktree owned by this run from the run base commit"],
       context: {
         stage: "git-operator",
         phase,
         ...(target === "implementation" ? { task_id: "implementation" } : {}),
+        ...(explorerDispatchId ? { explorer_dispatch_id: explorerDispatchId } : {}),
         base_commit: run.base_commit ?? null,
       },
     }, "git-operator"));
@@ -782,12 +838,13 @@ export class DispatchService {
       try { const evidence = JSON.parse(item.evidence_json ?? "{}"); return typeof evidence.task_worktree_id === "string" ? [evidence.task_worktree_id] : []; }
       catch { return []; }
     }));
-    if (taskWorktreeIds.some((worktreeId) => !mergedWorktrees.has(worktreeId))) {
+    const usesPlanWorktreeDirectly = taskWorktreeIds.length === 1 && taskWorktreeIds[0] === integration.worktree_id;
+    if (!usesPlanWorktreeDirectly && taskWorktreeIds.some((worktreeId) => !mergedWorktrees.has(worktreeId))) {
       this.ensureIntegrationDispatch(runId, taskWorktreeIds, integration.worktree_id);
       return;
     }
     const implementation = this.completedImplementationOperation(runId);
-    if (!implementation || implementation.kind !== "git.merge.task") return;
+    if (!implementation || usesPlanWorktreeDirectly && implementation.kind !== "git.commit" || !usesPlanWorktreeDirectly && implementation.kind !== "git.merge.task") return;
     const integrationHead = execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     if (implementation.commit !== integrationHead) return;
     const existing = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND role='test' AND state!='failed'").get(runId);

@@ -1,4 +1,4 @@
-import { mkdir, realpath, stat } from "node:fs/promises";
+import { mkdir, readdir, realpath, stat } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { ValidationError } from "./errors.js";
 import { commitPaths, createWorktree, currentBranch, currentHead, git, mergeNoFastForward, worktreeStatus } from "./git.js";
@@ -9,6 +9,17 @@ import { ScopeGate } from "./gates.js";
 import { DispatchService } from "./dispatch.js";
 
 export interface PreparedWorktree { worktree_id: string; branch: string; path: string; base_commit: string; reused: boolean; }
+export interface WorktreeStatus {
+  worktree_id: string;
+  type: "plan" | "integration" | "task";
+  owner: string;
+  branch: string;
+  path: string;
+  base_commit: string;
+  head: string | null;
+  state: string;
+  clean: boolean | null;
+}
 
 const safeSegment = (value: string): string => {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) throw new ValidationError(`unsafe Git name segment: ${value}`);
@@ -86,6 +97,18 @@ export class GitOrchestrator {
     const { branch, path } = worktreeNames(root, run, runId, taskId);
     const integration = isPlannedRun(run) ? this.activeIntegrationWorktree(runId, root, run) : undefined;
     if (isPlannedRun(run) && !integration) throw new ValidationError("planned Task requires an active plan worktree");
+    if (isPlannedRun(run) && integration) {
+      const taskDirectory = join(integration.path, ".ai-team", "plans", run.plan_id, "revisions", run.revision, "tasks");
+      let taskIds: string[] = [];
+      try {
+        taskIds = (await readdir(taskDirectory, { withFileTypes: true }))
+          .filter((entry) => entry.isFile() && /^TASK-\d{3}\.md$/.test(entry.name))
+          .map((entry) => entry.name.slice(0, -3).toLowerCase())
+          .sort();
+      } catch { /* no explicit task split */ }
+      if (taskIds.length <= 1) throw new ValidationError("planned revision with zero or one explicit TASK uses its plan worktree directly");
+      if (!taskIds.includes(taskId.toLowerCase())) throw new ValidationError(`unknown explicit planned Task: ${taskId}`);
+    }
     const integrationHead = integration ? await currentHead(integration.path) : undefined;
     if (integrationHead && baseCommit && baseCommit !== integrationHead) throw new ValidationError("planned Task base must equal the current plan worktree HEAD");
     let base = integrationHead ?? baseCommit ?? run.base_commit;
@@ -104,7 +127,7 @@ export class GitOrchestrator {
       if (operation.state !== "completed" || !existing) throw new ValidationError("worktree operation has unknown side effect; reconcile required");
       return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: true };
     }
-    const collision = this.store.db.prepare("SELECT run_id FROM worktrees WHERE branch=? OR path=?").get(branch, path) as any;
+    const collision = this.store.db.prepare("SELECT run_id FROM worktrees WHERE state='active' AND (branch=? OR path=?)").get(branch, path) as any;
     if (collision) throw new ValidationError(`branch or worktree belongs to another run: ${collision.run_id}`);
     try { await stat(path); throw new ValidationError(`unowned worktree path already exists: ${path}`); } catch (error) { if (error instanceof ValidationError) throw error; }
     try { await git(root, ["show-ref", "--verify", `refs/heads/${branch}`]); throw new ValidationError(`unowned branch already exists: ${branch}`); } catch (error) { if (error instanceof ValidationError && error.message.startsWith("unowned")) throw error; }
@@ -226,7 +249,7 @@ export class GitOrchestrator {
       if (operation.state !== "completed") throw new ValidationError("integration operation has unknown side effect; reconcile required");
       return { worktree_id: existing.worktree_id, branch: existing.branch, path: existing.path, base_commit: base, reused: true };
     }
-    const collision = this.store.db.prepare("SELECT run_id FROM worktrees WHERE branch=? OR path=?").get(branch, path) as any;
+    const collision = this.store.db.prepare("SELECT run_id FROM worktrees WHERE state='active' AND (branch=? OR path=?)").get(branch, path) as any;
     if (collision) throw new ValidationError(`branch or worktree belongs to another run: ${collision.run_id}`);
     try { await stat(path); throw new ValidationError(`unowned worktree path already exists: ${path}`); } catch (error) { if (error instanceof ValidationError) throw error; }
     try { await git(root, ["show-ref", "--verify", `refs/heads/${branch}`]); throw new ValidationError(`unowned branch already exists: ${branch}`); } catch (error) { if (error instanceof ValidationError && error.message.startsWith("unowned")) throw error; }
@@ -239,6 +262,20 @@ export class GitOrchestrator {
       .run(worktreeId, runId, branch, path, base, new Date().toISOString());
     this.store.finishOperation(operation.operationId, { worktreeId, head: await currentHead(path) });
     return { worktree_id: worktreeId, branch, path, base_commit: base, reused: false };
+  }
+
+  async status(runId: string): Promise<WorktreeStatus[]> {
+    const rows = this.store.db.prepare("SELECT worktree_id,branch,path,base_commit,state FROM worktrees WHERE run_id=? ORDER BY created_at,worktree_id")
+      .all(runId) as Array<{ worktree_id: string; branch: string; path: string; base_commit: string; state: string }>;
+    return Promise.all(rows.map(async (row) => {
+      const type = row.branch.startsWith("plan/") ? "plan" : row.branch.startsWith("integration/") ? "integration" : "task";
+      const owner = type === "task" ? row.branch.split("/").at(-1)!.split("--").at(-1)! : row.branch.split("/")[1] ?? row.branch;
+      try {
+        return { ...row, type, owner, head: await currentHead(row.path), clean: (await worktreeStatus(row.path)).clean };
+      } catch {
+        return { ...row, type, owner, head: null, clean: null };
+      }
+    }));
   }
 
   private worktree(runId: string, worktreeId: string): any {
@@ -372,7 +409,7 @@ export class GitOrchestrator {
   async cleanup(runId: string, dispatchId?: string): Promise<string[]> {
     this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
-    if (run.state !== "completed") throw new ValidationError("worktrees are retained unless the run completed");
+    if (run.state !== "completed" && !(run.state === "active" && run.stage === "canceling")) throw new ValidationError("worktrees are retained unless the run completed or entered managed cancellation");
     const rows = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND state='active' ORDER BY length(path) DESC").all(runId) as any[];
     const removed: string[] = [];
     for (const row of rows) {

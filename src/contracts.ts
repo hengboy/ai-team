@@ -340,19 +340,47 @@ export const resultSchemaForRole = (role: Role): Record<string, unknown> => ({
   properties: { ...resultEnvelopeSchema.properties, payload: ROLE_PAYLOAD_SCHEMAS[role] },
 });
 
+const payloadTemplateForRole = (role: Role): Record<string, unknown> => {
+  const evidence = [{ command: "replace with the executed command", outcome: "replace with the observed outcome" }];
+  switch (role) {
+    case "planning": return { actions: [], stage: "requirements", pending_questions: [], decision: null };
+    case "coding": return { actions: [] };
+    case "file-explorer": return {
+      allowed_read_paths: ["MEMORY.md", ".ai-team/index/feature-navigation.md"],
+      entry_points: [],
+      test_commands: [],
+      project_context: {
+        project_shape: "replace with the observed project shape",
+        memory: { domain_terms: [], repository_constraints: [], responsibilities: [], module_boundaries: [] },
+        navigation: [],
+        maintenance: { status: "replace with the context maintenance status", paths: [] },
+      },
+    };
+    case "frontend-developer":
+    case "backend-developer": return { modified_paths: [], self_tests: evidence };
+    case "test": return { checks: evidence };
+    case "git-operator": return { operations: evidence };
+    case "code-reviewer": return { axes: ["standards"] };
+    case "review-spec":
+    case "review-standards": return { finding_ids: [] };
+    case "environment-operator": return { managed_paths: [] };
+    case "researcher": return { report_path: "replace with the archived report path", conclusion_count: 1 };
+  }
+};
+
 export const createResultTemplate = (runId: string, dispatchId: string, role: Role): ResultEnvelope => ({
   schema_version: SCHEMA_VERSION,
   run_id: runId,
   dispatch_id: dispatchId,
   role,
   status: "completed",
-  summary: "",
+  summary: "replace with the completed work summary",
   findings: [],
   changes: [],
-  verification: [],
+  verification: [{ command: "replace with the verification command", outcome: "replace with the observed outcome" }],
   risks: [],
   decisions_needed: [],
   requested_support: [],
   handoff: null,
-  payload: {},
+  payload: payloadTemplateForRole(role),
 });

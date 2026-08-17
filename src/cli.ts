@@ -573,6 +573,7 @@ export const buildProgram = (): Command => {
       output(await withStore((store) => new WorkflowService(store).handoffToPlanning(runId, request)));
     });
   run.command("resume").argument("<run-id>").action(async (runId) => output(await withStore((store) => new DispatchService(store).resume(runId))));
+  run.command("cancel").argument("<run-id>").requiredOption("--reason <text>").action(async (runId, options) => output(await withStore((store) => new WorkflowService(store).requestCancellation(runId, options.reason))));
   run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined; const dispatchId = new DispatchService(store).resolveDecision(options.runId, options.decisionId, options.choice, note); output({ status: "resolved", dispatch_id: dispatchId }); }));
 
   const staging = program.command("staging");
@@ -702,7 +703,11 @@ export const buildProgram = (): Command => {
   });
 
   const gitCommand = program.command("git");
-  gitCommand.command("status").requiredOption("--run-id <id>").action(async ({ runId }) => output(await withStore(async (store) => { const run = store.getRun(runId); const repo = store.db.prepare("SELECT * FROM repositories WHERE repo_id=?").get(run.repo_id); return { run_id: runId, repository: repo, worktree: await worktreeStatus((repo as any).project_path) }; }, { readonly: true })));
+  gitCommand.command("status").requiredOption("--run-id <id>").action(async ({ runId }) => output(await withStore(async (store) => {
+    const run = store.getRun(runId);
+    const repo = store.db.prepare("SELECT * FROM repositories WHERE repo_id=?").get(run.repo_id);
+    return { run_id: runId, repository: repo, target_worktree: await worktreeStatus((repo as any).project_path), worktrees: await new GitOrchestrator(store).status(runId) };
+  }, { readonly: true })));
   gitCommand.command("prepare").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--task-id <id>", "task id or implementation", "implementation").option("--integration").option("--base-commit <sha>").option("--depends-on <worktree-id>").action(async (options) => output(await withStore((store) => options.integration ? new GitOrchestrator(store).prepareIntegration(options.runId, options.dispatchId) : new GitOrchestrator(store).prepareTask(options.runId, options.taskId, options.baseCommit, options.dependsOn, options.dispatchId))));
   gitCommand.command("adopt").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--path <path>").option("--branch <branch>").option("--base-commit <sha>").option("--commit <sha>").option("--task-id <id>", "task id or implementation", "implementation").action(async (options) => output(await withStore((store) => {
     if (options.commit && !options.path && !options.branch && !options.baseCommit) return new GitOrchestrator(store).adoptCommit(options.runId, options.commit, options.taskId, options.dispatchId);

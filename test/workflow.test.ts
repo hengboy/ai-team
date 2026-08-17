@@ -15,6 +15,7 @@ import { validateResearchConclusions, type ResearchConclusion } from "../src/res
 import { ReviewService, type ReviewResult } from "../src/review.js";
 import { StateStore } from "../src/state.js";
 import { WorkflowService } from "../src/workflow.js";
+import { GitOrchestrator } from "../src/git-orchestrator.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -40,6 +41,19 @@ const initializeRepositoryContext = async (repository: { directory: string; head
   await initializeProject(repository.directory, true);
   await git(repository.directory, "add", "--", ".gitignore", ".ai-team", "MEMORY.md");
   await git(repository.directory, "commit", "-m", "initialize project context");
+  repository.head = await git(repository.directory, "rev-parse", "HEAD");
+};
+
+const commitPlanRevision = async (repository: { directory: string; head: string }, planId: string, revision: string, taskIds: string[] = []): Promise<void> => {
+  const planRoot = path.join(repository.directory, ".ai-team", "plans", planId);
+  const revisionRoot = path.join(planRoot, "revisions", revision);
+  await mkdir(path.join(revisionRoot, "tasks"), { recursive: true });
+  await writeFile(path.join(planRoot, "plan.yaml"), `plan_id: ${planId}\nactive_revision: ${revision}\n`);
+  await writeFile(path.join(revisionRoot, "spec.md"), `# ${planId} ${revision} spec\n`);
+  await writeFile(path.join(revisionRoot, "plan.md"), `# ${planId} ${revision} plan\n`);
+  for (const taskId of taskIds) await writeFile(path.join(revisionRoot, "tasks", `${taskId}.md`), `# ${taskId}\n`);
+  await git(repository.directory, "add", "--", path.relative(repository.directory, planRoot));
+  await git(repository.directory, "commit", "-m", `freeze ${planId} ${revision}`);
   repository.head = await git(repository.directory, "rev-parse", "HEAD");
 };
 
@@ -508,6 +522,7 @@ test("coding start validates planned parameters, branch, clean worktree, and HEA
       /forbids request/,
     );
 
+    await commitPlanRevision(repository, "plan", "001", ["TASK-001"]);
     store.db.prepare(`INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at)
       VALUES (?,?,?,?,?,?)`).run("plan", "001", identity.repoId, "ready", "main", new Date().toISOString());
     const started = await workflow.codingStart({ project: repository.directory, mode: "planned", planId: "plan" });
@@ -517,6 +532,10 @@ test("coding start validates planned parameters, branch, clean worktree, and HEA
     assert.equal(run.revision, "001");
     assert.equal(run.target_branch, "main");
     assert.equal(run.base_commit, repository.head);
+    assert.equal(typeof run.plan_digest, "string");
+    assert.ok((run.plan_digest as string).length > 0);
+    assert.equal(started.role, "file-explorer");
+    assert.deepEqual(started.depends_on, []);
     const planWorktree = store.db.prepare("SELECT run_id,branch,path,base_commit,state FROM worktrees WHERE run_id=?").get(started.run_id) as { run_id: string; branch: string; path: string; base_commit: string; state: string };
     assert.deepEqual(planWorktree, {
       run_id: started.run_id,
@@ -527,7 +546,14 @@ test("coding start validates planned parameters, branch, clean worktree, and HEA
     });
     const dispatch = store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(started.dispatch_id) as { packet_json: string };
     assert.equal(JSON.parse(dispatch.packet_json).context.implementation_base_commit, repository.head);
+    await readFile(path.join(planWorktree.path, ".ai-team", "plans", "plan", "plan.yaml"), "utf8");
+    await readFile(path.join(planWorktree.path, ".ai-team", "plans", "plan", "revisions", "001", "spec.md"), "utf8");
+    await readFile(path.join(planWorktree.path, ".ai-team", "plans", "plan", "revisions", "001", "plan.md"), "utf8");
+    await readFile(path.join(planWorktree.path, ".ai-team", "plans", "plan", "revisions", "001", "tasks", "TASK-001.md"), "utf8");
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=?").get(started.run_id) as { count: number }).count, 1);
+    await assert.rejects(new GitOrchestrator(store).prepareTask(started.run_id, "TASK-001"), /uses its plan worktree directly/);
 
+    await commitPlanRevision(repository, "plan", "002");
     store.db.prepare(`INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at)
       VALUES (?,?,?,?,?,?)`).run("plan", "002", identity.repoId, "ready", "main", new Date().toISOString());
     await assert.rejects(
@@ -538,6 +564,7 @@ test("coding start validates planned parameters, branch, clean worktree, and HEA
     assert.equal(store.getRun(selected.run_id).revision, "002");
 
     const blockedPlan = "blocked-plan";
+    await commitPlanRevision(repository, blockedPlan, "001");
     store.db.prepare(`INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at)
       VALUES (?,?,?,?,?,?)`).run(blockedPlan, "001", identity.repoId, "ready", "main", new Date().toISOString());
     const blockedBranch = `plan/${blockedPlan}/${blockedPlan}-001`;
@@ -628,6 +655,42 @@ test("bug and feature coding modes require a request and capture their Git basel
   }
 });
 
+test("managed run cancellation cleans owned plan worktrees before recreating a planned run", async () => {
+  const repository = await createRepository();
+  await initializeRepositoryContext(repository);
+  await commitPlanRevision(repository, "20260817-recovery", "001");
+  const { store, home } = await openStore();
+  try {
+    const identity = await repositoryIdentity(repository.directory);
+    store.registerRepository(identity.repoId, identity.commonDir, identity.root);
+    store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,plan_commit,created_at) VALUES (?,?,?,?,?,?,?,?)")
+      .run("20260817-recovery", "001", identity.repoId, "ready", "main", "b".repeat(64), repository.head, new Date().toISOString());
+    const workflow = new WorkflowService(store);
+    const started = await workflow.codingStart({ project: repository.directory, mode: "planned", planId: "20260817-recovery", revision: "001" });
+    const cancellation = workflow.requestCancellation(started.run_id, "replace an anomalous planned run");
+    assert.equal(cancellation.state, "canceling");
+    assert.equal(cancellation.role, "git-operator");
+    const cleanupDispatchId = cancellation.dispatch_id!;
+    workflow.dispatches.claim(started.run_id, cleanupDispatchId, "git-operator");
+    const removed = await new GitOrchestrator(store).cleanup(started.run_id, cleanupDispatchId);
+    assert.equal(removed.length, 1);
+    await workflow.dispatches.submitValue(started.run_id, cleanupDispatchId, "git-operator", {
+      ...createResultTemplate(started.run_id, cleanupDispatchId, "git-operator"),
+      summary: "Canceled run worktrees removed",
+      verification: [{ command: "ai-team git status", outcome: "no active run-owned worktrees" }],
+      payload: { operations: [{ command: "ai-team git cleanup", outcome: "removed one plan worktree" }] },
+    });
+    assert.equal(store.getRun(started.run_id).state, "canceled");
+    const replacement = await workflow.codingStart({ project: repository.directory, mode: "planned", planId: "20260817-recovery", revision: "001" });
+    assert.notEqual(replacement.run_id, started.run_id);
+    assert.equal(store.getRun(replacement.run_id).plan_digest, "b".repeat(64));
+  } finally {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+    await rm(repository.directory, { recursive: true, force: true });
+  }
+});
+
 test("frozen coding runs hand off to one linked planning run without transferring task worktrees", async () => {
   const repository = await createRepository();
   await initializeRepositoryContext(repository);
@@ -674,12 +737,14 @@ test("automatic coding triage prioritizes one ready revision and otherwise class
     const workflow = new WorkflowService(store);
     const identity = await repositoryIdentity(repository.directory);
     store.registerRepository(identity.repoId, identity.commonDir, identity.root);
+    await commitPlanRevision(repository, "20260814-auto", "001");
     store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
       .run("20260814-auto", "001", identity.repoId, "ready", "main", new Date().toISOString());
     const planned = await workflow.codingStartAuto(repository.directory, "actual: broken\nexpected: works\nevidence: failing test");
     assert.equal(planned.triage, "planned");
     assert.equal(store.getRun(planned.run_id!).plan_id, "20260814-auto");
 
+    await commitPlanRevision(repository, "20260814-explicit", "001");
     store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
       .run("20260814-explicit", "001", identity.repoId, "ready", "main", new Date(Date.now() + 1).toISOString());
     await assert.rejects(

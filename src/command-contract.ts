@@ -84,6 +84,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "staging cleanup": ["ai-team staging cleanup --expired", "ai-team staging cleanup --run-id <run-id> [--staging-id <staging-id>] --all"],
   "run show": ["ai-team run show <run-id>"],
   "run resume": ["ai-team run resume <run-id>"],
+  "run cancel": ["ai-team run cancel <run-id> --reason <text>"],
   "run decide": ["ai-team run decide --run-id <run-id> --decision-id <opaque-id> --choice <text> [--note-file <file>]"],
   "scope check": ["ai-team scope check --run-id <run-id> --stage <stage> --paths <paths>"],
   "review create": ["ai-team review create --run-id <run-id> --revision-sha <commit> [--formal]"],
@@ -137,7 +138,7 @@ const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>
   "research archive": ["ai-team research archive --run-id <run-id> --project <path> --topic <text> --input-stdin"],
 });
 
-const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
+const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run cancel", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
 const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */

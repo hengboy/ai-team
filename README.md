@@ -49,7 +49,9 @@ Only a `ready` revision can enter planned coding. Coding always records the
 current target branch HEAD as its implementation base, blocks on a dirty target
 worktree, and uses managed worktrees under `.worktrees/`. Planned coding creates
 one run-owned plan worktree named `<plan-id>-<revision>` at startup; split tasks
-use `<plan-id>-<revision>--<task-id>` and merge back into that plan worktree.
+use that plan worktree directly unless the frozen revision contains multiple
+explicit `TASK-*.md` files. Multi-task revisions use
+`<plan-id>-<revision>--<task-id>` and merge back into the plan worktree.
 Direct bug and feature runs retain their run-scoped integration and task names.
 
 Use these recovery commands after a client session ends:
@@ -57,9 +59,15 @@ Use these recovery commands after a client session ends:
 ```sh
 ai-team run show <run-id>
 ai-team run resume <run-id>
+ai-team run cancel <run-id> --reason <reason>
 ai-team run decide --run-id <run-id> --decision-id <decision-id> --choice <choice-id>
 ai-team dispatch reconcile --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text>
 ```
+
+`run cancel` returns a Git Operator cleanup dispatch when the run owns
+worktrees. Claim that dispatch, run `git cleanup`, validate and submit its
+frozen result, then start the replacement run. Cancellation refuses pending
+Git operations, dirty worktrees, and unsafe paths.
 
 When a retryable result reports confirmed completed side effects, `run resume`
 returns the exact `dispatch reconcile` command that creates an audited replacement

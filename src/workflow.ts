@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { currentBranch, currentHead, git, repositoryIdentity, worktreeStatus } from "./git.js";
 import { StateStore } from "./state.js";
 import { DispatchService } from "./dispatch.js";
@@ -7,6 +8,8 @@ import { triageRequest } from "./planning.js";
 import { AGENT_BUILD } from "./roles.js";
 import { assertReadablePath } from "./security.js";
 import { GitOrchestrator } from "./git-orchestrator.js";
+import { sha256 } from "./utils.js";
+import type { Role } from "./constants.js";
 
 const clientPlatform = (): string => {
   const value = process.env.AI_TEAM_CLIENT_PLATFORM ?? process.env.AI_TEAM_PLATFORM ?? "codex";
@@ -91,13 +94,70 @@ export class WorkflowService {
     this.store.bindPlanningRevision(runId, repo.repoId, planId, revision);
   }
 
-  async codingStart(input: { project: string; mode: "planned" | "bug" | "feature"; planId?: string; revision?: string; request?: string }): Promise<{ run_id: string; dispatch_id: string }> {
+  requestCancellation(runId: string, reason: string): { state: "canceling" | "canceled"; dispatch_id: string | null; role: "git-operator" | null; depends_on: string[] } {
+    if (!reason.trim()) throw new ValidationError("run cancellation requires a reason");
+    const run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
+    if (run.profile !== "coding") throw new ValidationError("run cancellation is available only for coding runs");
+    const existing = this.store.db.prepare("SELECT dispatch_id,state FROM dispatches WHERE run_id=? AND role='git-operator' AND json_extract(packet_json,'$.context.phase')='cancel_cleanup' ORDER BY created_at DESC LIMIT 1")
+      .get(runId) as { dispatch_id: string; state: string } | undefined;
+    if (existing) return { state: existing.state === "completed" ? "canceled" : "canceling", dispatch_id: existing.dispatch_id, role: "git-operator", depends_on: [] };
+    if (run.state === "completed" || run.state === "canceled") throw new ValidationError(`run cannot be canceled from ${run.state}`);
+    const operation = this.store.db.prepare("SELECT operation_id FROM operations WHERE run_id=? AND state='pending' ORDER BY created_at LIMIT 1").get(runId) as { operation_id: string } | undefined;
+    if (operation) throw new ValidationError(`run cancellation requires operation reconciliation: ${operation.operation_id}`);
+    const worktrees = this.store.db.prepare("SELECT worktree_id FROM worktrees WHERE run_id=? AND state='active' ORDER BY created_at,worktree_id").all(runId) as Array<{ worktree_id: string }>;
+    if (!worktrees.length) {
+      this.store.db.transaction(() => {
+        this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND state IN ('pending','claimed')").run(new Date().toISOString(), runId);
+        this.store.db.prepare("UPDATE runs SET state='canceled',stage='canceled',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+        this.store.event(runId, "run.canceled", { reason, worktree_ids: [] });
+      })();
+      return { state: "canceled", dispatch_id: null, role: null, depends_on: [] };
+    }
+    const dispatchId = this.dispatches.create(runId, "git-operator", {
+      objective: "Remove every clean worktree and branch owned by this canceled run.",
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Remove only the listed run-owned worktrees", "Refuse dirty worktrees or unsafe paths"],
+      context: { stage: "git-operator", phase: "cancel_cleanup", reason, worktree_ids: worktrees.map(({ worktree_id }) => worktree_id) },
+    }, "coding");
+    this.store.db.transaction(() => {
+      this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND dispatch_id<>? AND state IN ('pending','claimed')")
+        .run(new Date().toISOString(), runId, dispatchId);
+      this.store.db.prepare("UPDATE decisions SET status='canceled',resolved_at=COALESCE(resolved_at,?) WHERE run_id=? AND status='pending'").run(new Date().toISOString(), runId);
+      this.store.db.prepare("UPDATE runs SET state='active',stage='canceling',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+      this.store.event(runId, "run.cancellation_requested", { reason, cleanup_dispatch_id: dispatchId, worktree_ids: worktrees.map(({ worktree_id }) => worktree_id) });
+    })();
+    return { state: "canceling", dispatch_id: dispatchId, role: "git-operator", depends_on: [] };
+  }
+
+  private async planningSnapshot(project: string, planId: string, revision: string): Promise<{ paths: string[]; digest: string }> {
+    const root = join(".ai-team", "plans", planId);
+    const revisionRoot = join(root, "revisions", revision);
+    const paths = [join(root, "plan.yaml"), join(revisionRoot, "spec.md"), join(revisionRoot, "plan.md")];
+    try {
+      await readFile(join(project, revisionRoot, "tasks.md"), "utf8");
+      paths.push(join(revisionRoot, "tasks.md"));
+    } catch { /* an unsplit plan has no tasks.md */ }
+    try {
+      const taskFiles = (await readdir(join(project, revisionRoot, "tasks"), { withFileTypes: true }))
+        .filter((entry) => entry.isFile() && /^TASK-\d{3}\.md$/.test(entry.name))
+        .map((entry) => join(revisionRoot, "tasks", entry.name))
+        .sort();
+      paths.push(...taskFiles);
+    } catch { /* an unsplit plan has no tasks directory */ }
+    const documents = await Promise.all(paths.map(async (path) => ({ path, content: await readFile(join(project, path), "utf8") })));
+    return { paths, digest: sha256(documents.map(({ path, content }) => `${path}\n${content}`).join("\n")) };
+  }
+
+  async codingStart(input: { project: string; mode: "planned" | "bug" | "feature"; planId?: string; revision?: string; request?: string }): Promise<{ run_id: string; dispatch_id: string; role: Role; depends_on: string[] }> {
     const repo = await repositoryIdentity(input.project);
     const status = await worktreeStatus(repo.root);
     if (!status.clean) throw new ValidationError("coding start requires a clean worktree", status);
     const branch = await currentBranch(repo.root);
     const head = await currentHead(repo.root);
     let selectedRevision = input.revision;
+    let planDigest: string | undefined;
+    let planPaths: string[] = [];
     if (input.mode === "planned") {
       if (!input.planId || input.request) throw new ValidationError("planned mode requires plan-id and forbids request input");
       const rows = this.store.db.prepare("SELECT * FROM revisions WHERE repo_id=? AND plan_id=? AND state='ready'").all(repo.repoId, input.planId) as any[];
@@ -110,6 +170,9 @@ export class WorkflowService {
         catch { throw new ValidationError("planning commit is not reachable from the current HEAD", { plan_commit: selected.plan_commit, head }); }
       } else if (selected.digest || selected.plan_digest) throw new ValidationError("planned revision has no committed planning baseline");
       selectedRevision = selected.revision as string;
+      const snapshot = await this.planningSnapshot(repo.root, input.planId, selectedRevision);
+      planPaths = snapshot.paths;
+      planDigest = typeof selected.digest === "string" && selected.digest.trim() ? selected.digest : snapshot.digest;
     } else {
       if (input.planId || input.revision) throw new ValidationError(`${input.mode} mode forbids plan-id and revision`);
       if (!input.request?.trim()) throw new ValidationError(`${input.mode} mode requires request input`);
@@ -117,10 +180,11 @@ export class WorkflowService {
       if (inferred !== input.mode) throw new ValidationError(`explicit ${input.mode} mode does not match inferred ${inferred}; planning required`);
     }
     this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
-    const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}), clientPlatform: clientPlatform() });
+    const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}), clientPlatform: clientPlatform(), ...(planDigest ? { planDigest } : {}) });
     if (input.mode === "planned") {
       try {
-        await new GitOrchestrator(this.store).prepareIntegration(runId);
+        const planWorktree = await new GitOrchestrator(this.store).prepareIntegration(runId);
+        await Promise.all(planPaths.map((path) => readFile(join(planWorktree.path, path), "utf8")));
       } catch (error) {
         const cause = error instanceof Error ? error.message : String(error);
         const retry = "Resolve the reported branch/worktree collision or reconcile the failed run, then start a new planned coding run.";
@@ -139,10 +203,10 @@ export class WorkflowService {
       acceptance_criteria: ["Scope is exhaustive", "Current HEAD and test entry points are reported"],
       context: { mode: input.mode, plan_id: input.planId ?? null, revision: selectedRevision ?? null, request: input.request ?? null, implementation_base_commit: head },
     }, "coding");
-    return { run_id: runId, dispatch_id: dispatchId };
+    return { run_id: runId, dispatch_id: dispatchId, role: "file-explorer", depends_on: [] };
   }
 
-  async codingStartAuto(project: string, request?: string, planId?: string, revision?: string): Promise<{ triage: "planned" | "bug" | "feature" | "planning"; run_id?: string; dispatch_id?: string }> {
+  async codingStartAuto(project: string, request?: string, planId?: string, revision?: string): Promise<{ triage: "planned" | "bug" | "feature" | "planning"; run_id?: string; dispatch_id?: string; role?: Role; depends_on?: string[] }> {
     const repo = await repositoryIdentity(project);
     this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
     if (revision && !planId) throw new ValidationError("automatic planned triage requires plan-id with revision");

@@ -14,7 +14,7 @@
 
 1. 检查平台锁定、分支、`HEAD`、`contract/role/template/document digest`、计划状态和实施基线；任一门禁失败即暂停并请求 `decision`。
 2. 让 **File Explorer** 返回精确入口、调用链、影响范围、路径授权来源和测试命令。
-3. `planned` run 启动时已有当前 run 持有的 `<planId>-<revision>` plan worktree，先让 **Git Operator** 验证其注册；拆分 Task 使用 `<planId>-<revision>--<taskId>` 并从 plan worktree 当前 `HEAD` 派生。direct run 保持 run-scoped `integration` worktree，并在通过 `pre_write` 范围门禁后使用幂等的 implementation prepare dispatch 创建 task worktree。只有对应 phase 的 run-owned active worktree 已注册后，才让 **开发角色** 在隔离 `worktree` 内实现；**Coding** 只调度、协调和收集结果，禁止直接写产品代码。
+3. `planned` run 启动时已有当前 run 持有的 `<planId>-<revision>` plan worktree，先让 **Git Operator** 验证其注册；冻结 revision 只有 0/1 个显式 `TASK-*.md` 时开发、测试、提交和最终合并都复用 plan worktree，只有多个显式 TASK 才使用 `<planId>-<revision>--<taskId>` 并从 plan worktree 当前 `HEAD` 派生。direct run 保持 run-scoped `integration` worktree，并在通过 `pre_write` 范围门禁后使用幂等的 implementation prepare dispatch 创建 task worktree。只有对应 phase 的 run-owned active worktree 已注册后，才让 **开发角色** 在隔离 `worktree` 内实现；**Coding** 只调度、协调和收集结果，禁止直接写产品代码。
    若 Coding coordinator 已完成且 developer 与 `pre_commit` 已结束、但 task worktree 尚未提交，`run resume` 只生成一个继承 Explorer 授权的 `continue_commit` replacement；必须 claim 该 replacement 后才能创建 Git Operator commit dispatch，禁止复用 completed coordinator 绕过权限。
 4. 让 **Test** 独立验证；修复或冲突后必须取得晚于修复提交的测试、构建和静态检查证据。任何可能产生截图的 `dispatch` 必须传递 `plan_id`、精确的 `.ai-team/plans/<planId>/screenshot/` 目录及对应写入范围；没有计划身份时禁止要求下游角色生成截图。
    入口、职责或模块边界变化时，协调开发角色同步目标项目 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md`，并在评审前运行 `ai-team context validate`。

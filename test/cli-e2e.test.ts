@@ -903,7 +903,7 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
   assert.equal(bundle.prompt, json(await cli(sandbox, ["dispatch", "prompt", ...identity])));
   assert.deepEqual(bundle.schema, json(await cli(sandbox, ["dispatch", "schema", ...identity])));
   assert.deepEqual(bundle.template, json(await cli(sandbox, ["dispatch", "template", ...identity])));
-  assert.equal(bundle.renderer_version, "dispatch-renderer-v4");
+  assert.equal(bundle.renderer_version, "dispatch-renderer-v5");
   for (const digest of Object.values(bundle.digests)) assert.match(digest, /^[a-f0-9]{64}$/);
 
   const result = {
@@ -968,7 +968,7 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
   const submitted = json<{
     reused: boolean;
     staging: { staging_id: string; state: string; content_digest: string };
-    continuation: { run_state: string; run_stage: string; pending_dispatches: Array<{ dispatch_id: string; role: string; state: string }>; pending_decision: unknown };
+    continuation: { run_state: string; run_stage: string; pending_dispatches: Array<{ dispatch_id: string; role: string; state: string; depends_on: string[] }>; pending_decision: unknown };
   }>(await cli(sandbox, ["dispatch", "submit", ...identity, "--staging-id", schemaError.details.staging_id]));
   assert.equal(submitted.reused, false);
   assert.deepEqual(submitted.staging, { staging_id: schemaError.details.staging_id, state: "consumed", content_digest: submitted.staging.content_digest });
@@ -979,7 +979,8 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
   );
   assert.equal(submitted.continuation.run_state, shown.run.state);
   assert.equal(submitted.continuation.run_stage, shown.run.stage);
-  assert.deepEqual(submitted.continuation.pending_dispatches, shown.dispatches.filter(({ state }) => state === "pending" || state === "claimed").map(({ dispatch_id, role, state }) => ({ dispatch_id, role, state })));
+  assert.deepEqual(submitted.continuation.pending_dispatches.map(({ dispatch_id, role, state }) => ({ dispatch_id, role, state })), shown.dispatches.filter(({ state }) => state === "pending" || state === "claimed").map(({ dispatch_id, role, state }) => ({ dispatch_id, role, state })));
+  assert.deepEqual(submitted.continuation.pending_dispatches[0]?.depends_on, [started.dispatch_id]);
   assert.equal(submitted.continuation.pending_decision, shown.decisions.find(({ status }) => status === "pending") ?? null);
 
   const second = json<{ run_id: string; dispatch_id: string }>(await cli(sandbox, [

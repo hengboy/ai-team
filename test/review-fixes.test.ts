@@ -237,6 +237,33 @@ test("planned Git prepare ignores arbitrary direct integration worktrees", async
   });
 });
 
+test("planned Coding dispatch waits for Git Operator and exposes dispatch dependencies", async () => {
+  await withStore(async (store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
+    const planId = "20260817-dispatch-order";
+    const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId, revision: "001", baseCommit: REVIEW_HEAD, targetBranch: "main", planDigest: "a".repeat(64) });
+    const planRevision = `${planId}-001`;
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_dispatch_order", runId, `plan/${planId}/${planRevision}`, join(process.cwd(), ".worktrees", "plans", planId, planRevision), REVIEW_HEAD, new Date().toISOString());
+    const dispatches = new DispatchService(store);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    dispatches.claim(runId, explorerId, "file-explorer");
+    const explorerSubmission = await dispatches.submitValue(runId, explorerId, "file-explorer", fileExplorerResult(runId, explorerId));
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='coding'").get(runId) as { count: number }).count, 0);
+    assert.equal(explorerSubmission.continuation.pending_dispatches[0]?.role, "git-operator");
+    assert.deepEqual(explorerSubmission.continuation.pending_dispatches[0]?.depends_on, [explorerId]);
+
+    const gitDispatch = explorerSubmission.continuation.pending_dispatches[0]!;
+    dispatches.claim(runId, gitDispatch.dispatch_id, "git-operator");
+    const gitSubmission = await dispatches.submitValue(runId, gitDispatch.dispatch_id, "git-operator", completedResult(runId, gitDispatch.dispatch_id, "git-operator", {
+      operations: [{ command: "verify registered plan worktree", outcome: "verified" }],
+    }));
+    assert.equal(gitSubmission.continuation.pending_dispatches[0]?.role, "coding");
+    assert.deepEqual(new Set(gitSubmission.continuation.pending_dispatches[0]?.depends_on), new Set([explorerId, gitDispatch.dispatch_id]));
+  });
+});
+
 test("only File Explorer may receive broad read paths including ./**", async () => {
   await withStore((store) => {
     const runId = createRun(store);

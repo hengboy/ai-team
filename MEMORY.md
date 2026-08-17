@@ -46,9 +46,9 @@
 
 ### 职责
 - `src/cli.ts` 负责绑定命令、恢复操作和规范 JSON 输出。
-- `src/workflow.ts` 负责 coding run 启动、主工作树 clean gate、实现基线冻结，并在 planned start 创建 run-owned plan worktree。
+- `src/workflow.ts` 负责 coding run 启动、主工作树 clean gate、实现基线冻结、planned plan worktree 创建，以及生成受管取消清理 dispatch。
 - `src/dispatch.ts` 负责校验、提交、规划生命周期、恢复和提交调度门禁。
-- `src/dispatch.ts` 同时负责 retryable replacement lineage、dispatch-bound typed decision、开发依赖、integration commit 门禁和冻结 review packet。
+- `src/dispatch.ts` 同时负责 retryable replacement lineage、dispatch-bound typed decision、planned Git-before-Coding 依赖、integration commit 门禁和冻结 review packet。
 - `src/state.ts` 负责 SQLite 的读写打开路径、前向迁移、锁、运行、决策、replacement 和操作记录。
 - `src/planning.ts` 负责校验完整修订文档以及修订与运行阶段的一致性。
 - `src/contracts.ts` 负责结果信封和角色载荷 schema。
