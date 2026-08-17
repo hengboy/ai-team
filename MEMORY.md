@@ -66,10 +66,11 @@
 - `src/review.ts` 仅评审已通过独立测试的 planned plan HEAD 或 direct integration HEAD，并验证 code-reviewer packet 的 revision、文档、diff、testedCommit 与 evidence digest 绑定。
 - `src/context.ts` 仅以 `.ai-team/index/feature-navigation.md` 为权威导航路径，并负责 schema/renderer 版本记录及旧格式迁移。
 - `src/environment.ts` 与 `agent-build/roles` 负责受管角色生成、能力定义及只读环境查询。
-- `src/cli.ts` 绑定 10 类支持 staging 的 JSON 消费命令，同时保留旧文件参数。
+- `src/cli.ts` 为 13 个受管 JSON 命令统一提供 file、`--staging-id` 与 `--input-stdin` 三种互斥输入；stdin 复用原 staging 生命周期，失败保留可重试条目。
+- `src/dispatch.ts` 保持原状态转换，并提供 claim bundle 与 submit 后的只读 continuation 投影；独立资产、validate 和 run 查询仍作为诊断路径。
 - `skills/setup-ai-team` 封装公共初始化和上下文校验命令，`skills/switch-ai-team-env` 封装公共环境切换和状态命令；两者均不改变 CLI 行为。
 - `test/*.test.ts` 包含单元测试、CLI 端到端测试、锁测试、契约测试和工作流回归测试。
 - `src/review.ts` 负责 formal review 绑定和公共状态查询，`src/dispatch.ts` 负责叶子汇总、恢复和 run 阶段推进。
 - `run handoff-to-planning` 只接受无 pending operation 的 frozen coding run；规划 revision 提交 ready 后恢复 source run，旧 pending/claimed dispatch 不得继续授权。
-- `run show` 仅公开协调所需的 run-owned worktree 元数据，不公开其他角色的原始 result 或 staging 内容。
+- `run show` 仅公开协调所需的 run-owned worktree 元数据，不公开其他角色的原始 result 或 staging 内容；submit continuation 只投影 run state/stage、pending dispatches 与 pending decision。
 <!-- ai-team:project-context:end -->

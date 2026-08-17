@@ -15,7 +15,7 @@ import { AGENT_BUILD, ROLE_MANIFEST, ROLE_MANIFEST_DIGEST } from "./roles.js";
 import { renderRoleBody } from "./agent-build.js";
 import { ROLES, STAGING_DEFAULT_RETENTION_HOURS, type Role } from "./constants.js";
 import { sha256, stableJson } from "./utils.js";
-import { commandContractFor } from "./command-contract.js";
+import { commandContractFor, recommendedCommandSyntaxFor } from "./command-contract.js";
 import { assertReadablePath, assertWritablePath } from "./security.js";
 
 const execFileAsync = promisify(execFile);
@@ -285,12 +285,37 @@ const legacyRendererNotUsed = (commands: string[]): { allowed_commands: string[]
   }))],
   parameter_types: {},
 }); */
+const renderedParameterType = (name: string): string => {
+  if (name === "path") return "本地路径";
+  if (["file", "request-file", "note-file"].includes(name)) return "可读文件";
+  if (["role", "actor-role"].includes(name)) return "角色枚举";
+  if (name === "platform") return "平台枚举";
+  if (name === "platform-list") return "平台列表";
+  if (name === "mode") return "planned|bug|feature";
+  if (name === "plan-id") return "日期加小写 slug";
+  if (["revision", "supersedes"].includes(name)) return "三位 revision";
+  if (name === "task-id") return "TASK-三位数字";
+  if (name === "run-id") return "run_ ULID";
+  if (name === "dispatch-id") return "dispatch_ ULID";
+  if (name === "staging-id") return "staging_ ULID";
+  if (["opaque-id", "decision-id", "barrier-id", "operation-id", "worktree-id", "integration-id", "depends-on"].includes(name)) return "CLI ID";
+  if (["name", "from", "to"].includes(name)) return "小写环境名";
+  if (["commit", "base-commit", "plan-commit", "revision-sha"].includes(name)) return "40 位 commit";
+  if (["branch", "target-branch"].includes(name)) return "分支名";
+  if (["paths", "scope"].includes(name)) return "逗号分隔相对路径";
+  if (name === "state") return "状态枚举";
+  if (name === "stage") return "阶段枚举";
+  return "非空文本";
+};
+
 const renderBody = (role: Role, platform: Platform, model: ModelConfig, environment: string): string => {
   const definition = ROLE_MANIFEST[role];
   const commandContract = commandContractFor(definition.commands);
+  const recommendedSyntax = recommendedCommandSyntaxFor(definition.commands);
+  const usedParameters = [...new Set(recommendedSyntax.flatMap((syntax) => [...syntax.matchAll(/<([^>]+)>/g)].map((match) => match[1]!)))];
   const metadata = { role, platform, environment, model, writes: definition.writes, staging: definition.staging, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, agent_build_digest: AGENT_BUILD.digest, template_version: AGENT_BUILD.templateVersion, command_contract: commandContract };
   const body = renderRoleBody(AGENT_BUILD, role, { role, purpose: definition.purpose, allowed_commands: definition.commands.join(", "), delegates: definition.delegates.join(", ") || "无", discovery: definition.discovery ? "允许" : "禁止；请请求文件探索代理支持", stop_conditions: "遇到运行数据包之外的工作时返回 requested_support", platform, environment, contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, template_version: AGENT_BUILD.templateVersion, spec_template: AGENT_BUILD.templates.spec!, plan_template: AGENT_BUILD.templates.plan!, task_template: AGENT_BUILD.templates.task! });
-  const instructions = `Role: ${role}\n\n${body}\n\n## 写入边界\n\n项目 writes：${definition.writes.length ? definition.writes.map((item) => `\`${item}\``).join(", ") : "无"}\n\nstaging.owned_entries：${definition.staging.owned_entries.length ? definition.staging.owned_entries.map((item) => `\`${item}\``).join(", ") : "无"}\n\n代理生成的每个临时 JSON 必须依次执行：\`staging create\` 获取当前 \`runId\` 下的条目、通过 stdin 执行 \`staging write --input-stdin\`、仅把 \`--staging-id\` 交给消费命令。消费成功后由 CLI 标记并清理该条目。不得为代理生成的 JSON 使用 \`--context-file\`、\`--documents-file\`、\`--file\`、\`--packet-file\`、\`--result-file\`、\`--evidence-file\`、\`--report-file\` 或 \`--resolution-file\`，也不得直接写入 \`$TMPDIR\`、项目目录或任意 \`AI_TEAM_HOME\` 路径。staging 所有权不扩大项目 writes。\n\n## CLI 命令契约\n\n允许命令：\n${commandContract.allowed_commands.map((command) => `- \`${command}\``).join("\n")}\n\n精确语法：\n${commandContract.syntax.map((syntax) => `- \`${syntax}\``).join("\n")}\n\n参数类型：\n${Object.entries(commandContract.parameter_types).map(([name, description]) => `- \`<${name}>\`: ${description}`).join("\n")}`;
+  const instructions = `Role: ${role}\n\n${body}\n\n## 写入边界\n\nwrites：${definition.writes.length ? definition.writes.map((item) => `\`${item}\``).join(", ") : "无"}；staging.owned_entries：${definition.staging.owned_entries.length ? definition.staging.owned_entries.map((item) => `\`${item}\``).join(", ") : "无"}。JSON 用消费命令 \`--input-stdin\`；失败后以返回的 \`staging_id\` 通过 \`--staging-id\` 修正重试。显式 staging、资产和 validate 命令仅用于恢复。不得直接写入 \`$TMPDIR\`、项目目录或 \`AI_TEAM_HOME\`；staging 所有权不扩大 writes。\n\n## 推荐命令语法\n\n${recommendedSyntax.map((syntax) => `- \`${syntax}\``).join("\n")}\n\n参数类型：${usedParameters.map((name) => ` \`<${name}>\`=${renderedParameterType(name)}`).join("；")}`;
   if (platform === "codex") {
     return `# ${FILE_MARKER}\n# ai_team.metadata = ${stableJson(metadata)}\nname = ${JSON.stringify(role)}\ndescription = ${JSON.stringify(definition.purpose)}\nmodel = ${JSON.stringify(model.model)}\nmodel_reasoning_effort = ${JSON.stringify(model.reasoning)}\ndeveloper_instructions = ${JSON.stringify(instructions)}\n`;
   }

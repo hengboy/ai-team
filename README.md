@@ -102,6 +102,19 @@ and `review` subcommands. Every dispatch binds a run, role, packet, frozen task
 prompt, strict result schema, and result template. A completed result requires
 verification evidence and is stored as a redacted, hashed artifact.
 
+The normal two-command dispatch path claims all frozen assets as one bundle and
+submits the result through stdin:
+
+```sh
+ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --bundle
+ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --input-stdin
+```
+
+The bundle includes packet, prompt, schema, template, their digests, and the
+renderer version. Submit still performs the full result schema and business
+validation, then returns a read-only continuation containing the current run
+state/stage, pending dispatches, and pending decision.
+
 Formal plans require one Spec and one Standards review for each frozen revision.
 Direct bug and feature runs require one Standards review. P0 and P1 findings
 must all have change and verification evidence before integration. Reviews are
@@ -120,7 +133,10 @@ the contract and role-manifest digests used to detect drift.
 
 Agent-produced JSON is stored under
 `${AI_TEAM_HOME:-~/.config/ai-team}/state/staging/<run-id>/` and is managed only
-through the CLI:
+through the CLI. Normal consumers accept JSON directly with `--input-stdin`;
+the CLI internally creates and writes a managed entry before running the same
+business validation and consumption path. The explicit commands remain the
+recovery and diagnostic path:
 
 ```sh
 ai-team staging create --run-id <id> --role <role> --kind <kind> [--dispatch-id <id>]
@@ -133,10 +149,17 @@ ai-team staging cleanup --run-id <id> [--staging-id <id>] --all
 The 10 kinds are `project-context`, `planning-documents`, `planning-tasks`,
 `dispatch-packet`, `dispatch-result`, `decision`, `git-reconcile-evidence`,
 `research-conclusions`, `review-result`, and `review-resolution`. Existing JSON
-file options remain supported; each consumer accepts either its file option or
-`--staging-id`, never both. Validation and Task preview do not consume content.
-Successful mutating commands persist their business result before deleting the
-staged file. Failed deletion is recorded as `cleanup_pending` for retry.
+file options remain supported; each of the 13 managed JSON commands accepts
+exactly one of its file option, `--staging-id`, or `--input-stdin`. Validation
+and Task preview do not consume content. Successful mutating commands persist
+their business result before deleting the staged file. Failed input or business
+validation returns the retained `staging_id` and state for correction through
+the existing `--staging-id` path. Failed deletion is recorded as
+`cleanup_pending` for retry.
+
+Because review staging ownership is axis-specific, `review submit --input-stdin`
+also requires `--role review-spec` or `--role review-standards`. File and
+`--staging-id` review submissions retain their existing syntax.
 
 Directories are mode `0700`, files are `0600`, and writes are limited to 2 MiB
 of valid JSON with atomic replacement and link/ownership/path checks. The

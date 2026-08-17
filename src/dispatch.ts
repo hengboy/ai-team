@@ -33,6 +33,23 @@ export interface RunResumeResult {
   } | null;
 }
 
+export interface DispatchContinuation {
+  run_state: string;
+  run_stage: string;
+  pending_dispatches: Array<{ dispatch_id: string; role: string; state: string }>;
+  pending_decision: Record<string, unknown> | null;
+}
+
+export interface DispatchBundle {
+  reused: boolean;
+  packet: DispatchPacket;
+  prompt: string;
+  schema: unknown;
+  template: ResultEnvelope;
+  digests: { packet: string; prompt: string; schema: string; template: string };
+  renderer_version: string;
+}
+
 type ReplacementAction = "reissued" | "superseded" | "reconciled";
 type ReplacementResult<Action extends ReplacementAction> = {
   action: Action;
@@ -273,6 +290,34 @@ export class DispatchService {
     return { reused, packet: JSON.parse(row.packet_json) as DispatchPacket };
   }
 
+  claimBundle(runId: string, dispatchId: string, role: Role): DispatchBundle {
+    const claimed = this.claim(runId, dispatchId, role);
+    const row = this.get(runId, dispatchId, role) as {
+      packet_json: string;
+      schema_json: string;
+      template_json: string;
+      packet_digest?: string;
+      prompt_digest?: string;
+      schema_digest?: string;
+      template_digest?: string;
+      renderer_version?: string;
+    };
+    const prompt = this.prompt(runId, dispatchId, role);
+    return {
+      ...claimed,
+      prompt,
+      schema: JSON.parse(row.schema_json),
+      template: JSON.parse(row.template_json) as ResultEnvelope,
+      digests: {
+        packet: row.packet_digest ?? sha256(row.packet_json),
+        prompt: row.prompt_digest ?? sha256(prompt),
+        schema: row.schema_digest ?? sha256(row.schema_json),
+        template: row.template_digest ?? sha256(row.template_json),
+      },
+      renderer_version: row.renderer_version ?? RENDERER_VERSION,
+    };
+  }
+
   cancel(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): { action: "canceled"; reused: boolean } {
     this.assertLifecycleActor(runId, actorRole, "dispatch cancel");
     if (!reason.trim()) throw new ValidationError("dispatch cancellation requires a reason");
@@ -505,6 +550,18 @@ export class DispatchService {
     });
     transaction();
     return { reused: false, artifact };
+  }
+
+  continuation(runId: string): DispatchContinuation {
+    const run = this.store.getRun(runId) as { state: string; stage: string };
+    return {
+      run_state: run.state,
+      run_stage: run.stage,
+      pending_dispatches: this.store.db.prepare("SELECT dispatch_id,role,state FROM dispatches WHERE run_id=? AND state IN ('pending','claimed') ORDER BY created_at,dispatch_id")
+        .all(runId) as DispatchContinuation["pending_dispatches"],
+      pending_decision: (this.store.db.prepare("SELECT * FROM decisions WHERE run_id=? AND status='pending' ORDER BY created_at,decision_id LIMIT 1")
+        .get(runId) as Record<string, unknown> | undefined) ?? null,
+    };
   }
 
   private advanceRun(runId: string, role: Role, result: ResultEnvelope): void {

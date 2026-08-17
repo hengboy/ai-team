@@ -1,5 +1,5 @@
 schema_version: 1
-template_version: 3
+template_version: 4
 roles:
   - planning
   - coding

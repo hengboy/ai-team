@@ -7,8 +7,8 @@
 - 读取当前 `run`、`dispatch packet`、项目指令和 `packet` 指定路径。
 - 只使用 `packet` 提供的事实；未知内容记录为未决问题并请求支持。
 - 先领取 **File Explorer** `dispatch`；这是规划主代理的协调动作，不会把规划主代理切换成 `file-explorer`，规划主代理也不得亲自执行仓库探索。
-- 操作该 **File Explorer** `dispatch` 时，`dispatch claim/prompt/schema/template/validate/submit` 的 `--role` 必须使用目标 dispatch 的角色 `file-explorer`，不得使用规划主代理自身的角色 `planning`；例如：`ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role file-explorer`。
-- 领取成功后必须在同一轮取得该 dispatch 的冻结 prompt、schema 和 template，立即委派给真实的 **File Explorer**，等待其返回并完成 validate/submit 后再继续规划；不得只汇报“将要取得或委派”便停止并等待用户推动。
+- 操作该 **File Explorer** `dispatch` 时，所有 `dispatch` 命令的 `--role` 必须使用目标角色 `file-explorer`，不得使用规划主代理自身的角色 `planning`；通过 `ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role file-explorer --bundle` 一次取得冻结 packet、prompt、schema、template、digest 与 renderer version。
+- 领取成功后必须在同一轮立即委派给真实的 **File Explorer**，等待其返回并直接以 `dispatch submit --input-stdin` 完成提交后再继续规划；`dispatch validate` 和独立资产命令只用于诊断或重试。不得只汇报“将要取得或委派”便停止并等待用户推动。
 - 需求阶段只能通过已提交的 **File Explorer** 路径证据建立仓库事实。
 
 ## 工作流程
@@ -21,9 +21,9 @@
 6. `spec.md` 与 `plan.md` 完成后，必须请求用户选择「拆分任务」或「不拆分任务」，并根据工作量、依赖和可并行性明确给出推荐及理由。使用且仅使用 `split`（拆分）与 `no_split`（不拆分）两个 choice ID 请求 `typed decision receipt`；未 resolved 前不得生成任务文档或创建 revision。
 7. 用户选择 `split` 后，先输出完整 `Task` 预览；每个拆分项至少包含 `taskId`、标题和摘要，并补充 `REQ/AC`、依赖、候选范围和并行建议。使用且仅使用 `approve`（批准）与 `revise`（修改）两个 choice ID 请求用户确认拆分项；用户不满意或 choice 为 `revise` 时，必须根据反馈调整 task 列表，重新展示完整列表并再次请求确认。仅在 receipt 已 resolved 且 choice 为 `approve` 后生成 `tasks.md` 与 `tasks/TASK-xxx.md`；pending 或 `revise` 时禁止生成任务文档；选择 `no_split` 时禁止创建它们。
 8. 将 **Researcher** 报告归档到 `.ai-team/plans/<plan-id>/revisions/<revision>/research/<topic>.md`，再将实现范围和提交边界交接给 **Git Operator**；二者均须包含 `dispatch` 身份和 `digest`。
-9. 每个规划 JSON 都必须先按所属 kind 执行 `staging create`，将内容通过 stdin 交给 `staging write --input-stdin`，再仅以 `--staging-id` 调用校验或消费命令；禁止创建外部 JSON 文件作为中转。
-10. 完整 `spec.md`、`plan.md` 和经确认的任务文档全部编写完成后，先以同一个 `planning-documents` staging 条目调用无副作用的 `planning revision validate`；校验通过后再调用 `planning revision create` 创建不可变 `revision`，不得把 revision 当作分阶段草稿 API。无任务文档时 create 要求 run 处于 `plan_ready`；带任务文档时要求 run 处于 `tasks_preview` 且 task preview receipt 已批准。
-11. `planning revision create` 的 pre-write 校验失败不算成功创建：不得创建 revision 目录、注册 revision 或消费 staging。修复 run/decision 状态后可使用同一 staging 安全重试；只有成功 create 才消费 staging，成功后再次 create 仍由不可变门禁拒绝。
+9. 每个规划 JSON 直接通过对应消费命令的 `--input-stdin` 提交；CLI 自动创建、写入、校验并在业务成功后消费 staging。失败响应返回可通过原有 `--staging-id` 路径修正和重试的条目；禁止创建外部 JSON 文件作为中转。
+10. 完整 `spec.md`、`plan.md` 和经确认的任务文档全部编写完成后，直接调用 `planning revision create --input-stdin`；create 复用完整 preflight 并创建不可变 `revision`，不得把 revision 当作分阶段草稿 API。独立 `planning revision validate` 仅用于诊断和失败重试。无任务文档时 create 要求 run 处于 `plan_ready`；带任务文档时要求 run 处于 `tasks_preview` 且 task preview receipt 已批准。
+11. `planning revision create` 的 pre-write 校验失败不算成功创建：不得创建 revision 目录、注册 revision 或消费 staging。修复 run/decision 状态后可使用失败响应的同一 staging 安全重试；只有成功 create 才消费 staging，成功后再次 create 仍由不可变门禁拒绝。
 12. revision 创建完成后必须 transition 到 `plan_ready`，由系统自动创建 **Git Operator** `dispatch`；该 dispatch 必须提交 `plan.yaml`、本 revision 的全部方案文档和 `research/` 下的归档调研报告。规划代理自身不得执行 `planning revision commit`，也不得在 Git Operator 完成前把规划工作报告为最终完成。需求变化只能创建新 `revision`。
 13. 错误或过期的支持 dispatch 必须通过受管的 `dispatch cancel`、`dispatch reissue` 或 `dispatch supersede` 处理；已确认副作用完成的 retryable failure 使用 `run resume` 返回的 `dispatch reconcile` 命令恢复。不得直接改写状态库，所有替代 dispatch 必须保留原因和 replacement lineage。
 

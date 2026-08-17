@@ -200,6 +200,7 @@ test("staging retention defaults for new and legacy configs and rejects invalid 
 
 test("renderAgents renders all twelve roles for all three platforms", () => {
   const files = renderAgents(balancedEnvironment());
+  let codexInstructionCharacters = 0;
 
   assert.equal(files.size, ROLES.length * PLATFORMS.length);
   for (const role of ROLES) {
@@ -207,9 +208,10 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
       const extension = platform === "codex" ? "toml" : "md";
       const content = files.get(`${platform}/agents/${role}.${extension}`);
       assert.ok(content, `missing ${platform} output for ${role}`);
-      assert.match(content, new RegExp(`Role: ${role}`));
-      assert.match(content, /CLI 命令契约/);
-      for (const command of ROLE_MANIFEST[role].commands) assert.ok(content.includes(`\`${command}\``), `missing command ${command} for ${role}`);
+      const instructionStart = content.indexOf(`Role: ${role}`);
+      assert.notEqual(instructionStart, -1);
+      const visibleInstructions = content.slice(instructionStart);
+      assert.match(visibleInstructions, /推荐命令语法/);
       const metadata = platform === "codex"
         ? JSON.parse(content.match(/^# ai_team\.metadata = (.+)$/m)?.[1] ?? "null")
         : YAML.parse(content.slice(content.indexOf("---") + 4, content.indexOf("---", content.indexOf("---") + 3))).ai_team;
@@ -218,10 +220,11 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
       assert.ok(Object.keys(metadata.command_contract.parameter_types).length > 0);
       assert.deepEqual(metadata.writes, ROLE_MANIFEST[role].writes);
       assert.deepEqual(metadata.staging, ROLE_MANIFEST[role].staging);
-      assert.match(content, /staging\.owned_entries/);
-      assert.match(content, /staging create.*staging write --input-stdin.*--staging-id/s);
-      assert.match(content, /不得直接写入.*\$TMPDIR.*项目目录.*AI_TEAM_HOME/);
-      assert.doesNotMatch(content, /--(?:context-file|documents-file|file|packet-file|result-file|evidence-file|report-file|resolution-file) <(?:json|file)>/);
+      assert.match(visibleInstructions, /staging\.owned_entries/);
+      assert.match(visibleInstructions, /--input-stdin.*staging_id.*--staging-id/s);
+      assert.match(visibleInstructions, /不得直接写入.*\$TMPDIR.*项目目录.*AI_TEAM_HOME/);
+      assert.doesNotMatch(visibleInstructions, /--(?:context-file|documents-file|file|packet-file|result-file|evidence-file|report-file|resolution-file) <(?:json|file)>/);
+      assert.doesNotMatch(visibleInstructions, /undefined/);
       if (platform === "codex") {
         assert.doesNotMatch(content, /^\[ai_team\]$/m);
         assert.match(content, new RegExp(`^name = "${role}"$`, "m"));
@@ -229,6 +232,9 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
         assert.match(content, /^developer_instructions = "Role:/m);
         assert.ok(content.includes(`"platform":"${platform}"`));
         assert.match(content, /model_reasoning_effort = "medium"/);
+        const encoded = content.match(/^developer_instructions = (.+)$/m)?.[1];
+        assert.ok(encoded);
+        codexInstructionCharacters += (JSON.parse(encoded) as string).length;
       } else {
         assert.match(content, new RegExp(`^  platform: ${platform}$`, "m"));
       }
@@ -243,6 +249,13 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
       }
     }
   }
+  assert.ok(codexInstructionCharacters <= 35_000, `Codex instructions total ${codexInstructionCharacters} characters`);
+  const reviewer = files.get("codex/agents/code-reviewer.toml") ?? "";
+  assert.match(reviewer, /<opaque-id>`=CLI ID/);
+  const environmentOperator = files.get("codex/agents/environment-operator.toml") ?? "";
+  assert.match(environmentOperator, /<name>`=小写环境名/);
+  assert.match(environmentOperator, /<from>`=小写环境名/);
+  assert.match(environmentOperator, /<to>`=小写环境名/);
 });
 
 test("planning and coding coordinate managed staging for every generated JSON", () => {
@@ -250,9 +263,9 @@ test("planning and coding coordinate managed staging for every generated JSON", 
   const planning = files.get("claude/agents/planning.md") ?? "";
   const coding = files.get("claude/agents/coding.md") ?? "";
 
-  assert.match(planning, /每个规划 JSON.*staging create.*staging write --input-stdin.*--staging-id/s);
-  assert.match(planning, /planning-documents.*planning revision create/s);
-  assert.match(planning, /planning revision validate.*pre-write.*安全重试/s);
+  assert.match(planning, /每个规划 JSON.*--input-stdin.*自动创建、写入、校验.*--staging-id/s);
+  assert.match(planning, /planning revision create --input-stdin.*完整 preflight/s);
+  assert.match(planning, /planning revision validate.*诊断.*失败重试/s);
   assert.match(planning, /已确认的完整需求列表.*`confirm`.*`revise`.*choice 为 `confirm`.*才可开始写入 `spec\.md`/s);
   assert.match(planning, /「拆分任务」.*「不拆分任务」.*推荐及理由.*`split`.*`no_split`/s);
   assert.match(planning, /`taskId`、标题和摘要.*`approve`.*`revise`.*调整 task 列表.*再次请求确认/s);
@@ -260,7 +273,7 @@ test("planning and coding coordinate managed staging for every generated JSON", 
   assert.match(planning, /问题 1、.*问题 2、.*从 1 递增/s);
   assert.match(planning, /transition 到 `plan_ready`.*自动创建 \*\*Git Operator\*\* `dispatch`/s);
   assert.match(planning, /归档调研报告/);
-  assert.match(coding, /每个调度、结果、决策和评审 JSON.*staging create.*staging write --input-stdin.*--staging-id/s);
+  assert.match(coding, /每个调度、结果、决策和评审 JSON.*--input-stdin.*自动管理 staging.*staging_id/s);
   assert.match(coding, /要求下游角色遵循同一流程/);
 });
 
@@ -271,9 +284,9 @@ test("planning remains coordinator while delegating claimed File Explorer dispat
     const extension = platform === "codex" ? "toml" : "md";
     const planning = files.get(`${platform}/agents/planning.${extension}`) ?? "";
     assert.match(planning, /协调动作.*不会把规划主代理切换成 `file-explorer`/s);
-    assert.match(planning, /dispatch claim\/prompt\/schema\/template\/validate\/submit.*`--role`.*目标 dispatch 的角色 `file-explorer`.*不得使用.*`planning`/s);
-    assert.match(planning, /ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role file-explorer/);
-    assert.match(planning, /同一轮取得.*冻结 prompt、schema 和 template.*立即委派给真实的 \*\*File Explorer\*\*/s);
+    assert.match(planning, /所有 `dispatch` 命令.*`--role`.*目标角色 `file-explorer`.*不得使用.*`planning`/s);
+    assert.match(planning, /ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role file-explorer --bundle/);
+    assert.match(planning, /一次取得冻结 packet、prompt、schema、template、digest 与 renderer version/s);
     assert.match(planning, /不得只汇报.*将要取得或委派.*便停止并等待用户推动/s);
   }
 });

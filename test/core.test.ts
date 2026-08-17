@@ -470,6 +470,34 @@ test("dispatch claim is idempotent and enforces run and role identity", async ()
   });
 });
 
+test("dispatch claim bundle returns the same frozen assets and digests idempotently", async () => {
+  await withStore((store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const packet: DispatchPacket = {
+      objective: "Inspect frozen assets",
+      allowed_read_paths: ["src/a.ts"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Assets match"],
+      context: { task: "TASK-001" },
+    };
+    const dispatchId = dispatches.create(runId, "backend-developer", packet);
+
+    const first = dispatches.claimBundle(runId, dispatchId, "backend-developer");
+    assert.equal(first.reused, false);
+    assert.deepEqual(first.packet, packet);
+    assert.equal(first.prompt, dispatches.prompt(runId, dispatchId, "backend-developer"));
+    assert.deepEqual(first.schema, dispatches.schema(runId, dispatchId, "backend-developer"));
+    assert.deepEqual(first.template, dispatches.template(runId, dispatchId, "backend-developer"));
+    assert.deepEqual(Object.keys(first.digests).sort(), ["packet", "prompt", "schema", "template"]);
+    for (const digest of Object.values(first.digests)) assert.match(digest, /^[a-f0-9]{64}$/);
+    assert.equal(first.renderer_version, "dispatch-renderer-v2");
+
+    const second = dispatches.claimBundle(runId, dispatchId, "backend-developer");
+    assert.deepEqual(second, { ...first, reused: true });
+  });
+});
+
 test("dispatch validates identity, requires claim, redacts artifacts, and reuses identical submissions", async () => {
   await withStore(async (store, home) => {
     const runId = createRun(store);
@@ -610,7 +638,7 @@ test("planning states allow only declared forward transitions", () => {
 
 test("planning revision commit has one exact generated command contract", () => {
   assert.deepEqual(COMMAND_SYNTAX["planning revision validate"], [
-    "ai-team planning revision validate --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> (--documents-file <file> | --run-id <run-id> --staging-id <staging-id>) [--supersedes <revision>]",
+    "ai-team planning revision validate --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> (--documents-file <file> | --run-id <run-id> (--staging-id <staging-id> | --input-stdin)) [--supersedes <revision>]",
   ]);
   assert.deepEqual(COMMAND_SYNTAX["planning revision commit"], [
     "ai-team planning revision commit --project <path> --plan-id <plan-id> --revision <revision> --run-id <run-id> --dispatch-id <dispatch-id>",
