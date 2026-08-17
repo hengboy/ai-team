@@ -20,8 +20,10 @@ import {
 } from "./constants.js";
 import {
   ensureManagedDirectory,
+  legacyStagingFilePath,
   readManagedJsonFile,
   removeManagedFile,
+  renameManagedFile,
   stagingFilePath,
   stagingRunDirectory,
   writeManagedJsonFile,
@@ -55,6 +57,7 @@ export interface StagingEntry {
 interface StagingEntryRow {
   staging_id: string;
   run_id: string;
+  sequence_no: number;
   dispatch_id: string | null;
   role: Role;
   kind: StagingKind;
@@ -263,6 +266,32 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "009-readable-staging-filenames",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      const stagingColumns = db.prepare("PRAGMA table_info(staging_entries)").all() as Array<{ name: string }>;
+      if (!stagingColumns.some((column) => column.name === "sequence_no")) db.exec("ALTER TABLE staging_entries ADD COLUMN sequence_no INTEGER;");
+      const runColumns = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+      if (!runColumns.some((column) => column.name === "next_staging_sequence")) {
+        db.exec("ALTER TABLE runs ADD COLUMN next_staging_sequence INTEGER NOT NULL DEFAULT 1;");
+      }
+      db.exec(`
+        WITH ranked AS (
+          SELECT staging_id, ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY created_at, staging_id) AS sequence_no
+          FROM staging_entries
+        )
+        UPDATE staging_entries
+          SET sequence_no=(SELECT ranked.sequence_no FROM ranked WHERE ranked.staging_id=staging_entries.staging_id)
+          WHERE sequence_no IS NULL;
+        UPDATE runs SET next_staging_sequence=COALESCE(
+          (SELECT MAX(sequence_no) + 1 FROM staging_entries WHERE staging_entries.run_id=runs.run_id),
+          1
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS staging_entries_run_sequence ON staging_entries(run_id, sequence_no);
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
@@ -297,6 +326,38 @@ export class StateStore {
 
   private static async removeDatabase(database: string): Promise<void> {
     for (const suffix of ["", "-wal", "-shm", "-journal"]) await rm(`${database}${suffix}`, { force: true });
+  }
+
+  private static async migrateStagingFiles(paths: HomePaths, db: Database.Database): Promise<void> {
+    const completed = db.prepare("SELECT value FROM state_meta WHERE key='staging_filename_migration'").get() as { value: string } | undefined;
+    if (completed?.value === "complete") return;
+    const rows = db.prepare(`SELECT * FROM staging_entries
+      WHERE file_dev IS NOT NULL AND file_ino IS NOT NULL AND state <> 'consumed'
+      ORDER BY run_id,sequence_no`).all() as StagingEntryRow[];
+    for (const row of rows) {
+      const inspectCandidate = async (path: string): Promise<ManagedFileIdentity> => {
+        const content = await readManagedJsonFile(paths.staging, path);
+        if (content.digest !== row.content_sha256 || content.bytes !== row.content_bytes) {
+          throw new ValidationError(`legacy staging content does not match persisted metadata: ${row.staging_id}`);
+        }
+        return content.identity;
+      };
+      const destination = stagingFilePath(paths.staging, row.run_id, row.sequence_no, row.kind, row.role);
+      try {
+        const identity = await inspectCandidate(destination);
+        db.prepare("UPDATE staging_entries SET file_dev=?,file_ino=? WHERE staging_id=?")
+          .run(identity.dev, identity.ino, row.staging_id);
+        continue;
+      } catch (error: any) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      const source = legacyStagingFilePath(paths.staging, row.run_id, row.staging_id);
+      const identity = await inspectCandidate(source);
+      await renameManagedFile(paths.staging, source, destination, identity);
+      db.prepare("UPDATE staging_entries SET file_dev=?,file_ino=? WHERE staging_id=?")
+        .run(identity.dev, identity.ino, row.staging_id);
+    }
+    db.prepare("INSERT INTO state_meta(key,value) VALUES ('staging_filename_migration','complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value").run();
   }
 
   private static async requiresEpochReset(database: string, root: string): Promise<boolean> {
@@ -378,6 +439,12 @@ export class StateStore {
       }
       // A reset starts from an empty state. The complete legacy snapshot is kept
       // for explicit recovery, but is intentionally never auto-restored.
+      releaseLock();
+      throw error;
+    }
+    try { await StateStore.migrateStagingFiles(paths, db); }
+    catch (error) {
+      db.close();
       releaseLock();
       throw error;
     }
@@ -537,8 +604,8 @@ export class StateStore {
     return { dev: row.file_dev, ino: row.file_ino };
   }
 
-  private stagingPath(row: Pick<StagingEntryRow, "run_id" | "staging_id">): string {
-    return stagingFilePath(this.paths.staging, row.run_id, row.staging_id);
+  private stagingPath(row: Pick<StagingEntryRow, "run_id" | "sequence_no" | "kind" | "role">): string {
+    return stagingFilePath(this.paths.staging, row.run_id, row.sequence_no, row.kind, row.role);
   }
 
   private async ensureStagingDirectories(runId?: string): Promise<void> {
@@ -608,20 +675,23 @@ export class StateStore {
     await this.ensureStagingDirectories();
     await this.cleanupStagingEntries({ expired: true, limit: STAGING_OPPORTUNISTIC_CLEANUP_LIMIT, now });
     const stagingId = makeId("staging");
+    const sequence = this.db.prepare(`UPDATE runs SET next_staging_sequence=next_staging_sequence+1 WHERE run_id=?
+      RETURNING next_staging_sequence-1 AS sequence_no`).get(input.runId) as { sequence_no: number } | undefined;
+    if (!sequence) throw new ValidationError(`unknown run: ${input.runId}`);
     const runDirectory = stagingRunDirectory(this.paths.staging, input.runId);
     await ensureManagedDirectory(this.paths.staging, runDirectory);
-    const path = stagingFilePath(this.paths.staging, input.runId, stagingId);
+    const path = stagingFilePath(this.paths.staging, input.runId, sequence.sequence_no, input.kind, input.role);
     const content = await writeManagedJsonFile(this.paths.staging, path, input.initialJson ?? "null");
     const timestamp = now.toISOString();
     const expiresAt = new Date(now.getTime() + retentionHours * 60 * 60 * 1000).toISOString();
     try {
       this.db.prepare(`INSERT INTO staging_entries(
-        staging_id,run_id,dispatch_id,role,kind,state,content_sha256,content_bytes,file_dev,file_ino,created_at,updated_at,expires_at
-      ) VALUES (?,?,?,?,?,'draft',?,?,?,?,?,?,?)`).run(
-        stagingId, input.runId, input.dispatchId ?? null, input.role, input.kind, content.digest, content.bytes,
+        staging_id,run_id,sequence_no,dispatch_id,role,kind,state,content_sha256,content_bytes,file_dev,file_ino,created_at,updated_at,expires_at
+      ) VALUES (?,?,?,?,?,?,'draft',?,?,?,?,?,?,?)`).run(
+        stagingId, input.runId, sequence.sequence_no, input.dispatchId ?? null, input.role, input.kind, content.digest, content.bytes,
         content.identity.dev, content.identity.ino, timestamp, timestamp, expiresAt,
       );
-      this.event(input.runId, "staging.created", { stagingId, dispatchId: input.dispatchId ?? null, role: input.role, kind: input.kind });
+      this.event(input.runId, "staging.created", { stagingId, sequenceNo: sequence.sequence_no, dispatchId: input.dispatchId ?? null, role: input.role, kind: input.kind });
     } catch (error) {
       await removeManagedFile(this.paths.staging, path, content.identity).catch(() => {});
       throw error;

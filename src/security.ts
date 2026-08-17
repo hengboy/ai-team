@@ -4,7 +4,7 @@ import { lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
 import { dirname, relative, resolve, sep, join } from "node:path";
 import { SecurityError } from "./errors.js";
 import { assertInside, assertRelativePosixPath, atomicWriteFile, sha256, type AtomicWriteOptions } from "./utils.js";
-import { STAGING_MAX_BYTES } from "./constants.js";
+import { STAGING_MAX_BYTES, type Role, type StagingKind } from "./constants.js";
 
 const SENSITIVE_PATTERNS = [
   /(^|\/)\.env(?:[./]|$)/,
@@ -101,7 +101,23 @@ export const assertRunId = (value: string): string => {
 export const stagingRunDirectory = (root: string, runId: string): string =>
   assertInside(root, join(root, assertRunId(runId)));
 
-export const stagingFilePath = (root: string, runId: string, stagingId: string): string =>
+const assertStagingSequence = (value: number): number => {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new SecurityError(`invalid staging sequence: ${value}`);
+  return value;
+};
+
+const assertStagingFilenamePart = (value: string, label: string): string => {
+  if (!/^[a-z][a-z0-9-]*$/.test(value)) throw new SecurityError(`invalid staging ${label}: ${value}`);
+  return value;
+};
+
+export const stagingFileName = (sequenceNo: number, kind: StagingKind, role: Role): string =>
+  `${String(assertStagingSequence(sequenceNo)).padStart(4, "0")}--${assertStagingFilenamePart(kind, "kind")}--${assertStagingFilenamePart(role, "role")}.json`;
+
+export const stagingFilePath = (root: string, runId: string, sequenceNo: number, kind: StagingKind, role: Role): string =>
+  assertInside(root, join(stagingRunDirectory(root, runId), stagingFileName(sequenceNo, kind, role)));
+
+export const legacyStagingFilePath = (root: string, runId: string, stagingId: string): string =>
   assertInside(root, join(stagingRunDirectory(root, runId), `${assertStagingId(stagingId)}.json`));
 
 export const ensureManagedDirectory = async (homeRoot: string, directory: string): Promise<void> => {
@@ -142,6 +158,28 @@ const assertManagedPathMissing = async (root: string, path: string): Promise<voi
     throw new SecurityError("staging content path already exists");
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
+  }
+};
+
+export const renameManagedFile = async (
+  root: string,
+  source: string,
+  destination: string,
+  expected: ManagedFileIdentity,
+): Promise<void> => {
+  assertInside(root, source);
+  assertInside(root, destination);
+  if (dirname(source) !== dirname(destination)) throw new SecurityError("staging rename must remain in the same run directory");
+  assertExpectedIdentity(await inspectManagedFile(root, source), expected);
+  await assertManagedPathMissing(root, destination);
+  await rename(source, destination);
+  try {
+    assertExpectedIdentity(await inspectManagedFile(root, destination), expected);
+    const directoryHandle = await open(dirname(destination), fsConstants.O_RDONLY);
+    try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+  } catch (error) {
+    try { await rename(destination, source); } catch { /* leave the file at its inspected destination for retry */ }
+    throw error;
   }
 };
 

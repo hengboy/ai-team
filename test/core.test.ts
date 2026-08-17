@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
-import { chmod, link, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +10,7 @@ import { DispatchService, type DispatchPacket } from "../src/dispatch.js";
 import { ValidationError } from "../src/errors.js";
 import { assertCoverage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, triage, validateCoverage } from "../src/planning.js";
 import { StateStore } from "../src/state.js";
+import { legacyStagingFilePath, stagingFilePath } from "../src/security.js";
 import { makePlanId } from "../src/utils.js";
 
 const RUN_ID = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -110,7 +111,7 @@ test("state migration is recorded once and survives reopening", async () => {
   try {
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }],
     );
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
@@ -121,7 +122,7 @@ test("state migration is recorded once and survives reopening", async () => {
     store = await StateStore.open(home);
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }],
     );
   } finally {
     store.close();
@@ -138,7 +139,7 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
     try {
       assert.equal(
         (reader.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count,
-        8,
+        9,
       );
       assert.throws(() => reader.db.prepare("UPDATE runs SET state='failed'").run(), /readonly|read-only/i);
     } finally {
@@ -160,7 +161,7 @@ test("managed staging persists metadata without JSON content and consumes files"
     );
     const entry = await store.createStagingEntry({ runId, role: "backend-developer", kind: "dispatch-result" });
     const directory = join(home, "state", "staging", runId);
-    const path = join(directory, `${entry.stagingId}.json`);
+    const path = join(directory, "0001--dispatch-result--backend-developer.json");
 
     assert.equal((await stat(join(home, "state", "staging"))).mode & 0o777, 0o700);
     assert.equal((await stat(directory)).mode & 0o777, 0o700);
@@ -188,11 +189,116 @@ test("managed staging persists metadata without JSON content and consumes files"
   });
 });
 
+test("managed staging filenames expose run-local creation order without reusing consumed sequences", async () => {
+  await withStore(async (store, home) => {
+    const runId = createRun(store);
+    const first = await store.createStagingEntry({ runId, role: "test", kind: "dispatch-result" });
+    await store.createStagingEntry({ runId, role: "planning", kind: "planning-tasks" });
+    const directory = join(home, "state", "staging", runId);
+
+    assert.deepEqual(await readdir(directory), [
+      "0001--dispatch-result--test.json",
+      "0002--planning-tasks--planning.json",
+    ]);
+    assert.deepEqual(
+      store.db.prepare("SELECT sequence_no,role,kind FROM staging_entries WHERE run_id=? ORDER BY sequence_no").all(runId),
+      [
+        { sequence_no: 1, role: "test", kind: "dispatch-result" },
+        { sequence_no: 2, role: "planning", kind: "planning-tasks" },
+      ],
+    );
+
+    await store.consumeStagingEntry(first.stagingId, { runId, role: "test", kind: "dispatch-result" });
+    await store.createStagingEntry({ runId, role: "code-reviewer", kind: "review-result" });
+    assert.deepEqual(await readdir(directory), [
+      "0002--planning-tasks--planning.json",
+      "0003--review-result--code-reviewer.json",
+    ]);
+  });
+});
+
+test("concurrent staging creation allocates distinct filenames", async () => {
+  await withStore(async (store, home) => {
+    const runId = createRun(store);
+    await Promise.all([
+      store.createStagingEntry({ runId, role: "test", kind: "dispatch-result" }),
+      store.createStagingEntry({ runId, role: "test", kind: "dispatch-result" }),
+    ]);
+    assert.deepEqual(await readdir(join(home, "state", "staging", runId)), [
+      "0001--dispatch-result--test.json",
+      "0002--dispatch-result--test.json",
+    ]);
+  });
+});
+
+test("migration 009 renames legacy staging files and continues their run sequence", async () => {
+  const home = await temporaryHome();
+  let store: StateStore | undefined = await StateStore.open(home);
+  try {
+    const runId = createRun(store);
+    const entry = await store.createStagingEntry({ runId, role: "file-explorer", kind: "dispatch-result" });
+    const current = stagingFilePath(store.paths.staging, runId, 1, "dispatch-result", "file-explorer");
+    const legacy = legacyStagingFilePath(store.paths.staging, runId, entry.stagingId);
+    store.close();
+    store = undefined;
+    await rename(current, legacy);
+
+    const database = new Database(join(home, "state", "state.sqlite"));
+    database.prepare("UPDATE staging_entries SET sequence_no=NULL,file_dev='0',file_ino='0' WHERE staging_id=?").run(entry.stagingId);
+    database.prepare("UPDATE runs SET next_staging_sequence=1 WHERE run_id=?").run(runId);
+    database.prepare("DELETE FROM state_meta WHERE key='staging_filename_migration'").run();
+    database.prepare("DELETE FROM schema_migrations WHERE name='009-readable-staging-filenames'").run();
+    database.close();
+
+    store = await StateStore.open(home);
+    const migrated = store.db.prepare("SELECT sequence_no,file_dev,file_ino FROM staging_entries WHERE staging_id=?").get(entry.stagingId) as {
+      sequence_no: number;
+      file_dev: string;
+      file_ino: string;
+    };
+    const migratedInfo = await stat(current, { bigint: true });
+    assert.deepEqual(migrated, { sequence_no: 1, file_dev: String(migratedInfo.dev), file_ino: String(migratedInfo.ino) });
+    assert.equal((await stat(current)).mode & 0o777, 0o600);
+    await assert.rejects(stat(legacy), { code: "ENOENT" });
+
+    await store.createStagingEntry({ runId, role: "planning", kind: "planning-documents" });
+    assert.equal((await stat(stagingFilePath(store.paths.staging, runId, 2, "planning-documents", "planning"))).mode & 0o777, 0o600);
+  } finally {
+    store?.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("migration 009 rejects legacy staging content that does not match persisted metadata", async () => {
+  const home = await temporaryHome();
+  let store: StateStore | undefined = await StateStore.open(home);
+  try {
+    const runId = createRun(store);
+    const entry = await store.createStagingEntry({ runId, role: "test", kind: "dispatch-result" });
+    const current = stagingFilePath(store.paths.staging, runId, 1, "dispatch-result", "test");
+    const legacy = legacyStagingFilePath(store.paths.staging, runId, entry.stagingId);
+    store.close();
+    store = undefined;
+    await rename(current, legacy);
+    await writeFile(legacy, "{\"tampered\":true}", { mode: 0o600 });
+
+    const database = new Database(join(home, "state", "state.sqlite"));
+    database.prepare("DELETE FROM state_meta WHERE key='staging_filename_migration'").run();
+    database.prepare("DELETE FROM schema_migrations WHERE name='009-readable-staging-filenames'").run();
+    database.close();
+
+    await assert.rejects(StateStore.open(home), /legacy staging content does not match persisted metadata/);
+  } finally {
+    store?.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("managed staging rejects invalid JSON, oversized writes, links, modes, and path replacement", async () => {
   await withStore(async (store, home) => {
     const runId = createRun(store);
     const entry = await store.createStagingEntry({ runId, role: "test", kind: "dispatch-result" });
-    const path = join(home, "state", "staging", runId, `${entry.stagingId}.json`);
+    const path = join(home, "state", "staging", runId, "0001--dispatch-result--test.json");
     await store.writeStagingEntry(entry.stagingId, "{\"valid\":true}", { runId, role: "test" });
 
     await assert.rejects(store.writeStagingEntry(entry.stagingId, "{", { runId, role: "test" }), /not valid JSON/);
@@ -224,7 +330,7 @@ test("managed staging expires and cleans only selected entries", async () => {
     const entry = await store.createStagingEntry({ runId, role: "planning", kind: "planning-tasks", retentionHours: 1, now: old });
     assert.equal(store.expireStagingEntries(new Date("2026-08-01T02:00:00.000Z")), 1);
     assert.equal(store.getStagingEntry(entry.stagingId).state, "expired");
-    const path = join(home, "state", "staging", runId, `${entry.stagingId}.json`);
+    const path = join(home, "state", "staging", runId, "0001--planning-tasks--planning.json");
     await chmod(path, 0o644);
     const failed = await store.cleanupStagingEntries({ expired: true, now: new Date("2026-08-01T02:00:00.000Z") });
     assert.deepEqual(failed, { matched: 1, removed: 0, pending: 1 });

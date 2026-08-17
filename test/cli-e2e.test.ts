@@ -538,7 +538,7 @@ test("staging CLI initializes frozen dispatch results and consumes only after su
   ]));
   assert.equal(created.state, "draft");
   assert.equal(created.dispatchId, started.dispatch_id);
-  const stagingPath = join(sandbox.aiTeamHome, "state", "staging", started.run_id, `${created.stagingId}.json`);
+  const stagingPath = join(sandbox.aiTeamHome, "state", "staging", started.run_id, "0001--dispatch-result--file-explorer.json");
   assert.equal((await stat(join(sandbox.aiTeamHome, "state", "staging"))).mode & 0o777, 0o700);
   assert.equal((await stat(join(sandbox.aiTeamHome, "state", "staging", started.run_id))).mode & 0o777, 0o700);
   assert.equal((await stat(stagingPath)).mode & 0o777, 0o600);

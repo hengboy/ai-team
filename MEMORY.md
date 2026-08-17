@@ -17,6 +17,7 @@
 - legacy output
 - managed staging entry
 - staging kind
+- staging sequence
 - cleanup_pending
 - environment provenance
 - packed install gate
@@ -38,7 +39,7 @@
 - 规划修订的 Git 变更仅由 Git Operator 执行。
 - 必须从仓库源码构建和安装，禁止直接编辑全局 dist 文件。
 - 发布验收必须安装真实 npm tarball，且该网络门禁与日常 `verify` 分离。
-- 代理生成的 JSON 必须使用受管 staging CLI；staging 元数据和审计事件不得保存原始 JSON。
+- 代理生成的 JSON 必须使用受管 staging CLI；staging 元数据和审计事件不得保存原始 JSON；文件名使用 run 内不可复用序号标识创建顺序和产出阶段。
 
 ### 职责
 - `src/cli.ts` 负责绑定命令、恢复操作和规范 JSON 输出。
@@ -52,7 +53,7 @@
 - `src/constants.ts` 从安装包 `package.json` 严格读取 CLI 版本。
 - `src/environment.ts` 负责解析环境模型，并解释整对象 default/override 来源和环境间语义差异。
 - `scripts/verify-packed-install.ts` 负责在隔离 consumer 中验证真实 npm tarball。
-- `src/security.ts` 与 `src/state.ts` 负责 staging 文件系统安全、生命周期元数据、保留和清理。
+- `src/security.ts` 与 `src/state.ts` 负责 staging 文件系统安全、run 内序号分配、可读文件名迁移、生命周期元数据、保留和清理。
 - `skills/init-ai-team` 负责在目标 Git 项目中初始化并校验 AI Team 的可复用 Codex 工作流。
 - `src/dispatch.ts` 将已完成的评审叶子汇总到所属 barrier，并幂等创建唯一的 review resolution 或最终 Git Operator continuation。
 - `src/review.ts` 提供 barrier 幂等创建，以及按 barrier ID 或 run revision 查询状态。
