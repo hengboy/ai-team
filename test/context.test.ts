@@ -56,6 +56,35 @@ test("context initialization is idempotent and preserves existing instructions",
   assert.equal((await validateProjectContext(root)).valid, true);
 });
 
+test("context initialization migrates the legacy navigation path and MEMORY reference", async (t) => {
+  const root = await repository();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await initializeProjectContext(root, true);
+  const canonicalPath = join(root, ".ai-team", "index", "feature-navigation.md");
+  const legacyPath = join(root, ".ai-work-flow", "index", "feature-navigation.md");
+  await mkdir(join(root, ".ai-work-flow", "index"), { recursive: true });
+  await writeFile(legacyPath, await readFile(canonicalPath, "utf8"));
+  await rm(canonicalPath);
+  await writeFile(
+    join(root, "MEMORY.md"),
+    `${await readFile(join(root, "MEMORY.md"), "utf8")}\nNavigation: .ai-work-flow/index/feature-navigation.md\n`,
+  );
+
+  const legacy = await validateProjectContext(root);
+  assert.equal(legacy.valid, false);
+  assert.ok(legacy.navigation.issues.some((issue) => issue.includes(".ai-work-flow/index/feature-navigation.md") && issue.includes("ai-team init")));
+
+  const migrated = await initializeProjectContext(root, true);
+  assert.equal(migrated.navigation_path, ".ai-team/index/feature-navigation.md");
+  assert.equal(migrated.navigation_status, "created");
+  assert.match(await readFile(canonicalPath, "utf8"), /# 功能导航/);
+  await assert.rejects(stat(legacyPath));
+  const memory = await readFile(join(root, "MEMORY.md"), "utf8");
+  assert.doesNotMatch(memory, /\.ai-work-flow\/index\/feature-navigation\.md/);
+  assert.match(memory, /\.ai-team\/index\/feature-navigation\.md/);
+  assert.equal((await validateProjectContext(root)).valid, true);
+});
+
 test("context update merges and deduplicates managed entries while retaining user content", async (t) => {
   const root = await repository();
   t.after(() => rm(root, { recursive: true, force: true }));

@@ -111,9 +111,12 @@ ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <ro
 ```
 
 The bundle includes packet, prompt, schema, template, their digests, and the
-renderer version. Submit still performs the full result schema and business
-validation, then returns a read-only continuation containing the current run
-state/stage, pending dispatches, and pending decision.
+renderer version. The delegated role owns its submit: it submits the envelope
+once and returns the CLI receipt instead of an unsubmitted envelope. The receipt
+contains submission state, artifact ID/path, digest, and a read-only continuation
+with the current run state/stage, pending dispatches, and pending decision. A
+coordinator that receives `submission.state=\"submitted\"` must not create a new
+staging entry or submit the dispatch again. Repeated submit remains idempotent.
 
 Formal plans require one Spec and one Standards review for each frozen revision.
 Direct bug and feature runs require one Standards review. P0 and P1 findings
@@ -125,6 +128,11 @@ exactly once. File Explorer may receive the repository root; downstream packets
 contain the exact paths returned by File Explorer. Planning Task graphs are
 validated for IDs, dependencies, cycles, coverage fields, and overlapping write
 scopes before safe execution batches are produced.
+
+A planning run may finish at `no_change` only from requirements after a resolved
+`verify_existing` decision. The planning result records repository evidence and
+the decision receipt, completes the run without a revision, worktree, Git
+Operator dispatch, or product commit, and creates no continuation.
 
 Run `ai-team <command> --help` for exact parameters. `ai-team contract` prints
 the contract and role-manifest digests used to detect drift.

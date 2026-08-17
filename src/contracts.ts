@@ -50,6 +50,40 @@ export interface ProjectContext {
   maintenance: { status: string; paths: string[] };
 }
 
+export interface TypedDecisionInput {
+  question: string;
+  choices: Array<{ id: string; label: string; impact: string }>;
+  recommendation?: string;
+  type?: string;
+}
+
+const DECISION_CHOICE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["id", "label", "impact"],
+  properties: {
+    id: { type: "string", minLength: 1 },
+    label: { type: "string", minLength: 1 },
+    impact: { type: "string", minLength: 1 },
+  },
+} as const;
+
+const DECISION_INPUT_SHAPE = {
+  type: "object",
+  additionalProperties: false,
+  required: ["question", "choices"],
+  properties: {
+    question: { type: "string", minLength: 1 },
+    choices: { type: "array", minItems: 2, uniqueItems: true, items: DECISION_CHOICE_SCHEMA },
+    recommendation: { type: "string", minLength: 1 },
+    type: { type: "string", minLength: 1 },
+  },
+} as const;
+export const DECISION_INPUT_SCHEMA = {
+  $id: "https://ai-team.local/schemas/decision-input-v1.json",
+  ...DECISION_INPUT_SHAPE,
+} as const;
+
 export const resultEnvelopeSchema = {
   $id: "https://ai-team.local/schemas/result-envelope-v1.json",
   type: "object",
@@ -66,7 +100,7 @@ export const resultEnvelopeSchema = {
     changes: { type: "array", items: {} },
     verification: { type: "array", items: {} },
     risks: { type: "array", items: {} },
-    decisions_needed: { type: "array", items: {} },
+    decisions_needed: { type: "array", items: DECISION_INPUT_SHAPE },
     requested_support: { type: "array", items: {} },
     handoff: { type: ["object", "string", "null"] },
     payload: { type: "object", required: [], additionalProperties: true },
@@ -92,39 +126,7 @@ const stringArray = { type: "array", items: { type: "string" } } as const;
 const contextText = { type: "string", minLength: 1, pattern: "^(?!\\s*$)[^\\r\\n]+$" } as const;
 const contextStringArray = { type: "array", items: contextText } as const;
 const evidenceArray = { type: "array", minItems: 1, items: { type: "object", additionalProperties: false, required: ["command", "outcome"], properties: { command: { type: "string" }, outcome: { type: "string" } } } } as const;
-export interface TypedDecisionInput {
-  question: string;
-  choices: Array<{ id: string; label: string; impact: string }>;
-  recommendation?: string;
-  type?: string;
-}
-
-export const DECISION_INPUT_SCHEMA = {
-  $id: "https://ai-team.local/schemas/decision-input-v1.json",
-  type: "object",
-  additionalProperties: false,
-  required: ["question", "choices"],
-  properties: {
-    question: { type: "string", minLength: 1 },
-    choices: {
-      type: "array",
-      minItems: 2,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["id", "label", "impact"],
-        properties: {
-          id: { type: "string", minLength: 1 },
-          label: { type: "string", minLength: 1 },
-          impact: { type: "string", minLength: 1 },
-        },
-      },
-    },
-    recommendation: { type: "string", minLength: 1 },
-    type: { type: "string", minLength: 1 },
-  },
-} as const;
-const decisionSchema = { anyOf: [DECISION_INPUT_SCHEMA, { type: "null" }] } as const;
+const decisionSchema = { anyOf: [DECISION_INPUT_SHAPE, { type: "null" }] } as const;
 export const projectContextSchema = {
   type: "object",
   additionalProperties: false,
@@ -166,8 +168,37 @@ export const projectContextSchema = {
 } as const;
 const validateProjectContextInput = ajv.compile<ProjectContext>(projectContextSchema);
 const validateDecisionInput = ajv.compile<TypedDecisionInput>(DECISION_INPUT_SCHEMA);
+const planningProperties = {
+  actions: stringArray,
+  pending_questions: { type: "array", maxItems: 1, items: { type: "string", minLength: 1 } },
+  decision: decisionSchema,
+} as const;
+const planningPayloadSchema = {
+  oneOf: [
+    {
+      type: "object", additionalProperties: false, required: ["actions", "stage", "pending_questions", "decision"],
+      properties: { ...planningProperties, stage: { enum: ["requirements", "requirements_confirmed", "spec_ready", "plan_ready", "tasks_preview", "ready"] } },
+    },
+    {
+      type: "object", additionalProperties: false, required: ["actions", "stage", "pending_questions", "decision", "no_change"],
+      properties: {
+        ...planningProperties,
+        stage: { const: "no_change" },
+        no_change: {
+          type: "object", additionalProperties: false, required: ["decision_id", "conclusion", "repository_evidence"],
+          properties: {
+            decision_id: { type: "string", pattern: "^decision_[0-9A-HJKMNP-TV-Z]{26}$" },
+            conclusion: { type: "string", minLength: 1 },
+            repository_evidence: evidenceArray,
+          },
+        },
+      },
+    },
+  ],
+} as const;
+
 export const ROLE_PAYLOAD_SCHEMAS: Record<Role, object> = {
-  planning: { type: "object", additionalProperties: false, required: ["actions", "stage", "pending_questions", "decision"], properties: { actions: stringArray, stage: { enum: ["requirements", "requirements_confirmed", "spec_ready", "plan_ready", "tasks_preview", "ready"] }, pending_questions: { type: "array", maxItems: 1, items: { type: "string", minLength: 1 } }, decision: decisionSchema } },
+  planning: planningPayloadSchema,
   coding: { type: "object", additionalProperties: false, required: ["actions"], properties: { actions: stringArray, triage: { enum: ["planned", "bug", "feature", "planning"] } } },
   "file-explorer": { type: "object", additionalProperties: false, required: ["allowed_read_paths", "entry_points", "test_commands", "project_context"], properties: { allowed_read_paths: stringArray, entry_points: stringArray, test_commands: stringArray, project_context: projectContextSchema } },
   "frontend-developer": { type: "object", additionalProperties: false, required: ["modified_paths", "self_tests"], properties: { modified_paths: stringArray, self_tests: evidenceArray } },
@@ -207,7 +238,10 @@ const validationDetail = (pointer: string, constraint: string, message: string):
 
 const prefixValidationDetail = (prefix: string, error: ValidationDetail): ValidationDetail => {
   const pointer = `${prefix}${error.pointer === "/" ? "" : error.pointer}`;
-  return { ...error, path: pointer, pointer, field: pointerField(pointer) };
+  const message = error.constraint === "type" && /\/decisions_needed\/\d+\/choices\/\d+$/.test(pointer)
+    ? "must be an object with required string properties {id,label,impact}"
+    : error.message;
+  return { ...error, path: pointer, pointer, field: pointerField(pointer), message };
 };
 
 export const formatSchemaErrors = (errors: ErrorObject[] | null | undefined): ValidationDetail[] =>
@@ -216,7 +250,10 @@ export const formatSchemaErrors = (errors: ErrorObject[] | null | undefined): Va
     const additional = error.keyword === "additionalProperties" ? (error.params as { additionalProperty?: string }).additionalProperty : undefined;
     const property = missing ?? additional;
     const pointer = property ? `${error.instancePath}/${property.replaceAll("~", "~0").replaceAll("/", "~1")}` : error.instancePath || "/";
-    return validationDetail(pointer, error.keyword, error.message ?? "invalid value");
+    const message = error.keyword === "type" && /\/decisions_needed\/\d+\/choices\/\d+$/.test(pointer)
+      ? "must be an object with required string properties {id,label,impact}"
+      : error.message ?? "invalid value";
+    return validationDetail(pointer, error.keyword, message);
   });
 
 export const checkDecisionInput = (value: unknown): { valid: true; value: TypedDecisionInput } | { valid: false; errors: ValidationDetail[] } => {

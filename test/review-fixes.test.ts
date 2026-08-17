@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Ajv } from "ajv";
 
 import { validateCommand } from "../src/command-contract.js";
 import { checkDecisionInput, checkProjectContext, checkResultEnvelope, createResultTemplate, resultSchemaForRole, ROLE_PAYLOAD_SCHEMAS } from "../src/contracts.js";
@@ -97,6 +98,11 @@ test("an exact File Explorer result creates one planning or coding dispatch and 
 
       const first = await dispatches.submit(runId, explorerId, "file-explorer", resultPath);
       assert.equal(first.reused, false);
+      assert.equal(first.submission.state, "submitted");
+      assert.equal(first.submission.artifact, first.artifact);
+      assert.match(first.submission.artifact_id, /^artifact_/);
+      assert.match(first.submission.digest, /^[a-f0-9]{64}$/);
+      assert.equal(first.continuation.run_stage, nextRole);
       assert.equal(store.getRun(runId).stage, nextRole);
       const generated = store.db.prepare(
         "SELECT role, state, packet_json FROM dispatches WHERE run_id=? AND role=?",
@@ -111,7 +117,9 @@ test("an exact File Explorer result creates one planning or coding dispatch and 
       ]);
 
       const duplicate = await dispatches.submit(runId, explorerId, "file-explorer", resultPath);
-      assert.deepEqual(duplicate, { reused: true, artifact: first.artifact });
+      assert.equal(duplicate.reused, true);
+      assert.deepEqual(duplicate.submission, first.submission);
+      assert.deepEqual(duplicate.continuation, first.continuation);
       const count = store.db.prepare(
         "SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role=?",
       ).get(runId, nextRole) as { count: number };
@@ -357,6 +365,42 @@ test("completed results enforce the payload schema selected for every role", () 
   };
   assert.equal(checkResultEnvelope(needsDecision).valid, true);
   assert.equal(checkResultEnvelope({ ...needsDecision, payload: {} }).valid, false);
+});
+
+test("public planning schema and runtime validator share the typed decision contract", () => {
+  const runId = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const dispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const question = "Use the implementation already present at HEAD?";
+  const base = {
+    ...completedResult(runId, dispatchId, "planning", {
+      actions: ["confirm existing implementation"],
+      stage: "requirements",
+      pending_questions: [question],
+      decision: null,
+    }),
+    status: "needs_decision" as const,
+    verification: [],
+  };
+  const schema = resultSchemaForRole("planning");
+  const validateSchema = new Ajv({ allErrors: true, strict: false }).compile(schema);
+  const validDecision = {
+    question,
+    choices: [
+      { id: "verify_existing", label: "Verify existing", impact: "Finish without product changes" },
+      { id: "plan_changes", label: "Plan changes", impact: "Continue normal planning" },
+    ],
+  };
+  const valid = { ...base, decisions_needed: [validDecision], payload: { ...base.payload, decision: validDecision } };
+  assert.equal(validateSchema(valid), true);
+  assert.equal(checkResultEnvelope(valid).valid, true);
+
+  const invalidDecision = { question, choices: ["verify_existing", "plan_changes"] };
+  const invalid = { ...base, decisions_needed: [invalidDecision], payload: { ...base.payload, decision: invalidDecision } };
+  assert.equal(validateSchema(invalid), false);
+  assert.equal(checkResultEnvelope(invalid).valid, false);
+  assert.ok(validateSchema.errors?.some((error) => error.instancePath === "/decisions_needed/0/choices/0" && error.message === "must be object"));
+  const runtime = checkResultEnvelope(invalid);
+  assert.ok(!runtime.valid && runtime.errors.some((error) => error.pointer === "/decisions_needed/0/choices/0" && error.message.includes("{id,label,impact}")));
 });
 
 test("project context and context command contracts reject unsafe paths and identities", () => {
@@ -741,6 +785,67 @@ test("resolving a planning decision restores the run and creates exactly one con
       (store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='planning' AND state='pending'").get(runId) as { count: number }).count,
       1,
     );
+  });
+});
+
+test("verify_existing completes a planning run as audited no_change without implementation artifacts", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store, "planning");
+    store.db.prepare("UPDATE runs SET stage='requirements' WHERE run_id=?").run(runId);
+    const dispatches = new DispatchService(store);
+    const questionDispatch = dispatches.create(runId, "planning", dispatchPacket(), "planning");
+    dispatches.claim(runId, questionDispatch, "planning");
+    const question = "The requested behavior exists at HEAD. How should this run finish?";
+    const decision = {
+      question,
+      choices: [
+        { id: "verify_existing", label: "Verify existing", impact: "Record evidence and finish without changes" },
+        { id: "plan_changes", label: "Plan changes", impact: "Continue the normal planning workflow" },
+      ],
+      recommendation: "verify_existing",
+    };
+    await dispatches.submitValue(runId, questionDispatch, "planning", completedResult(runId, questionDispatch, "planning", {
+      actions: ["present verified HEAD implementation"],
+      stage: "requirements",
+      pending_questions: [question],
+      decision,
+    }));
+    const decisionRow = store.db.prepare("SELECT decision_id FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string };
+    const continuationId = dispatches.resolvePlanningDecision(runId, decisionRow.decision_id, "verify_existing", "Accept repository evidence");
+    assert.equal(dispatches.resolvePlanningDecision(runId, decisionRow.decision_id, "verify_existing", "Accept repository evidence"), continuationId);
+    dispatches.claim(runId, continuationId, "planning");
+
+    const result = completedResult(runId, continuationId, "planning", {
+      actions: ["record no-change completion"],
+      stage: "no_change",
+      pending_questions: [],
+      decision: null,
+      no_change: {
+        decision_id: decisionRow.decision_id,
+        conclusion: "The requested behavior is already implemented at HEAD.",
+        repository_evidence: [
+          { command: "git show HEAD:src/dispatch.ts", outcome: "The requested workflow is present" },
+          { command: "npm test -- --test-name-pattern no_change", outcome: "Relevant behavior passed" },
+        ],
+      },
+    });
+    const first = await dispatches.submitValue(runId, continuationId, "planning", result);
+    assert.deepEqual(
+      store.db.prepare("SELECT state,stage,plan_id,revision FROM runs WHERE run_id=?").get(runId),
+      { state: "completed", stage: "no_change", plan_id: null, revision: null },
+    );
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId) as { count: number }).count, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='git-operator'").get(runId) as { count: number }).count, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=?").get(runId) as { count: number }).count, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM revisions").get() as { count: number }).count, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=?").get(runId) as { count: number }).count, 0);
+    const event = store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='planning.no_change_completed'").get(runId) as { payload_json: string };
+    assert.equal((JSON.parse(event.payload_json) as { decision_receipt: { choice: string } }).decision_receipt.choice, "verify_existing");
+
+    const retried = await dispatches.submitValue(runId, continuationId, "planning", result);
+    assert.equal(retried.reused, true);
+    assert.deepEqual(retried.submission, first.submission);
+    assert.deepEqual(retried.continuation, { run_state: "completed", run_stage: "no_change", pending_dispatches: [], pending_decision: null });
   });
 });
 

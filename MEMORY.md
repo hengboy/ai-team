@@ -60,6 +60,7 @@
 - `src/review.ts` 提供 barrier 幂等创建，以及按 barrier ID 或 run revision 查询状态。
 - `src/workflow.ts` 负责显式 direct mode 分诊一致性，并将 frozen coding run 原子关联到 planning run，保留原 task worktree 所有权。
 - `src/dispatch.ts` 负责 requirement 问题序号、分阶段 Git prepare、worktree 注册校验及 completed coordinator 的提交 continuation。
+- `src/dispatch.ts` 负责 delegated role 自提交回执、renderer 版本冻结，以及 `verify_existing` 驱动的受审计 `no_change` 规划终态。
 
 ### 模块边界
 - `src/git-orchestrator.ts` 与 `src/git.ts` 负责 planned revision-scoped plan/task worktree、direct run-scoped integration/task 编排、clean worktree adopt/transfer，并将相关身份写入操作证据。
@@ -72,5 +73,6 @@
 - `test/*.test.ts` 包含单元测试、CLI 端到端测试、锁测试、契约测试和工作流回归测试。
 - `src/review.ts` 负责 formal review 绑定和公共状态查询，`src/dispatch.ts` 负责叶子汇总、恢复和 run 阶段推进。
 - `run handoff-to-planning` 只接受无 pending operation 的 frozen coding run；规划 revision 提交 ready 后恢复 source run，旧 pending/claimed dispatch 不得继续授权。
+- `src/contracts.ts` 让公开 result schema 与运行时 validator 复用 typed decision shape，并定义无 revision/worktree/Git 副作用的 planning `no_change` payload。
 - `run show` 仅公开协调所需的 run-owned worktree 元数据，不公开其他角色的原始 result 或 staging 内容；submit continuation 只投影 run state/stage、pending dispatches 与 pending decision。
 <!-- ai-team:project-context:end -->

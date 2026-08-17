@@ -10,6 +10,7 @@ import { assertRelativePosixPath, stableJson } from "./utils.js";
 
 export const MEMORY_PATH = "MEMORY.md";
 export const NAVIGATION_PATH = ".ai-team/index/feature-navigation.md";
+export const LEGACY_NAVIGATION_PATH = ".ai-work-flow/index/feature-navigation.md";
 export const INSTRUCTION_PATHS = ["AGENTS.md", "CLAUDE.md"] as const;
 export const CONTEXT_RULE = "所有`仓库文件检索`、`目录遍历`、`文件名/全文搜索`、`入口定位`、`调用链`和`未知依赖探索`必须委派给 **File Explorer**；其他代理只能读取 `packet` 明确授权或 **File Explorer** 返回的精确路径，遇到未知路径时请求支持，不得自行使用 `rg`、`find`、`glob` 或`全仓扫描`。测试过程中产生的所有截图必须保存到对应计划的 `.ai-team/plans/<planId>/screenshot/` 目录；执行角色必须使用 `packet` 提供的 `plan_id` 和精确截图目录，缺失时停止并请求支持。入口、职责或模块边界变化时，同轮更新根 `MEMORY.md` 与唯一权威路径 `.ai-team/index/feature-navigation.md`。评审以已提交 `MEMORY.md` 为 standards source。";
 
@@ -240,16 +241,23 @@ const prepareInitialization = async (root: string): Promise<{ plan: ContextInitP
   const navigationFile = join(root, NAVIGATION_PATH);
   const memory = await readOptional(memoryFile);
   const canonicalNavigation = await readOptional(navigationFile);
-  const navigation = canonicalNavigation;
+  const legacyNavigation = canonicalNavigation === undefined ? await readOptional(join(root, LEGACY_NAVIGATION_PATH)) : undefined;
+  const navigation = canonicalNavigation ?? legacyNavigation;
   ensureSingleManagedSection(memory, "memory");
   ensureSingleManagedSection(navigation, "navigation");
 
-  const memoryContent = memory === undefined
+  const canonicalMemory = memory?.replaceAll(LEGACY_NAVIGATION_PATH, NAVIGATION_PATH);
+  const memoryContent = canonicalMemory === undefined
     ? `${renderMemorySection(emptyMemory())}\n`
-    : memory.includes(MEMORY_START) ? (parseMemory(memory), memory) : appendSection(memory, renderMemorySection(emptyMemory()));
+    : canonicalMemory.includes(MEMORY_START) ? (parseMemory(canonicalMemory), canonicalMemory) : appendSection(canonicalMemory, renderMemorySection(emptyMemory()));
   const navigationContent = navigation === undefined
     ? `${renderNavigationSection([])}\n`
-    : navigation.includes(NAVIGATION_START) ? (parseNavigation(navigation), navigation) : appendSection(navigation, renderNavigationSection([]));
+    : navigation.includes(NAVIGATION_START)
+      ? (() => {
+          const parsed = parseNavigation(navigation);
+          return replaceSection(navigation, parsed.start, parsed.end, renderNavigationSection(parsed.entries));
+        })()
+      : appendSection(navigation, renderNavigationSection([]));
   const writes: PendingWrite[] = [];
   if (memoryContent !== memory) writes.push({ path: memoryFile, content: memoryContent, existed: memory !== undefined });
   if (navigationContent !== canonicalNavigation) writes.push({ path: navigationFile, content: navigationContent, existed: canonicalNavigation !== undefined });
@@ -341,6 +349,7 @@ export const initializeProjectContext = async (project: string, confirmDirty = f
     throw new ValidationError("project context or instruction files have uncommitted changes; confirmation required", { paths: prepared.plan.dirty_paths });
   }
   await atomicReplaceFiles(prepared.writes);
+  if (prepared.plan.navigation_status === "created") await rm(join(identity.root, LEGACY_NAVIGATION_PATH), { force: true });
   return prepared.plan;
 };
 
@@ -360,7 +369,9 @@ export const updateProjectContext = async (project: string, value: unknown): Pro
 
   const baseMemory = memorySource === undefined
     ? `${renderMemorySection(emptyMemory())}\n`
-    : memorySource.includes(MEMORY_START) ? memorySource : appendSection(memorySource, renderMemorySection(emptyMemory()));
+    : memorySource.replaceAll(LEGACY_NAVIGATION_PATH, NAVIGATION_PATH).includes(MEMORY_START)
+      ? memorySource.replaceAll(LEGACY_NAVIGATION_PATH, NAVIGATION_PATH)
+      : appendSection(memorySource.replaceAll(LEGACY_NAVIGATION_PATH, NAVIGATION_PATH), renderMemorySection(emptyMemory()));
   const parsedMemory = parseMemory(baseMemory);
   const mergedMemory: MemoryData = {
     projectShape: parsedMemory.data.projectShape || context.project_shape.trim(),
@@ -402,6 +413,7 @@ export const validateProjectContext = async (project: string): Promise<ContextVa
   const root = identity.root;
   const memorySource = await readOptional(join(root, MEMORY_PATH));
   const navigationSource = await readOptional(join(root, NAVIGATION_PATH));
+  const legacyNavigationSource = navigationSource === undefined ? await readOptional(join(root, LEGACY_NAVIGATION_PATH)) : undefined;
   const memoryIssues: string[] = [];
   const navigationIssues: string[] = [];
   let memorySections = 0;
@@ -412,6 +424,7 @@ export const validateProjectContext = async (project: string): Promise<ContextVa
     try {
       parseMemory(memorySource);
       if (!memorySource.includes(CONTEXT_FORMAT)) memoryIssues.push(`legacy context format; run ai-team context update --project ${root} with the current File Explorer project_context`);
+      if (memorySource.includes(LEGACY_NAVIGATION_PATH)) memoryIssues.push(`MEMORY.md references legacy ${LEGACY_NAVIGATION_PATH}; run ai-team init ${root} --yes to migrate to ${NAVIGATION_PATH}`);
     } catch (error) { memoryIssues.push((error as Error).message); }
   } else memoryIssues.push("MEMORY.md is missing");
   if (navigationSource !== undefined) {
@@ -420,6 +433,8 @@ export const validateProjectContext = async (project: string): Promise<ContextVa
       navigationEntries = parseNavigation(navigationSource).entries;
       if (!navigationSource.includes(CONTEXT_FORMAT)) navigationIssues.push(`legacy context format; run ai-team context update --project ${root} with the current File Explorer project_context`);
     } catch (error) { navigationIssues.push((error as Error).message); }
+  } else if (legacyNavigationSource !== undefined) {
+    navigationIssues.push(`${NAVIGATION_PATH} is missing while legacy ${LEGACY_NAVIGATION_PATH} exists; run ai-team init ${root} --yes to migrate it`);
   } else navigationIssues.push(`${NAVIGATION_PATH} is missing`);
   const invalidPaths: string[] = [];
   for (const entry of navigationEntries) for (const path of entry.entry_paths) {

@@ -11,7 +11,7 @@ import { ValidationError } from "../src/errors.js";
 import { assertCoverage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, triage, validateCoverage } from "../src/planning.js";
 import { StateStore } from "../src/state.js";
 import { legacyStagingFilePath, stagingFilePath } from "../src/security.js";
-import { makePlanId } from "../src/utils.js";
+import { makePlanId, sha256 } from "../src/utils.js";
 
 const RUN_ID = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const DISPATCH_ID = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -491,10 +491,39 @@ test("dispatch claim bundle returns the same frozen assets and digests idempoten
     assert.deepEqual(first.template, dispatches.template(runId, dispatchId, "backend-developer"));
     assert.deepEqual(Object.keys(first.digests).sort(), ["packet", "prompt", "schema", "template"]);
     for (const digest of Object.values(first.digests)) assert.match(digest, /^[a-f0-9]{64}$/);
-    assert.equal(first.renderer_version, "dispatch-renderer-v2");
+    assert.equal(first.renderer_version, "dispatch-renderer-v3");
 
     const second = dispatches.claimBundle(runId, dispatchId, "backend-developer");
     assert.deepEqual(second, { ...first, reused: true });
+  });
+});
+
+test("dispatch prompt preserves the frozen v2 renderer for existing dispatches", async () => {
+  await withStore((store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const packet: DispatchPacket = {
+      objective: "Inspect a frozen legacy prompt",
+      allowed_read_paths: ["src/a.ts"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Prompt remains byte-stable"],
+      context: {},
+    };
+    const dispatchId = dispatches.create(runId, "backend-developer", packet);
+    const legacyPrompt = [
+      "Role: backend-developer",
+      `Run: ${runId}`,
+      `Dispatch: ${dispatchId}`,
+      "Objective: Inspect a frozen legacy prompt",
+      "Allowed read paths: src/a.ts",
+      "Allowed write paths: none",
+      "Acceptance criteria: Prompt remains byte-stable",
+      "Context: {}",
+      "Return only the frozen result envelope and role payload schema.",
+    ].join("\n");
+    store.db.prepare("UPDATE dispatches SET renderer_version='dispatch-renderer-v2',prompt_digest=? WHERE dispatch_id=?")
+      .run(sha256(legacyPrompt), dispatchId);
+    assert.equal(dispatches.prompt(runId, dispatchId, "backend-developer"), legacyPrompt);
   });
 });
 
@@ -533,10 +562,11 @@ test("dispatch validates identity, requires claim, redacts artifacts, and reuses
     assert.equal(first.reused, false);
     assert.match(await readFile(first.artifact, "utf8"), /\[REDACTED\]/);
     assert.doesNotMatch(await readFile(first.artifact, "utf8"), /sk-1234567890abcdef/);
-    assert.deepEqual(await dispatches.submit(runId, dispatchId, "backend-developer", resultPath), {
-      reused: true,
-      artifact: first.artifact,
-    });
+    const reused = await dispatches.submit(runId, dispatchId, "backend-developer", resultPath);
+    assert.equal(reused.reused, true);
+    assert.equal(reused.artifact, first.artifact);
+    assert.deepEqual(reused.submission, first.submission);
+    assert.deepEqual(reused.continuation, first.continuation);
 
     await writeFile(resultPath, JSON.stringify({ ...result, summary: "A different valid result" }));
     await assert.rejects(

@@ -681,7 +681,7 @@ export const buildProgram = (): Command => {
     if (options.resultFile && !options.stagingId && !options.inputStdin) {
       output(await withStore(async (store) => {
         const service = new DispatchService(store);
-        return { ...await service.submit(options.runId, options.dispatchId, options.role, options.resultFile), continuation: service.continuation(options.runId) };
+        return service.submit(options.runId, options.dispatchId, options.role, options.resultFile);
       }));
       return;
     }
@@ -691,7 +691,7 @@ export const buildProgram = (): Command => {
       try {
         const service = new DispatchService(store);
         const result = await service.submitValue(options.runId, options.dispatchId, options.role, input.value);
-        return { ...withStagingResult(result, await input.consume()), continuation: service.continuation(options.runId) };
+        return withStagingResult(result, await input.consume());
       } catch (error) { input.validationFailed(error); }
     }));
   });

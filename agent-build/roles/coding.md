@@ -21,7 +21,7 @@
 5. 正式方案执行一次冻结的 **Spec**/**Standards** `review barrier`，`direct` 仅执行 **Standards**；收集并处理 `P0/P1` 一次。
 6. 让 **Git Operator** 按授权范围提交；planned Task 按依赖从最新 plan commit 派生并合回 plan worktree，direct Task 沿用 integration worktree；全部使用无 `--ff` 合并，最终合入 run 的 `target_branch` 后清理。冲突内容由对应 **开发代理** 解决后由 **Git Operator** 继续 `merge`。
 7. 所有阶段均要求结果通过 `frozen schema`，并记录平台、基线、`digest`、变更路径和可重放证据。
-8. 每个调度、结果、决策和评审 JSON 直接通过对应消费命令的 `--input-stdin` 提交；CLI 自动管理 staging，失败时使用响应中的 `staging_id` 经原有路径修正和重试。要求下游角色遵循同一流程，禁止创建外部 JSON 文件作为中转。
+8. 每个被委派角色自行通过对应消费命令的 `--input-stdin` 提交结果，并返回包含 `submission`、artifact、digest 与 `continuation` 的 CLI receipt；协调方看到 `submission.state=submitted` 后不得创建新 staging 或重复 submit。CLI 自动管理 staging，失败时使用响应中的 `staging_id` 经原有路径修正和重试。禁止创建外部 JSON 文件作为中转。
 9. 错误或过期的支持 dispatch 必须通过受管的 `dispatch cancel`、`dispatch reissue` 或 `dispatch supersede` 处理；已确认副作用完成的 retryable failure 使用 `run resume` 返回的 `dispatch reconcile` 命令恢复。不得直接改写状态库，所有替代 dispatch 必须保留原因和 replacement lineage。
 
 ## 文档模板

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -574,6 +574,26 @@ test("context update accepts File Explorer output and validate reports maintenan
   assert.equal(await readFile(join(sandbox.repo, "README.md"), "utf8"), businessBefore);
 });
 
+test("context validate diagnoses and init migrates the legacy navigation path", async (t) => {
+  const sandbox = await makeSandbox(t);
+  json(await cli(sandbox, ["init", sandbox.repo]));
+  const canonicalPath = join(sandbox.repo, ".ai-team", "index", "feature-navigation.md");
+  const legacyPath = join(sandbox.repo, ".ai-work-flow", "index", "feature-navigation.md");
+  await mkdir(join(sandbox.repo, ".ai-work-flow", "index"), { recursive: true });
+  await rename(canonicalPath, legacyPath);
+  await writeFile(join(sandbox.repo, "MEMORY.md"), `${await readFile(join(sandbox.repo, "MEMORY.md"), "utf8")}\nLegacy: .ai-work-flow/index/feature-navigation.md\n`);
+
+  const diagnosed = json<{ valid: boolean; navigation: { issues: string[] } }>(await cli(sandbox, ["context", "validate", "--project", sandbox.repo]));
+  assert.equal(diagnosed.valid, false);
+  assert.ok(diagnosed.navigation.issues.some((issue) => issue.includes(".ai-work-flow/index/feature-navigation.md") && issue.includes("ai-team init")));
+
+  json(await cli(sandbox, ["init", sandbox.repo, "--yes"]));
+  await stat(canonicalPath);
+  await assert.rejects(stat(legacyPath));
+  assert.doesNotMatch(await readFile(join(sandbox.repo, "MEMORY.md"), "utf8"), /\.ai-work-flow\/index\/feature-navigation\.md/);
+  assert.equal(json<{ valid: boolean }>(await cli(sandbox, ["context", "validate", "--project", sandbox.repo])).valid, true);
+});
+
 test("staging CLI initializes frozen dispatch results and consumes only after submit", async (t) => {
   const sandbox = await makeSandbox(t);
   const requestFile = join(sandbox.root, "request.md");
@@ -821,7 +841,7 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
   assert.equal(bundle.prompt, json(await cli(sandbox, ["dispatch", "prompt", ...identity])));
   assert.deepEqual(bundle.schema, json(await cli(sandbox, ["dispatch", "schema", ...identity])));
   assert.deepEqual(bundle.template, json(await cli(sandbox, ["dispatch", "template", ...identity])));
-  assert.equal(bundle.renderer_version, "dispatch-renderer-v2");
+  assert.equal(bundle.renderer_version, "dispatch-renderer-v3");
   for (const digest of Object.values(bundle.digests)) assert.match(digest, /^[a-f0-9]{64}$/);
 
   const result = {
@@ -1028,6 +1048,85 @@ test("planning dispatch can be claimed, inspected, submitted, resumed, and decid
     choice: "minimal",
     note: "Keep the change narrowly scoped.\n",
   }]);
+});
+
+test("planning no_change submit consumes one staging entry and leaves a terminal run", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const store = await StateStore.open(sandbox.aiTeamHome);
+  const repoId = "repo-cli-no-change";
+  store.registerRepository(repoId, join(sandbox.repo, ".git"), sandbox.repo);
+  const runId = store.createRun({ repoId, profile: "planning", mode: "planned", request: "Verify the implementation already at HEAD" });
+  store.db.prepare("UPDATE runs SET stage='requirements' WHERE run_id=?").run(runId);
+  const dispatches = new DispatchService(store);
+  const packet = {
+    objective: "Confirm whether the existing implementation should close the run",
+    allowed_read_paths: ["README.md"],
+    allowed_write_paths: [],
+    acceptance_criteria: ["Record the user choice"],
+    context: {},
+  };
+  const questionDispatch = dispatches.create(runId, "planning", packet, "planning");
+  dispatches.claim(runId, questionDispatch, "planning");
+  const question = "The requested behavior exists at HEAD. How should this run finish?";
+  const decision = {
+    question,
+    choices: [
+      { id: "verify_existing", label: "Verify existing", impact: "Finish without changes" },
+      { id: "plan_changes", label: "Plan changes", impact: "Continue planning" },
+    ],
+    recommendation: "verify_existing",
+  };
+  await dispatches.submitValue(runId, questionDispatch, "planning", {
+    ...createResultTemplate(runId, questionDispatch, "planning"),
+    summary: "HEAD behavior was presented for confirmation.",
+    verification: [{ command: "git show HEAD", outcome: "Requested behavior is present" }],
+    payload: { actions: ["confirm existing implementation"], stage: "requirements", pending_questions: [question], decision },
+  });
+  const decisionId = (store.db.prepare("SELECT decision_id FROM decisions WHERE run_id=?").get(runId) as { decision_id: string }).decision_id;
+  const continuationId = dispatches.resolvePlanningDecision(runId, decisionId, "verify_existing");
+  const result = {
+    ...dispatches.template(runId, continuationId, "planning"),
+    summary: "The run completed without repository changes.",
+    verification: [{ command: "npm test", outcome: "Existing implementation passed" }],
+    payload: {
+      actions: ["record no-change completion"],
+      stage: "no_change",
+      pending_questions: [],
+      decision: null,
+      no_change: {
+        decision_id: decisionId,
+        conclusion: "The requested behavior is already implemented at HEAD.",
+        repository_evidence: [{ command: "git show HEAD", outcome: "Implementation and tests are present" }],
+      },
+    },
+  };
+  store.close();
+
+  json(await cli(sandbox, ["dispatch", "claim", "--run-id", runId, "--dispatch-id", continuationId, "--role", "planning"]));
+  const submitted = json<{
+    reused: boolean;
+    submission: { state: string; artifact_id: string; digest: string };
+    staging: { staging_id: string; state: string };
+    continuation: { run_state: string; run_stage: string; pending_dispatches: unknown[]; pending_decision: unknown };
+  }>(await cliWithInput(sandbox, [
+    "dispatch", "submit", "--run-id", runId, "--dispatch-id", continuationId, "--role", "planning", "--input-stdin",
+  ], JSON.stringify(result)));
+  assert.equal(submitted.reused, false);
+  assert.equal(submitted.submission.state, "submitted");
+  assert.match(submitted.submission.artifact_id, /^artifact_/);
+  assert.match(submitted.submission.digest, /^[a-f0-9]{64}$/);
+  assert.equal(submitted.staging.state, "consumed");
+  assert.deepEqual(submitted.continuation, { run_state: "completed", run_stage: "no_change", pending_dispatches: [], pending_decision: null });
+
+  const terminal = await StateStore.open(sandbox.aiTeamHome);
+  assert.deepEqual(
+    terminal.db.prepare("SELECT state,stage,plan_id,revision FROM runs WHERE run_id=?").get(runId),
+    { state: "completed", stage: "no_change", plan_id: null, revision: null },
+  );
+  assert.equal((terminal.db.prepare("SELECT count(*) AS count FROM staging_entries WHERE run_id=?").get(runId) as { count: number }).count, 1);
+  assert.equal((terminal.db.prepare("SELECT count(*) AS count FROM staging_entries WHERE run_id=? AND state!='consumed'").get(runId) as { count: number }).count, 0);
+  assert.equal((terminal.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId) as { count: number }).count, 0);
+  terminal.close();
 });
 
 test("planning revision commit rejects a claimed Git Operator dispatch for another revision before mutation", async (t) => {

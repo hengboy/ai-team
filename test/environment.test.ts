@@ -258,7 +258,7 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
   assert.match(environmentOperator, /<to>`=小写环境名/);
 });
 
-test("planning and coding coordinate managed staging for every generated JSON", () => {
+test("planning and coding distinguish owned JSON from delegated submit responsibility", () => {
   const files = renderAgents(balancedEnvironment());
   const planning = files.get("claude/agents/planning.md") ?? "";
   const coding = files.get("claude/agents/coding.md") ?? "";
@@ -273,8 +273,10 @@ test("planning and coding coordinate managed staging for every generated JSON", 
   assert.match(planning, /问题 1、.*问题 2、.*从 1 递增/s);
   assert.match(planning, /transition 到 `plan_ready`.*自动创建 \*\*Git Operator\*\* `dispatch`/s);
   assert.match(planning, /归档调研报告/);
-  assert.match(coding, /每个调度、结果、决策和评审 JSON.*--input-stdin.*自动管理 staging.*staging_id/s);
-  assert.match(coding, /要求下游角色遵循同一流程/);
+  assert.match(planning, /由 \*\*File Explorer\*\* 自行.*dispatch submit --input-stdin.*submission.*continuation/s);
+  assert.match(planning, /submission\.state=submitted.*不得创建新 staging 或重复 submit/s);
+  assert.match(coding, /每个被委派角色自行.*--input-stdin.*submission.*continuation/s);
+  assert.match(coding, /submission\.state=submitted.*不得创建新 staging 或重复 submit/s);
 });
 
 test("planning remains coordinator while delegating claimed File Explorer dispatches", () => {

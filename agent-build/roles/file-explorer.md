@@ -19,4 +19,4 @@
 
 ## 结果
 
-严格返回角色 `payload`；摘要、发现、验证、风险和 `handoff` 必须能让主代理创建下一份最小 `dispatch`。
+按冻结 template/schema 生成结果后，由你自行执行一次 `dispatch submit --input-stdin`。严格返回 CLI receipt（含 `submission`、artifact、digest 与 `continuation`），不得返回未提交 envelope；摘要、发现、验证、风险和 `handoff` 必须能让主代理创建下一份最小 `dispatch`。

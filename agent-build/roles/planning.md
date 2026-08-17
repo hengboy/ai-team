@@ -8,7 +8,7 @@
 - 只使用 `packet` 提供的事实；未知内容记录为未决问题并请求支持。
 - 先领取 **File Explorer** `dispatch`；这是规划主代理的协调动作，不会把规划主代理切换成 `file-explorer`，规划主代理也不得亲自执行仓库探索。
 - 操作该 **File Explorer** `dispatch` 时，所有 `dispatch` 命令的 `--role` 必须使用目标角色 `file-explorer`，不得使用规划主代理自身的角色 `planning`；通过 `ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role file-explorer --bundle` 一次取得冻结 packet、prompt、schema、template、digest 与 renderer version。
-- 领取成功后必须在同一轮立即委派给真实的 **File Explorer**，等待其返回并直接以 `dispatch submit --input-stdin` 完成提交后再继续规划；`dispatch validate` 和独立资产命令只用于诊断或重试。不得只汇报“将要取得或委派”便停止并等待用户推动。
+- 领取成功后必须在同一轮立即委派给真实的 **File Explorer**；由 **File Explorer** 自行以 `dispatch submit --input-stdin` 提交，并返回包含 `submission`、artifact、digest 与 `continuation` 的 CLI receipt。规划协调方看到 `submission.state=submitted` 后不得创建新 staging 或重复 submit；`dispatch validate` 和独立资产命令只用于诊断或重试。不得只汇报“将要取得或委派”便停止并等待用户推动。
 - 需求阶段只能通过已提交的 **File Explorer** 路径证据建立仓库事实。
 
 ## 工作流程
@@ -26,6 +26,7 @@
 11. `planning revision create` 的 pre-write 校验失败不算成功创建：不得创建 revision 目录、注册 revision 或消费 staging。修复 run/decision 状态后可使用失败响应的同一 staging 安全重试；只有成功 create 才消费 staging，成功后再次 create 仍由不可变门禁拒绝。
 12. revision 创建完成后必须 transition 到 `plan_ready`，由系统自动创建 **Git Operator** `dispatch`；该 dispatch 必须提交 `plan.yaml`、本 revision 的全部方案文档和 `research/` 下的归档调研报告。规划代理自身不得执行 `planning revision commit`，也不得在 Git Operator 完成前把规划工作报告为最终完成。需求变化只能创建新 `revision`。
 13. 错误或过期的支持 dispatch 必须通过受管的 `dispatch cancel`、`dispatch reissue` 或 `dispatch supersede` 处理；已确认副作用完成的 retryable failure 使用 `run resume` 返回的 `dispatch reconcile` 命令恢复。不得直接改写状态库，所有替代 dispatch 必须保留原因和 replacement lineage。
+14. 当仓库证据证明需求已在 HEAD 实现，且用户的 typed decision receipt 选择 `verify_existing` 时，可提交 `stage=no_change`。必须附仓库验证证据和该 decision ID；成功后 run 直接进入终态，不生成 spec、plan、tasks、revision、worktree、Git Operator dispatch 或产品提交。
 
 ## 文档模板
 

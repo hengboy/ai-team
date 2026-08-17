@@ -40,6 +40,19 @@ export interface DispatchContinuation {
   pending_decision: Record<string, unknown> | null;
 }
 
+export interface DispatchSubmission {
+  reused: boolean;
+  artifact: string;
+  submission: {
+    state: "submitted";
+    dispatch_state: string;
+    artifact_id: string;
+    artifact: string;
+    digest: string;
+  };
+  continuation: DispatchContinuation;
+}
+
 export interface DispatchBundle {
   reused: boolean;
   packet: DispatchPacket;
@@ -69,10 +82,10 @@ interface ReviewBarrierRow {
   standards_dispatch_id?: string;
 }
 
-const RENDERER_VERSION = "dispatch-renderer-v2";
+const RENDERER_VERSION = "dispatch-renderer-v3";
 const EXPLORER_CONTEXT_PATHS = ["MEMORY.md", ".ai-team/index/feature-navigation.md"] as const;
 
-const promptFor = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
+const promptLines = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string[] => [
   `Role: ${role}`,
   `Run: ${runId}`,
   `Dispatch: ${dispatchId}`,
@@ -81,7 +94,15 @@ const promptFor = (runId: string, dispatchId: string, role: Role, packet: Dispat
   `Allowed write paths: ${packet.allowed_write_paths.join(", ") || "none"}`,
   `Acceptance criteria: ${packet.acceptance_criteria.join("; ")}`,
   `Context: ${stableJson(packet.context)}`,
+];
+const promptForV2 = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
+  ...promptLines(runId, dispatchId, role, packet),
   "Return only the frozen result envelope and role payload schema.",
+].join("\n");
+const promptFor = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
+  ...promptLines(runId, dispatchId, role, packet),
+  "Build the frozen result envelope from the template and schema, then submit it exactly once with dispatch submit --input-stdin.",
+  "Return the CLI submission receipt containing submission and continuation; do not return an unsubmitted envelope.",
 ].join("\n");
 
 const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
@@ -422,8 +443,9 @@ export class DispatchService {
 
   prompt(runId: string, dispatchId: string, role: Role): string {
     const row = this.get(runId, dispatchId, role);
-    const rendered = promptFor(runId, dispatchId, role, JSON.parse(row.packet_json) as DispatchPacket);
-    if (row.renderer_version === RENDERER_VERSION && row.prompt_digest && row.prompt_digest !== sha256(rendered)) throw new ValidationError("dispatch prompt digest mismatch; frozen asset is corrupted");
+    const renderer = row.renderer_version === RENDERER_VERSION ? promptFor : promptForV2;
+    const rendered = renderer(runId, dispatchId, role, JSON.parse(row.packet_json) as DispatchPacket);
+    if (row.prompt_digest && row.prompt_digest !== sha256(rendered)) throw new ValidationError("dispatch prompt digest mismatch; frozen asset is corrupted");
     return rendered;
   }
   schema(runId: string, dispatchId: string, role: Role): unknown { return JSON.parse(this.get(runId, dispatchId, role).schema_json); }
@@ -467,7 +489,9 @@ export class DispatchService {
       throw new ValidationError("dispatch must be claimed before validate");
     }
     const run = this.store.getRun(runId) as { state: string };
-    const validRunState = dispatch.state === "needs_decision" ? run.state === "needs_decision" : run.state === "active";
+    const validRunState = dispatch.state === "needs_decision"
+      ? run.state === "needs_decision"
+      : dispatch.state === "completed" ? run.state === "active" || run.state === "completed" : run.state === "active";
     if (!validRunState) throw new ValidationError("run must be active before validate");
     const result = checkResultEnvelope(value);
     if (!result.valid) throw new ValidationError("result envelope is invalid", result.errors);
@@ -477,7 +501,7 @@ export class DispatchService {
     return result.value;
   }
 
-  async submit(runId: string, dispatchId: string, role: Role, path: string): Promise<{ reused: boolean; artifact: string }> {
+  async submit(runId: string, dispatchId: string, role: Role, path: string): Promise<DispatchSubmission> {
     assertReadablePath(path);
     const info = await stat(path);
     if (info.size > 2 * 1024 * 1024) throw new ValidationError("result file exceeds the 2 MiB limit");
@@ -485,7 +509,7 @@ export class DispatchService {
     return this.submitValue(runId, dispatchId, role, JSON.parse(source), source);
   }
 
-  async submitValue(runId: string, dispatchId: string, role: Role, value: unknown, source?: string): Promise<{ reused: boolean; artifact: string }> {
+  async submitValue(runId: string, dispatchId: string, role: Role, value: unknown, source?: string): Promise<DispatchSubmission> {
     const row = this.get(runId, dispatchId, role);
     const bindReviewBarrier = (result: ResultEnvelope): void => {
       if ((role !== "review-spec" && role !== "review-standards") || result.status !== "completed") return;
@@ -499,7 +523,15 @@ export class DispatchService {
       const incoming = this.validateValue(runId, dispatchId, role, value);
       bindReviewBarrier(incoming);
       if (stableJson(result) !== stableJson(incoming)) throw new ValidationError("dispatch was already submitted with a different result");
-      return { reused: true, artifact: this.artifactPath(runId, dispatchId) };
+      const artifact = this.store.db.prepare("SELECT artifact_id,path,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'")
+        .get(runId, dispatchId) as { artifact_id: string; path: string; sha256: string } | undefined;
+      if (!artifact) throw new ValidationError("submitted dispatch result artifact is missing");
+      return {
+        reused: true,
+        artifact: artifact.path,
+        submission: { state: "submitted", dispatch_state: row.state, artifact_id: artifact.artifact_id, artifact: artifact.path, digest: artifact.sha256 },
+        continuation: this.continuation(runId),
+      };
     }
     if (row.state !== "claimed") throw new ValidationError("dispatch must be claimed before submit");
     const result = this.validateValue(runId, dispatchId, role, value);
@@ -549,7 +581,12 @@ export class DispatchService {
       }
     });
     transaction();
-    return { reused: false, artifact };
+    return {
+      reused: false,
+      artifact,
+      submission: { state: "submitted", dispatch_state: dispatchState, artifact_id: artifactId, artifact, digest },
+      continuation: this.continuation(runId),
+    };
   }
 
   continuation(runId: string): DispatchContinuation {
@@ -921,11 +958,16 @@ export class DispatchService {
   }
 
   private advancePlanning(runId: string, result: ResultEnvelope): void {
-    const payload = result.payload as { stage: string; pending_questions: string[]; decision: { question: string; choices: Array<{ id: string; label: string; impact: string }>; recommendation: string } | null };
+    const payload = result.payload as {
+      stage: string;
+      pending_questions: string[];
+      decision: { question: string; choices: Array<{ id: string; label: string; impact: string }>; recommendation: string } | null;
+      no_change?: { decision_id: string; conclusion: string; repository_evidence: Array<{ command: string; outcome: string }> };
+    };
     const run = this.store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string; stage: string };
     const transitions: Record<string, string[]> = {
       planning: ["requirements"],
-      requirements: ["requirements", "requirements_confirmed"],
+      requirements: ["requirements", "requirements_confirmed", "no_change"],
       requirements_confirmed: ["spec_ready"],
       spec_ready: ["plan_ready"],
       plan_ready: ["tasks_preview", "ready"],
@@ -933,6 +975,32 @@ export class DispatchService {
       ready: [],
     };
     if (!transitions[run.stage]?.includes(payload.stage)) throw new ValidationError(`invalid planning stage transition: ${run.stage} -> ${payload.stage}`);
+    if (payload.stage === "no_change") {
+      if (!payload.no_change) throw new ValidationError("planning no_change requires repository evidence and a decision receipt");
+      const decision = this.store.db.prepare("SELECT status,choice,receipt_json FROM decisions WHERE run_id=? AND decision_id=?")
+        .get(runId, payload.no_change.decision_id) as { status: string; choice?: string; receipt_json?: string } | undefined;
+      if (!decision || decision.status !== "resolved" || decision.choice !== "verify_existing") {
+        throw new ValidationError("planning no_change requires a resolved verify_existing decision receipt");
+      }
+      if (run.plan_id || run.revision) throw new ValidationError("planning no_change cannot complete a run with a bound revision");
+      const sideEffects = {
+        worktrees: (this.store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=?").get(runId) as { count: number }).count,
+        operations: (this.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=?").get(runId) as { count: number }).count,
+        git_dispatches: (this.store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='git-operator'").get(runId) as { count: number }).count,
+      };
+      if (sideEffects.worktrees || sideEffects.operations || sideEffects.git_dispatches) {
+        throw new ValidationError("planning no_change cannot complete after implementation or Git side effects", sideEffects);
+      }
+      const decisionReceipt = JSON.parse(decision.receipt_json ?? "{}") as Record<string, unknown>;
+      this.store.db.prepare("UPDATE runs SET stage='no_change',state='completed',updated_at=? WHERE run_id=?")
+        .run(new Date().toISOString(), runId);
+      this.store.event(runId, "planning.no_change_completed", {
+        conclusion: payload.no_change.conclusion,
+        repository_evidence: payload.no_change.repository_evidence,
+        decision_receipt: decisionReceipt,
+      });
+      return;
+    }
     if (run.plan_id && run.revision) {
       const revision = this.store.db.prepare("SELECT state FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
         .get(run.repo_id, run.plan_id, run.revision) as { state: string } | undefined;
@@ -983,6 +1051,12 @@ export class DispatchService {
   resolvePlanningDecision(runId: string, decisionId: string, choice: string, note?: string): string {
     const run = this.store.getRun(runId) as { profile: string };
     if (run.profile !== "planning") throw new ValidationError("only planning runs can resolve planning decisions");
+    const existing = this.store.db.prepare("SELECT status,choice,receipt_json FROM decisions WHERE run_id=? AND decision_id=?").get(runId, decisionId) as { status: string; choice?: string; receipt_json?: string } | undefined;
+    if (existing?.status === "resolved") {
+      const receipt = JSON.parse(existing.receipt_json ?? "{}") as { successor_dispatch_id?: string };
+      if (existing.choice === choice && receipt.successor_dispatch_id) return receipt.successor_dispatch_id;
+      throw new ValidationError("decision is unknown, stale, or already resolved");
+    }
     let dispatchId = "";
     this.store.db.transaction(() => {
       this.store.decide(runId, decisionId, choice, note);
@@ -992,6 +1066,10 @@ export class DispatchService {
         .run(new Date().toISOString(), runId);
       this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
       dispatchId = this.continuePlanning(runId);
+      const successor = this.store.db.prepare("SELECT packet_digest FROM dispatches WHERE dispatch_id=?").get(dispatchId) as { packet_digest?: string };
+      const receipt = this.store.db.prepare("SELECT receipt_json FROM decisions WHERE decision_id=?").get(decisionId) as { receipt_json: string };
+      this.store.db.prepare("UPDATE decisions SET receipt_json=? WHERE decision_id=?")
+        .run(stableJson({ ...JSON.parse(receipt.receipt_json), successor_dispatch_id: dispatchId, successor_packet_digest: successor.packet_digest ?? null }), decisionId);
     })();
     return dispatchId;
   }
