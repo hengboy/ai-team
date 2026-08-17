@@ -73,6 +73,8 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "dispatch prompt": ["ai-team dispatch prompt --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
   "dispatch schema": ["ai-team dispatch schema --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
   "dispatch template": ["ai-team dispatch template --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
+  "dispatch packet-schema": ["ai-team dispatch packet-schema --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
+  "dispatch packet-template": ["ai-team dispatch packet-template --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
   "dispatch validate": ["ai-team dispatch validate --run-id <run-id> --dispatch-id <dispatch-id> --role <role> (--result-file <json> | --staging-id <staging-id> | --input-stdin)"],
   "dispatch submit": ["ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> (--result-file <json> | --staging-id <staging-id> | --input-stdin)"],
   "decision create": ["ai-team decision create --run-id <run-id> --dispatch-id <dispatch-id> (--file <json> | --staging-id <staging-id> | --input-stdin)"],
@@ -140,7 +142,7 @@ const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>
 });
 
 const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run cancel", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
-const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
+const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch packet-schema", "dispatch packet-template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */
 export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.freeze({
@@ -148,7 +150,7 @@ export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.
   "context.validate": { required: ["project"], optional: [], ...((COMMAND_SYNTAX["context validate"]) ? { syntax: COMMAND_SYNTAX["context validate"] } : {}) },
   "planning.start": { required: ["project"], optional: ["requestFile", "requestStdin"], exclusive: [["requestFile", "requestStdin"]], ...((COMMAND_SYNTAX["planning start"]) ? { syntax: COMMAND_SYNTAX["planning start"] } : {}) },
   "coding.start": { required: ["project"], optional: ["mode", "planId", "revision", "requestFile", "requestStdin"], patterns: { planId: IDS.planId, revision: IDS.revision }, ...((COMMAND_SYNTAX["coding start"]) ? { syntax: COMMAND_SYNTAX["coding start"] } : {}) },
-  "dispatch.identity": { required: ["runId", "dispatchId", "role"], optional: [], patterns: { runId: IDS.runId, dispatchId: IDS.dispatchId }, syntax: ["ai-team dispatch <claim|prompt|schema|template|validate|submit> --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"] },
+  "dispatch.identity": { required: ["runId", "dispatchId", "role"], optional: [], patterns: { runId: IDS.runId, dispatchId: IDS.dispatchId }, syntax: ["ai-team dispatch <claim|prompt|schema|template|packet-schema|packet-template|validate|submit> --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"] },
   "run.identity": { required: ["runId"], optional: [], patterns: { runId: IDS.runId }, syntax: ["ai-team run <show|resume> <run-id>"] },
   "review.create": { required: ["runId", "revisionSha"], optional: ["formal"], patterns: { runId: IDS.runId, revisionSha: IDS.commit }, ...((COMMAND_SYNTAX["review create"]) ? { syntax: COMMAND_SYNTAX["review create"] } : {}) },
 });
@@ -185,6 +187,8 @@ const RECOVERY_ONLY_COMMANDS = new Set([
   "dispatch prompt",
   "dispatch schema",
   "dispatch template",
+  "dispatch packet-schema",
+  "dispatch packet-template",
   "dispatch validate",
   "decision schema",
   "decision template",

@@ -566,7 +566,7 @@ export const buildProgram = (): Command => {
     });
 
   const run = program.command("run");
-  run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), review_barrier: new ReviewService(store).current(runId), events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId), decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId), dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId), worktrees: store.db.prepare("SELECT worktree_id,branch,path,base_commit,state,adopted_from_run_id FROM worktrees WHERE run_id=? ORDER BY created_at,worktree_id").all(runId) }), { readonly: true })));
+  run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({ run: store.getRun(runId), review_barrier: new ReviewService(store).current(runId), events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId), decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId), dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId), worktrees: store.db.prepare("SELECT worktree_id,branch,path,base_commit,state,adopted_from_run_id FROM worktrees WHERE run_id=? ORDER BY created_at,worktree_id").all(runId), ...new DispatchService(store).runShowProjection(runId) }), { readonly: true })));
   requestOptions(run.command("handoff-to-planning").argument("<run-id>"))
     .action(async (runId, options) => {
       const request = await WorkflowService.requestFrom(options.requestFile, options.requestStdin);
@@ -577,8 +577,14 @@ export const buildProgram = (): Command => {
   run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => {
     const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined;
     const dispatchId = new DispatchService(store).resolveDecision(options.runId, options.decisionId, options.choice, note);
-    const dispatch = store.db.prepare("SELECT role FROM dispatches WHERE run_id=? AND dispatch_id=?").get(options.runId, dispatchId) as { role: string } | undefined;
-    output({ status: "resolved", dispatch_id: dispatchId, role: dispatch?.role ?? null });
+    const dispatch = store.db.prepare("SELECT role,replacement_for,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(options.runId, dispatchId) as { role: string; replacement_for?: string; packet_json: string } | undefined;
+    const context = dispatch ? (JSON.parse(dispatch.packet_json) as DispatchPacket).context : {};
+    output({ status: "resolved", dispatch_id: dispatchId, role: dispatch?.role ?? null, recovery_action: dispatch?.replacement_for || context.resolved_decision ? {
+      type: "dispatch_replacement",
+      replacement_for: dispatch?.replacement_for ?? null,
+      resolved_decision: context.resolved_decision ?? null,
+      next_command: dispatch ? `ai-team dispatch claim --run-id ${options.runId} --dispatch-id ${dispatchId} --role ${dispatch.role} --bundle` : null,
+    } : null });
   }));
 
   const staging = program.command("staging");
@@ -694,6 +700,8 @@ export const buildProgram = (): Command => {
   dispatchCommand("prompt").action(async (options) => output(await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role), { readonly: true }), { legacyRaw: true }));
   dispatchCommand("schema").action(async (options) => output(await withStore((store) => new DispatchService(store).schema(options.runId, options.dispatchId, options.role), { readonly: true })));
   dispatchCommand("template").action(async (options) => output(await withStore((store) => new DispatchService(store).template(options.runId, options.dispatchId, options.role), { readonly: true })));
+  dispatchCommand("packet-schema").action(async (options) => output(await withStore((store) => new DispatchService(store).packetSchema(options.runId, options.dispatchId, options.role), { readonly: true })));
+  dispatchCommand("packet-template").action(async (options) => output(await withStore((store) => new DispatchService(store).packetTemplate(options.runId, options.dispatchId, options.role), { readonly: true })));
   jsonOptions(dispatchCommand("validate"), "--result-file").action(async (options) => {
     if (options.resultFile && (options.stagingId || options.inputStdin)) throw new ValidationError("provide exactly one JSON file option, --staging-id, or --input-stdin");
     if (options.resultFile) { output({ valid: true, result: await withStore((store) => new DispatchService(store).validateFile(options.runId, options.dispatchId, options.role, options.resultFile), { readonly: true }) }); return; }

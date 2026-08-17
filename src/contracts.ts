@@ -3,7 +3,7 @@ import type { ErrorObject } from "ajv";
 import { RESULT_STATUSES, ROLES, SCHEMA_VERSION, type ResultStatus, type Role } from "./constants.js";
 import { COMMAND_CONTRACT_BASE } from "./command-contract.js";
 import { sha256, stableJson } from "./utils.js";
-import { isSensitivePath } from "./security.js";
+import { isSensitivePath, pathMatchesScope } from "./security.js";
 
 export interface ResultEnvelope {
   schema_version: number;
@@ -299,10 +299,9 @@ export const checkResultEnvelope = (value: unknown): { valid: true; value: Resul
   }
   if (envelope.status === "completed" && envelope.role === "file-explorer") {
     const payload = envelope.payload as { allowed_read_paths: string[]; project_context: ProjectContext };
-    const authorized = new Set(payload.allowed_read_paths);
     const requiredContextPaths = ["MEMORY.md", ".ai-team/index/feature-navigation.md"];
-    const missingContextPaths = requiredContextPaths.filter((path) => !authorized.has(path));
-    const missingEntryPaths = payload.project_context.navigation.flatMap((entry) => entry.entry_paths.filter((path) => !authorized.has(path)));
+    const missingContextPaths = requiredContextPaths.filter((path) => !pathMatchesScope(path, payload.allowed_read_paths));
+    const missingEntryPaths = payload.project_context.navigation.flatMap((entry) => entry.entry_paths.filter((path) => !pathMatchesScope(path, payload.allowed_read_paths)));
     if (missingContextPaths.length || missingEntryPaths.length) {
       return { valid: false, errors: [validationDetail("/payload/allowed_read_paths", "authorization", `project context paths are not authorized: ${[...missingContextPaths, ...missingEntryPaths].join(", ")}`)] };
     }

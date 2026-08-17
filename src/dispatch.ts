@@ -60,6 +60,8 @@ export interface DispatchBundle {
   prompt: string;
   schema: unknown;
   template: ResultEnvelope;
+  packet_schema: unknown;
+  packet_template: DispatchPacket;
   digests: { packet: string; prompt: string; schema: string; template: string };
   renderer_version: string;
 }
@@ -91,6 +93,56 @@ const IMPLEMENTATION_TEST_COMMANDS = [
   "npm run lint",
   "npm run build",
 ] as const;
+
+const packetContextRequirements = (role: Role, phase?: unknown, taskId?: unknown): string[] => {
+  if (phase === "continue_implementation") {
+    return ["phase", "explorer_dispatch_id", "coordinator_dispatch_id", "prepare_git_dispatch_id", "task_id", "worktree_id", "worktree_path"];
+  }
+  if (phase === "prepare_implementation_worktree") {
+    return /^TASK-\d{3}$/.test(String(taskId ?? ""))
+      ? ["phase", "task_id", "explorer_dispatch_id", "coordinator_dispatch_id"]
+      : ["phase", "task_id"];
+  }
+  if (role === "frontend-developer" || role === "backend-developer") return ["explorer_dispatch_id", "worktree_id"];
+  return [];
+};
+
+export const dispatchPacketSchema = (role: Role, phase?: unknown, taskId?: unknown): Record<string, unknown> => {
+  const contextRequired = packetContextRequirements(role, phase, taskId);
+  const contextProperties = Object.fromEntries(contextRequired.map((key) => [key, {
+    type: "string",
+    ...(key === "task_id" ? { pattern: phase === "continue_implementation" ? "^TASK-[0-9]{3}$" : "^(?:TASK-[0-9]{3}|implementation)$" } : {}),
+  }]));
+  return {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    additionalProperties: false,
+    required: ["objective", "allowed_read_paths", "allowed_write_paths", "acceptance_criteria", "context"],
+    properties: {
+      objective: { type: "string", minLength: 1 },
+      allowed_read_paths: { type: "array", items: { type: "string", minLength: 1 } },
+      allowed_write_paths: { type: "array", items: { type: "string", minLength: 1 } },
+      acceptance_criteria: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+      context: {
+        type: "object",
+        additionalProperties: true,
+        ...(contextRequired.length ? { required: contextRequired } : {}),
+        properties: contextProperties,
+      },
+    },
+  };
+};
+
+export const dispatchPacketTemplate = (role: Role, packet: DispatchPacket): DispatchPacket => {
+  const required = packetContextRequirements(role, packet.context.phase, packet.context.task_id);
+  return {
+    objective: packet.objective,
+    allowed_read_paths: [...packet.allowed_read_paths],
+    allowed_write_paths: [...packet.allowed_write_paths],
+    acceptance_criteria: [...packet.acceptance_criteria],
+    context: { ...packet.context, ...Object.fromEntries(required.map((key) => [key, packet.context[key] ?? ""])) },
+  };
+};
 
 interface ImplementationSnapshot {
   coordinatorDispatchId: string;
@@ -149,7 +201,9 @@ const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   const value = packet as Record<string, unknown>;
   const allowed = new Set(["objective", "allowed_read_paths", "allowed_write_paths", "acceptance_criteria", "context"]);
   const unknown = Object.keys(value).filter((key) => !allowed.has(key));
-  if (unknown.length) throw new ValidationError("dispatch packet has unknown fields", unknown.map((key) => `/${key}`));
+  if (unknown.length) throw new ValidationError("dispatch packet has unknown fields", unknown.map((key) => ({
+    path: `/${key}`, pointer: `/${key}`, field: key, constraint: "additionalProperties", message: "unknown field",
+  })));
   if (typeof value.objective !== "string" || !value.objective.trim()) throw new ValidationError("dispatch packet objective must be a non-empty string", ["/objective"]);
   for (const key of ["allowed_read_paths", "allowed_write_paths", "acceptance_criteria"] as const) {
     if (!Array.isArray(value[key]) || value[key].some((item) => typeof item !== "string" || !item.trim())) {
@@ -157,6 +211,17 @@ const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
     }
   }
   if (!(value.context && typeof value.context === "object" && !Array.isArray(value.context))) throw new ValidationError("dispatch packet context must be an object", ["/context"]);
+  const context = value.context as Record<string, unknown>;
+  const enforcedContext = context.phase === "continue_implementation" || context.phase === "prepare_implementation_worktree"
+    ? packetContextRequirements(role, context.phase, context.task_id)
+    : [];
+  const missingContext = enforcedContext.filter((key) => typeof context[key] !== "string" || !(context[key] as string).trim());
+  if (missingContext.length) throw new ValidationError("dispatch packet context is incomplete for role and phase", missingContext.map((key) => ({
+    path: `/context/${key}`, pointer: `/context/${key}`, field: key, constraint: "required", message: "required context field is missing",
+  })));
+  if (typeof context.task_id === "string" && context.task_id !== "implementation" && !/^TASK-\d{3}$/.test(context.task_id)) {
+    throw new ValidationError("dispatch packet context.task_id is invalid", [{ path: "/context/task_id", pointer: "/context/task_id", field: "task_id", constraint: "pattern", message: "must match TASK- followed by three digits" }]);
+  }
   if (!(value.acceptance_criteria as string[]).length) throw new ValidationError("dispatch packet requires acceptance criteria", ["/acceptance_criteria"]);
   const reads = role === "file-explorer"
     ? [...new Set([...EXPLORER_CONTEXT_PATHS, ...(value.allowed_read_paths as string[])])]
@@ -193,8 +258,8 @@ const assertExplorerAuthorization = (store: StateStore, runId: string, role: Rol
   const explorer = store.db.prepare("SELECT state,role,result_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, context.explorer_dispatch_id) as { state: string; role: string; result_json?: string } | undefined;
   if (!explorer || explorer.role !== "file-explorer" || explorer.state !== "completed" || !explorer.result_json) throw new ValidationError("downstream dispatch requires a completed Explorer dispatch");
   const payload = JSON.parse(explorer.result_json) as { payload?: { allowed_read_paths?: string[] } };
-  const authorized = new Set([...(payload.payload?.allowed_read_paths ?? []), ...(context.path_authorization ?? [])]);
-  const unauthorized = packet.allowed_read_paths.filter((path) => !authorized.has(path));
+  const authorized = [...(payload.payload?.allowed_read_paths ?? []), ...(context.path_authorization ?? [])];
+  const unauthorized = packet.allowed_read_paths.filter((path) => !pathMatchesScope(path, authorized));
   if (unauthorized.length) throw new ValidationError("downstream read paths are not authorized by Explorer evidence", unauthorized);
 };
 
@@ -219,8 +284,16 @@ export class DispatchService {
       throw new ValidationError(`${actor} cannot delegate to ${role}`);
     }
     const validated = validatePacket(packet, role);
+    if (actorRole === "coding" && role === "git-operator" && validated.context.phase === "prepare_implementation_worktree" && /^TASK-\d{3}$/.test(String(validated.context.task_id ?? ""))) {
+      if (validated.context.coordinator_dispatch_id !== actorDispatchId) {
+        throw new ValidationError("planned task prepare packet must preserve its Coding coordinator identity", ["/context/coordinator_dispatch_id"]);
+      }
+    }
     if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "continue_testing") {
       this.assertContinueTestingDelegation(actorDispatchId!, role, actorPacket, validated);
+    }
+    if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "continue_implementation") {
+      this.assertContinueImplementationDelegation(actorDispatchId!, role, actorPacket, validated);
     }
     if (role === "file-explorer") {
       const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get((this.store.getRun(runId) as { repo_id: string }).repo_id) as { project_path: string } | undefined;
@@ -240,6 +313,18 @@ export class DispatchService {
     const dispatchId = this.insert(runId, role, validated);
     if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "continue_testing") this.changeStage(runId, "test", dispatchId);
     return dispatchId;
+  }
+
+  private assertContinueImplementationDelegation(actorDispatchId: string, role: Role, coordinator: DispatchPacket, packet: DispatchPacket): void {
+    if (role !== "frontend-developer" && role !== "backend-developer") {
+      throw new ValidationError("continue_implementation Coding dispatch can only delegate to a developer role");
+    }
+    const expected = coordinator.context as Record<string, unknown>;
+    const actual = packet.context as Record<string, unknown>;
+    const inherited = ["explorer_dispatch_id", "task_id", "worktree_id", "worktree_path"];
+    const mismatch = inherited.filter((key) => stableJson(actual[key]) !== stableJson(expected[key]));
+    if (actual.coordinator_dispatch_id !== actorDispatchId) mismatch.push("coordinator_dispatch_id");
+    if (mismatch.length) throw new ValidationError("continue_implementation developer packet must preserve its frozen task identity", mismatch.map((key) => `/context/${key}`));
   }
 
   private assertContinueTestingDelegation(actorDispatchId: string, role: Role, coordinator: DispatchPacket, packet: DispatchPacket): void {
@@ -403,6 +488,8 @@ export class DispatchService {
       prompt,
       schema: JSON.parse(row.schema_json),
       template: JSON.parse(row.template_json) as ResultEnvelope,
+      packet_schema: this.packetSchema(runId, dispatchId, role),
+      packet_template: this.packetTemplate(runId, dispatchId, role),
       digests: {
         packet: row.packet_digest ?? sha256(row.packet_json),
         prompt: row.prompt_digest ?? sha256(prompt),
@@ -627,6 +714,14 @@ export class DispatchService {
   }
   schema(runId: string, dispatchId: string, role: Role): unknown { return JSON.parse(this.get(runId, dispatchId, role).schema_json); }
   template(runId: string, dispatchId: string, role: Role): ResultEnvelope { return JSON.parse(this.get(runId, dispatchId, role).template_json) as ResultEnvelope; }
+  packetSchema(runId: string, dispatchId: string, role: Role): unknown {
+    const packet = JSON.parse(this.get(runId, dispatchId, role).packet_json) as DispatchPacket;
+    return dispatchPacketSchema(role, packet.context.phase, packet.context.task_id);
+  }
+  packetTemplate(runId: string, dispatchId: string, role: Role): DispatchPacket {
+    const packet = JSON.parse(this.get(runId, dispatchId, role).packet_json) as DispatchPacket;
+    return dispatchPacketTemplate(role, packet);
+  }
 
   assertClaimed(runId: string, dispatchId: string, role: Role): void {
     const row = this.get(runId, dispatchId, role);
@@ -788,6 +883,28 @@ export class DispatchService {
     };
   }
 
+  runShowProjection(runId: string): {
+    continuation: DispatchContinuation;
+    pending_dependencies: Array<{ dispatch_id: string; depends_on: string[] }>;
+    suggested_commands: string[];
+  } {
+    const continuation = this.continuation(runId);
+    const suggestedCommands = continuation.pending_dispatches.map((dispatch) => dispatch.state === "pending"
+      ? `ai-team dispatch claim --run-id ${runId} --dispatch-id ${dispatch.dispatch_id} --role ${dispatch.role} --bundle`
+      : `ai-team staging create --run-id ${runId} --dispatch-id ${dispatch.dispatch_id} --role ${dispatch.role} --kind dispatch-result`);
+    const decision = continuation.pending_decision as { decision_id?: unknown } | null;
+    if (typeof decision?.decision_id === "string") {
+      suggestedCommands.push(`ai-team run decide --run-id ${runId} --decision-id ${decision.decision_id} --choice <choice>`);
+    }
+    const run = this.store.getRun(runId) as { state: string };
+    if (!suggestedCommands.length && run.state === "active") suggestedCommands.push(`ai-team run resume ${runId}`);
+    return {
+      continuation,
+      pending_dependencies: continuation.pending_dispatches.map(({ dispatch_id, depends_on }) => ({ dispatch_id, depends_on })),
+      suggested_commands: suggestedCommands,
+    };
+  }
+
   private advanceRun(runId: string, role: Role, result: ResultEnvelope): void {
     const run = this.store.getRun(runId) as { profile: string; mode?: string };
     if (role === "file-explorer") {
@@ -828,6 +945,10 @@ export class DispatchService {
       const context = row ? (JSON.parse(row.packet_json) as DispatchPacket).context as { phase?: unknown; explorer_dispatch_id?: unknown; reconciliation?: unknown } : {};
       if (run.mode === "planned" && context.phase === "prepare_worktrees") {
         if (typeof context.explorer_dispatch_id === "string") this.createPlannedCodingDispatch(runId, context.explorer_dispatch_id, result.dispatch_id);
+        return;
+      }
+      if (run.mode === "planned" && context.phase === "prepare_implementation_worktree") {
+        this.ensurePlannedTaskContinuation(runId, result.dispatch_id);
         return;
       }
       if (context.phase === "cancel_cleanup") {
@@ -920,6 +1041,79 @@ export class DispatchService {
         plan_worktree_path: worktree.path,
       },
     }, "coding");
+    this.changeStage(runId, "coding", dispatchId);
+    return dispatchId;
+  }
+
+  private ensurePlannedTaskContinuation(runId: string, prepareDispatchId?: string): string | undefined {
+    const run = this.store.getRun(runId) as { profile: string; mode?: string; state: string; plan_id?: string; revision?: string };
+    if (run.profile !== "coding" || run.mode !== "planned" || run.state !== "active") return undefined;
+    const prepare = (prepareDispatchId
+      ? this.store.db.prepare(`SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator' AND state='completed'
+          AND json_extract(packet_json,'$.context.phase')='prepare_implementation_worktree'`).get(runId, prepareDispatchId)
+      : this.store.db.prepare(`SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='git-operator' AND state='completed'
+          AND json_extract(packet_json,'$.context.phase')='prepare_implementation_worktree' ORDER BY completed_at DESC,created_at DESC LIMIT 1`).get(runId)) as { dispatch_id: string; packet_json: string } | undefined;
+    if (!prepare) return undefined;
+    const preparePacket = JSON.parse(prepare.packet_json) as DispatchPacket;
+    const prepareContext = preparePacket.context as Record<string, unknown>;
+    const taskId = typeof prepareContext.task_id === "string" ? prepareContext.task_id : "";
+    if (!/^TASK-\d{3}$/.test(taskId)) return undefined;
+    const existing = this.store.db.prepare(`SELECT dispatch_id,state FROM dispatches WHERE run_id=? AND role='coding' AND state IN ('pending','claimed','completed')
+      AND json_extract(packet_json,'$.context.phase')='continue_implementation'
+      AND json_extract(packet_json,'$.context.prepare_git_dispatch_id')=? ORDER BY created_at DESC LIMIT 1`)
+      .get(runId, prepare.dispatch_id) as { dispatch_id: string; state: string } | undefined;
+    if (existing) return existing.state === "pending" || existing.state === "claimed" ? existing.dispatch_id : undefined;
+    const taskKey = taskId.toLowerCase();
+    const worktree = this.store.db.prepare(`SELECT worktree_id,path FROM worktrees WHERE run_id=? AND state='active'
+      AND (branch LIKE ? OR branch LIKE ?) ORDER BY created_at DESC LIMIT 1`)
+      .get(runId, `task/%/${taskKey}`, `task/%--${taskKey}`) as { worktree_id: string; path: string } | undefined;
+    if (!worktree) throw new ValidationError("planned task continuation requires the prepared task worktree");
+    const developer = this.store.db.prepare(`SELECT 1 FROM dispatches WHERE run_id=? AND role IN ('frontend-developer','backend-developer') AND state!='failed'
+      AND json_extract(packet_json,'$.context.worktree_id')=?`).get(runId, worktree.worktree_id);
+    if (developer) return undefined;
+    const requestedCoordinatorId = typeof prepareContext.coordinator_dispatch_id === "string" ? prepareContext.coordinator_dispatch_id : undefined;
+    const coordinator = (requestedCoordinatorId
+      ? this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='coding' AND state='completed'").get(runId, requestedCoordinatorId)
+      : this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='coding' AND state='completed' ORDER BY completed_at DESC,created_at DESC LIMIT 1").get(runId)) as { dispatch_id: string; packet_json: string } | undefined;
+    if (!coordinator) throw new ValidationError("planned task continuation requires its completed Coding coordinator");
+    const coordinatorPacket = JSON.parse(coordinator.packet_json) as DispatchPacket;
+    const explorerDispatchId = typeof prepareContext.explorer_dispatch_id === "string"
+      ? prepareContext.explorer_dispatch_id
+      : typeof coordinatorPacket.context.explorer_dispatch_id === "string" ? coordinatorPacket.context.explorer_dispatch_id : undefined;
+    const explorer = explorerDispatchId
+      ? this.store.db.prepare("SELECT result_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='file-explorer' AND state='completed'").get(runId, explorerDispatchId) as { result_json?: string } | undefined
+      : undefined;
+    if (!explorer?.result_json) throw new ValidationError("planned task continuation requires its completed Explorer authorization");
+    const explorerResult = JSON.parse(explorer.result_json) as ResultEnvelope;
+    const authorizedPaths = explorerResult.payload.allowed_read_paths;
+    if (!Array.isArray(authorizedPaths) || authorizedPaths.some((path) => typeof path !== "string")) throw new ValidationError("planned task continuation requires valid Explorer paths");
+    const packet = validatePacket({
+      objective: `Continue ${taskId} by dispatching one developer role in its prepared task worktree.`,
+      allowed_read_paths: authorizedPaths,
+      allowed_write_paths: [],
+      acceptance_criteria: ["Dispatch a developer with the frozen task worktree identity", "Preserve the completed Explorer authorization and prepare lineage"],
+      context: {
+        stage: "coding",
+        phase: "continue_implementation",
+        explorer_dispatch_id: explorerDispatchId,
+        coordinator_dispatch_id: coordinator.dispatch_id,
+        prepare_git_dispatch_id: prepare.dispatch_id,
+        task_id: taskId,
+        worktree_id: worktree.worktree_id,
+        worktree_path: worktree.path,
+        plan_id: run.plan_id ?? null,
+        revision: run.revision ?? null,
+      },
+    }, "coding");
+    assertExplorerAuthorization(this.store, runId, "coding", packet);
+    const dispatchId = this.insert(runId, "coding", packet, coordinator.dispatch_id);
+    this.store.event(runId, "coding.continue_implementation_created", {
+      dispatchId,
+      task_id: taskId,
+      worktree_id: worktree.worktree_id,
+      prepare_git_dispatch_id: prepare.dispatch_id,
+      replacement_for: coordinator.dispatch_id,
+    });
     this.changeStage(runId, "coding", dispatchId);
     return dispatchId;
   }
@@ -1033,8 +1227,7 @@ export class DispatchService {
       : [...new Set([...developers.flatMap((developer) => (JSON.parse(developer.packet_json) as DispatchPacket).allowed_read_paths), "package.json"])];
     if (!Array.isArray(authorizedPaths) || authorizedPaths.some((path) => typeof path !== "string")) return undefined;
     if (!explorer && (this.store.getRun(runId) as { mode?: string }).mode === "planned") return undefined;
-    const authorized = new Set(authorizedPaths as string[]);
-    if (changedPaths.some((path) => !authorized.has(path))) throw new ValidationError("implementation paths are not authorized by Explorer evidence");
+    if (changedPaths.some((path) => !pathMatchesScope(path, authorizedPaths as string[]))) throw new ValidationError("implementation paths are not authorized by Explorer evidence");
     const implementationArtifacts = developers.map((developer) => {
       const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result' ORDER BY created_at DESC LIMIT 1")
         .get(runId, developer.dispatch_id) as { artifact_id: string; sha256: string } | undefined;
@@ -1630,11 +1823,11 @@ export class DispatchService {
   }
 
   private ensureCodingCommitContinuation(runId: string): string | undefined {
-    const run = this.store.getRun(runId) as { profile: string; state: string };
+    const run = this.store.getRun(runId) as { profile: string; state: string; mode?: string };
     if (run.profile !== "coding" || run.state !== "active") return undefined;
     const preCommit = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit' ORDER BY event_id DESC LIMIT 1")
       .get(runId) as { payload_json: string } | undefined;
-    if (!preCommit) return undefined;
+    if (!preCommit && run.mode !== "planned") return undefined;
     const developers = this.store.db.prepare(`SELECT d.dispatch_id,d.state,d.packet_json,d.result_json FROM dispatches d
       WHERE d.run_id=? AND d.role IN ('frontend-developer','backend-developer')
       AND NOT EXISTS (SELECT 1 FROM dispatches successor WHERE successor.replacement_for=d.dispatch_id)`).all(runId) as Array<{ dispatch_id: string; state: string; packet_json: string; result_json?: string }>;
@@ -1674,9 +1867,8 @@ export class DispatchService {
       try { return ((JSON.parse(developer.result_json!) as ResultEnvelope).payload as { modified_paths?: string[] }).modified_paths ?? []; }
       catch { return []; }
     }))];
-    const authorized = new Set(authorizedPaths as string[]);
-    if (changedPaths.some((path) => !authorized.has(path))) throw new ValidationError("coding continuation developer paths are not authorized by Explorer evidence");
-    const scope = JSON.parse(preCommit.payload_json) as { digest?: unknown };
+    if (changedPaths.some((path) => !pathMatchesScope(path, authorizedPaths as string[]))) throw new ValidationError("coding continuation developer paths are not authorized by Explorer evidence");
+    const scope = preCommit ? JSON.parse(preCommit.payload_json) as { digest?: unknown } : undefined;
     const packet = validatePacket({
       objective: "Continue the completed implementation by dispatching Git Operator to commit every uncommitted task worktree.",
       allowed_read_paths: authorizedPaths as string[],
@@ -1690,7 +1882,7 @@ export class DispatchService {
         developer_dispatch_ids: developers.map((developer) => developer.dispatch_id),
         task_worktree_ids: uncommittedWorktreeIds,
         changed_paths: changedPaths,
-        scope_digest: typeof scope.digest === "string" ? scope.digest : null,
+        scope_digest: typeof scope?.digest === "string" ? scope.digest : sha256(stableJson(changedPaths.sort())),
       },
     }, "coding");
     assertExplorerAuthorization(this.store, runId, "coding", packet);
@@ -1800,6 +1992,7 @@ export class DispatchService {
         if (pendingTest && run.stage !== "test") this.changeStage(runId, "test", pendingTest.dispatch_id);
         const pendingDispatch = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId);
         if (pendingDispatch) return;
+        if (run.profile === "coding" && this.ensurePlannedTaskContinuation(runId)) return;
       }
       let retryableHasNoSideEffects = false;
       if (retryableDispatch?.result_json) {

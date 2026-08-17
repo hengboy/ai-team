@@ -7,11 +7,11 @@ import test from "node:test";
 import { checkResultEnvelope, createResultTemplate } from "../src/contracts.js";
 import { ROLES } from "../src/constants.js";
 import { COMMAND_CONTRACT_BASE, COMMAND_PARAMETER_TYPES, COMMAND_SYNTAX, commandContractFor } from "../src/command-contract.js";
-import { DispatchService, type DispatchPacket } from "../src/dispatch.js";
+import { DispatchService, dispatchPacketSchema, dispatchPacketTemplate, type DispatchPacket } from "../src/dispatch.js";
 import { ValidationError } from "../src/errors.js";
 import { assertCoverage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, triage, validateCoverage } from "../src/planning.js";
 import { StateStore } from "../src/state.js";
-import { legacyStagingFilePath, stagingFilePath } from "../src/security.js";
+import { legacyStagingFilePath, pathMatchesScope, stagingFilePath } from "../src/security.js";
 import { makePlanId, sha256 } from "../src/utils.js";
 
 const RUN_ID = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -103,6 +103,59 @@ test("result contract rejects role payload fields outside the role schema", () =
   const result = checkResultEnvelope({ ...validResult(), payload: { modified_paths: [], self_tests: [], arbitrary: true } });
   assert.equal(result.valid, false);
   if (!result.valid) assert.ok(result.errors.some(({ path, field, constraint, message }) => path === "/payload/arbitrary" && field === "arbitrary" && constraint === "additionalProperties" && message === "must NOT have additional properties"));
+});
+
+test("dispatch packet contract exposes role and phase context with JSON pointer errors", async () => {
+  const developerSchema = dispatchPacketSchema("backend-developer") as { properties: { context: { required: string[] } } };
+  assert.deepEqual(developerSchema.properties.context.required, ["explorer_dispatch_id", "worktree_id"]);
+  const continuationPacket: DispatchPacket = {
+    objective: "Continue TASK-001",
+    allowed_read_paths: [],
+    allowed_write_paths: [],
+    acceptance_criteria: ["Dispatch the frozen task"],
+    context: {
+      phase: "continue_implementation",
+      explorer_dispatch_id: "dispatch_explorer",
+      coordinator_dispatch_id: "dispatch_coordinator",
+      prepare_git_dispatch_id: "dispatch_prepare",
+      task_id: "TASK-001",
+      worktree_id: "worktree_task_001",
+      worktree_path: "/tmp/task-001",
+    },
+  };
+  const continuationSchema = dispatchPacketSchema("coding", "continue_implementation") as { properties: { context: { required: string[] } } };
+  assert.ok(continuationSchema.properties.context.required.includes("task_id"));
+  const continuationTemplate = dispatchPacketTemplate("coding", continuationPacket);
+  assert.equal(continuationTemplate.context.worktree_id, "worktree_task_001");
+  assert.equal(continuationTemplate.objective, continuationPacket.objective);
+  const plannedPrepareSchema = dispatchPacketSchema("git-operator", "prepare_implementation_worktree", "TASK-001") as { properties: { context: { required: string[] } } };
+  assert.ok(plannedPrepareSchema.properties.context.required.includes("explorer_dispatch_id"));
+  assert.ok(plannedPrepareSchema.properties.context.required.includes("coordinator_dispatch_id"));
+  const directPrepareSchema = dispatchPacketSchema("git-operator", "prepare_implementation_worktree", "implementation") as { properties: { context: { required: string[] } } };
+  assert.deepEqual(directPrepareSchema.properties.context.required, ["phase", "task_id"]);
+
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const packet = {
+      objective: "Reject an unknown packet field",
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Return a precise pointer"],
+      context: {},
+      depends_on: [],
+    };
+    assert.throws(
+      () => new DispatchService(store).create(runId, "coding", packet as unknown as DispatchPacket),
+      (error: unknown) => error instanceof ValidationError
+        && (error.details as Array<{ pointer?: string }>).some(({ pointer }) => pointer === "/depends_on"),
+    );
+  });
+});
+
+test("project root dot scope recursively authorizes repository paths", () => {
+  assert.equal(pathMatchesScope("src/dispatch.ts", ["."]), true);
+  assert.equal(pathMatchesScope(".ai-team/index/feature-navigation.md", ["."]), true);
+  assert.equal(pathMatchesScope("src/dispatch.ts", ["test/**"]), false);
 });
 
 test("task revisions can take the managed draft to plan_ready transition", () => {

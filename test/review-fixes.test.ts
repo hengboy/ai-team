@@ -1050,6 +1050,114 @@ test("run resume creates one claimed coding continuation before Git commit dispa
   });
 });
 
+test("planned task prepare completion creates one identity-bound Coding continuation", async () => {
+  await withStore(async (store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
+    const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "20260817-continuation", revision: "001" });
+    const dispatches = new DispatchService(store);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+    const coordinatorId = dispatches.create(runId, "coding", {
+      ...dispatchPacket(["src/dispatch.ts", "test/review-fixes.test.ts"]),
+      context: { explorer_dispatch_id: explorerId },
+    });
+    dispatches.claim(runId, coordinatorId, "coding");
+    const prepareId = dispatches.create(runId, "git-operator", {
+      ...dispatchPacket([]),
+      context: {
+        phase: "prepare_implementation_worktree",
+        task_id: "TASK-001",
+        explorer_dispatch_id: explorerId,
+        coordinator_dispatch_id: coordinatorId,
+      },
+    }, "coding", coordinatorId);
+    await dispatches.submitValue(runId, coordinatorId, "coding", completedResult(runId, coordinatorId, "coding", { actions: ["prepare TASK-001"] }));
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_task_001", runId, "task/20260817-continuation/20260817-continuation-001--task-001", `/tmp/${runId}-task-001`, REVIEW_HEAD, new Date().toISOString());
+    dispatches.claim(runId, prepareId, "git-operator");
+    const submitted = await dispatches.submitValue(runId, prepareId, "git-operator", completedResult(runId, prepareId, "git-operator", {
+      operations: [{ command: "ai-team git prepare --task-id TASK-001", outcome: "registered worktree_task_001" }],
+    }));
+
+    assert.equal(submitted.continuation.pending_dispatches.length, 1);
+    const continuationId = submitted.continuation.pending_dispatches[0]!.dispatch_id;
+    const continuation = store.db.prepare("SELECT replacement_for,packet_json FROM dispatches WHERE dispatch_id=?").get(continuationId) as { replacement_for: string; packet_json: string };
+    const context = JSON.parse(continuation.packet_json).context;
+    assert.equal(continuation.replacement_for, coordinatorId);
+    assert.deepEqual({
+      phase: context.phase,
+      explorer_dispatch_id: context.explorer_dispatch_id,
+      coordinator_dispatch_id: context.coordinator_dispatch_id,
+      prepare_git_dispatch_id: context.prepare_git_dispatch_id,
+      task_id: context.task_id,
+      worktree_id: context.worktree_id,
+    }, {
+      phase: "continue_implementation",
+      explorer_dispatch_id: explorerId,
+      coordinator_dispatch_id: coordinatorId,
+      prepare_git_dispatch_id: prepareId,
+      task_id: "TASK-001",
+      worktree_id: "worktree_task_001",
+    });
+    assert.deepEqual(dispatches.resume(runId).pending_dispatches, submitted.continuation.pending_dispatches.map(({ dispatch_id, role, state }) => ({ dispatch_id, role, state })));
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=?").get(runId) as { count: number }).count, 0);
+
+    dispatches.claim(runId, continuationId, "coding");
+    const developerPacket = {
+      objective: "Implement TASK-001",
+      allowed_read_paths: ["src/dispatch.ts"],
+      allowed_write_paths: ["src/dispatch.ts"],
+      acceptance_criteria: ["Implement the frozen task"],
+      context: {
+        explorer_dispatch_id: explorerId,
+        coordinator_dispatch_id: continuationId,
+        task_id: "TASK-001",
+        worktree_id: "worktree_task_001",
+        worktree_path: `/tmp/${runId}-task-001`,
+      },
+    };
+    assert.throws(() => dispatches.create(runId, "backend-developer", {
+      ...developerPacket,
+      context: { ...developerPacket.context, task_id: "TASK-002" },
+    }, "coding", continuationId), /preserve its frozen task identity/);
+    assert.match(dispatches.create(runId, "backend-developer", developerPacket, "coding", continuationId), /^dispatch_/);
+  });
+});
+
+test("planned run resume restores a missing task continuation without a recovery decision", async () => {
+  await withStore(async (store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
+    const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "20260817-resume", revision: "001" });
+    const dispatches = new DispatchService(store);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+    const coordinatorId = dispatches.create(runId, "coding", { ...dispatchPacket(["src/dispatch.ts"]), context: { explorer_dispatch_id: explorerId } });
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(completedResult(runId, coordinatorId, "coding", { actions: ["prepare TASK-001"] })), new Date().toISOString(), coordinatorId);
+    const prepareId = dispatches.create(runId, "git-operator", {
+      ...dispatchPacket([]),
+      context: { phase: "prepare_implementation_worktree", task_id: "TASK-001", explorer_dispatch_id: explorerId, coordinator_dispatch_id: coordinatorId },
+    });
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(completedResult(runId, prepareId, "git-operator", { operations: [] })), new Date().toISOString(), prepareId);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_resume_task_001", runId, "task/20260817-resume/20260817-resume-001--task-001", `/tmp/${runId}-task-001`, REVIEW_HEAD, new Date().toISOString());
+
+    const first = dispatches.resume(runId);
+    const second = dispatches.resume(runId);
+    assert.equal(first.pending_dispatches.length, 1);
+    assert.deepEqual(second.pending_dispatches, first.pending_dispatches);
+    const restored = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(first.pending_dispatches[0]!.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(restored.context.phase, "continue_implementation");
+    assert.equal(restored.context.prepare_git_dispatch_id, prepareId);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=?").get(runId) as { count: number }).count, 0);
+  });
+});
+
 test("pre_commit_then_refreeze dispatches Git from the real dirty diff and refreezes post-commit evidence", async () => {
   await withStore(async (store) => {
     const repository = await temporaryDirectory();
@@ -1454,6 +1562,10 @@ test("retryable recovery decision is dispatch-bound and regenerate-context activ
       store.db.prepare("SELECT state,replacement_for FROM dispatches WHERE dispatch_id=?").get(replacementId),
       { state: "pending", replacement_for: frontendId },
     );
+    const replacementPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(replacementId) as { packet_json: string }).packet_json);
+    assert.equal(replacementPacket.context.recovery.replacement_for, frontendId);
+    assert.equal(replacementPacket.context.resolved_decision.choice, "regenerate-context");
+    assert.equal(dispatches.resume(runId).pending_decision, null);
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE replacement_for=?").get(frontendId) as { count: number }).count, 1);
   });
 });

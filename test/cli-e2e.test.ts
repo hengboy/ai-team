@@ -895,6 +895,8 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
     prompt: string;
     schema: Record<string, unknown>;
     template: Record<string, any>;
+    packet_schema: Record<string, any>;
+    packet_template: Record<string, any>;
     digests: Record<string, string>;
     renderer_version: string;
   }>(await cli(sandbox, ["dispatch", "claim", ...identity, "--bundle"]));
@@ -903,6 +905,9 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
   assert.equal(bundle.prompt, json(await cli(sandbox, ["dispatch", "prompt", ...identity])));
   assert.deepEqual(bundle.schema, json(await cli(sandbox, ["dispatch", "schema", ...identity])));
   assert.deepEqual(bundle.template, json(await cli(sandbox, ["dispatch", "template", ...identity])));
+  assert.deepEqual(bundle.packet_schema, json(await cli(sandbox, ["dispatch", "packet-schema", ...identity])));
+  assert.deepEqual(bundle.packet_template, json(await cli(sandbox, ["dispatch", "packet-template", ...identity])));
+  assert.deepEqual(bundle.packet_schema.required, ["objective", "allowed_read_paths", "allowed_write_paths", "acceptance_criteria", "context"]);
   assert.equal(bundle.renderer_version, "dispatch-renderer-v5");
   for (const digest of Object.values(bundle.digests)) assert.match(digest, /^[a-f0-9]{64}$/);
 
@@ -974,7 +979,7 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
   assert.deepEqual(submitted.staging, { staging_id: schemaError.details.staging_id, state: "consumed", content_digest: submitted.staging.content_digest });
   assert.match(submitted.staging.content_digest, /^[a-f0-9]{64}$/);
 
-  const shown = json<{ run: { state: string; stage: string }; dispatches: Array<{ dispatch_id: string; role: string; state: string }>; decisions: Array<{ status: string }> }>(
+  const shown = json<{ run: { state: string; stage: string }; dispatches: Array<{ dispatch_id: string; role: string; state: string }>; decisions: Array<{ status: string }>; continuation: typeof submitted.continuation; pending_dependencies: Array<{ dispatch_id: string; depends_on: string[] }>; suggested_commands: string[] }>(
     await cli(sandbox, ["run", "show", started.run_id]),
   );
   assert.equal(submitted.continuation.run_state, shown.run.state);
@@ -982,6 +987,9 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
   assert.deepEqual(submitted.continuation.pending_dispatches.map(({ dispatch_id, role, state }) => ({ dispatch_id, role, state })), shown.dispatches.filter(({ state }) => state === "pending" || state === "claimed").map(({ dispatch_id, role, state }) => ({ dispatch_id, role, state })));
   assert.deepEqual(submitted.continuation.pending_dispatches[0]?.depends_on, [started.dispatch_id]);
   assert.equal(submitted.continuation.pending_decision, shown.decisions.find(({ status }) => status === "pending") ?? null);
+  assert.deepEqual(shown.continuation, submitted.continuation);
+  assert.deepEqual(shown.pending_dependencies, submitted.continuation.pending_dispatches.map(({ dispatch_id, depends_on }) => ({ dispatch_id, depends_on })));
+  assert.ok(shown.suggested_commands.some((command) => command.includes(`dispatch claim --run-id ${started.run_id}`)));
 
   const second = json<{ run_id: string; dispatch_id: string }>(await cli(sandbox, [
     "planning", "start", "--project", sandbox.repo, "--request-file", requestFile,

@@ -65,7 +65,7 @@ export const canonicalizeInside = async (root: string, candidate: string, allowM
 };
 
 export const pathMatchesScope = (path: string, scopes: string[]): boolean => scopes.some((scope) => {
-  if (scope === "**") return true;
+  if (scope === "**" || scope === ".") return true;
   const prefix = scope.endsWith("/**") ? scope.slice(0, -3) : scope;
   return path === prefix || path.startsWith(`${prefix}/`);
 });
