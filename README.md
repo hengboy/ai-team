@@ -69,6 +69,11 @@ worktrees. Claim that dispatch, run `git cleanup`, validate and submit its
 frozen result, then start the replacement run. Cancellation refuses pending
 Git operations, dirty worktrees, and unsafe paths.
 
+Resolving a planned recovery decision with `repair-recreate` or
+`managed-reconcile` performs the same managed cancellation, links failed start
+runs in audit events, and returns a `git-operator` cleanup dispatch instead of
+copying the blocked Coding packet.
+
 When a retryable result reports confirmed completed side effects, `run resume`
 returns the exact `dispatch reconcile` command that creates an audited replacement
 without discarding the original dispatch lineage or verification evidence.

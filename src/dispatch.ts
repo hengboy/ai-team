@@ -661,14 +661,14 @@ export class DispatchService {
     }
     if (role === "git-operator") {
       const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string } | undefined;
-      const context = row ? (JSON.parse(row.packet_json) as DispatchPacket).context as { phase?: unknown; explorer_dispatch_id?: unknown } : {};
+      const context = row ? (JSON.parse(row.packet_json) as DispatchPacket).context as { phase?: unknown; explorer_dispatch_id?: unknown; reconciliation?: unknown } : {};
       if (run.mode === "planned" && context.phase === "prepare_worktrees") {
         if (typeof context.explorer_dispatch_id === "string") this.createPlannedCodingDispatch(runId, context.explorer_dispatch_id, result.dispatch_id);
         return;
       }
       if (context.phase === "cancel_cleanup") {
         this.store.db.prepare("UPDATE runs SET state='canceled',stage='canceled',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
-        this.store.event(runId, "run.canceled", { cleanup_dispatch_id: result.dispatch_id });
+        this.store.event(runId, "run.canceled", { cleanup_dispatch_id: result.dispatch_id, reconciliation: context.reconciliation ?? null });
         return;
       }
     }
@@ -1174,13 +1174,65 @@ export class DispatchService {
   }
 
   resolveDecision(runId: string, decisionId: string, choice: string, note?: string): string {
-    const run = this.store.getRun(runId) as { profile: string };
+    const run = this.store.getRun(runId) as { profile: string; mode?: string; repo_id?: string; plan_id?: string; revision?: string };
     if (run.profile === "planning") return this.resolvePlanningDecision(runId, decisionId, choice, note);
-    const existingDecision = this.store.db.prepare("SELECT status,choice,receipt_json,dispatch_id FROM decisions WHERE run_id=? AND decision_id=?").get(runId, decisionId) as { status: string; choice?: string; receipt_json?: string; dispatch_id?: string } | undefined;
+    const existingDecision = this.store.db.prepare("SELECT status,choice,receipt_json,dispatch_id,decision_type FROM decisions WHERE run_id=? AND decision_id=?").get(runId, decisionId) as { status: string; choice?: string; receipt_json?: string; dispatch_id?: string; decision_type: string } | undefined;
     if (existingDecision?.status === "resolved") {
       const receipt = JSON.parse(existingDecision.receipt_json ?? "{}") as { successor_dispatch_id?: string };
       if (choice === existingDecision.choice && receipt.successor_dispatch_id) return receipt.successor_dispatch_id;
       throw new ValidationError("decision is unknown, stale, or already resolved");
+    }
+    const managedPlannedRecovery = run.mode === "planned"
+      && (existingDecision?.decision_type === "planned_run_binding" && choice === "repair-recreate"
+        || existingDecision?.decision_type === "planned_run_recovery_gap" && choice === "managed-reconcile");
+    if (managedPlannedRecovery) {
+      if (!run.repo_id || !run.plan_id || !run.revision || !existingDecision?.dispatch_id) throw new ValidationError("managed planned recovery requires a bound planned run and dispatch");
+      const pendingOperation = this.store.db.prepare("SELECT operation_id FROM operations WHERE run_id=? AND state='pending' ORDER BY created_at LIMIT 1").get(runId) as { operation_id: string } | undefined;
+      if (pendingOperation) throw new ValidationError(`managed planned recovery requires operation reconciliation: ${pendingOperation.operation_id}`);
+      const worktrees = this.store.db.prepare("SELECT worktree_id FROM worktrees WHERE run_id=? AND state='active' ORDER BY created_at,worktree_id").all(runId) as Array<{ worktree_id: string }>;
+      if (!worktrees.length) throw new ValidationError("managed planned recovery requires at least one active run-owned worktree");
+      const conflicts = this.store.db.prepare(`SELECT run_id FROM runs WHERE repo_id=? AND plan_id=? AND revision=? AND run_id<>? AND state='failed'
+        ORDER BY created_at,run_id`).all(run.repo_id, run.plan_id, run.revision, runId) as Array<{ run_id: string }>;
+      let dispatchId = "";
+      this.store.db.transaction(() => {
+        const blocked = this.store.db.prepare("SELECT dispatch_id,role FROM dispatches WHERE run_id=? AND dispatch_id=? AND state IN ('needs_decision','retryable_failure')")
+          .get(runId, existingDecision.dispatch_id) as { dispatch_id: string; role: Role } | undefined;
+        if (!blocked || blocked.role !== "coding") throw new ValidationError("managed planned recovery requires a blocked Coding dispatch");
+        this.store.decide(runId, decisionId, choice, note);
+        this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?").run(new Date().toISOString(), blocked.dispatch_id);
+        dispatchId = this.insert(runId, "git-operator", validatePacket({
+          objective: "Clean every obsolete worktree owned by the anomalous planned run before recreating it.",
+          allowed_read_paths: [],
+          allowed_write_paths: [],
+          acceptance_criteria: ["Remove only clean worktrees owned by the source run", "Release plan and obsolete task branches", "Preserve reconciliation events for every failed replacement run"],
+          context: {
+            stage: "git-operator",
+            phase: "cancel_cleanup",
+            worktree_ids: worktrees.map(({ worktree_id }) => worktree_id),
+            reconciliation: {
+              decision_id: decisionId,
+              choice,
+              conflicting_run_ids: conflicts.map(({ run_id }) => run_id),
+              restart: { plan_id: run.plan_id, revision: run.revision },
+            },
+          },
+        }, "git-operator"), blocked.dispatch_id);
+        this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND dispatch_id<>? AND state IN ('pending','claimed')")
+          .run(new Date().toISOString(), runId, dispatchId);
+        this.store.db.prepare("UPDATE runs SET state='active',stage='canceling',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+        for (const conflict of conflicts) {
+          this.store.db.prepare("UPDATE runs SET state='canceled',stage='reconciled',source_run_id=?,updated_at=? WHERE run_id=? AND state='failed'")
+            .run(runId, new Date().toISOString(), conflict.run_id);
+          this.store.event(conflict.run_id, "run.failed_start_reconciled", { source_run_id: runId, decision_id: decisionId, cleanup_dispatch_id: dispatchId });
+        }
+        this.store.event(runId, "run.reconciliation_requested", { decision_id: decisionId, cleanup_dispatch_id: dispatchId, conflicting_run_ids: conflicts.map(({ run_id }) => run_id), worktree_ids: worktrees.map(({ worktree_id }) => worktree_id) });
+        const successor = this.store.db.prepare("SELECT packet_digest FROM dispatches WHERE dispatch_id=?").get(dispatchId) as { packet_digest?: string };
+        const receipt = this.store.db.prepare("SELECT receipt_json FROM decisions WHERE decision_id=?").get(decisionId) as { receipt_json: string };
+        this.store.db.prepare("UPDATE decisions SET receipt_json=? WHERE decision_id=?")
+          .run(stableJson({ ...JSON.parse(receipt.receipt_json), successor_dispatch_id: dispatchId, successor_packet_digest: successor.packet_digest ?? null, conflicting_run_ids: conflicts.map(({ run_id }) => run_id) }), decisionId);
+        this.changeStage(runId, "canceling", dispatchId);
+      })();
+      return dispatchId;
     }
     let dispatchId = "";
     this.store.db.transaction(() => {

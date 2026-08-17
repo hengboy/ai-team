@@ -655,7 +655,7 @@ test("bug and feature coding modes require a request and capture their Git basel
   }
 });
 
-test("managed run cancellation cleans owned plan worktrees before recreating a planned run", async () => {
+test("managed planned reconciliation cleans legacy worktrees, audits failed starts, and restarts idempotently", async () => {
   const repository = await createRepository();
   await initializeRepositoryContext(repository);
   await commitPlanRevision(repository, "20260817-recovery", "001");
@@ -667,23 +667,52 @@ test("managed run cancellation cleans owned plan worktrees before recreating a p
       .run("20260817-recovery", "001", identity.repoId, "ready", "main", "b".repeat(64), repository.head, new Date().toISOString());
     const workflow = new WorkflowService(store);
     const started = await workflow.codingStart({ project: repository.directory, mode: "planned", planId: "20260817-recovery", revision: "001" });
-    const cancellation = workflow.requestCancellation(started.run_id, "replace an anomalous planned run");
-    assert.equal(cancellation.state, "canceling");
-    assert.equal(cancellation.role, "git-operator");
-    const cleanupDispatchId = cancellation.dispatch_id!;
+    const taskBranch = "task/20260817-recovery/20260817-recovery-001--implementation";
+    const taskPath = path.join(repository.directory, ".worktrees", "tasks", "20260817-recovery", "20260817-recovery-001--implementation");
+    await mkdir(path.dirname(taskPath), { recursive: true });
+    await git(repository.directory, "worktree", "add", "-b", taskBranch, taskPath, repository.head);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_legacy_implementation", started.run_id, taskBranch, taskPath, repository.head, new Date().toISOString());
+    const failedRunId = store.createRun({ repoId: identity.repoId, profile: "coding", mode: "planned", planId: "20260817-recovery", revision: "001", baseCommit: repository.head, targetBranch: "main", planDigest: "b".repeat(64) });
+    store.db.prepare("UPDATE runs SET state='failed',stage='git-operator' WHERE run_id=?").run(failedRunId);
+    store.event(failedRunId, "run.start_failed", { cause: `branch or worktree belongs to another run: ${started.run_id}` });
+    const blockedDispatchId = workflow.dispatches.create(started.run_id, "coding", {
+      objective: "Recover the anomalous planned run",
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Create a managed cleanup action"],
+      context: { stage: "coding" },
+    });
+    store.db.prepare("UPDATE dispatches SET state='needs_decision' WHERE dispatch_id=?").run(blockedDispatchId);
+    store.db.prepare("UPDATE runs SET state='needs_decision',stage='coding' WHERE run_id=?").run(started.run_id);
+    const decisionId = store.createDecision(started.run_id, "How should the planned run recover?", [
+      { id: "managed-reconcile", label: "Managed reconciliation", impact: "Clean old ownership and restart" },
+      { id: "stop", label: "Stop", impact: "Keep the run blocked" },
+    ], "managed-reconcile", "planned_run_recovery_gap", blockedDispatchId);
+    const cleanupDispatchId = workflow.dispatches.resolveDecision(started.run_id, decisionId, "managed-reconcile");
+    assert.equal(workflow.dispatches.resolveDecision(started.run_id, decisionId, "managed-reconcile"), cleanupDispatchId);
+    const cleanupPacket = JSON.parse((store.db.prepare("SELECT role,packet_json FROM dispatches WHERE dispatch_id=?").get(cleanupDispatchId) as { role: string; packet_json: string }).packet_json);
+    assert.equal((store.db.prepare("SELECT role FROM dispatches WHERE dispatch_id=?").get(cleanupDispatchId) as { role: string }).role, "git-operator");
+    assert.equal(cleanupPacket.context.phase, "cancel_cleanup");
+    assert.deepEqual(cleanupPacket.context.reconciliation.conflicting_run_ids, [failedRunId]);
+    assert.deepEqual(store.db.prepare("SELECT state,stage,source_run_id FROM runs WHERE run_id=?").get(failedRunId), { state: "canceled", stage: "reconciled", source_run_id: started.run_id });
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM run_events WHERE run_id=? AND type='run.failed_start_reconciled'").get(failedRunId) as { count: number }).count, 1);
     workflow.dispatches.claim(started.run_id, cleanupDispatchId, "git-operator");
     const removed = await new GitOrchestrator(store).cleanup(started.run_id, cleanupDispatchId);
-    assert.equal(removed.length, 1);
+    assert.equal(removed.length, 2);
     await workflow.dispatches.submitValue(started.run_id, cleanupDispatchId, "git-operator", {
       ...createResultTemplate(started.run_id, cleanupDispatchId, "git-operator"),
       summary: "Canceled run worktrees removed",
       verification: [{ command: "ai-team git status", outcome: "no active run-owned worktrees" }],
-      payload: { operations: [{ command: "ai-team git cleanup", outcome: "removed one plan worktree" }] },
+      payload: { operations: [{ command: "ai-team git cleanup", outcome: "removed the plan and obsolete implementation worktrees" }] },
     });
     assert.equal(store.getRun(started.run_id).state, "canceled");
     const replacement = await workflow.codingStart({ project: repository.directory, mode: "planned", planId: "20260817-recovery", revision: "001" });
     assert.notEqual(replacement.run_id, started.run_id);
     assert.equal(store.getRun(replacement.run_id).plan_digest, "b".repeat(64));
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=? AND state='active'").get(replacement.run_id) as { count: number }).count, 1);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=? AND state='active' AND branch LIKE 'task/%'").get(replacement.run_id) as { count: number }).count, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND status='pending'").get(replacement.run_id) as { count: number }).count, 0);
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });

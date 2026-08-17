@@ -574,7 +574,12 @@ export const buildProgram = (): Command => {
     });
   run.command("resume").argument("<run-id>").action(async (runId) => output(await withStore((store) => new DispatchService(store).resume(runId))));
   run.command("cancel").argument("<run-id>").requiredOption("--reason <text>").action(async (runId, options) => output(await withStore((store) => new WorkflowService(store).requestCancellation(runId, options.reason))));
-  run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => { const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined; const dispatchId = new DispatchService(store).resolveDecision(options.runId, options.decisionId, options.choice, note); output({ status: "resolved", dispatch_id: dispatchId }); }));
+  run.command("decide").requiredOption("--run-id <id>").requiredOption("--decision-id <id>").requiredOption("--choice <id>").option("--note-file <file>").action(async (options) => withStore(async (store) => {
+    const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined;
+    const dispatchId = new DispatchService(store).resolveDecision(options.runId, options.decisionId, options.choice, note);
+    const dispatch = store.db.prepare("SELECT role FROM dispatches WHERE run_id=? AND dispatch_id=?").get(options.runId, dispatchId) as { role: string } | undefined;
+    output({ status: "resolved", dispatch_id: dispatchId, role: dispatch?.role ?? null });
+  }));
 
   const staging = program.command("staging");
   staging.command("create").requiredOption("--run-id <id>").addOption(roleOption()).addOption(new Option("--kind <kind>").choices([...STAGING_KINDS]).makeOptionMandatory()).option("--dispatch-id <id>").action(async (options) => {
