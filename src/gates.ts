@@ -19,12 +19,31 @@ export type ScopeGateStage = "triage" | "pre_write" | "pre_commit";
 export class ScopeGate {
   constructor(readonly store: StateStore) {}
 
-  check(runId: string, stage: ScopeGateStage, paths: string[]): { digest: string; complete: boolean } {
+  check(runId: string, stage: ScopeGateStage, paths: string[], worktreeId?: string): { digest: string; complete: boolean } {
     const run = this.store.getRun(runId) as any;
-    if (!(["bug", "feature"] as string[]).includes(run.mode)) throw new ValidationError("scope gate applies only to direct runs");
+    const direct = (["bug", "feature"] as string[]).includes(run.mode);
+    if (!direct && run.mode !== "planned") throw new ValidationError("scope gate applies only to direct or planned coding runs");
     const normalized = [...new Set(paths)].sort();
-    if (!normalized.length) throw new ValidationError("direct scope cannot be empty");
+    if (!normalized.length) throw new ValidationError("scope cannot be empty");
     const digest = sha256(stableJson(normalized));
+    if (!direct) {
+      if (stage !== "pre_commit") throw new ValidationError("planned runs support only the pre_commit scope gate");
+      if (!worktreeId) throw new ValidationError("planned pre_commit scope requires a worktree id");
+      const owned = this.store.db.prepare("SELECT 1 FROM worktrees WHERE worktree_id=? AND run_id=? AND state='active'").get(worktreeId, runId);
+      if (!owned) throw new ValidationError("planned pre_commit worktree does not belong to run");
+      const previous = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
+        .get(runId, worktreeId) as { payload_json: string } | undefined;
+      if (previous) {
+        const existing = JSON.parse(previous.payload_json) as { digest: string };
+        if (existing.digest !== digest) {
+          this.store.db.prepare("UPDATE runs SET state='frozen',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+          throw new ValidationError("planned pre_commit scope changed; run frozen");
+        }
+        return { digest, complete: true };
+      }
+      this.store.event(runId, "scope.pre_commit", { stage, digest, paths: normalized, worktree_id: worktreeId });
+      return { digest, complete: true };
+    }
     const previous = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type LIKE 'scope.%' ORDER BY event_id").all(runId) as Array<{ payload_json: string }>;
     const existing = previous.map((row) => JSON.parse(row.payload_json) as { stage: ScopeGateStage; digest: string });
     if (existing.some((item) => item.digest !== digest)) {
@@ -40,6 +59,15 @@ export class ScopeGate {
     this.store.event(runId, `scope.${stage}`, { stage, digest, paths: normalized });
     if (stage === "pre_write") new DispatchService(this.store).ensureGitPrepareDispatch(runId, "implementation");
     return { digest, complete: stage === "pre_commit" };
+  }
+
+  assertPreCommit(runId: string, paths: string[], worktreeId: string): void {
+    const digest = sha256(stableJson([...new Set(paths)].sort()));
+    const event = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
+      .get(runId, worktreeId) as { payload_json: string } | undefined;
+    if (!event || (JSON.parse(event.payload_json) as { digest?: string }).digest !== digest) {
+      throw new ValidationError("planned run has not passed pre_commit scope gate for this worktree");
+    }
   }
 
   assertPassed(runId: string, stage: Exclude<ScopeGateStage, "pre_commit">): void {

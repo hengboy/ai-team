@@ -11,6 +11,7 @@ import { StateStore } from "./state.js";
 import { assertRevisionRunStage } from "./planning.js";
 import { assertRelativePosixPath, makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
 import type { ReviewFinding, ReviewResult } from "./review.js";
+import { ScopeGate } from "./gates.js";
 
 export interface DispatchPacket {
   objective: string;
@@ -387,7 +388,13 @@ export class DispatchService {
     return dispatchId;
   }
 
-  private recoveryReplacement(runId: string, failed: { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string }, resolvedDecision?: Record<string, unknown>): string {
+  private recoveryReplacement(
+    runId: string,
+    failed: { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string },
+    resolvedDecision?: Record<string, unknown>,
+    replacementFor = failed.dispatch_id,
+    additionalVerification: unknown[] = [],
+  ): string {
     const previous = JSON.parse(failed.packet_json) as DispatchPacket;
     const result = failed.result_json ? JSON.parse(failed.result_json) as ResultEnvelope : undefined;
     let root = failed;
@@ -440,15 +447,69 @@ export class DispatchService {
         ...(adoptionEvidence?.implementation_revision ? { implementation_revision: adoptionEvidence.implementation_revision } : {}),
         ...(resolvedDecision ? { resolved_decision: resolvedDecision } : {}),
         recovery: {
-          replacement_for: failed.dispatch_id,
+          replacement_for: replacementFor,
           source_packet_digest: originalRecovery?.source_packet_digest ?? root.packet_digest ?? sha256(root.packet_json),
           source_artifact_id: originalRecovery?.source_artifact_id ?? artifact?.artifact_id ?? null,
           source_artifact_digest: originalRecovery?.source_artifact_digest ?? artifact?.sha256 ?? null,
-          completed_verification: [...completedVerification, ...(result?.verification ?? [])],
+          completed_verification: [...completedVerification, ...(result?.verification ?? []), ...additionalVerification],
         },
       },
     }, failed.role);
-    return this.insert(runId, failed.role, packet, failed.dispatch_id);
+    return this.insert(runId, failed.role, packet, replacementFor);
+  }
+
+  private plannedOwnershipRecovery(
+    runId: string,
+    failed: { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string },
+  ): string | undefined {
+    if (failed.role !== "git-operator") return undefined;
+    const run = this.store.getRun(runId) as { mode?: string; repo_id: string; plan_id?: string; revision?: string };
+    if (run.mode !== "planned" || !run.plan_id || !run.revision) return undefined;
+    const packet = JSON.parse(failed.packet_json) as DispatchPacket;
+    const context = packet.context as { phase?: unknown; integration_worktree_id?: unknown; task_worktree_ids?: unknown };
+    if (context.phase !== "integrate_implementation"
+      || typeof context.integration_worktree_id !== "string"
+      || !Array.isArray(context.task_worktree_ids)
+      || context.task_worktree_ids.some((id) => typeof id !== "string")) return undefined;
+    const worktreeIds = [...new Set([context.integration_worktree_id, ...(context.task_worktree_ids as string[])])];
+    const rows = worktreeIds.map((worktreeId) => this.store.db.prepare(`SELECT w.worktree_id,w.run_id,w.branch,w.path,r.repo_id
+      FROM worktrees w JOIN runs r ON r.run_id=w.run_id WHERE w.worktree_id=? AND w.state='active'`).get(worktreeId) as {
+        worktree_id: string; run_id: string; branch: string; path: string; repo_id: string;
+      } | undefined);
+    if (rows.some((row) => !row || row.repo_id !== run.repo_id)) return undefined;
+    const foreign = rows.filter((row) => row!.run_id !== runId).map((row) => row!);
+    if (!foreign.length) return undefined;
+    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
+    if (!repository) return undefined;
+    const planRevision = `${run.plan_id}-${run.revision}`;
+    const integration = rows[0]!;
+    const expectedPlanPath = join(repository.project_path, ".worktrees", "plans", run.plan_id, planRevision);
+    if (integration.branch !== `plan/${run.plan_id}/${planRevision}` || integration.path !== expectedPlanPath) return undefined;
+    if (rows.slice(1).some((row) => !row!.branch.startsWith(`task/${run.plan_id}/${planRevision}--`))) return undefined;
+    const dispatchId = this.insert(runId, "git-operator", validatePacket({
+      objective: "Restore this planned run's registered worktree ownership before retrying the frozen task merge.",
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Transfer only the listed clean managed worktrees to this run", "Do not perform the task merge in this dispatch"],
+      context: {
+        stage: "git-operator",
+        phase: "reconcile_worktree_ownership",
+        source_dispatch_id: failed.dispatch_id,
+        integration_worktree_id: context.integration_worktree_id,
+        task_worktree_ids: context.task_worktree_ids,
+        worktree_ids: foreign.map(({ worktree_id }) => worktree_id),
+        recovery: {
+          replacement_for: failed.dispatch_id,
+          source_packet_digest: failed.packet_digest ?? sha256(failed.packet_json),
+        },
+      },
+    }, "git-operator"), failed.dispatch_id);
+    this.store.event(runId, "worktree.ownership_reconcile_created", {
+      dispatch_id: dispatchId,
+      source_dispatch_id: failed.dispatch_id,
+      worktree_ids: foreign.map(({ worktree_id }) => worktree_id),
+    });
+    return dispatchId;
   }
 
   private get(runId: string, dispatchId: string, role: Role): any {
@@ -942,13 +1003,21 @@ export class DispatchService {
     }
     if (role === "git-operator") {
       const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string } | undefined;
-      const context = row ? (JSON.parse(row.packet_json) as DispatchPacket).context as { phase?: unknown; explorer_dispatch_id?: unknown; reconciliation?: unknown } : {};
+      const context = row ? (JSON.parse(row.packet_json) as DispatchPacket).context as { phase?: unknown; explorer_dispatch_id?: unknown; reconciliation?: unknown; source_dispatch_id?: unknown } : {};
       if (run.mode === "planned" && context.phase === "prepare_worktrees") {
         if (typeof context.explorer_dispatch_id === "string") this.createPlannedCodingDispatch(runId, context.explorer_dispatch_id, result.dispatch_id);
         return;
       }
       if (run.mode === "planned" && context.phase === "prepare_implementation_worktree") {
         this.ensurePlannedTaskContinuation(runId, result.dispatch_id);
+        return;
+      }
+      if (run.mode === "planned" && context.phase === "reconcile_worktree_ownership") {
+        if (typeof context.source_dispatch_id !== "string") throw new ValidationError("ownership reconciliation is missing its source merge dispatch");
+        const failed = this.store.db.prepare("SELECT dispatch_id,role,packet_json,packet_digest,result_json,replacement_for FROM dispatches WHERE run_id=? AND dispatch_id=?")
+          .get(runId, context.source_dispatch_id) as { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string } | undefined;
+        if (!failed) throw new ValidationError("ownership reconciliation source merge dispatch was not found");
+        this.recoveryReplacement(runId, failed, undefined, result.dispatch_id, result.verification);
         return;
       }
       if (context.phase === "cancel_cleanup") {
@@ -1146,7 +1215,7 @@ export class DispatchService {
   }
 
   private assertGitPrepareResult(runId: string, packet: DispatchPacket): void {
-    const context = packet.context as { phase?: unknown; task_id?: unknown };
+    const context = packet.context as { phase?: unknown; task_id?: unknown; worktree_ids?: unknown };
     if (context.phase === "prepare_worktrees") {
       const worktree = this.activeIntegrationWorktree(runId);
       if (!worktree) throw new ValidationError("prepare_worktrees requires a registered active integration worktree or plan worktree owned by this run");
@@ -1156,6 +1225,13 @@ export class DispatchService {
       const worktree = this.store.db.prepare("SELECT 1 FROM worktrees WHERE run_id=? AND state='active' AND (branch LIKE ? OR branch LIKE ?)")
         .get(runId, `task/%/${taskId}`, `task/%--${taskId}`);
       if (!worktree) throw new ValidationError("prepare_implementation_worktree requires a registered active implementation task worktree owned by this run");
+    }
+    if (context.phase === "reconcile_worktree_ownership") {
+      if (!Array.isArray(context.worktree_ids) || !context.worktree_ids.length || context.worktree_ids.some((id) => typeof id !== "string")) {
+        throw new ValidationError("ownership reconciliation requires registered worktree ids");
+      }
+      const owned = context.worktree_ids.every((worktreeId) => this.store.db.prepare("SELECT 1 FROM worktrees WHERE worktree_id=? AND run_id=? AND state='active'").get(worktreeId, runId));
+      if (!owned) throw new ValidationError("ownership reconciliation did not transfer every worktree to this run");
     }
   }
 
@@ -1739,7 +1815,7 @@ export class DispatchService {
       ORDER BY created_at DESC LIMIT 1`).get(runId, decision.decision_id) as { dispatch_id: string } | undefined;
     if (existing) return existing.dispatch_id;
 
-    const run = this.store.getRun(runId) as { plan_id?: string; revision?: string; plan_digest?: string };
+    const run = this.store.getRun(runId) as { mode?: string; plan_id?: string; revision?: string; plan_digest?: string };
     const worktree = this.activeIntegrationWorktree(runId);
     if (!worktree) return undefined;
     const developers = this.store.db.prepare(`SELECT d.dispatch_id,d.role,d.packet_json,d.completed_at FROM dispatches d
@@ -1774,6 +1850,9 @@ export class DispatchService {
 
     const changedPaths = dirtyWorktreePaths(worktree.path);
     const blockedPaths = changedPaths.filter((path) => !pathMatchesScope(path, developerAllowedWritePaths));
+    if (run.mode === "planned" && changedPaths.length && !blockedPaths.length) {
+      new ScopeGate(this.store).check(runId, "pre_commit", developerAllowedWritePaths, worktree.worktree_id);
+    }
     const commonContext = {
       decision_id: decision.decision_id,
       review_dispatch_id: sourceReviewId,
@@ -1868,6 +1947,20 @@ export class DispatchService {
       catch { return []; }
     }))];
     if (changedPaths.some((path) => !pathMatchesScope(path, authorizedPaths as string[]))) throw new ValidationError("coding continuation developer paths are not authorized by Explorer evidence");
+    const plannedScopeDigests: Array<{ worktree_id: string; digest: string }> = [];
+    if (run.mode === "planned") {
+      for (const worktreeId of uncommittedWorktreeIds) {
+        const scopes = [...new Set(developers.flatMap((developer) => {
+          try {
+            const packet = JSON.parse(developer.packet_json) as DispatchPacket;
+            return packet.context.worktree_id === worktreeId ? packet.allowed_write_paths : [];
+          } catch { return []; }
+        }))];
+        if (!scopes.length) throw new ValidationError("planned pre_commit scope requires frozen developer write paths");
+        const gate = new ScopeGate(this.store).check(runId, "pre_commit", scopes, worktreeId);
+        plannedScopeDigests.push({ worktree_id: worktreeId, digest: gate.digest });
+      }
+    }
     const scope = preCommit ? JSON.parse(preCommit.payload_json) as { digest?: unknown } : undefined;
     const packet = validatePacket({
       objective: "Continue the completed implementation by dispatching Git Operator to commit every uncommitted task worktree.",
@@ -1882,7 +1975,9 @@ export class DispatchService {
         developer_dispatch_ids: developers.map((developer) => developer.dispatch_id),
         task_worktree_ids: uncommittedWorktreeIds,
         changed_paths: changedPaths,
-        scope_digest: typeof scope?.digest === "string" ? scope.digest : sha256(stableJson(changedPaths.sort())),
+        scope_digest: plannedScopeDigests.length
+          ? sha256(stableJson(plannedScopeDigests))
+          : typeof scope?.digest === "string" ? scope.digest : sha256(stableJson(changedPaths.sort())),
       },
     }, "coding");
     assertExplorerAuthorization(this.store, runId, "coding", packet);
@@ -2005,7 +2100,7 @@ export class DispatchService {
         this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
           .run(new Date().toISOString(), retryableDispatch.dispatch_id);
         this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
-        this.recoveryReplacement(runId, retryableDispatch);
+        if (!this.plannedOwnershipRecovery(runId, retryableDispatch)) this.recoveryReplacement(runId, retryableDispatch);
         return;
       }
       if (run.state === "retryable_failure") return;

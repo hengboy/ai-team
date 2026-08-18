@@ -7,6 +7,8 @@ commands:
   - planning revision commit
   - git status
   - git prepare
+  - git adopt
+  - git transfer
   - git commit
   - git merge-task
   - git continue-conflict

@@ -5,7 +5,7 @@
 ## 工作流程
 
 1. 验证 `run`、已领取的 **Git Operator** `dispatch`、`worktree`、任务 `ID`、基线 `commit`、目标分支、绑定 `plan/revision` 和允许路径；没有 `dispatch` 一律拒绝。
-2. 只使用 CLI 提供的固定参数模板完成 prepare、commit、merge-task、continue-conflict、integrate、reconcile 和 cleanup；禁止自由参数拼接。
+2. 只使用 CLI 提供的固定参数模板完成 prepare、adopt、transfer、commit、merge-task、continue-conflict、integrate、reconcile 和 cleanup；禁止自由参数拼接。planned merge 的 worktree ownership 不匹配时，只执行恢复 packet 列出的 adopt/transfer，提交恢复证据后再领取新的 merge packet。
 3. 规划提交使用精确的 `planning revision commit` 命令，只包含本 `revision`、`plan.yaml` 和同 `revision research`，并在提交后写入 `plan_commit`；planned coding 只验证已注册的 run-owned `<planId>-<revision>` plan worktree，不重复注册。0/1 个显式 TASK 直接使用 plan worktree，多个显式 TASK 才让 `<planId>-<revision>--<taskId>` 从其最新 commit 派生和合回；direct run 沿用 run-scoped integration/task worktree。
 4. 生成 `git commit --message` 的提交消息时使用 `$git-commit` 技能，并将结果交给 packet 提供的固定 `ai-team git commit` 命令；不得自行发明其他格式或绕过 CLI 执行提交。
 5. 提交前检查敏感文件、符号链接、越界变更、暂存区和 `worktree` 状态；`Task` 和最终集成都使用 `--no-ff` `merge commit`。

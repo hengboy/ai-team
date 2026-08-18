@@ -50,6 +50,25 @@ test("direct scope passes three matching gates and freezes on drift", async () =
   } finally { store.close(); await rm(home, { recursive: true, force: true }); }
 });
 
+test("planned pre_commit scope is bound to its run-owned worktree", async () => {
+  const home = await mkdtemp(join(tmpdir(), "ai-team-planned-gate-"));
+  const store = await StateStore.open(home);
+  try {
+    store.registerRepository("repo", "/tmp/repo.git", "/tmp/repo");
+    const run = store.createRun({ repoId: "repo", profile: "coding", mode: "planned", planId: "planned-gate", revision: "001" });
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_planned_gate", run, "task/planned-gate/planned-gate-001--task-001", "/tmp/repo/.worktrees/tasks/planned-gate/planned-gate-001--task-001", "a".repeat(40), new Date().toISOString());
+    const gate = new ScopeGate(store);
+    assert.throws(() => gate.check(run, "pre_write", ["src/**"], "worktree_planned_gate"), /only the pre_commit/);
+    assert.throws(() => gate.check(run, "pre_commit", ["src/**"]), /requires a worktree id/);
+    const completed = gate.check(run, "pre_commit", ["src/**"], "worktree_planned_gate");
+    assert.equal(completed.complete, true);
+    assert.deepEqual(gate.check(run, "pre_commit", ["src/**"], "worktree_planned_gate"), completed);
+    gate.assertPreCommit(run, ["src/**"], "worktree_planned_gate");
+    assert.throws(() => gate.assertPreCommit(run, ["test/**"], "worktree_planned_gate"), /has not passed pre_commit/);
+  } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+});
+
 test("planning commit stages only the immutable revision and includes trailers", async () => {
   const root = await mkdtemp(join(tmpdir(), "ai-team-plan-commit-"));
   try {

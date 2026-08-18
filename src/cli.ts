@@ -778,7 +778,7 @@ export const buildProgram = (): Command => {
   gitCommand.command("cleanup").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").action(async ({ runId, dispatchId }) => output({ removed: await withStore((store) => new GitOrchestrator(store).cleanup(runId, dispatchId)) }));
 
   const scope = program.command("scope");
-  scope.command("check").requiredOption("--run-id <id>").addOption(new Option("--stage <stage>").choices(["triage", "pre_write", "pre_commit"]).makeOptionMandatory()).requiredOption("--paths <paths>", "comma-separated repository-relative paths").action(async (options) => output(await withStore((store) => new ScopeGate(store).check(options.runId, options.stage, options.paths.split(",")))));
+  scope.command("check").requiredOption("--run-id <id>").addOption(new Option("--stage <stage>").choices(["triage", "pre_write", "pre_commit"]).makeOptionMandatory()).requiredOption("--paths <paths>", "comma-separated repository-relative paths").option("--worktree-id <id>", "required for planned pre_commit scope").action(async (options) => output(await withStore((store) => new ScopeGate(store).check(options.runId, options.stage, options.paths.split(","), options.worktreeId))));
 
   const decision = program.command("decision");
   decision.command("schema").action(() => output(DECISION_INPUT_SCHEMA));

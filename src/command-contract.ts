@@ -88,7 +88,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "run resume": ["ai-team run resume <run-id>"],
   "run cancel": ["ai-team run cancel <run-id> --reason <text>"],
   "run decide": ["ai-team run decide --run-id <run-id> --decision-id <opaque-id> --choice <text> [--note-file <file>]"],
-  "scope check": ["ai-team scope check --run-id <run-id> --stage <stage> --paths <paths>"],
+  "scope check": ["ai-team scope check --run-id <run-id> --stage <stage> --paths <paths> [--worktree-id <worktree-id>]"],
   "review create": ["ai-team review create --run-id <run-id> --revision-sha <commit> [--formal]"],
   "review schema": ["ai-team review schema"],
   "review submit": ["ai-team review submit --run-id <run-id> --barrier-id <opaque-id> ((--result-file <json> | --staging-id <staging-id>) | --role <role> --input-stdin)"],

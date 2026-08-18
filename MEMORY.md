@@ -48,7 +48,7 @@
 - `src/cli.ts` 负责绑定命令、恢复操作和规范 JSON 输出。
 - `src/workflow.ts` 负责 coding run 启动、主工作树 clean gate、实现基线冻结、planned plan worktree 创建，以及生成受管取消清理 dispatch。
 - `src/dispatch.ts` 负责校验、提交、规划生命周期、恢复和提交调度门禁。
-- `src/dispatch.ts` 同时负责 retryable replacement lineage、dispatch-bound typed decision、planned recovery decision 到 Git cleanup 的转换、planned Git-before-Coding 依赖、integration commit 门禁和冻结 review packet。
+- `src/dispatch.ts` 同时负责 retryable replacement lineage、planned merge 前置 worktree ownership 恢复、dispatch-bound typed decision、planned recovery decision 到 Git cleanup 的转换、planned Git-before-Coding 依赖、integration commit 门禁和冻结 review packet。
 - `src/state.ts` 负责 SQLite 的读写打开路径、前向迁移、锁、运行、决策、replacement 和操作记录。
 - `src/planning.ts` 负责校验完整修订文档以及修订与运行阶段的一致性。
 - `src/contracts.ts` 负责结果信封和角色载荷 schema。
@@ -66,7 +66,7 @@
 - `src/dispatch.ts` 负责 delegated role 自提交回执、renderer 版本冻结，以及 `verify_existing` 驱动的受审计 `no_change` 规划终态。
 
 ### 模块边界
-- `src/git-orchestrator.ts` 与 `src/git.ts` 负责 planned revision-scoped plan/task worktree、direct run-scoped integration/task 编排、clean worktree adopt/transfer，并将相关身份写入操作证据。
+- `src/git-orchestrator.ts` 与 `src/git.ts` 负责 planned revision-scoped plan/task worktree、direct run-scoped integration/task 编排、clean worktree adopt/transfer、planned pre_commit worktree scope 与 no-ff merge，并将相关身份写入操作证据。
 - `src/review.ts` 仅评审已通过独立测试的 planned plan HEAD 或 direct integration HEAD，并验证 code-reviewer packet 的 revision、文档、diff、testedCommit 与 evidence digest 绑定。
 - `src/context.ts` 仅以 `.ai-team/index/feature-navigation.md` 为权威导航路径，并负责 schema/renderer 版本记录及旧格式迁移。
 - `src/environment.ts` 与 `agent-build/roles` 负责受管角色生成、能力定义及只读环境查询。
