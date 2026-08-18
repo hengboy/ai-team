@@ -236,6 +236,211 @@ test("planned pre_commit accepts the exact plan-owned worktree without changing 
   }
 });
 
+test("planned resume replaces a clean stale next-Task worktree from current plan HEAD without replaying the prior merge", async () => {
+  const fixture = await createFixture();
+  try {
+    const planId = "20260818-stale-task";
+    const revision = "001";
+    const taskRoot = join(fixture.root, ".ai-team", "plans", planId, "revisions", revision, "tasks");
+    await mkdir(join(fixture.root, ".ai-team", "index"), { recursive: true });
+    await mkdir(taskRoot, { recursive: true });
+    await writeFile(join(fixture.root, "MEMORY.md"), "# fixture\n");
+    await writeFile(join(fixture.root, ".ai-team", "index", "feature-navigation.md"), "# fixture\n");
+    await writeFile(join(taskRoot, "TASK-001.md"), "# TASK-001\n");
+    await writeFile(join(taskRoot, "TASK-002.md"), "# TASK-002\n");
+    await rawGit(fixture.root, ["add", ".ai-team", "MEMORY.md"]);
+    await rawGit(fixture.root, ["commit", "-m", "Freeze stale task fixture"]);
+    const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    const identity = await repositoryIdentity(fixture.root);
+    const runId = fixture.store.createRun({
+      repoId: identity.repoId,
+      profile: "coding",
+      mode: "planned",
+      planId,
+      revision,
+      baseCommit,
+      targetBranch: "main",
+    });
+    fixture.store.initializeRunTasks(runId, ["TASK-001", "TASK-002"].map((taskId, index) => ({
+      task_id: taskId,
+      source_path: `.ai-team/plans/${planId}/revisions/${revision}/tasks/${taskId}.md`,
+      source_digest: String(index + 1).repeat(64),
+    })));
+    const plan = await fixture.orchestrator.prepareIntegration(runId);
+    const staleSecond = await fixture.orchestrator.prepareTask(runId, "TASK-002");
+    const first = await fixture.orchestrator.prepareTask(runId, "TASK-001");
+    await writeFile(join(first.path, "task-one.txt"), "task one\n");
+    new ScopeGate(fixture.store).check(runId, "pre_commit", ["task-one.txt"], first.worktree_id);
+    await fixture.orchestrator.commit(runId, first.worktree_id, "Complete TASK-001", ["task-one.txt"]);
+    const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, first.worktree_id);
+
+    const dispatches = new DispatchService(fixture.store);
+    const packet = {
+      objective: "Recover the stale next Task",
+      allowed_read_paths: ["MEMORY.md", ".ai-team/index/feature-navigation.md", "task-one.txt"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Preserve prior integration"],
+      context: {},
+    };
+    const explorerId = dispatches.create(runId, "file-explorer", { ...packet, allowed_read_paths: ["."] });
+    const explorerResult = {
+      ...createResultTemplate(runId, explorerId, "file-explorer"),
+      summary: "scope complete",
+      verification: [{ command: "fixture", outcome: "passed" }],
+      payload: {
+        allowed_read_paths: packet.allowed_read_paths,
+        entry_points: ["MEMORY.md"],
+        test_commands: ["fixture"],
+        project_context: {
+          project_shape: "fixture",
+          memory: { domain_terms: [], repository_constraints: [], responsibilities: [], module_boundaries: [] },
+          navigation: [{ feature: "Fixture", keywords: ["fixture"], entry_paths: ["MEMORY.md"], module_boundary: "root" }],
+          maintenance: { status: "current", paths: ["MEMORY.md", ".ai-team/index/feature-navigation.md"] },
+        },
+      },
+    };
+    fixture.store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(explorerResult), new Date().toISOString(), explorerId);
+    const coordinatorId = dispatches.create(runId, "coding", { ...packet, context: { explorer_dispatch_id: explorerId, worktree_id: plan.worktree_id } });
+    fixture.store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify({ ...createResultTemplate(runId, coordinatorId, "coding"), summary: "TASK-001 integrated", verification: [], payload: { actions: [] } }), new Date().toISOString(), coordinatorId);
+
+    const resumed = dispatches.resume(runId);
+    const replacement = resumed.pending_dispatches.find(({ role }) => role === "git-operator")!;
+    const replacementPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(replacement.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(replacementPacket.context.task_id, "TASK-002");
+    assert.equal(replacementPacket.context.base_commit, merged);
+    assert.equal(replacementPacket.context.replace_worktree_id, staleSecond.worktree_id);
+    assert.equal(replacementPacket.context.replace_base_commit, baseCommit);
+    assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.merge.task'").get(runId) as { count: number }).count, 1);
+
+    dispatches.claim(runId, replacement.dispatch_id, "git-operator");
+    const refreshed = await fixture.orchestrator.prepareTask(runId, "TASK-002", merged, undefined, replacement.dispatch_id);
+    assert.equal(refreshed.worktree_id, staleSecond.worktree_id);
+    assert.equal(refreshed.base_commit, merged);
+    assert.equal(await rawGit(refreshed.path, ["rev-parse", "HEAD"]), merged);
+    assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.merge.task'").get(runId) as { count: number }).count, 1);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("planned single explicit Task reuses the plan worktree and reaches final Test only after integration", async () => {
+  const fixture = await createFixture();
+  try {
+    const planId = "20260818-single-task";
+    const revision = "001";
+    const taskRoot = join(fixture.root, ".ai-team", "plans", planId, "revisions", revision, "tasks");
+    await mkdir(join(fixture.root, ".ai-team", "index"), { recursive: true });
+    await mkdir(taskRoot, { recursive: true });
+    await writeFile(join(fixture.root, "MEMORY.md"), "# fixture\n");
+    await writeFile(join(fixture.root, ".ai-team", "index", "feature-navigation.md"), "# fixture\n");
+    await writeFile(join(fixture.root, ".ai-team", "plans", planId, "revisions", revision, "plan.md"), "# plan\n");
+    await writeFile(join(taskRoot, "TASK-001.md"), "# TASK-001\n");
+    await writeFile(join(fixture.root, "package.json"), JSON.stringify({ name: "fixture", scripts: { test: "node --test" } }));
+    await rawGit(fixture.root, ["add", ".ai-team", "MEMORY.md", "package.json"]);
+    await rawGit(fixture.root, ["commit", "-m", "Freeze single task fixture"]);
+    const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    const identity = await repositoryIdentity(fixture.root);
+    const runId = fixture.store.createRun({ repoId: identity.repoId, profile: "coding", mode: "planned", planId, revision, baseCommit, targetBranch: "main" });
+    fixture.store.initializeRunTasks(runId, [{
+      task_id: "TASK-001",
+      source_path: `.ai-team/plans/${planId}/revisions/${revision}/tasks/TASK-001.md`,
+      source_digest: "1".repeat(64),
+    }]);
+    const plan = await fixture.orchestrator.prepareIntegration(runId);
+    const dispatches = new DispatchService(fixture.store);
+    const packet = (allowedReadPaths: string[] = []) => ({
+      objective: "Exercise a single frozen Task",
+      allowed_read_paths: allowedReadPaths,
+      allowed_write_paths: [],
+      acceptance_criteria: ["Preserve the single Task identity"],
+      context: {},
+    });
+    const result = (dispatchId: string, role: Parameters<typeof createResultTemplate>[2], payload: Record<string, unknown>) => ({
+      ...createResultTemplate(runId, dispatchId, role),
+      summary: `${role} completed`,
+      verification: [{ command: "fixture", outcome: "passed" }],
+      payload,
+    });
+    const explorerId = dispatches.create(runId, "file-explorer", packet(["."]));
+    dispatches.claim(runId, explorerId, "file-explorer");
+    const explored = await dispatches.submitValue(runId, explorerId, "file-explorer", result(explorerId, "file-explorer", {
+      allowed_read_paths: ["MEMORY.md", ".ai-team/index/feature-navigation.md", "single.txt"],
+      entry_points: ["MEMORY.md"],
+      test_commands: ["npm run test"],
+      project_context: {
+        project_shape: "fixture",
+        memory: { domain_terms: [], repository_constraints: [], responsibilities: [], module_boundaries: [] },
+        navigation: [{ feature: "Fixture", keywords: ["fixture"], entry_paths: ["MEMORY.md"], module_boundary: "root" }],
+        maintenance: { status: "current", paths: ["MEMORY.md", ".ai-team/index/feature-navigation.md"] },
+      },
+    }));
+    const verifyPlan = explored.continuation.pending_dispatches.find(({ role }) => role === "git-operator")!;
+    dispatches.claim(runId, verifyPlan.dispatch_id, "git-operator");
+    const verified = await dispatches.submitValue(runId, verifyPlan.dispatch_id, "git-operator", result(verifyPlan.dispatch_id, "git-operator", {
+      operations: [{ command: "verify plan worktree", outcome: plan.worktree_id }],
+    }));
+    assert.deepEqual(fixture.store.runTasks(runId).map(({ state, worktree_id }) => ({ state, worktree_id })), [{ state: "prepared", worktree_id: plan.worktree_id }]);
+    assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=? AND branch LIKE 'task/%'").get(runId) as { count: number }).count, 0);
+
+    const coordinator = verified.continuation.pending_dispatches.find(({ role }) => role === "coding")!;
+    dispatches.claim(runId, coordinator.dispatch_id, "coding");
+    const developerId = dispatches.create(runId, "backend-developer", {
+      ...packet(["single.txt"]),
+      allowed_write_paths: ["single.txt"],
+      context: {
+        explorer_dispatch_id: explorerId,
+        coordinator_dispatch_id: coordinator.dispatch_id,
+        task_id: "TASK-001",
+        worktree_id: plan.worktree_id,
+        worktree_path: plan.path,
+      },
+    }, "coding", coordinator.dispatch_id);
+    dispatches.claim(runId, developerId, "backend-developer");
+    await writeFile(join(plan.path, "single.txt"), "single task\n");
+    await dispatches.submitValue(runId, coordinator.dispatch_id, "coding", result(coordinator.dispatch_id, "coding", { actions: ["implement TASK-001"] }));
+    await dispatches.submitValue(runId, developerId, "backend-developer", result(developerId, "backend-developer", {
+      modified_paths: ["single.txt"], self_tests: [{ command: "npm run test", outcome: "passed" }],
+    }));
+    assert.equal(fixture.store.runTasks(runId)[0]!.state, "implemented");
+
+    const taskTest = dispatches.continuation(runId).pending_dispatches.find(({ role }) => role === "test")!;
+    const taskTestPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(taskTest.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(taskTestPacket.context.phase, "task_test");
+    dispatches.claim(runId, taskTest.dispatch_id, "test");
+    await dispatches.submitValue(runId, taskTest.dispatch_id, "test", result(taskTest.dispatch_id, "test", {
+      checks: taskTestPacket.context.test_commands.map((command: string) => ({ command, outcome: "passed" })),
+    }));
+    assert.equal(fixture.store.runTasks(runId)[0]!.state, "tested");
+
+    const commitContinuation = dispatches.resume(runId).pending_dispatches.find(({ role }) => role === "coding")!;
+    dispatches.claim(runId, commitContinuation.dispatch_id, "coding");
+    const commitDispatch = dispatches.create(runId, "git-operator", {
+      ...packet(["single.txt"]),
+      context: { phase: "commit_implementation", explorer_dispatch_id: explorerId, task_id: "TASK-001", worktree_id: plan.worktree_id },
+    }, "coding", commitContinuation.dispatch_id);
+    dispatches.claim(runId, commitDispatch, "git-operator");
+    const committed = await fixture.orchestrator.commit(runId, plan.worktree_id, "Complete TASK-001", ["single.txt"], commitDispatch);
+    await dispatches.submitValue(runId, commitDispatch, "git-operator", result(commitDispatch, "git-operator", {
+      operations: [{ command: "commit TASK-001", outcome: committed.commit }],
+    }));
+    assert.equal(fixture.store.runTasks(runId)[0]!.state, "integrated");
+
+    const finalTest = dispatches.continuation(runId).pending_dispatches.find(({ role, dispatch_id }) => {
+      if (role !== "test") return false;
+      const row = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatch_id) as { packet_json: string };
+      return JSON.parse(row.packet_json).context.phase !== "task_test";
+    })!;
+    const finalPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(finalTest.dispatch_id) as { packet_json: string }).packet_json);
+    assert.deepEqual(finalPacket.context.frozen_task_ids, ["TASK-001"]);
+    assert.deepEqual(finalPacket.context.implementation_artifacts.map((artifact: { task_id: string }) => artifact.task_id), ["TASK-001"]);
+    assert.deepEqual(finalPacket.context.changed_paths, ["single.txt"]);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
 test("planned multi-task run continues from prepare through test and derives the next task from the no-ff merge", async () => {
   const fixture = await createFixture();
   try {
@@ -246,9 +451,12 @@ test("planned multi-task run continues from prepare through test and derives the
     await mkdir(taskRoot, { recursive: true });
     await writeFile(join(fixture.root, "MEMORY.md"), "# fixture\n");
     await writeFile(join(fixture.root, ".ai-team", "index", "feature-navigation.md"), "# fixture\n");
+    await writeFile(join(fixture.root, ".ai-team", "plans", planId, "revisions", revision, "plan.md"), "# plan\n\n## 验证\n\n- Run repository scripts.\n");
     await writeFile(join(taskRoot, "TASK-001.md"), "# TASK-001\n");
     await writeFile(join(taskRoot, "TASK-002.md"), "# TASK-002\n");
-    await rawGit(fixture.root, ["add", ".ai-team", "MEMORY.md"]);
+    await writeFile(join(taskRoot, "TASK-003.md"), "# TASK-003\n");
+    await writeFile(join(fixture.root, "package.json"), JSON.stringify({ name: "fixture", scripts: { test: "node --test", lint: "eslint ." } }));
+    await rawGit(fixture.root, ["add", ".ai-team", "MEMORY.md", "package.json"]);
     await rawGit(fixture.root, ["commit", "-m", "Freeze continuation tasks"]);
     const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
     const identity = await repositoryIdentity(fixture.root);
@@ -261,6 +469,11 @@ test("planned multi-task run continues from prepare through test and derives the
       baseCommit,
       targetBranch: "main",
     });
+    fixture.store.initializeRunTasks(runId, ["TASK-001", "TASK-002", "TASK-003"].map((taskId, index) => ({
+      task_id: taskId,
+      source_path: `.ai-team/plans/${planId}/revisions/${revision}/tasks/${taskId}.md`,
+      source_digest: String(index + 1).repeat(64),
+    })));
     const plan = await fixture.orchestrator.prepareIntegration(runId);
     const dispatches = new DispatchService(fixture.store);
     const packet = (allowedReadPaths: string[] = []) => ({
@@ -276,7 +489,7 @@ test("planned multi-task run continues from prepare through test and derives the
       verification: [{ command: "fixture verification", outcome: "passed" }],
       payload,
     });
-    const authorizedPaths = ["MEMORY.md", ".ai-team/index/feature-navigation.md", "task-one.txt", "task-two.txt"];
+    const authorizedPaths = ["MEMORY.md", ".ai-team/index/feature-navigation.md", "task-one.txt", "task-two.txt", "task-three.txt"];
     const explorerId = dispatches.create(runId, "file-explorer", packet(["."]));
     fixture.store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?").run(JSON.stringify(result(explorerId, "file-explorer", {
       allowed_read_paths: authorizedPaths,
@@ -321,6 +534,15 @@ test("planned multi-task run continues from prepare through test and derives the
       modified_paths: ["task-one.txt"], self_tests: [{ command: "fixture verification", outcome: "passed" }],
     }));
 
+    const taskTest = dispatches.continuation(runId).pending_dispatches.find(({ role }) => role === "test")!;
+    const taskTestPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(taskTest.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(taskTestPacket.context.phase, "task_test");
+    assert.equal(taskTestPacket.context.task_id, "TASK-001");
+    dispatches.claim(runId, taskTest.dispatch_id, "test");
+    await dispatches.submitValue(runId, taskTest.dispatch_id, "test", result(taskTest.dispatch_id, "test", {
+      checks: taskTestPacket.context.test_commands.map((command: string) => ({ command, outcome: "passed" })),
+    }));
+
     const commitContinuation = dispatches.resume(runId).pending_dispatches[0]!;
     dispatches.claim(runId, commitContinuation.dispatch_id, "coding");
     const commitDispatchId = dispatches.create(runId, "git-operator", {
@@ -344,13 +566,106 @@ test("planned multi-task run continues from prepare through test and derives the
     }));
     assert.equal((await rawGit(plan.path, ["rev-list", "--parents", "-n", "1", merged])).split(" ").length, 3);
 
-    const testDispatch = dispatches.continuation(runId).pending_dispatches.find(({ role }) => role === "test")!;
-    dispatches.claim(runId, testDispatch.dispatch_id, "test");
-    await dispatches.submitValue(runId, testDispatch.dispatch_id, "test", result(testDispatch.dispatch_id, "test", {
-      checks: [{ command: "fixture verification", outcome: "passed" }],
-    }));
-    const secondTask = await fixture.orchestrator.prepareTask(runId, "TASK-002");
+    const nextPrepare = dispatches.continuation(runId).pending_dispatches.find(({ role }) => role === "git-operator")!;
+    const nextPreparePacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(nextPrepare.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(nextPreparePacket.context.phase, "prepare_implementation_worktree");
+    assert.equal(nextPreparePacket.context.task_id, "TASK-002");
+    assert.equal(nextPreparePacket.context.base_commit, merged);
+    dispatches.claim(runId, nextPrepare.dispatch_id, "git-operator");
+    const secondTask = await fixture.orchestrator.prepareTask(runId, "TASK-002", merged, undefined, nextPrepare.dispatch_id);
     assert.equal(secondTask.base_commit, merged);
+    const secondPrepared = await dispatches.submitValue(runId, nextPrepare.dispatch_id, "git-operator", result(nextPrepare.dispatch_id, "git-operator", {
+      operations: [{ command: "ai-team git prepare --task-id TASK-002", outcome: secondTask.worktree_id }],
+    }));
+    const completeTask = async (taskId: string, task: typeof secondTask, path: string, continuationId: string): Promise<string> => {
+      dispatches.claim(runId, continuationId, "coding");
+      const developerId = dispatches.create(runId, "backend-developer", {
+        ...packet([path]),
+        allowed_write_paths: [path],
+        context: {
+          explorer_dispatch_id: explorerId,
+          coordinator_dispatch_id: continuationId,
+          task_id: taskId,
+          worktree_id: task.worktree_id,
+          worktree_path: task.path,
+        },
+      }, "coding", continuationId);
+      dispatches.claim(runId, developerId, "backend-developer");
+      await writeFile(join(task.path, path), `${taskId}\n`);
+      await dispatches.submitValue(runId, continuationId, "coding", result(continuationId, "coding", { actions: [`dispatch ${taskId} developer`] }));
+      await dispatches.submitValue(runId, developerId, "backend-developer", result(developerId, "backend-developer", {
+        modified_paths: [path], self_tests: [{ command: "fixture verification", outcome: "passed" }],
+      }));
+
+      const testDispatch = dispatches.continuation(runId).pending_dispatches.find(({ role, dispatch_id }) => {
+        if (role !== "test") return false;
+        const row = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatch_id) as { packet_json: string };
+        return JSON.parse(row.packet_json).context.task_id === taskId;
+      })!;
+      const testPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(testDispatch.dispatch_id) as { packet_json: string }).packet_json);
+      assert.equal(testPacket.context.phase, "task_test");
+      dispatches.claim(runId, testDispatch.dispatch_id, "test");
+      await dispatches.submitValue(runId, testDispatch.dispatch_id, "test", result(testDispatch.dispatch_id, "test", {
+        checks: testPacket.context.test_commands.map((command: string) => ({ command, outcome: "passed" })),
+      }));
+
+      const commitContinuation = dispatches.resume(runId).pending_dispatches.find(({ role, dispatch_id }) => {
+        if (role !== "coding") return false;
+        const row = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatch_id) as { packet_json: string };
+        return JSON.parse(row.packet_json).context.phase === "continue_commit";
+      })!;
+      dispatches.claim(runId, commitContinuation.dispatch_id, "coding");
+      const commitDispatchId = dispatches.create(runId, "git-operator", {
+        ...packet([path]),
+        context: { phase: "commit_implementation", explorer_dispatch_id: explorerId, worktree_id: task.worktree_id, task_id: taskId },
+      }, "coding", commitContinuation.dispatch_id);
+      dispatches.claim(runId, commitDispatchId, "git-operator");
+      const committed = await fixture.orchestrator.commit(runId, task.worktree_id, `Complete ${taskId}`, [path], commitDispatchId);
+      await dispatches.submitValue(runId, commitDispatchId, "git-operator", result(commitDispatchId, "git-operator", {
+        operations: [{ command: "ai-team git commit", outcome: committed.commit }],
+      }));
+      const mergeDispatch = dispatches.continuation(runId).pending_dispatches.find(({ role }) => role === "git-operator")!;
+      dispatches.claim(runId, mergeDispatch.dispatch_id, "git-operator");
+      const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, taskId, mergeDispatch.dispatch_id);
+      await dispatches.submitValue(runId, mergeDispatch.dispatch_id, "git-operator", result(mergeDispatch.dispatch_id, "git-operator", {
+        operations: [{ command: "ai-team git merge-task", outcome: merged }],
+      }));
+      return merged;
+    };
+
+    const taskContinuationId = (pending: typeof secondPrepared.continuation.pending_dispatches, taskId: string): string => pending.find(({ role, dispatch_id }) => {
+      if (role !== "coding") return false;
+      const row = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatch_id) as { packet_json: string };
+      const context = JSON.parse(row.packet_json).context;
+      return context.phase === "continue_implementation" && context.task_id === taskId;
+    })!.dispatch_id;
+    const secondContinuationId = taskContinuationId(secondPrepared.continuation.pending_dispatches, "TASK-002");
+    const secondMerged = await completeTask("TASK-002", secondTask, "task-two.txt", secondContinuationId);
+    assert.equal((fixture.store.db.prepare(`SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='test'
+      AND COALESCE(json_extract(packet_json,'$.context.phase'),'')!='task_test'`).get(runId) as { count: number }).count, 0);
+    const thirdPrepare = dispatches.continuation(runId).pending_dispatches.find(({ role }) => role === "git-operator")!;
+    const thirdPreparePacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(thirdPrepare.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(thirdPreparePacket.context.task_id, "TASK-003");
+    assert.equal(thirdPreparePacket.context.base_commit, secondMerged);
+    dispatches.claim(runId, thirdPrepare.dispatch_id, "git-operator");
+    const thirdTask = await fixture.orchestrator.prepareTask(runId, "TASK-003", secondMerged, undefined, thirdPrepare.dispatch_id);
+    const thirdPrepared = await dispatches.submitValue(runId, thirdPrepare.dispatch_id, "git-operator", result(thirdPrepare.dispatch_id, "git-operator", {
+      operations: [{ command: "ai-team git prepare --task-id TASK-003", outcome: thirdTask.worktree_id }],
+    }));
+    const thirdContinuationId = taskContinuationId(thirdPrepared.continuation.pending_dispatches, "TASK-003");
+    const thirdMerged = await completeTask("TASK-003", thirdTask, "task-three.txt", thirdContinuationId);
+    const finalTest = dispatches.continuation(runId).pending_dispatches.find(({ role, dispatch_id }) => {
+      if (role !== "test") return false;
+      const row = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatch_id) as { packet_json: string };
+      return JSON.parse(row.packet_json).context.phase !== "task_test";
+    })!;
+    const finalPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(finalTest.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(finalPacket.context.implementation_commit, thirdMerged);
+    assert.deepEqual(finalPacket.context.frozen_task_ids, ["TASK-001", "TASK-002", "TASK-003"]);
+    assert.deepEqual(finalPacket.context.implementation_artifacts.map((artifact: { task_id: string }) => artifact.task_id).sort(), ["TASK-001", "TASK-002", "TASK-003"]);
+    assert.deepEqual(finalPacket.context.changed_paths.sort(), ["task-one.txt", "task-three.txt", "task-two.txt"]);
+    assert.deepEqual(fixture.store.runTasks(runId).map(({ state }) => state), ["integrated", "integrated", "integrated"]);
+
     const resumed = dispatches.resume(runId);
     assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND json_extract(packet_json,'$.context.phase')='continue_implementation' AND json_extract(packet_json,'$.context.task_id')='TASK-001'").get(runId) as { count: number }).count, 1);
     assert.equal(resumed.pending_decision, null);

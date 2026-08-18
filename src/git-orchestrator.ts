@@ -129,6 +129,38 @@ export class GitOrchestrator {
     const key = `worktree:create:${runId}:${branch}:${base}`;
     const existing = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=?").get(runId, branch) as any;
     if (existing) {
+      if (existing.base_commit !== base) {
+        if (!dispatchId) throw new ValidationError("stale planned Task worktree requires its managed replacement dispatch");
+        const dispatch = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+          .get(runId, dispatchId) as { packet_json: string };
+        const context = (JSON.parse(dispatch.packet_json) as { context?: Record<string, unknown> }).context ?? {};
+        if (context.phase !== "prepare_implementation_worktree" || context.task_id !== taskId
+          || context.replace_worktree_id !== existing.worktree_id || context.base_commit !== base) {
+          throw new ValidationError("stale planned Task worktree replacement is not authorized by the frozen dispatch");
+        }
+        if (!(await worktreeStatus(existing.path)).clean || await currentHead(existing.path) !== existing.base_commit) {
+          throw new ValidationError("stale planned Task worktree has implementation changes and cannot be replaced");
+        }
+        const replacement = this.store.beginOperation("git.worktree.replace", `worktree:replace:${runId}:${branch}:${existing.base_commit}:${base}`, {
+          worktree_id: existing.worktree_id,
+          branch,
+          path,
+          stale_base: existing.base_commit,
+          base,
+          dispatch_id: dispatchId,
+        }, runId);
+        if (replacement.reused) {
+          if (replacement.state !== "completed") throw new ValidationError("worktree replacement has unknown side effect; reconcile required");
+          return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: true };
+        }
+        await git(root, ["worktree", "remove", existing.path]);
+        await git(root, ["branch", "-d", existing.branch]);
+        await createWorktree(root, path, branch, base);
+        this.store.db.prepare("UPDATE worktrees SET path=?,base_commit=?,state='active',created_at=? WHERE worktree_id=?")
+          .run(path, base, new Date().toISOString(), existing.worktree_id);
+        this.store.finishOperation(replacement.operationId, { worktree_id: existing.worktree_id, branch, path, base, replaced: true, head: await currentHead(path) });
+        return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: false };
+      }
       const operation = this.store.beginOperation("git.worktree.create", key, { branch, path, base }, runId);
       if (operation.state !== "completed" || !existing) throw new ValidationError("worktree operation has unknown side effect; reconcile required");
       return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: true };

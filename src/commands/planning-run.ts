@@ -414,6 +414,7 @@ export const registerRunCommands = (program: Command, dependencies: PlanningRunD
     events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId),
     decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId),
     dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId),
+    tasks: store.runTasks(runId),
     worktrees: store.db.prepare("SELECT worktree_id,branch,path,base_commit,state,adopted_from_run_id FROM worktrees WHERE run_id=? ORDER BY created_at,worktree_id").all(runId),
     ...new DispatchService(store).runShowProjection(runId),
   }), { readonly: true })));

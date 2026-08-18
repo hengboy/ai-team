@@ -130,10 +130,10 @@ const prepareCompletedImplementation = async (store: StateStore): Promise<{
   await mkdir(path.dirname(worktreePath), { recursive: true });
   await symlink(process.cwd(), worktreePath, "dir");
   store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
-    .run(worktreeId, runId, `plan/${run.plan_id}/${run.plan_id}-${run.revision}`, worktreePath, REVIEW_HEAD, new Date().toISOString());
+    .run(worktreeId, runId, `plan/${run.plan_id}/${run.plan_id}-${run.revision}`, worktreePath, REVIEW_BASE, new Date().toISOString());
 
   const dispatches = new WorkflowService(store).dispatches;
-  const authorizedPaths = ["src/dispatch.ts", "test/workflow.test.ts", "package.json"];
+  const authorizedPaths = execFileSync("git", ["diff", "--name-only", REVIEW_BASE, REVIEW_HEAD], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
   const explorerDispatchId = dispatches.create(runId, "file-explorer", {
     objective: "authorize implementation fixture",
     allowed_read_paths: ["."],

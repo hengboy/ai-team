@@ -296,6 +296,31 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "012-run-task-states",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      db.exec(`
+        CREATE TABLE run_tasks (
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          source_path TEXT NOT NULL,
+          source_digest TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('pending','prepared','implemented','tested','committed','integrated')),
+          worktree_id TEXT REFERENCES worktrees(worktree_id),
+          developer_dispatch_id TEXT REFERENCES dispatches(dispatch_id),
+          test_dispatch_id TEXT REFERENCES dispatches(dispatch_id),
+          implementation_commit TEXT,
+          integration_commit TEXT,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(run_id,task_id),
+          UNIQUE(run_id,ordinal)
+        );
+        CREATE INDEX run_tasks_state ON run_tasks(run_id,state,ordinal);
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
@@ -477,6 +502,79 @@ export class StateStore {
     const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(runId) as Record<string, unknown> | undefined;
     if (!run) throw new ValidationError(`unknown run: ${runId}`);
     return run;
+  }
+
+  initializeRunTasks(runId: string, tasks: Array<{ task_id: string; source_path: string; source_digest: string }>): void {
+    this.getRun(runId);
+    if (new Set(tasks.map(({ task_id }) => task_id)).size !== tasks.length
+      || tasks.some(({ task_id, source_path, source_digest }) => !/^TASK-\d{3}$/.test(task_id) || !source_path || !/^[a-f0-9]{64}$/.test(source_digest))) {
+      throw new ValidationError("frozen run task metadata is invalid");
+    }
+    const existing = this.db.prepare("SELECT task_id,ordinal,source_path,source_digest FROM run_tasks WHERE run_id=? ORDER BY ordinal")
+      .all(runId) as Array<{ task_id: string; ordinal: number; source_path: string; source_digest: string }>;
+    const expected = tasks.map((task, ordinal) => ({ ...task, ordinal }));
+    if (existing.length) {
+      if (stableJson(existing) !== stableJson(expected)) throw new ValidationError("run task manifest is already frozen with different metadata");
+      return;
+    }
+    const insert = this.db.prepare(`INSERT INTO run_tasks(run_id,task_id,ordinal,source_path,source_digest,state,updated_at)
+      VALUES (?,?,?,?,?,'pending',?)`);
+    this.db.transaction(() => {
+      const now = new Date().toISOString();
+      for (const task of expected) insert.run(runId, task.task_id, task.ordinal, task.source_path, task.source_digest, now);
+      if (expected.length) this.event(runId, "run.tasks_frozen", { tasks: expected });
+    })();
+  }
+
+  runTasks(runId: string): Array<{
+    task_id: string;
+    ordinal: number;
+    source_path: string;
+    source_digest: string;
+    state: "pending" | "prepared" | "implemented" | "tested" | "committed" | "integrated";
+    worktree_id?: string;
+    developer_dispatch_id?: string;
+    test_dispatch_id?: string;
+    implementation_commit?: string;
+    integration_commit?: string;
+  }> {
+    return this.db.prepare("SELECT * FROM run_tasks WHERE run_id=? ORDER BY ordinal").all(runId) as ReturnType<StateStore["runTasks"]>;
+  }
+
+  advanceRunTask(
+    runId: string,
+    taskId: string,
+    state: "prepared" | "implemented" | "tested" | "committed" | "integrated",
+    evidence: {
+      worktree_id?: string;
+      developer_dispatch_id?: string;
+      test_dispatch_id?: string;
+      implementation_commit?: string;
+      integration_commit?: string;
+      recovered?: boolean;
+    } = {},
+  ): void {
+    const task = this.db.prepare("SELECT state FROM run_tasks WHERE run_id=? AND task_id=?").get(runId, taskId) as { state: string } | undefined;
+    if (!task) throw new ValidationError(`unknown frozen run task: ${taskId}`);
+    const states = ["pending", "prepared", "implemented", "tested", "committed", "integrated"];
+    const currentIndex = states.indexOf(task.state);
+    const nextIndex = states.indexOf(state);
+    if (nextIndex < currentIndex) return;
+    if (nextIndex > currentIndex + 1 && !evidence.recovered) throw new ValidationError(`invalid run task transition: ${task.state} -> ${state}`);
+    this.db.prepare(`UPDATE run_tasks SET state=?,worktree_id=COALESCE(?,worktree_id),developer_dispatch_id=COALESCE(?,developer_dispatch_id),
+      test_dispatch_id=COALESCE(?,test_dispatch_id),implementation_commit=COALESCE(?,implementation_commit),integration_commit=COALESCE(?,integration_commit),updated_at=?
+      WHERE run_id=? AND task_id=?`).run(
+      state,
+      evidence.worktree_id ?? null,
+      evidence.developer_dispatch_id ?? null,
+      evidence.test_dispatch_id ?? null,
+      evidence.implementation_commit ?? null,
+      evidence.integration_commit ?? null,
+      new Date().toISOString(),
+      runId,
+      taskId,
+    );
+    this.event(runId, evidence.recovered ? "run.task_recovered" : "run.task_advanced", { task_id: taskId, from: task.state, to: state, ...evidence });
   }
 
   event(runId: string, type: string, payload: unknown): void {

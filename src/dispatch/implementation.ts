@@ -1,10 +1,3 @@
-export const IMPLEMENTATION_TEST_COMMANDS = [
-  "npm run test -- src/components/AiRoutingGateway/AiRoutingGateway.test.tsx",
-  "npm run test",
-  "npm run lint",
-  "npm run build",
-] as const;
-
 export interface ImplementationSnapshot {
   coordinatorDispatchId: string;
   explorerDispatchId: string | null;
@@ -12,7 +5,7 @@ export interface ImplementationSnapshot {
   developerDispatchIds: string[];
   implementationDispatchId: string;
   implementationArtifact: { artifact_id: string; digest: string };
-  implementationArtifacts: Array<{ dispatch_id: string; artifact_id: string; digest: string }>;
+  implementationArtifacts: Array<{ task_id?: string; dispatch_id: string; artifact_id: string; digest: string }>;
   implementationCommit: string;
   implementationCommitted: boolean;
   changedPaths: string[];
@@ -21,6 +14,14 @@ export interface ImplementationSnapshot {
   planId: string | null;
   revision: string | null;
   planDigest: string | null;
+  frozenTaskIds: string[];
+  testCommands: string[];
+  testCommandProvenance: {
+    explorer_dispatch_id: string;
+    plan_id: string | null;
+    revision: string | null;
+    repo_id: string;
+  };
 }
 
 export const buildTestPacket = (snapshot: ImplementationSnapshot, coordinatorDispatchId?: string) => ({
@@ -36,7 +37,9 @@ export const buildTestPacket = (snapshot: ImplementationSnapshot, coordinatorDis
     implementation_dispatch_id: snapshot.implementationDispatchId, implementation_artifact: snapshot.implementationArtifact,
     implementation_artifacts: snapshot.implementationArtifacts, implementation_commit: snapshot.implementationCommit,
     implementation_committed: snapshot.implementationCommitted, changed_paths: snapshot.changedPaths,
-    test_commands: [...IMPLEMENTATION_TEST_COMMANDS],
+    frozen_task_ids: snapshot.frozenTaskIds,
+    test_commands: snapshot.testCommands,
+    test_command_provenance: snapshot.testCommandProvenance,
     ...(coordinatorDispatchId ? { coordinator_dispatch_id: coordinatorDispatchId } : {}),
   },
 });
@@ -59,7 +62,9 @@ export const buildContinueTestingPacket = (snapshot: ImplementationSnapshot) => 
     implementation_commit: snapshot.implementationCommit,
     implementation_committed: snapshot.implementationCommitted,
     changed_paths: snapshot.changedPaths,
-    test_commands: [...IMPLEMENTATION_TEST_COMMANDS],
+    frozen_task_ids: snapshot.frozenTaskIds,
+    test_commands: snapshot.testCommands,
+    test_command_provenance: snapshot.testCommandProvenance,
     permitted_delegate_role: "test",
   },
 });

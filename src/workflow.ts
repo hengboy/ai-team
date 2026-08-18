@@ -1,4 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { currentBranch, currentHead, git, repositoryIdentity, worktreeStatus } from "./git.js";
 import { StateStore } from "./state.js";
@@ -130,7 +131,11 @@ export class WorkflowService {
     return { state: "canceling", dispatch_id: dispatchId, role: "git-operator", depends_on: [] };
   }
 
-  private async planningSnapshot(project: string, planId: string, revision: string): Promise<{ paths: string[]; digest: string }> {
+  private async planningSnapshot(project: string, planId: string, revision: string, planCommit?: string): Promise<{
+    paths: string[];
+    digest: string;
+    tasks: Array<{ task_id: string; source_path: string; source_digest: string }>;
+  }> {
     const root = join(".ai-team", "plans", planId);
     const revisionRoot = join(root, "revisions", revision);
     const paths = [join(root, "plan.yaml"), join(revisionRoot, "spec.md"), join(revisionRoot, "plan.md")];
@@ -138,15 +143,31 @@ export class WorkflowService {
       await readFile(join(project, revisionRoot, "tasks.md"), "utf8");
       paths.push(join(revisionRoot, "tasks.md"));
     } catch { /* an unsplit plan has no tasks.md */ }
-    try {
-      const taskFiles = (await readdir(join(project, revisionRoot, "tasks"), { withFileTypes: true }))
-        .filter((entry) => entry.isFile() && /^TASK-\d{3}\.md$/.test(entry.name))
-        .map((entry) => join(revisionRoot, "tasks", entry.name))
-        .sort();
-      paths.push(...taskFiles);
-    } catch { /* an unsplit plan has no tasks directory */ }
+    let taskFiles: string[] = [];
+    if (planCommit) {
+      try {
+        taskFiles = execFileSync("git", ["-C", project, "ls-tree", "-r", "--name-only", planCommit, "--", join(revisionRoot, "tasks")], { encoding: "utf8" })
+          .split("\n").filter((path) => /\/TASK-\d{3}\.md$/.test(path)).sort();
+      } catch { throw new ValidationError("planned TASK metadata could not be read from the frozen plan commit"); }
+    } else {
+      try {
+        taskFiles = (await readdir(join(project, revisionRoot, "tasks"), { withFileTypes: true }))
+          .filter((entry) => entry.isFile() && /^TASK-\d{3}\.md$/.test(entry.name))
+          .map((entry) => join(revisionRoot, "tasks", entry.name))
+          .sort();
+      } catch { /* an unsplit plan has no tasks directory */ }
+    }
+    paths.push(...taskFiles);
     const documents = await Promise.all(paths.map(async (path) => ({ path, content: await readFile(join(project, path), "utf8") })));
-    return { paths, digest: sha256(documents.map(({ path, content }) => `${path}\n${content}`).join("\n")) };
+    const tasks = await Promise.all(taskFiles.map(async (path) => {
+      const content = planCommit
+        ? execFileSync("git", ["-C", project, "show", `${planCommit}:${path}`], { encoding: "utf8" })
+        : await readFile(join(project, path), "utf8");
+      const current = documents.find((document) => document.path === path)?.content;
+      if (current !== content) throw new ValidationError(`planned Task differs from frozen plan commit: ${path}`);
+      return { task_id: path.slice(path.lastIndexOf("/") + 1, -3), source_path: path, source_digest: sha256(content) };
+    }));
+    return { paths, tasks, digest: sha256(documents.map(({ path, content }) => `${path}\n${content}`).join("\n")) };
   }
 
   async codingStart(input: { project: string; mode: "planned" | "bug" | "feature"; planId?: string; revision?: string; request?: string }): Promise<{ run_id: string; dispatch_id: string; role: Role; depends_on: string[] }> {
@@ -158,6 +179,7 @@ export class WorkflowService {
     let selectedRevision = input.revision;
     let planDigest: string | undefined;
     let planPaths: string[] = [];
+    let planTasks: Array<{ task_id: string; source_path: string; source_digest: string }> = [];
     if (input.mode === "planned") {
       if (!input.planId || input.request) throw new ValidationError("planned mode requires plan-id and forbids request input");
       const rows = this.store.db.prepare("SELECT * FROM revisions WHERE repo_id=? AND plan_id=? AND state='ready'").all(repo.repoId, input.planId) as any[];
@@ -170,8 +192,9 @@ export class WorkflowService {
         catch { throw new ValidationError("planning commit is not reachable from the current HEAD", { plan_commit: selected.plan_commit, head }); }
       } else if (selected.digest || selected.plan_digest) throw new ValidationError("planned revision has no committed planning baseline");
       selectedRevision = selected.revision as string;
-      const snapshot = await this.planningSnapshot(repo.root, input.planId, selectedRevision);
+      const snapshot = await this.planningSnapshot(repo.root, input.planId, selectedRevision, selected.plan_commit as string | undefined);
       planPaths = snapshot.paths;
+      planTasks = snapshot.tasks;
       planDigest = typeof selected.digest === "string" && selected.digest.trim() ? selected.digest : snapshot.digest;
     } else {
       if (input.planId || input.revision) throw new ValidationError(`${input.mode} mode forbids plan-id and revision`);
@@ -182,6 +205,7 @@ export class WorkflowService {
     this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
     const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}), clientPlatform: clientPlatform(), ...(planDigest ? { planDigest } : {}) });
     if (input.mode === "planned") {
+      this.store.initializeRunTasks(runId, planTasks);
       try {
         const planWorktree = await new GitOrchestrator(this.store).prepareIntegration(runId);
         await Promise.all(planPaths.map((path) => readFile(join(planWorktree.path, path), "utf8")));

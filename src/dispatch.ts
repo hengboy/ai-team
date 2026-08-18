@@ -1,7 +1,7 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, realpathSync, readFileSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { Role } from "./constants.js";
 import { checkDecisionInput, checkResultEnvelope, createResultTemplate, resultSchemaForRole, type ResultEnvelope } from "./contracts.js";
 import { ValidationError } from "./errors.js";
@@ -25,7 +25,7 @@ import {
   RENDERER_VERSION as PACKET_RENDERER_VERSION,
   validatePacket as validateDispatchPacket,
 } from "./dispatch/packet.js";
-import { buildContinueTestingPacket, buildReviewPacket as assembleReviewPacket, buildTestPacket, IMPLEMENTATION_TEST_COMMANDS as TEST_COMMANDS } from "./dispatch/implementation.js";
+import { buildContinueTestingPacket, buildReviewPacket as assembleReviewPacket, buildTestPacket } from "./dispatch/implementation.js";
 import { assertPlanningTransition, planningContinuationPacket, planningSubmissionIntent } from "./dispatch/planning.js";
 import { isManagedPlannedRecovery, livenessRecoveryIntent, managedCleanupPacket, reconciliationIntent, reissuePacket, retryableResultHasNoSideEffects } from "./dispatch/recovery.js";
 
@@ -113,8 +113,6 @@ interface ReviewBarrierRow {
 
 const RENDERER_VERSION = PACKET_RENDERER_VERSION;
 const EXPLORER_CONTEXT_PATHS = PACKET_EXPLORER_CONTEXT_PATHS;
-const IMPLEMENTATION_TEST_COMMANDS = TEST_COMMANDS;
-
 export const dispatchPacketSchema = (role: Role, phase?: unknown, taskId?: unknown): Record<string, unknown> => {
   return packetSchema(role, phase, taskId);
 };
@@ -130,7 +128,7 @@ interface ImplementationSnapshot {
   developerDispatchIds: string[];
   implementationDispatchId: string;
   implementationArtifact: { artifact_id: string; digest: string };
-  implementationArtifacts: Array<{ dispatch_id: string; artifact_id: string; digest: string }>;
+  implementationArtifacts: Array<{ task_id?: string; dispatch_id: string; artifact_id: string; digest: string }>;
   implementationCommit: string;
   implementationCommitted: boolean;
   changedPaths: string[];
@@ -139,6 +137,9 @@ interface ImplementationSnapshot {
   planId: string | null;
   revision: string | null;
   planDigest: string | null;
+  frozenTaskIds: string[];
+  testCommands: string[];
+  testCommandProvenance: { explorer_dispatch_id: string; plan_id: string | null; revision: string | null; repo_id: string };
 }
 
 const dirtyWorktreePaths = (worktreePath: string): string[] => {
@@ -148,6 +149,9 @@ const dirtyWorktreePaths = (worktreePath: string): string[] => {
     .trim().split("\n").filter(Boolean);
   return [...new Set([...tracked, ...untracked])].sort();
 };
+
+const successfulOutcome = (value: unknown): boolean => typeof value === "string"
+  && ["passed", "success", "succeeded", "completed", "ok"].includes(value.trim().toLowerCase());
 
 const promptForV2 = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
   renderPromptV2(runId, dispatchId, role, packet),
@@ -230,6 +234,10 @@ export class DispatchService {
     }
     assertExplorerAuthorization(this.store, runId, role, validated);
     if (actorRole === "coding" && (role === "frontend-developer" || role === "backend-developer")) {
+      const tasks = this.plannedTaskRows(runId);
+      if (tasks.length === 1 && validated.context.task_id !== tasks[0]!.task_id) {
+        throw new ValidationError("single explicit planned Task developer packet must preserve its frozen task identity", ["/context/task_id"]);
+      }
       const worktreeId = (validated.context as { worktree_id?: unknown }).worktree_id;
       if (typeof worktreeId !== "string" || !worktreeId) throw new ValidationError(`${role} dispatch requires context.worktree_id`, ["/context/worktree_id"]);
       const worktree = this.store.db.prepare("SELECT branch FROM worktrees WHERE worktree_id=? AND run_id=? AND state='active'").get(worktreeId, runId) as { branch: string } | undefined;
@@ -248,6 +256,7 @@ export class DispatchService {
     const expected = coordinator.context as Record<string, unknown>;
     const actual = packet.context as Record<string, unknown>;
     const inherited = ["explorer_dispatch_id", "task_id", "worktree_id", "worktree_path"];
+    if (expected.predecessor_repair !== undefined) inherited.push("predecessor_repair");
     const mismatch = inherited.filter((key) => stableJson(actual[key]) !== stableJson(expected[key]));
     if (actual.coordinator_dispatch_id !== actorDispatchId) mismatch.push("coordinator_dispatch_id");
     if (mismatch.length) throw new ValidationError("continue_implementation developer packet must preserve its frozen task identity", mismatch.map((key) => `/context/${key}`));
@@ -259,14 +268,12 @@ export class DispatchService {
     const actual = packet.context as Record<string, unknown>;
     const inherited = [
       "explorer_dispatch_id", "plan_id", "revision", "plan_digest", "worktree_id", "worktree_path",
-      "implementation_dispatch_id", "implementation_artifact", "implementation_commit", "implementation_committed", "test_commands",
+      "implementation_dispatch_id", "implementation_artifact", "implementation_artifacts", "implementation_commit", "implementation_committed",
+      "changed_paths", "frozen_task_ids", "test_commands", "test_command_provenance",
     ];
     const mismatch = inherited.filter((key) => stableJson(actual[key]) !== stableJson(expected[key]));
     if (actual.coordinator_dispatch_id !== actorDispatchId) mismatch.push("coordinator_dispatch_id");
     if (mismatch.length) throw new ValidationError("continue_testing Test packet must preserve its frozen implementation evidence", mismatch.map((key) => `/context/${key}`));
-    if (stableJson(actual.test_commands) !== stableJson(IMPLEMENTATION_TEST_COMMANDS)) {
-      throw new ValidationError("continue_testing Test packet requires the frozen test commands", ["/context/test_commands"]);
-    }
   }
 
   createPlanningCommit(runId: string, packet: DispatchPacket): string {
@@ -966,8 +973,32 @@ export class DispatchService {
       const context = (JSON.parse(row.packet_json) as DispatchPacket).context;
       if (context.phase === "finalize_integration") this.verifyFinalization(runId, dispatchId, true);
     }
+    if ((role === "frontend-developer" || role === "backend-developer") && result.status === "completed") {
+      const packet = JSON.parse(row.packet_json) as DispatchPacket;
+      const predecessor = packet.context.predecessor_repair as { required_commands?: unknown } | undefined;
+      const requiredCommands = Array.isArray(predecessor?.required_commands)
+        ? predecessor.required_commands.filter((command): command is string => typeof command === "string")
+        : [];
+      if (requiredCommands.length) {
+        const selfTests = Array.isArray((result.payload as { self_tests?: unknown }).self_tests)
+          ? (result.payload as { self_tests: Array<{ command?: unknown; outcome?: unknown }> }).self_tests
+          : [];
+        const byCommand = new Map(selfTests.flatMap(({ command, outcome }) => typeof command === "string" ? [[command, outcome] as const] : []));
+        const failed = requiredCommands.filter((command) => !successfulOutcome(byCommand.get(command)));
+        if (failed.length) throw new ValidationError("developer predecessor repair is missing successful frozen checks", failed);
+      }
+    }
     if (role === "test" && result.status === "completed") {
       const packet = JSON.parse(row.packet_json) as DispatchPacket;
+      const expectedCommands = Array.isArray(packet.context.test_commands)
+        ? packet.context.test_commands.filter((command): command is string => typeof command === "string")
+        : [];
+      const checks = Array.isArray((result.payload as { checks?: unknown }).checks)
+        ? (result.payload as { checks: Array<{ command?: unknown; outcome?: unknown }> }).checks
+        : [];
+      const checkedCommands = new Map(checks.flatMap(({ command, outcome }) => typeof command === "string" ? [[command, outcome] as const] : []));
+      const failedCommands = expectedCommands.filter((command) => !successfulOutcome(checkedCommands.get(command)));
+      if (failedCommands.length) throw new ValidationError("completed Test result is missing successful frozen test commands", failedCommands);
       const testedCommit = (packet.context as { implementation_commit?: unknown }).implementation_commit;
       if (typeof testedCommit === "string" && /^[a-f0-9]{40}$/.test(testedCommit)) {
         result.payload = { ...result.payload, testedCommit };
@@ -1102,6 +1133,14 @@ export class DispatchService {
         return;
       }
       if (run.mode === "planned" && context.phase === "prepare_implementation_worktree") {
+        const taskId = typeof (context as { task_id?: unknown }).task_id === "string" ? (context as { task_id: string }).task_id : undefined;
+        if (taskId && this.plannedTaskRows(runId).some((task) => task.task_id === taskId)) {
+          const taskKey = taskId.toLowerCase();
+          const worktree = this.store.db.prepare(`SELECT worktree_id FROM worktrees WHERE run_id=? AND state='active' AND (branch LIKE ? OR branch LIKE ?)
+            ORDER BY created_at DESC LIMIT 1`).get(runId, `task/%/${taskKey}`, `task/%--${taskKey}`) as { worktree_id: string } | undefined;
+          if (!worktree) throw new ValidationError("completed planned task prepare is missing its registered worktree");
+          this.store.advanceRunTask(runId, taskId, "prepared", { worktree_id: worktree.worktree_id });
+        }
         this.ensurePlannedTaskContinuation(runId, result.dispatch_id);
         return;
       }
@@ -1127,7 +1166,31 @@ export class DispatchService {
         return;
       }
     }
+    if (run.mode === "planned" && (role === "frontend-developer" || role === "backend-developer")) {
+      const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string };
+      const packet = JSON.parse(packetRow.packet_json) as DispatchPacket;
+      const taskId = typeof packet.context.task_id === "string" ? packet.context.task_id : undefined;
+      if (taskId && this.plannedTaskRows(runId).some((task) => task.task_id === taskId)) {
+        this.store.advanceRunTask(runId, taskId, "implemented", { worktree_id: String(packet.context.worktree_id), developer_dispatch_id: result.dispatch_id });
+        this.createPlannedTaskTest(runId, result.dispatch_id);
+        return;
+      }
+    }
+    if (run.mode === "planned" && role === "test") {
+      const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string };
+      const packet = JSON.parse(packetRow.packet_json) as DispatchPacket;
+      if (packet.context.phase === "task_test" && typeof packet.context.task_id === "string") {
+        this.store.advanceRunTask(runId, packet.context.task_id, "tested", { worktree_id: String(packet.context.worktree_id), test_dispatch_id: result.dispatch_id });
+        this.changeStage(runId, "coding", result.dispatch_id);
+        this.ensureCodingCommitContinuation(runId);
+        return;
+      }
+    }
     if (["coding", "frontend-developer", "backend-developer", "git-operator"].includes(role)) {
+      if (run.mode === "planned") {
+        this.reconcilePlannedTaskStates(runId);
+        if (this.ensureNextPlannedTaskPrepare(runId)) return;
+      }
       this.advanceImplementation(runId);
       return;
     }
@@ -1137,6 +1200,287 @@ export class DispatchService {
   private changeStage(runId: string, stage: string, dispatchId: string): void {
     this.store.db.prepare("UPDATE runs SET stage=?,updated_at=? WHERE run_id=?").run(stage, new Date().toISOString(), runId);
     this.store.event(runId, "run.stage_changed", { stage, dispatchId });
+  }
+
+  private plannedTaskRows(runId: string): ReturnType<StateStore["runTasks"]> {
+    const run = this.store.getRun(runId) as { mode?: string; repo_id: string; plan_id?: string; revision?: string; plan_digest?: string };
+    if (run.mode !== "planned") return [];
+    let tasks = this.store.runTasks(runId);
+    if (tasks.length || !run.plan_id || !run.revision) return tasks;
+    const revision = this.store.db.prepare("SELECT digest,plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+      .get(run.repo_id, run.plan_id, run.revision) as { digest?: string; plan_commit?: string } | undefined;
+    if (!revision?.plan_commit || !revision.digest) return tasks;
+    if (run.plan_digest !== revision.digest) throw new ValidationError("legacy planned task recovery plan_digest does not match the frozen revision");
+    if (!/^[a-f0-9]{40}$/.test(revision.plan_commit)) throw new ValidationError("legacy planned task recovery requires a frozen plan commit");
+    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
+    if (!repository) throw new ValidationError("legacy planned task recovery repository is not registered");
+    const taskRoot = `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/tasks`;
+    let names: string[] = [];
+    try {
+      names = execFileSync("git", ["-C", repository.project_path, "ls-tree", "-r", "--name-only", revision.plan_commit, "--", taskRoot], { encoding: "utf8" })
+        .trim().split("\n").map((path) => path.slice(path.lastIndexOf("/") + 1)).filter((name) => /^TASK-\d{3}\.md$/.test(name)).sort();
+    } catch { throw new ValidationError("legacy planned task recovery could not read the frozen plan commit"); }
+    this.store.initializeRunTasks(runId, names.map((name) => {
+      const sourcePath = `${taskRoot}/${name}`;
+      const content = execFileSync("git", ["-C", repository.project_path, "show", `${revision.plan_commit}:${sourcePath}`], { encoding: "utf8" });
+      return { task_id: name.slice(0, -3), source_path: sourcePath, source_digest: sha256(content) };
+    }));
+    tasks = this.store.runTasks(runId);
+    return tasks;
+  }
+
+  private testCommandSnapshot(runId: string, worktreePath: string, explorerDispatchId: string): {
+    commands: string[];
+    provenance: { explorer_dispatch_id: string; plan_id: string | null; revision: string | null; repo_id: string };
+  } {
+    const run = this.store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string };
+    const packagePath = join(worktreePath, "package.json");
+    let packageJson: { scripts?: Record<string, string> };
+    try { packageJson = JSON.parse(readFileSync(packagePath, "utf8")) as { scripts?: Record<string, string> }; }
+    catch { throw new ValidationError("Test packet requires a readable current-repository package.json"); }
+    const scripts = packageJson.scripts ?? {};
+    const commands: string[] = [];
+    if (run.plan_id && run.revision) {
+      let plan = "";
+      const revision = this.store.db.prepare("SELECT plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+        .get(run.repo_id, run.plan_id, run.revision) as { plan_commit?: string } | undefined;
+      if (revision?.plan_commit) {
+        if (!/^[a-f0-9]{40}$/.test(revision.plan_commit)) throw new ValidationError("Test packet requires a valid frozen plan commit");
+        const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
+        if (!repository) throw new ValidationError("Test packet repository is not registered");
+        const planPath = `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/plan.md`;
+        try { plan = execFileSync("git", ["-C", repository.project_path, "show", `${revision.plan_commit}:${planPath}`], { encoding: "utf8" }); }
+        catch { throw new ValidationError("Test packet could not read plan.md from the frozen plan commit"); }
+      }
+      for (const match of plan.matchAll(/`(npm\s+(?:run\s+)?[A-Za-z0-9:_-]+(?:\s+--\s+[^`]+)?)`/g)) {
+        const command = match[1]!.trim();
+        const script = command.match(/^npm\s+(?:run\s+)?([A-Za-z0-9:_-]+)/)?.[1];
+        if (!script || typeof scripts[script] !== "string") throw new ValidationError(`frozen plan references an unknown package script: ${command}`);
+        const pathText = command.match(/\s--\s+(.+)$/)?.[1];
+        for (const raw of pathText?.split(/\s+/) ?? []) {
+          const path = raw.replace(/^['"]|['"]$/g, "");
+          if (!path || path.startsWith("-") || /[*?{}]/.test(path)) continue;
+          const root = realpathSync(worktreePath);
+          const candidate = resolve(root, path);
+          const lexicalRelative = relative(root, candidate);
+          if (lexicalRelative.startsWith("..") || isAbsolute(lexicalRelative) || !existsSync(candidate)) {
+            throw new ValidationError(`frozen test command path does not exist inside the current repository: ${path}`);
+          }
+          const canonicalRelative = relative(root, realpathSync(candidate));
+          if (canonicalRelative.startsWith("..") || isAbsolute(canonicalRelative)) {
+            throw new ValidationError(`frozen test command path escapes the current repository: ${path}`);
+          }
+        }
+        commands.push(command);
+      }
+    }
+    for (const script of ["test", "typecheck", "lint", "build"]) {
+      if (typeof scripts[script] === "string") commands.push(`npm run ${script}`);
+    }
+    const frozen = [...new Set(commands)];
+    if (!frozen.length) throw new ValidationError("Test packet requires at least one command from the current repository package.json or frozen plan");
+    return {
+      commands: frozen,
+      provenance: {
+        explorer_dispatch_id: explorerDispatchId,
+        plan_id: run.plan_id ?? null,
+        revision: run.revision ?? null,
+        repo_id: run.repo_id,
+      },
+    };
+  }
+
+  private reconcilePlannedTaskStates(runId: string): void {
+    const tasks = this.plannedTaskRows(runId);
+    if (!tasks.length) return;
+    for (const task of tasks) {
+      const taskKey = task.task_id.toLowerCase();
+      const worktree = (task.worktree_id
+        ? this.store.db.prepare("SELECT worktree_id,branch,base_commit FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, task.worktree_id)
+        : this.store.db.prepare(`SELECT worktree_id,branch,base_commit FROM worktrees WHERE run_id=? AND state='active' AND (branch LIKE ? OR branch LIKE ?)
+          ORDER BY created_at DESC LIMIT 1`).get(runId, `task/%/${taskKey}`, `task/%--${taskKey}`)) as { worktree_id: string; branch: string; base_commit: string } | undefined;
+      const developer = this.store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role IN ('frontend-developer','backend-developer') AND state='completed'
+        AND json_extract(packet_json,'$.context.task_id')=? ORDER BY completed_at DESC LIMIT 1`).get(runId, task.task_id) as { dispatch_id: string } | undefined;
+      const taskTest = this.store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='test' AND state='completed'
+        AND json_extract(packet_json,'$.context.phase')='task_test' AND json_extract(packet_json,'$.context.task_id')=? ORDER BY completed_at DESC LIMIT 1`)
+        .get(runId, task.task_id) as { dispatch_id: string } | undefined;
+      const commit = worktree ? (this.store.db.prepare(`SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.commit' AND state='completed'
+        AND json_extract(evidence_json,'$.worktree_id')=? ORDER BY completed_at DESC LIMIT 1`).get(runId, worktree.worktree_id) as { evidence_json?: string } | undefined) : undefined;
+      const merge = worktree ? (this.store.db.prepare(`SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.merge.task' AND state='completed'
+        AND json_extract(evidence_json,'$.task_worktree_id')=? ORDER BY completed_at DESC LIMIT 1`).get(runId, worktree.worktree_id) as { evidence_json?: string } | undefined) : undefined;
+      const commitEvidence = JSON.parse(commit?.evidence_json ?? "{}") as { commit?: string };
+      const mergeEvidence = JSON.parse(merge?.evidence_json ?? "{}") as { commit?: string };
+      if (merge && mergeEvidence.commit) this.store.advanceRunTask(runId, task.task_id, "integrated", {
+        recovered: task.state !== "committed",
+        ...(worktree ? { worktree_id: worktree.worktree_id } : {}),
+        ...(developer ? { developer_dispatch_id: developer.dispatch_id } : {}),
+        ...(taskTest ? { test_dispatch_id: taskTest.dispatch_id } : {}),
+        ...(commitEvidence.commit ? { implementation_commit: commitEvidence.commit } : {}),
+        integration_commit: mergeEvidence.commit,
+      });
+      else if (commit && commitEvidence.commit) {
+        const evidence = {
+          ...(worktree ? { worktree_id: worktree.worktree_id } : {}),
+          ...(developer ? { developer_dispatch_id: developer.dispatch_id } : {}),
+          ...(taskTest ? { test_dispatch_id: taskTest.dispatch_id } : {}),
+          implementation_commit: commitEvidence.commit,
+        };
+        this.store.advanceRunTask(runId, task.task_id, "committed", { recovered: task.state !== "tested", ...evidence });
+        if (worktree?.branch.startsWith("plan/")) {
+          this.store.advanceRunTask(runId, task.task_id, "integrated", { ...evidence, integration_commit: commitEvidence.commit });
+        }
+      }
+      else if (taskTest) this.store.advanceRunTask(runId, task.task_id, "tested", { recovered: task.state !== "implemented", ...(worktree ? { worktree_id: worktree.worktree_id } : {}), ...(developer ? { developer_dispatch_id: developer.dispatch_id } : {}), test_dispatch_id: taskTest.dispatch_id });
+      else if (developer) this.store.advanceRunTask(runId, task.task_id, "implemented", { recovered: task.state !== "prepared", ...(worktree ? { worktree_id: worktree.worktree_id } : {}), developer_dispatch_id: developer.dispatch_id });
+      else if (worktree) {
+        const integration = this.activeIntegrationWorktree(runId);
+        const currentPlanHead = integration ? execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim() : undefined;
+        if (worktree.branch.startsWith("task/") && currentPlanHead && worktree.base_commit !== currentPlanHead) continue;
+        this.store.advanceRunTask(runId, task.task_id, "prepared", { recovered: task.state !== "pending", worktree_id: worktree.worktree_id });
+      }
+    }
+  }
+
+  private handlePrematurePlannedTest(runId: string): void {
+    const tasks = this.plannedTaskRows(runId);
+    if (!tasks.length || tasks.every(({ state }) => state === "integrated")) return;
+    const tests = this.store.db.prepare(`SELECT dispatch_id,state,packet_json FROM dispatches WHERE run_id=? AND role='test' AND state IN ('pending','claimed','completed','failed','retryable_failure')
+      ORDER BY created_at`).all(runId) as Array<{ dispatch_id: string; state: string; packet_json: string }>;
+    const handledIds = new Set((this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='test.premature_handled'").all(runId) as Array<{ payload_json: string }>)
+      .map(({ payload_json }) => (JSON.parse(payload_json) as { dispatch_id: string }).dispatch_id));
+    const premature = tests.filter(({ dispatch_id, packet_json }) => !handledIds.has(dispatch_id) && (JSON.parse(packet_json) as DispatchPacket).context.phase !== "task_test");
+    if (!premature.length) return;
+    this.store.db.transaction(() => {
+      for (const test of premature) {
+        this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
+          .run(new Date().toISOString(), test.dispatch_id);
+        this.store.event(runId, "test.premature_handled", { dispatch_id: test.dispatch_id, previous_state: test.state, incomplete_task_ids: tasks.filter(({ state }) => state !== "integrated").map(({ task_id }) => task_id) });
+      }
+      const commits = premature.map(({ packet_json }) => (JSON.parse(packet_json) as DispatchPacket).context.implementation_commit).filter((commit): commit is string => typeof commit === "string");
+      for (const commit of commits) {
+        const reviewers = this.store.db.prepare(`SELECT dispatch_id,state FROM dispatches WHERE run_id=? AND role='code-reviewer' AND state IN ('pending','claimed','completed')
+          AND json_extract(packet_json,'$.context.revision_sha')=?`).all(runId, commit) as Array<{ dispatch_id: string; state: string }>;
+        for (const reviewer of reviewers) {
+          this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?").run(new Date().toISOString(), reviewer.dispatch_id);
+          this.store.event(runId, "review.premature_handled", { dispatch_id: reviewer.dispatch_id, previous_state: reviewer.state, revision_sha: commit });
+        }
+      }
+      this.store.db.prepare("UPDATE runs SET stage='coding',state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+    })();
+  }
+
+  private ensureNextPlannedTaskPrepare(runId: string): string | undefined {
+    const tasks = this.plannedTaskRows(runId);
+    if (!tasks.length) return undefined;
+    const next = tasks.find(({ state }) => state !== "integrated");
+    if (!next || next.state !== "pending") return undefined;
+    if (tasks.slice(0, next.ordinal).some(({ state }) => state !== "integrated")) return undefined;
+    const integration = this.activeIntegrationWorktree(runId);
+    if (!integration) throw new ValidationError("planned task prepare requires the active plan worktree");
+    const baseCommit = execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const taskKey = next.task_id.toLowerCase();
+    const taskWorktree = this.store.db.prepare(`SELECT worktree_id,base_commit FROM worktrees WHERE run_id=? AND state='active'
+      AND (branch LIKE ? OR branch LIKE ?) ORDER BY created_at DESC LIMIT 1`).get(runId, `task/%/${taskKey}`, `task/%--${taskKey}`) as { worktree_id: string; base_commit: string } | undefined;
+    const existing = this.store.db.prepare(`SELECT dispatch_id,state FROM dispatches WHERE run_id=? AND role='git-operator' AND state IN ('pending','claimed','completed')
+      AND json_extract(packet_json,'$.context.phase')='prepare_implementation_worktree'
+      AND json_extract(packet_json,'$.context.task_id')=? ORDER BY created_at DESC LIMIT 1`).get(runId, next.task_id) as { dispatch_id: string; state: string } | undefined;
+    const staleWorktree = taskWorktree && taskWorktree.base_commit !== baseCommit ? taskWorktree : undefined;
+    if (existing && !staleWorktree) return existing.dispatch_id;
+    const coordinator = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='coding' AND state='completed' ORDER BY completed_at DESC,created_at DESC LIMIT 1")
+      .get(runId) as { dispatch_id: string; packet_json: string } | undefined;
+    if (!coordinator) return undefined;
+    const coordinatorPacket = JSON.parse(coordinator.packet_json) as DispatchPacket;
+    const explorerDispatchId = typeof coordinatorPacket.context.explorer_dispatch_id === "string"
+      ? coordinatorPacket.context.explorer_dispatch_id
+      : (this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='file-explorer' AND state='completed' ORDER BY completed_at DESC LIMIT 1").get(runId) as { dispatch_id?: string } | undefined)?.dispatch_id;
+    if (!explorerDispatchId) throw new ValidationError("planned task prepare requires completed Explorer provenance");
+    const recoveredTests = (this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='test.premature_handled' ORDER BY event_id")
+      .all(runId) as Array<{ payload_json: string }>).map(({ payload_json }) => (JSON.parse(payload_json) as { dispatch_id: string }).dispatch_id);
+    const handledTests = recoveredTests.map((dispatchId) => {
+      const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result' ORDER BY created_at DESC LIMIT 1")
+        .get(runId, dispatchId) as { artifact_id: string; sha256: string } | undefined;
+      const dispatch = this.store.db.prepare("SELECT result_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, dispatchId) as { result_json?: string } | undefined;
+      const result = JSON.parse(dispatch?.result_json ?? "{}") as { payload?: { checks?: Array<{ command?: unknown; outcome?: unknown }> } };
+      const failedChecks = (result.payload?.checks ?? []).filter(({ outcome }) => !successfulOutcome(outcome)).flatMap(({ command, outcome }) =>
+        typeof command === "string" ? [{ command, outcome: String(outcome ?? "unknown") }] : []);
+      return {
+        dispatch_id: dispatchId,
+        ...(artifact ? { artifact_id: artifact.artifact_id, digest: artifact.sha256 } : {}),
+        failed_checks: failedChecks,
+      };
+    });
+    const predecessorCommands = [...new Set(handledTests.flatMap(({ failed_checks }) => failed_checks.map(({ command }) => command)))];
+    const dispatchId = this.insert(runId, "git-operator", validatePacket({
+      objective: `Prepare ${next.task_id} from the current plan HEAD after every earlier frozen Task is integrated.`,
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Create exactly one task worktree from the frozen current plan HEAD", "Do not repeat an already integrated Task"],
+      context: {
+        stage: "git-operator",
+        phase: "prepare_implementation_worktree",
+        task_id: next.task_id,
+        explorer_dispatch_id: explorerDispatchId,
+        coordinator_dispatch_id: coordinator.dispatch_id,
+        base_commit: baseCommit,
+        previous_task_ids: tasks.slice(0, next.ordinal).map(({ task_id }) => task_id),
+        ...(staleWorktree ? { replace_worktree_id: staleWorktree.worktree_id, replace_base_commit: staleWorktree.base_commit } : {}),
+        ...(handledTests.length ? { predecessor_repair: { required: true, handled_tests: handledTests, required_commands: predecessorCommands } } : {}),
+      },
+    }, "git-operator"), existing?.dispatch_id);
+    if (existing && existing.state !== "completed") {
+      this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?").run(new Date().toISOString(), existing.dispatch_id);
+    }
+    if (staleWorktree) this.store.event(runId, "worktree.stale_reprepare_created", {
+      dispatch_id: dispatchId,
+      replacement_for: existing?.dispatch_id ?? null,
+      task_id: next.task_id,
+      worktree_id: staleWorktree.worktree_id,
+      stale_base_commit: staleWorktree.base_commit,
+      required_base_commit: baseCommit,
+    });
+    this.changeStage(runId, "git-operator", dispatchId);
+    return dispatchId;
+  }
+
+  private createPlannedTaskTest(runId: string, developerDispatchId: string): string | undefined {
+    const developer = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND state='completed'")
+      .get(runId, developerDispatchId) as { packet_json: string } | undefined;
+    if (!developer) return undefined;
+    const packet = JSON.parse(developer.packet_json) as DispatchPacket;
+    const taskId = typeof packet.context.task_id === "string" ? packet.context.task_id : undefined;
+    if (!taskId || !this.plannedTaskRows(runId).some((task) => task.task_id === taskId)) return undefined;
+    const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='test' AND state!='failed'
+      AND json_extract(packet_json,'$.context.phase')='task_test' AND json_extract(packet_json,'$.context.task_id')=? ORDER BY created_at DESC LIMIT 1`)
+      .get(runId, taskId) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
+    const worktreeId = String(packet.context.worktree_id);
+    const worktree = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, worktreeId) as { path: string } | undefined;
+    const explorerDispatchId = typeof packet.context.explorer_dispatch_id === "string" ? packet.context.explorer_dispatch_id : undefined;
+    if (!worktree || !explorerDispatchId) throw new ValidationError("planned task Test requires its worktree and Explorer provenance");
+    const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'").get(runId, developerDispatchId) as { artifact_id: string; sha256: string } | undefined;
+    if (!artifact) throw new ValidationError("planned task Test requires the implementation artifact");
+    const frozen = this.testCommandSnapshot(runId, worktree.path, explorerDispatchId);
+    const dispatchId = this.insert(runId, "test", validatePacket({
+      objective: `Independently verify ${taskId} in its prepared task worktree before commit.`,
+      allowed_read_paths: packet.allowed_read_paths,
+      allowed_write_paths: [],
+      acceptance_criteria: ["Run every frozen task test command", "Do not commit or integrate the task"],
+      context: {
+        stage: "test",
+        phase: "task_test",
+        task_id: taskId,
+        explorer_dispatch_id: explorerDispatchId,
+        worktree_id: worktreeId,
+        worktree_path: worktree.path,
+        implementation_dispatch_id: developerDispatchId,
+        implementation_artifact: { artifact_id: artifact.artifact_id, digest: artifact.sha256 },
+        implementation_committed: false,
+        test_commands: frozen.commands,
+        test_command_provenance: frozen.provenance,
+      },
+    }, "test"));
+    this.changeStage(runId, "test", dispatchId);
+    return dispatchId;
   }
 
   private completedImplementationOperation(runId: string): { commit: string; paths: string[]; kind: string } | undefined {
@@ -1164,6 +1508,10 @@ export class DispatchService {
     const result = JSON.parse(explorer.result_json) as ResultEnvelope;
     const worktree = this.activeIntegrationWorktree(runId);
     if (!worktree) throw new ValidationError("planned Coding dispatch requires the verified plan worktree");
+    const tasks = this.plannedTaskRows(runId);
+    if (tasks.length === 1 && tasks[0]!.state === "pending") {
+      this.store.advanceRunTask(runId, tasks[0]!.task_id, "prepared", { worktree_id: worktree.worktree_id });
+    }
     const dispatchId = this.create(runId, "coding", {
       objective: "Create an implementation plan from the exact File Explorer scope and dispatch the implementation roles.",
       allowed_read_paths: (result.payload.allowed_read_paths as string[] | undefined) ?? [],
@@ -1175,6 +1523,7 @@ export class DispatchService {
         git_operator_dispatch_id: gitDispatchId,
         worktree_id: worktree.worktree_id,
         plan_worktree_path: worktree.path,
+        ...(tasks.length === 1 ? { task_id: tasks[0]!.task_id } : {}),
       },
     }, "coding");
     this.changeStage(runId, "coding", dispatchId);
@@ -1224,10 +1573,14 @@ export class DispatchService {
     const authorizedPaths = explorerResult.payload.allowed_read_paths;
     if (!Array.isArray(authorizedPaths) || authorizedPaths.some((path) => typeof path !== "string")) throw new ValidationError("planned task continuation requires valid Explorer paths");
     const packet = validatePacket({
-      objective: `Continue ${taskId} by dispatching one developer role in its prepared task worktree.`,
+      objective: `Continue ${taskId} by dispatching one developer role in its prepared task worktree${prepareContext.predecessor_repair ? ", including the recorded predecessor repair" : ""}.`,
       allowed_read_paths: authorizedPaths,
       allowed_write_paths: [],
-      acceptance_criteria: ["Dispatch a developer with the frozen task worktree identity", "Preserve the completed Explorer authorization and prepare lineage"],
+      acceptance_criteria: [
+        "Dispatch a developer with the frozen task worktree identity",
+        "Preserve the completed Explorer authorization and prepare lineage",
+        ...(prepareContext.predecessor_repair ? ["Resolve the handled predecessor Test findings before implementing this Task"] : []),
+      ],
       context: {
         stage: "coding",
         phase: "continue_implementation",
@@ -1239,6 +1592,7 @@ export class DispatchService {
         worktree_path: worktree.path,
         plan_id: run.plan_id ?? null,
         revision: run.revision ?? null,
+        ...(prepareContext.predecessor_repair ? { predecessor_repair: prepareContext.predecessor_repair } : {}),
       },
     }, "coding");
     assertExplorerAuthorization(this.store, runId, "coding", packet);
@@ -1308,15 +1662,18 @@ export class DispatchService {
     integrationWorktreeId: string,
     taskBindings: Array<{ task_id: string | null; worktree_id: string }>,
   ): string {
-    const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches
-      WHERE run_id=? AND role='git-operator' AND state!='failed'
+    const existing = (this.store.db.prepare(`SELECT dispatch_id,packet_json FROM dispatches
+      WHERE run_id=? AND role='git-operator' AND state IN ('pending','claimed')
       AND json_extract(packet_json,'$.context.phase')='integrate_implementation'
-      ORDER BY created_at DESC LIMIT 1`).get(runId) as { dispatch_id: string } | undefined;
+      ORDER BY created_at DESC`).all(runId) as Array<{ dispatch_id: string; packet_json: string }>).find(({ packet_json }) => {
+        const ids = (JSON.parse(packet_json) as DispatchPacket).context.task_worktree_ids;
+        return stableJson(Array.isArray(ids) ? [...ids].sort() : []) === stableJson([...taskWorktreeIds].sort());
+      });
     if (existing) return existing.dispatch_id;
     const onlyTaskBinding = taskBindings[0];
     const taskBinding = taskBindings.length === 1 && onlyTaskBinding?.task_id ? onlyTaskBinding : undefined;
     return this.insert(runId, "git-operator", validatePacket({
-      objective: "Merge every completed implementation task into the integration worktree before independent testing.",
+      objective: "Merge the next completed frozen Task into the current plan worktree before preparing its successor.",
       allowed_read_paths: [],
       allowed_write_paths: [],
       acceptance_criteria: ["Merge every listed task worktree exactly once", "Return the frozen integration HEAD"],
@@ -1336,7 +1693,8 @@ export class DispatchService {
   }
 
   private implementationSnapshot(runId: string): ImplementationSnapshot | undefined {
-    const run = this.store.getRun(runId) as { mode?: string; plan_id?: string; revision?: string; plan_digest?: string };
+    const run = this.store.getRun(runId) as { mode?: string; repo_id: string; plan_id?: string; revision?: string; plan_digest?: string };
+    const frozenTasks = this.plannedTaskRows(runId);
     const coordinator = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='coding' AND state='completed' ORDER BY completed_at DESC,created_at DESC LIMIT 1")
       .get(runId) as { dispatch_id: string; packet_json: string } | undefined;
     const developers = this.store.db.prepare(`SELECT d.dispatch_id,d.state,d.result_json,d.packet_json,d.completed_at FROM dispatches d
@@ -1366,16 +1724,28 @@ export class DispatchService {
       try { const evidence = JSON.parse(item.evidence_json ?? "{}"); return typeof evidence.task_worktree_id === "string" ? [evidence.task_worktree_id] : []; }
       catch { return []; }
     }));
-    if (!usesPlanWorktreeDirectly && taskWorktreeIds.some((worktreeId) => !mergedWorktrees.has(worktreeId))) {
-      this.ensureIntegrationDispatch(runId, taskWorktreeIds, integration.worktree_id, taskBindings);
+    const unmergedWorktreeIds = taskWorktreeIds.filter((worktreeId) => !mergedWorktrees.has(worktreeId));
+    if (!usesPlanWorktreeDirectly && unmergedWorktreeIds.length) {
+      this.ensureIntegrationDispatch(
+        runId,
+        unmergedWorktreeIds,
+        integration.worktree_id,
+        taskBindings.filter(({ worktree_id }) => unmergedWorktreeIds.includes(worktree_id)),
+      );
       return undefined;
     }
+    if (frozenTasks.length && frozenTasks.some(({ state }) => state !== "integrated")) return undefined;
     const implementation = this.completedImplementationOperation(runId);
     if (usesPlanWorktreeDirectly && implementation && implementation.kind !== "git.commit" || !usesPlanWorktreeDirectly && implementation?.kind !== "git.merge.task") return undefined;
     const integrationHead = execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     if (implementation && implementation.commit !== integrationHead) return undefined;
     if (!implementation) return undefined;
-    const changedPaths = [...new Set(implementation.paths)] as string[];
+    const integrationRow = this.store.db.prepare("SELECT base_commit FROM worktrees WHERE run_id=? AND worktree_id=?")
+      .get(runId, integration.worktree_id) as { base_commit: string } | undefined;
+    if (!integrationRow?.base_commit) return undefined;
+    const changedPaths = execFileSync("git", ["-C", integration.path, "diff", "--name-only", `${integrationRow.base_commit}..${implementation.commit}`], { encoding: "utf8" })
+      .trim().split("\n").filter(Boolean);
+    if (!changedPaths.length) return undefined;
     const coordinatorPacket = JSON.parse(coordinator.packet_json) as DispatchPacket;
     const inheritedExplorerId = (coordinatorPacket.context as { explorer_dispatch_id?: unknown }).explorer_dispatch_id;
     const explorer = (typeof inheritedExplorerId === "string"
@@ -1390,11 +1760,18 @@ export class DispatchService {
     const implementationArtifacts = developers.map((developer) => {
       const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result' ORDER BY created_at DESC LIMIT 1")
         .get(runId, developer.dispatch_id) as { artifact_id: string; sha256: string } | undefined;
-      return artifact ? { dispatch_id: developer.dispatch_id, artifact_id: artifact.artifact_id, digest: artifact.sha256 } : undefined;
+      const taskId = (JSON.parse(developer.packet_json) as DispatchPacket).context.task_id;
+      return artifact ? { ...(typeof taskId === "string" ? { task_id: taskId } : {}), dispatch_id: developer.dispatch_id, artifact_id: artifact.artifact_id, digest: artifact.sha256 } : undefined;
     });
     if (implementationArtifacts.some((artifact) => !artifact)) return undefined;
+    if (frozenTasks.length) {
+      const artifactTaskIds = new Set(implementationArtifacts.map((artifact) => artifact?.task_id).filter((taskId): taskId is string => typeof taskId === "string"));
+      if (frozenTasks.some(({ task_id }) => !artifactTaskIds.has(task_id))) return undefined;
+    }
     const primary = [...developers].sort((left, right) => (right.completed_at ?? "").localeCompare(left.completed_at ?? ""))[0]!;
     const primaryArtifact = implementationArtifacts[developers.indexOf(primary)]!;
+    if (!explorer?.dispatch_id) return undefined;
+    const frozenCommands = this.testCommandSnapshot(runId, integration.path, explorer.dispatch_id);
     return {
       coordinatorDispatchId: coordinator.dispatch_id,
       explorerDispatchId: explorer?.dispatch_id ?? null,
@@ -1411,6 +1788,9 @@ export class DispatchService {
       planId: run.plan_id ?? null,
       revision: run.revision ?? null,
       planDigest: run.plan_digest ?? null,
+      frozenTaskIds: frozenTasks.map(({ task_id }) => task_id),
+      testCommands: frozenCommands.commands,
+      testCommandProvenance: frozenCommands.provenance,
     };
   }
 
@@ -1910,6 +2290,10 @@ export class DispatchService {
     if (developerWorktreeIds.some((value) => typeof value !== "string" || !value)) return undefined;
     const worktreeIds = [...new Set(developerWorktreeIds as string[])];
     const activeTaskWorktrees = new Set((this.store.db.prepare("SELECT worktree_id FROM worktrees WHERE run_id=? AND state='active' AND branch LIKE 'task/%'").all(runId) as Array<{ worktree_id: string }>).map((worktree) => worktree.worktree_id));
+    if (run.mode === "planned") {
+      const tasks = this.plannedTaskRows(runId);
+      if (tasks.length === 1 && tasks[0]!.worktree_id) activeTaskWorktrees.add(tasks[0]!.worktree_id);
+    }
     if (worktreeIds.some((worktreeId) => !activeTaskWorktrees.has(worktreeId))) return undefined;
     const committed = new Set((this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.commit' AND state='completed'").all(runId) as Array<{ evidence_json?: string }>).flatMap((operation) => {
       try {
@@ -1919,6 +2303,11 @@ export class DispatchService {
     }));
     const uncommittedWorktreeIds = worktreeIds.filter((worktreeId) => !committed.has(worktreeId));
     if (!uncommittedWorktreeIds.length) return undefined;
+    if (run.mode === "planned") {
+      const tasks = this.plannedTaskRows(runId);
+      const untested = tasks.filter((task) => task.worktree_id && uncommittedWorktreeIds.includes(task.worktree_id) && task.state !== "tested");
+      if (untested.length) return undefined;
+    }
     const coordinator = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='coding' AND state='completed' ORDER BY completed_at DESC,created_at DESC LIMIT 1")
       .get(runId) as { dispatch_id: string; packet_json: string } | undefined;
     if (!coordinator) return undefined;
@@ -2025,6 +2414,8 @@ export class DispatchService {
       if (pendingOperation) return;
       if (run.profile === "coding") {
         this.reconcileReview(runId);
+        this.reconcilePlannedTaskStates(runId);
+        this.handlePrematurePlannedTest(runId);
         run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
       }
       const retryableDispatch = run.state === "retryable_failure"
@@ -2046,7 +2437,7 @@ export class DispatchService {
         if (pendingTest && run.stage !== "test") this.changeStage(runId, "test", pendingTest.dispatch_id);
         const pendingDispatch = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId);
         if (pendingDispatch) return;
-        if (run.profile === "coding" && this.ensurePlannedTaskContinuation(runId)) return;
+        if (run.profile === "coding" && (this.ensurePlannedTaskContinuation(runId) || this.ensureNextPlannedTaskPrepare(runId))) return;
       }
       const retryableHasNoSideEffects = retryableResultHasNoSideEffects(retryableDispatch?.result_json);
       if (retryableDispatch && retryableHasNoSideEffects && !mergePartialEffect) {
