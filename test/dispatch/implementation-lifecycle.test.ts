@@ -469,7 +469,7 @@ test("planned multi-Task resume handles a premature final Test and prepares the 
       await writeFile(join(repository, ".ai-team", "index", "feature-navigation.md"), "# fixture\n");
       await writeFile(join(repository, ".ai-team", "plans", "multi-task", "revisions", "001", "plan.md"), "# plan\n\n## 验证\n\n- Run repository scripts.\n");
       for (const taskId of ["TASK-001", "TASK-002", "TASK-003"]) {
-        await writeFile(join(repository, ".ai-team", "plans", "multi-task", "revisions", "001", "tasks", `${taskId}.md`), `# ${taskId}\n`);
+        await writeFile(join(repository, ".ai-team", "plans", "multi-task", "revisions", "001", "tasks", `${taskId}.md`), `# ${taskId}\n\n- 允许写入路径：\`src/dispatch.ts\`\n`);
       }
       await writeFile(join(repository, "package.json"), JSON.stringify({ name: "fixture", scripts: { test: "node --test", lint: "eslint ." } }));
       execFileSync("git", ["add", "."], { cwd: repository });
@@ -576,8 +576,18 @@ test("planned multi-Task resume handles a premature final Test and prepares the 
         modified_paths: ["src/dispatch.ts"], self_tests: [{ command: "npm run lint", outcome: "passed" }],
       }));
       assert.equal(store.runTasks(runId)[1]!.state, "implemented");
-      assert.equal((store.db.prepare(`SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='test' AND state='pending'
-        AND json_extract(packet_json,'$.context.phase')='task_test' AND json_extract(packet_json,'$.context.task_id')='TASK-002'`).get(runId) as { count: number }).count, 1);
+      const taskTest = store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='test' AND state='pending'
+        AND json_extract(packet_json,'$.context.phase')='task_test' AND json_extract(packet_json,'$.context.task_id')='TASK-002'`).get(runId) as { dispatch_id: string };
+      assert.ok(taskTest.dispatch_id);
+      store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), taskTest.dispatch_id);
+      store.advanceRunTask(runId, "TASK-002", "integrated", { recovered: true, worktree_id: taskTwo.worktree_id });
+      const nextPrepare = dispatches.resume(runId).pending_dispatches.find(({ role, dispatch_id }) => {
+        if (role !== "git-operator") return false;
+        const row = store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatch_id) as { packet_json: string };
+        return JSON.parse(row.packet_json).context.task_id === "TASK-003";
+      })!;
+      const nextPreparePacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(nextPrepare.dispatch_id) as { packet_json: string }).packet_json);
+      assert.equal(nextPreparePacket.context.predecessor_repair, undefined);
     } finally {
       await rm(repository, { recursive: true, force: true });
     }

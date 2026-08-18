@@ -223,7 +223,7 @@ export class DispatchService {
       this.assertContinueTestingDelegation(actorDispatchId!, role, actorPacket, validated);
     }
     if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "continue_implementation") {
-      this.assertContinueImplementationDelegation(actorDispatchId!, role, actorPacket, validated);
+      this.assertContinueImplementationDelegation(runId, actorDispatchId!, role, actorPacket, validated);
     }
     if (role === "file-explorer") {
       const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get((this.store.getRun(runId) as { repo_id: string }).repo_id) as { project_path: string } | undefined;
@@ -249,7 +249,7 @@ export class DispatchService {
     return dispatchId;
   }
 
-  private assertContinueImplementationDelegation(actorDispatchId: string, role: Role, coordinator: DispatchPacket, packet: DispatchPacket): void {
+  private assertContinueImplementationDelegation(runId: string, actorDispatchId: string, role: Role, coordinator: DispatchPacket, packet: DispatchPacket): void {
     if (role !== "frontend-developer" && role !== "backend-developer") {
       throw new ValidationError("continue_implementation Coding dispatch can only delegate to a developer role");
     }
@@ -260,6 +260,16 @@ export class DispatchService {
     const mismatch = inherited.filter((key) => stableJson(actual[key]) !== stableJson(expected[key]));
     if (actual.coordinator_dispatch_id !== actorDispatchId) mismatch.push("coordinator_dispatch_id");
     if (mismatch.length) throw new ValidationError("continue_implementation developer packet must preserve its frozen task identity", mismatch.map((key) => `/context/${key}`));
+    if (this.plannedTaskRows(runId).some((task) => task.task_id === expected.task_id)) {
+      const frozenTaskWritePaths = this.frozenTaskWritePaths(runId, String(expected.task_id));
+      const unauthorized = packet.allowed_write_paths.filter((path) => !pathMatchesScope(path, frozenTaskWritePaths));
+      if (unauthorized.length) throw new ValidationError("continue_implementation developer write paths exceed the frozen Task authorization", {
+        offending_dispatch_id: actorDispatchId,
+        unauthorized_paths: unauthorized,
+        authorization_source_expected: "frozen Task allowed write paths",
+        frozen_task_write_paths: frozenTaskWritePaths,
+      });
+    }
   }
 
   private assertContinueTestingDelegation(actorDispatchId: string, role: Role, coordinator: DispatchPacket, packet: DispatchPacket): void {
@@ -825,6 +835,10 @@ export class DispatchService {
     if (sourceTaskId !== replacementTaskId) {
       throw new ValidationError(`replacement dispatch must preserve task identity: expected_task_id=${String(sourceTaskId)}; actual_task_id=${String(replacementTaskId)}`);
     }
+    if ((role === "frontend-developer" || role === "backend-developer")
+      && stableJson(sourcePacket.context.predecessor_repair) !== stableJson(packet.context.predecessor_repair)) {
+      throw new ValidationError("replacement developer dispatch must preserve predecessor repair evidence");
+    }
     for (const key of ["task_worktree_id", "implementation_worktree_id"] as const) {
       const expected = typeof sourcePacket.context[key] === "string" ? sourcePacket.context[key] : null;
       const actual = typeof packet.context[key] === "string" ? packet.context[key] : null;
@@ -973,9 +987,10 @@ export class DispatchService {
       const context = (JSON.parse(row.packet_json) as DispatchPacket).context;
       if (context.phase === "finalize_integration") this.verifyFinalization(runId, dispatchId, true);
     }
+    let resolvedPredecessorRepair: { handled_test_dispatch_ids: string[]; required_commands: string[] } | undefined;
     if ((role === "frontend-developer" || role === "backend-developer") && result.status === "completed") {
       const packet = JSON.parse(row.packet_json) as DispatchPacket;
-      const predecessor = packet.context.predecessor_repair as { required_commands?: unknown } | undefined;
+      const predecessor = packet.context.predecessor_repair as { required_commands?: unknown; handled_tests?: unknown } | undefined;
       const requiredCommands = Array.isArray(predecessor?.required_commands)
         ? predecessor.required_commands.filter((command): command is string => typeof command === "string")
         : [];
@@ -986,6 +1001,12 @@ export class DispatchService {
         const byCommand = new Map(selfTests.flatMap(({ command, outcome }) => typeof command === "string" ? [[command, outcome] as const] : []));
         const failed = requiredCommands.filter((command) => !successfulOutcome(byCommand.get(command)));
         if (failed.length) throw new ValidationError("developer predecessor repair is missing successful frozen checks", failed);
+        const handledTestDispatchIds = Array.isArray(predecessor?.handled_tests)
+          ? predecessor.handled_tests.flatMap((entry) => entry && typeof entry === "object" && typeof (entry as { dispatch_id?: unknown }).dispatch_id === "string"
+            ? [(entry as { dispatch_id: string }).dispatch_id]
+            : [])
+          : [];
+        resolvedPredecessorRepair = { handled_test_dispatch_ids: handledTestDispatchIds, required_commands: requiredCommands };
       }
     }
     if (role === "test" && result.status === "completed") {
@@ -1020,6 +1041,10 @@ export class DispatchService {
       this.store.db.prepare("INSERT OR IGNORE INTO artifacts(artifact_id,run_id,dispatch_id,kind,path,sha256,redacted,created_at) VALUES (?,?,?,'result',?,?,1,?)")
         .run(artifactId, runId, dispatchId, artifact, digest, new Date().toISOString());
       this.store.event(runId, "dispatch.completed", { dispatchId, status: result.status, artifactId, digest });
+      if (resolvedPredecessorRepair) this.store.event(runId, "test.predecessor_repair_resolved", {
+        developer_dispatch_id: dispatchId,
+        ...resolvedPredecessorRepair,
+      });
       if (result.status === "completed" || planningQuestion) {
         if (role === "planning") this.advancePlanning(runId, result);
         else if (role === "review-spec" || role === "review-standards") {
@@ -1229,6 +1254,26 @@ export class DispatchService {
     return tasks;
   }
 
+  private frozenTaskWritePaths(runId: string, taskId: string): string[] {
+    const task = this.plannedTaskRows(runId).find((candidate) => candidate.task_id === taskId);
+    if (!task) throw new ValidationError(`unknown frozen run task: ${taskId}`);
+    const run = this.store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string };
+    const revision = this.store.db.prepare("SELECT plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+      .get(run.repo_id, run.plan_id, run.revision) as { plan_commit?: string } | undefined;
+    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?")
+      .get(run.repo_id) as { project_path: string } | undefined;
+    if (!repository || !revision?.plan_commit) throw new ValidationError("frozen Task write authorization requires the frozen plan commit");
+    let content = "";
+    try {
+      content = execFileSync("git", ["-C", repository.project_path, "show", `${revision.plan_commit}:${task.source_path}`], { encoding: "utf8" });
+    } catch { throw new ValidationError(`could not read frozen Task write authorization: ${task.source_path}`); }
+    if (sha256(content) !== task.source_digest) throw new ValidationError(`frozen Task digest does not match: ${task.source_path}`);
+    const line = content.split(/\r?\n/).find((candidate) => /^-\s*(?:允许写入路径|Allowed write paths)\s*[：:]/i.test(candidate));
+    const paths = line ? [...line.matchAll(/`([^`]+)`/g)].map((match) => match[1]!.trim()).filter(Boolean) : [];
+    if (!paths.length) throw new ValidationError(`frozen Task is missing allowed write paths: ${task.source_path}`);
+    return [...new Set(paths)];
+  }
+
   private testCommandSnapshot(runId: string, worktreePath: string, explorerDispatchId: string): {
     commands: string[];
     provenance: { explorer_dispatch_id: string; plan_id: string | null; revision: string | null; repo_id: string };
@@ -1394,9 +1439,14 @@ export class DispatchService {
       ? coordinatorPacket.context.explorer_dispatch_id
       : (this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='file-explorer' AND state='completed' ORDER BY completed_at DESC LIMIT 1").get(runId) as { dispatch_id?: string } | undefined)?.dispatch_id;
     if (!explorerDispatchId) throw new ValidationError("planned task prepare requires completed Explorer provenance");
+    const resolvedTests = new Set((this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='test.predecessor_repair_resolved' ORDER BY event_id")
+      .all(runId) as Array<{ payload_json: string }>).flatMap(({ payload_json }) => {
+        const ids = (JSON.parse(payload_json) as { handled_test_dispatch_ids?: unknown }).handled_test_dispatch_ids;
+        return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+      }));
     const recoveredTests = (this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='test.premature_handled' ORDER BY event_id")
       .all(runId) as Array<{ payload_json: string }>).map(({ payload_json }) => (JSON.parse(payload_json) as { dispatch_id: string }).dispatch_id);
-    const handledTests = recoveredTests.map((dispatchId) => {
+    const handledTests = recoveredTests.filter((dispatchId) => !resolvedTests.has(dispatchId)).map((dispatchId) => {
       const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result' ORDER BY created_at DESC LIMIT 1")
         .get(runId, dispatchId) as { artifact_id: string; sha256: string } | undefined;
       const dispatch = this.store.db.prepare("SELECT result_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, dispatchId) as { result_json?: string } | undefined;
@@ -1756,7 +1806,27 @@ export class DispatchService {
       : [...new Set([...developers.flatMap((developer) => (JSON.parse(developer.packet_json) as DispatchPacket).allowed_read_paths), "package.json"])];
     if (!Array.isArray(authorizedPaths) || authorizedPaths.some((path) => typeof path !== "string")) return undefined;
     if (!explorer && (this.store.getRun(runId) as { mode?: string }).mode === "planned") return undefined;
-    if (changedPaths.some((path) => !pathMatchesScope(path, authorizedPaths as string[]))) throw new ValidationError("implementation paths are not authorized by Explorer evidence");
+    if (run.mode === "planned" && frozenTasks.length) {
+      const developerWritePaths = developers.flatMap((developer) => (JSON.parse(developer.packet_json) as DispatchPacket).allowed_write_paths);
+      const frozenTaskWritePaths = frozenTasks.flatMap((task) => this.frozenTaskWritePaths(runId, task.task_id));
+      const unauthorizedPaths = changedPaths.filter((path) =>
+        !pathMatchesScope(path, developerWritePaths) || !pathMatchesScope(path, frozenTaskWritePaths));
+      if (unauthorizedPaths.length) throw new ValidationError("planned implementation paths are not authorized by frozen Task write paths", {
+        offending_dispatch_id: developers.find((developer) => {
+          try {
+            const modifiedPaths = ((JSON.parse(developer.result_json ?? "{}") as ResultEnvelope).payload as { modified_paths?: string[] }).modified_paths ?? [];
+            return modifiedPaths.some((path) => unauthorizedPaths.includes(path));
+          } catch { return false; }
+        })?.dispatch_id ?? coordinator.dispatch_id,
+        unauthorized_paths: unauthorizedPaths,
+        authorization_source_expected: "frozen Task write paths + developer packet allowed_write_paths + planned pre_commit scope",
+        explorer_paths: authorizedPaths,
+        frozen_task_write_paths: [...new Set(frozenTaskWritePaths)],
+        pre_commit_scope_digest: sha256(stableJson([...new Set(developerWritePaths)].sort())),
+      });
+    } else if (changedPaths.some((path) => !pathMatchesScope(path, authorizedPaths as string[]))) {
+      throw new ValidationError("implementation paths are not authorized by Explorer evidence");
+    }
     const implementationArtifacts = developers.map((developer) => {
       const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result' ORDER BY created_at DESC LIMIT 1")
         .get(runId, developer.dispatch_id) as { artifact_id: string; sha256: string } | undefined;
@@ -2327,7 +2397,27 @@ export class DispatchService {
       try { return ((JSON.parse(developer.result_json!) as ResultEnvelope).payload as { modified_paths?: string[] }).modified_paths ?? []; }
       catch { return []; }
     }))];
-    if (changedPaths.some((path) => !pathMatchesScope(path, authorizedPaths as string[]))) throw new ValidationError("coding continuation developer paths are not authorized by Explorer evidence");
+    if (run.mode === "planned") {
+      for (const developer of developers) {
+        const developerPacket = JSON.parse(developer.packet_json) as DispatchPacket;
+        const developerResult = JSON.parse(developer.result_json!) as ResultEnvelope;
+        const modifiedPaths = (developerResult.payload as { modified_paths?: string[] }).modified_paths ?? [];
+        const frozenTaskWritePaths = this.frozenTaskWritePaths(runId, String(developerPacket.context.task_id));
+        const unauthorizedPaths = modifiedPaths.filter((path) =>
+          !pathMatchesScope(path, frozenTaskWritePaths) || !pathMatchesScope(path, developerPacket.allowed_write_paths));
+        if (unauthorizedPaths.length) throw new ValidationError("planned developer paths are not authorized by the frozen Task and pre_commit scope", {
+          offending_dispatch_id: developer.dispatch_id,
+          unauthorized_paths: unauthorizedPaths,
+          authorization_source_expected: "frozen Task write paths + developer packet allowed_write_paths + planned pre_commit scope",
+          explorer_paths: authorizedPaths,
+          frozen_task_write_paths: frozenTaskWritePaths,
+          developer_write_paths: developerPacket.allowed_write_paths,
+          pre_commit_scope_digest: sha256(stableJson([...new Set(developerPacket.allowed_write_paths)].sort())),
+        });
+      }
+    } else if (changedPaths.some((path) => !pathMatchesScope(path, authorizedPaths as string[]))) {
+      throw new ValidationError("coding continuation developer paths are not authorized by Explorer evidence");
+    }
     const plannedScopeDigests: Array<{ worktree_id: string; digest: string }> = [];
     if (run.mode === "planned") {
       for (const worktreeId of uncommittedWorktreeIds) {
