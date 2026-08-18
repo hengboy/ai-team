@@ -387,17 +387,19 @@ export class GitOrchestrator {
 
   async mergeTask(runId: string, integrationId: string, taskId: string, dispatchId?: string): Promise<string> {
     this.assertGitOperator(runId, dispatchId);
+    let taskWorktreeId = taskId;
     if (dispatchId) {
-      new DispatchService(this.store).assertMergeWorktreeBindings(runId, dispatchId, integrationId, [taskId]);
+      taskWorktreeId = new DispatchService(this.store).assertMergeWorktreeBindings(runId, dispatchId, integrationId, taskId).task_worktree_id;
     }
     const integration = this.plannedIntegrationWorktree(runId, integrationId);
-    const task = this.worktree(runId, taskId);
+    const task = this.worktree(runId, taskWorktreeId);
     const taskCommit = await currentHead(task.path);
     const operation = this.store.beginOperation("git.merge.task", `merge-task:${runId}:${integration.branch}:${task.branch}:${taskCommit}`, {
       integration: integration.branch,
       task: task.branch,
       integration_worktree_id: integrationId,
-      task_worktree_id: taskId,
+      task_id: taskId,
+      task_worktree_id: taskWorktreeId,
     }, runId);
     if (operation.reused) {
       if (operation.state !== "completed") throw new ValidationError("merge side effect is unknown; reconcile required");
@@ -407,7 +409,8 @@ export class GitOrchestrator {
     this.store.finishOperation(operation.operationId, {
       commit,
       task_commit: taskCommit,
-      task_worktree_id: taskId,
+      task_id: taskId,
+      task_worktree_id: taskWorktreeId,
       integration_worktree_id: integrationId,
     });
     return commit;

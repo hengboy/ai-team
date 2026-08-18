@@ -333,8 +333,12 @@ test("planned multi-task run continues from prepare through test and derives the
       operations: [{ command: "ai-team git commit", outcome: committed.commit }],
     }));
     const mergeDispatch = dispatches.continuation(runId).pending_dispatches.find(({ role }) => role === "git-operator")!;
+    const mergePacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(mergeDispatch.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(mergePacket.context.task_id, "TASK-001");
+    assert.equal(mergePacket.context.task_worktree_id, firstTask.worktree_id);
+    assert.equal(mergePacket.context.implementation_worktree_id, firstTask.worktree_id);
     dispatches.claim(runId, mergeDispatch.dispatch_id, "git-operator");
-    const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, firstTask.worktree_id, mergeDispatch.dispatch_id);
+    const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, "TASK-001", mergeDispatch.dispatch_id);
     await dispatches.submitValue(runId, mergeDispatch.dispatch_id, "git-operator", result(mergeDispatch.dispatch_id, "git-operator", {
       operations: [{ command: "ai-team git merge-task", outcome: merged }],
     }));
@@ -394,12 +398,16 @@ test("historical planned merge reissues failed ownership repair, adopts only the
       context: {
         phase: "integrate_implementation",
         integration_worktree_id: plan.worktree_id,
+        task_id: "TASK-001",
+        task_worktree_id: task.worktree_id,
         task_worktree_ids: [task.worktree_id],
+        implementation_worktree_id: task.worktree_id,
+        worktree_id: task.worktree_id,
       },
     });
     dispatches.claim(runId, mergeDispatchId, "git-operator");
     await assert.rejects(
-      fixture.orchestrator.mergeTask(runId, plan.worktree_id, task.worktree_id, mergeDispatchId),
+      fixture.orchestrator.mergeTask(runId, plan.worktree_id, "TASK-001", mergeDispatchId),
       (error: Error) => error.message.includes(`worktree ${task.worktree_id} is not consumable by run ${runId}`)
         && error.message.includes("constraint=run_id=expected_run_id")
         && error.message.includes(`actual_run_id=${legacyRunId}`),
@@ -425,6 +433,9 @@ test("historical planned merge reissues failed ownership repair, adopts only the
     const ownershipPacket = JSON.parse(ownershipRow.packet_json);
     assert.equal(ownershipRow.replacement_for, mergeDispatchId);
     assert.equal(ownershipPacket.context.phase, "reconcile_worktree_ownership");
+    assert.equal(ownershipPacket.context.task_id, "TASK-001");
+    assert.equal(ownershipPacket.context.task_worktree_id, task.worktree_id);
+    assert.equal(ownershipPacket.context.implementation_worktree_id, task.worktree_id);
     const taskCommit = await rawGit(task.path, ["rev-parse", "HEAD"]);
     assert.deepEqual(ownershipPacket.context.worktree_ids, [task.worktree_id]);
     assert.deepEqual(ownershipPacket.context.task_worktrees, [{
@@ -473,10 +484,14 @@ test("historical planned merge reissues failed ownership repair, adopts only the
     assert.notEqual(replacement.dispatch_id, mergeDispatchId);
     const replacementRow = fixture.store.db.prepare("SELECT replacement_for,packet_json FROM dispatches WHERE dispatch_id=?").get(replacement.dispatch_id) as { replacement_for: string; packet_json: string };
     assert.equal(replacementRow.replacement_for, retry.dispatch_id);
-    assert.equal(JSON.parse(replacementRow.packet_json).context.phase, "integrate_implementation");
+    const replacementPacket = JSON.parse(replacementRow.packet_json);
+    assert.equal(replacementPacket.context.phase, "integrate_implementation");
+    assert.equal(replacementPacket.context.task_id, "TASK-001");
+    assert.equal(replacementPacket.context.task_worktree_id, task.worktree_id);
+    assert.equal(replacementPacket.context.implementation_worktree_id, task.worktree_id);
 
     dispatches.claim(runId, replacement.dispatch_id, "git-operator");
-    const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, task.worktree_id, replacement.dispatch_id);
+    const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, "TASK-001", replacement.dispatch_id);
     await dispatches.submitValue(runId, replacement.dispatch_id, "git-operator", {
       ...createResultTemplate(runId, replacement.dispatch_id, "git-operator"),
       summary: "TASK-001 merged",
@@ -585,12 +600,15 @@ test("planned merge reconciles completed transfer and adopt before merging exact
     });
     dispatches.claim(runId, reconciled.dispatch_id, "git-operator");
     await assert.rejects(
-      fixture.orchestrator.mergeTask(runId, plan.worktree_id, "worktree_unbound_task", reconciled.dispatch_id),
-      (error: Error) => error.message.includes(`expected_worktree_ids=["${plan.worktree_id}","worktree_unbound_task"]`)
-        && error.message.includes(`actual_bound_ids=["${plan.worktree_id}","${task.worktree_id}"]`)
-        && error.message.includes('missing_bindings=["worktree_unbound_task"]'),
+      fixture.orchestrator.mergeTask(runId, "worktree_unbound_integration", "TASK-001", reconciled.dispatch_id),
+      (error: Error) => error.message.includes("expected_task_id=TASK-001")
+        && error.message.includes("actual_task_id=TASK-001")
+        && error.message.includes(`expected_task_worktree_id=${task.worktree_id}`)
+        && error.message.includes(`actual_task_worktree_id=${task.worktree_id}`)
+        && error.message.includes("expected_integration_worktree_id=worktree_unbound_integration")
+        && error.message.includes(`actual_integration_worktree_id=${plan.worktree_id}`),
     );
-    const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, task.worktree_id, reconciled.dispatch_id);
+    const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, "TASK-001", reconciled.dispatch_id);
     assert.equal((await rawGit(plan.path, ["rev-list", "--parents", "-n", "1", merged])).split(" ").length, 3);
     assert.equal(await fixture.orchestrator.mergeTask(runId, plan.worktree_id, task.worktree_id), merged);
     assert.equal(

@@ -22,6 +22,20 @@ const rowFor = (store: StateStore, worktreeId: string): OwnedWorktree | undefine
   store.db.prepare("SELECT worktree_id,run_id,branch,path,base_commit,state FROM worktrees WHERE worktree_id=?")
     .get(worktreeId) as OwnedWorktree | undefined;
 
+export const resolveTaskIdentityWorktree = (store: StateStore, runId: string, taskId: string): OwnedWorktree => {
+  const { run } = context(store, runId);
+  if (run.mode !== "planned" || !run.plan_id || !run.revision || !/^TASK-\d{3}$/.test(taskId)) {
+    throw new ValidationError(`task identity ${taskId} cannot be resolved for run ${runId}`);
+  }
+  const branch = `task/${run.plan_id}/${run.plan_id}-${run.revision}--${taskId.toLowerCase()}`;
+  const row = store.db.prepare(`SELECT w.worktree_id,w.run_id,w.branch,w.path,w.base_commit,w.state
+    FROM worktrees w JOIN runs r ON r.run_id=w.run_id
+    WHERE w.branch=? AND w.state='active' AND r.repo_id=?`)
+    .get(branch, run.repo_id) as OwnedWorktree | undefined;
+  if (!row) throw new ValidationError(`task identity ${taskId} has no active worktree record for run ${runId}`);
+  return row;
+};
+
 const ownershipError = (worktreeId: string, runId: string, row: OwnedWorktree | undefined, constraint: string): ValidationError =>
   new ValidationError(
     `worktree ${worktreeId} is not consumable by run ${runId}: constraint=${constraint}; expected_run_id=${runId}; actual_run_id=${row?.run_id ?? "not_found"}`,
