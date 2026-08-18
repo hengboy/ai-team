@@ -400,7 +400,9 @@ test("historical planned merge reissues failed ownership repair, adopts only the
     dispatches.claim(runId, mergeDispatchId, "git-operator");
     await assert.rejects(
       fixture.orchestrator.mergeTask(runId, plan.worktree_id, task.worktree_id, mergeDispatchId),
-      /worktree does not belong to run/,
+      (error: Error) => error.message.includes(`worktree ${task.worktree_id} is not consumable by run ${runId}`)
+        && error.message.includes("constraint=run_id=expected_run_id")
+        && error.message.includes(`actual_run_id=${legacyRunId}`),
     );
     const historicalFailure = {
       ...createResultTemplate(runId, mergeDispatchId, "git-operator"),
@@ -487,6 +489,98 @@ test("historical planned merge reissues failed ownership repair, adopts only the
     assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.merge.task'").get(runId) as { count: number }).count, 1);
     assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND json_extract(packet_json,'$.context.phase')='integrate_implementation'").get(runId) as { count: number }).count, 2);
     assert.equal((fixture.store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id=?").get(plan.worktree_id) as { run_id: string }).run_id, legacyRunId);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("planned merge reconciles completed transfer and adopt before merging exactly once", async () => {
+  const fixture = await createFixture();
+  try {
+    const planId = "20260818-partial-ownership";
+    const revision = "001";
+    const taskRoot = join(fixture.root, ".ai-team", "plans", planId, "revisions", revision, "tasks");
+    await mkdir(taskRoot, { recursive: true });
+    await writeFile(join(taskRoot, "TASK-001.md"), "# TASK-001\n");
+    await writeFile(join(taskRoot, "TASK-002.md"), "# TASK-002\n");
+    await rawGit(fixture.root, ["add", ".ai-team"]);
+    await rawGit(fixture.root, ["commit", "-m", "Freeze partial ownership tasks"]);
+    const identity = await repositoryIdentity(fixture.root);
+    const runId = fixture.store.createRun({
+      repoId: identity.repoId,
+      profile: "coding",
+      mode: "planned",
+      planId,
+      revision,
+      baseCommit: await rawGit(fixture.root, ["rev-parse", "HEAD"]),
+      targetBranch: "main",
+    });
+    const legacyRunId = fixture.store.createRun({ repoId: identity.repoId, profile: "coding", mode: "feature", targetBranch: "main" });
+    const plan = await fixture.orchestrator.prepareIntegration(runId);
+    const task = await fixture.orchestrator.prepareTask(runId, "TASK-001");
+    await writeFile(join(task.path, "task-one.txt"), "task one\n");
+    new ScopeGate(fixture.store).check(runId, "pre_commit", ["task-one.txt"], task.worktree_id);
+    await fixture.orchestrator.commit(runId, task.worktree_id, "Complete TASK-001", ["task-one.txt"]);
+    await fixture.orchestrator.transfer(legacyRunId, plan.worktree_id);
+    await fixture.orchestrator.transfer(legacyRunId, task.worktree_id);
+
+    const dispatches = new DispatchService(fixture.store);
+    const mergeDispatchId = dispatches.create(runId, "git-operator", {
+      objective: "Restore ownership and merge TASK-001",
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Merge the task exactly once"],
+      context: {
+        phase: "integrate_implementation",
+        integration_worktree_id: plan.worktree_id,
+        task_worktree_ids: [task.worktree_id],
+      },
+    });
+    dispatches.claim(runId, mergeDispatchId, "git-operator");
+    assert.equal((await fixture.orchestrator.transfer(runId, plan.worktree_id, mergeDispatchId)).reused, false);
+    const taskCommit = await rawGit(task.path, ["rev-parse", "HEAD"]);
+    assert.equal((await fixture.orchestrator.adopt(runId, task.path, task.branch, plan.base_commit, taskCommit, mergeDispatchId)).reused, false);
+    assert.equal((await fixture.orchestrator.transfer(runId, plan.worktree_id, mergeDispatchId)).reused, true);
+    assert.equal((await fixture.orchestrator.adopt(runId, task.path, task.branch, plan.base_commit, taskCommit, mergeDispatchId)).reused, true);
+    assert.equal(
+      (fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.worktree.transfer'").get(runId) as { count: number }).count,
+      1,
+    );
+    assert.equal(
+      (fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.worktree.adopt'").get(runId) as { count: number }).count,
+      1,
+    );
+
+    await dispatches.submitValue(runId, mergeDispatchId, "git-operator", {
+      ...createResultTemplate(runId, mergeDispatchId, "git-operator"),
+      status: "retryable_failure",
+      summary: "Ownership completed before the client disconnected",
+      verification: [{ command: "ai-team git transfer/adopt", outcome: "completed" }],
+      failure_class: "client_disconnect",
+      side_effect_state: "none",
+      payload: { operations: [{ command: "ai-team git transfer/adopt", outcome: "completed" }] },
+    });
+
+    const resumed = dispatches.resume(runId);
+    assert.equal(resumed.recovery?.side_effect_state, "completed");
+    assert.match(resumed.recovery?.next_command ?? "", /dispatch reconcile/);
+    assert.match((await fixture.orchestrator.reconcile(runId))[0]?.fact ?? "", /merge not started/);
+
+    const reconciled = dispatches.reconcile(runId, mergeDispatchId, "git-operator", "coding", "ownership completed; merge did not start");
+    const replacementRow = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(reconciled.dispatch_id) as { packet_json: string };
+    assert.equal(JSON.parse(replacementRow.packet_json).context.phase, "integrate_implementation");
+    dispatches.claim(runId, reconciled.dispatch_id, "git-operator");
+    const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, task.worktree_id, reconciled.dispatch_id);
+    assert.equal((await rawGit(plan.path, ["rev-list", "--parents", "-n", "1", merged])).split(" ").length, 3);
+    assert.equal(await fixture.orchestrator.mergeTask(runId, plan.worktree_id, task.worktree_id), merged);
+    assert.equal(
+      (fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.merge.task'").get(runId) as { count: number }).count,
+      1,
+    );
+    assert.equal(
+      (fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind IN ('git.worktree.transfer','git.worktree.adopt')").get(runId) as { count: number }).count,
+      2,
+    );
   } finally {
     await fixture.dispose();
   }

@@ -12,6 +12,7 @@ import { assertRevisionRunStage } from "./planning.js";
 import { assertRelativePosixPath, makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
 import type { ReviewFinding, ReviewResult } from "./review.js";
 import { ScopeGate } from "./gates.js";
+import { completedMergeOwnershipPartialEffect, type MergeOwnershipPartialEffect } from "./worktree-ownership.js";
 
 export interface DispatchPacket {
   objective: string;
@@ -524,6 +525,27 @@ export class DispatchService {
     return dispatchId;
   }
 
+  private plannedMergePartialEffect(
+    runId: string,
+    dispatch: { role: Role; packet_json: string },
+  ): MergeOwnershipPartialEffect | undefined {
+    if (dispatch.role !== "git-operator") return undefined;
+    let context: Record<string, unknown>;
+    try { context = (JSON.parse(dispatch.packet_json) as DispatchPacket).context; }
+    catch { return undefined; }
+    if (context.phase !== "integrate_implementation" && context.phase !== "reconcile_worktree_ownership"
+      || typeof context.integration_worktree_id !== "string"
+      || !Array.isArray(context.task_worktree_ids)
+      || !context.task_worktree_ids.length
+      || context.task_worktree_ids.some((id) => typeof id !== "string")) return undefined;
+    return completedMergeOwnershipPartialEffect(
+      this.store,
+      runId,
+      context.integration_worktree_id,
+      context.task_worktree_ids as string[],
+    );
+  }
+
   private get(runId: string, dispatchId: string, role: Role): any {
     const row = this.store.db.prepare("SELECT * FROM dispatches WHERE run_id=? AND dispatch_id=? AND role=?").get(runId, dispatchId, role);
     if (!row) throw new ValidationError("dispatch identity does not match run and role");
@@ -654,7 +676,8 @@ export class DispatchService {
     let result: { status?: string; side_effect_state?: string };
     try { result = JSON.parse(row.result_json ?? ""); }
     catch { throw new ValidationError("dispatch reconciliation requires a valid retryable result envelope"); }
-    if (result.status !== "retryable_failure" || result.side_effect_state !== "completed") {
+    const partialEffect = this.plannedMergePartialEffect(runId, row);
+    if (result.status !== "retryable_failure" || (result.side_effect_state !== "completed" && !partialEffect)) {
       throw new ValidationError("dispatch reconciliation requires confirmed completed side effects", [
         { path: "/side_effect_state", pointer: "/side_effect_state", field: "side_effect_state", constraint: "const", message: "must equal completed" },
       ]);
@@ -665,7 +688,15 @@ export class DispatchService {
         .run(new Date().toISOString(), dispatchId);
       this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
       replacementId = this.recoveryReplacement(runId, { dispatch_id: dispatchId, ...row });
-      this.store.event(runId, "dispatch.reconciled", { dispatchId, replacement_dispatch_id: replacementId, role, actor_role: actorRole, reason, side_effect_state: "completed" });
+      this.store.event(runId, "dispatch.reconciled", {
+        dispatchId,
+        replacement_dispatch_id: replacementId,
+        role,
+        actor_role: actorRole,
+        reason,
+        side_effect_state: "completed",
+        ...(partialEffect ? { ownership_operation_ids: partialEffect.operation_ids, merge_pending: true } : {}),
+      });
     })();
     return { action: "reconciled", dispatch_id: replacementId, replacement_for: dispatchId, reused: false };
   }
@@ -2112,6 +2143,7 @@ export class DispatchService {
       const retryableDispatch = run.state === "retryable_failure"
         ? this.store.db.prepare("SELECT dispatch_id,role,packet_json,packet_digest,result_json,replacement_for FROM dispatches WHERE run_id=? AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1").get(runId) as { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string } | undefined
         : undefined;
+      const mergePartialEffect = retryableDispatch ? this.plannedMergePartialEffect(runId, retryableDispatch) : undefined;
       if (pendingDecision) {
         if (retryableDispatch && !pendingDecision.dispatch_id) {
           const receipt = { ...JSON.parse(pendingDecision.receipt_json ?? "{}"), dispatch_id: retryableDispatch.dispatch_id };
@@ -2136,7 +2168,7 @@ export class DispatchService {
           retryableHasNoSideEffects = result.status === "retryable_failure" && result.side_effect_state === "none";
         } catch { /* corrupt legacy results remain blocked */ }
       }
-      if (retryableDispatch && retryableHasNoSideEffects) {
+      if (retryableDispatch && retryableHasNoSideEffects && !mergePartialEffect) {
         this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
           .run(new Date().toISOString(), retryableDispatch.dispatch_id);
         this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
@@ -2162,19 +2194,21 @@ export class DispatchService {
     })();
     const resumedRun = this.store.getRun(runId) as Record<string, unknown> & { profile: Role; state: string };
     const blockedRetryable = resumedRun.state === "retryable_failure"
-      ? this.store.db.prepare("SELECT dispatch_id,role,result_json FROM dispatches WHERE run_id=? AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1")
-        .get(runId) as { dispatch_id: string; role: Role; result_json?: string } | undefined
+      ? this.store.db.prepare("SELECT dispatch_id,role,packet_json,result_json FROM dispatches WHERE run_id=? AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1")
+        .get(runId) as { dispatch_id: string; role: Role; packet_json: string; result_json?: string } | undefined
       : undefined;
     let recovery: RunResumeResult["recovery"] = null;
     if (blockedRetryable?.result_json) {
       try {
         const result = JSON.parse(blockedRetryable.result_json) as { side_effect_state?: "completed" | "unknown" };
-        if (result.side_effect_state === "completed" || result.side_effect_state === "unknown") {
+        const partialEffect = this.plannedMergePartialEffect(runId, blockedRetryable);
+        if (result.side_effect_state === "completed" || result.side_effect_state === "unknown" || partialEffect) {
+          const sideEffectState = partialEffect ? "completed" : result.side_effect_state as "completed" | "unknown";
           recovery = {
             state: "action_required",
             dispatch_id: blockedRetryable.dispatch_id,
-            side_effect_state: result.side_effect_state,
-            next_command: result.side_effect_state === "completed"
+            side_effect_state: sideEffectState,
+            next_command: sideEffectState === "completed"
               ? `ai-team dispatch reconcile --run-id ${runId} --dispatch-id ${blockedRetryable.dispatch_id} --role ${blockedRetryable.role} --actor-role ${resumedRun.profile} --reason "reconcile confirmed completed side effect"`
               : null,
           };
