@@ -22,6 +22,24 @@ export type { StagingBinding, StagingCleanupSelector, StagingEntry } from "./sta
 /** Increment when persisted state contracts change incompatibly. */
 export const STATE_SCHEMA_EPOCH = 2;
 
+export const assertExplicitTaskWritePaths = (paths: string[], sourcePath: string): string[] => {
+  const normalized = [...new Set(paths)].sort();
+  if (!normalized.length) throw new ValidationError(`frozen Task is missing allowed write paths: ${sourcePath}`);
+  const invalid = normalized.filter((path) => path === "." || path.startsWith("/") || path.includes("\\")
+    || path.split("/").includes("..") || /[*?{}[\]]/.test(path) || !/^[A-Za-z0-9._/@+-]+$/.test(path)
+    || (!path.includes("/") && !path.includes(".")));
+  if (invalid.length) {
+    throw new ValidationError(`frozen Task allowed write paths must be explicit repository paths: ${sourcePath}`, { invalid_paths: invalid });
+  }
+  return normalized;
+};
+
+export const frozenTaskWritePathsFromDocument = (content: string, sourcePath: string): string[] => {
+  const line = content.split(/\r?\n/).find((candidate) => /^-\s*(?:允许写入路径|Allowed write paths)\s*[：:]/i.test(candidate));
+  const paths = line ? [...line.matchAll(/`([^`]+)`/g)].map((match) => match[1]!.trim()).filter(Boolean) : [];
+  return assertExplicitTaskWritePaths(paths, sourcePath);
+};
+
 export interface StateStoreOpenOptions {
   readonly?: boolean;
 }
@@ -321,6 +339,14 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "013-run-task-write-paths",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      const columns = db.prepare("PRAGMA table_info(run_tasks)").all() as Array<{ name: string }>;
+      if (!columns.some((column) => column.name === "write_paths_json")) db.exec("ALTER TABLE run_tasks ADD COLUMN write_paths_json TEXT;");
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
@@ -504,24 +530,30 @@ export class StateStore {
     return run;
   }
 
-  initializeRunTasks(runId: string, tasks: Array<{ task_id: string; source_path: string; source_digest: string }>): void {
+  initializeRunTasks(runId: string, tasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[] }>): void {
     this.getRun(runId);
     if (new Set(tasks.map(({ task_id }) => task_id)).size !== tasks.length
-      || tasks.some(({ task_id, source_path, source_digest }) => !/^TASK-\d{3}$/.test(task_id) || !source_path || !/^[a-f0-9]{64}$/.test(source_digest))) {
+      || tasks.some(({ task_id, source_path, source_digest, write_paths }) => !/^TASK-\d{3}$/.test(task_id) || !source_path
+        || !/^[a-f0-9]{64}$/.test(source_digest) || !write_paths.length || write_paths.some((path) => !path))) {
       throw new ValidationError("frozen run task metadata is invalid");
     }
-    const existing = this.db.prepare("SELECT task_id,ordinal,source_path,source_digest FROM run_tasks WHERE run_id=? ORDER BY ordinal")
-      .all(runId) as Array<{ task_id: string; ordinal: number; source_path: string; source_digest: string }>;
-    const expected = tasks.map((task, ordinal) => ({ ...task, ordinal }));
+    const existing = this.db.prepare("SELECT task_id,ordinal,source_path,source_digest,write_paths_json FROM run_tasks WHERE run_id=? ORDER BY ordinal")
+      .all(runId) as Array<{ task_id: string; ordinal: number; source_path: string; source_digest: string; write_paths_json?: string }>;
+    const expected = tasks.map((task, ordinal) => ({
+      ...task,
+      write_paths: assertExplicitTaskWritePaths(task.write_paths, task.source_path),
+      ordinal,
+    }));
     if (existing.length) {
-      if (stableJson(existing) !== stableJson(expected)) throw new ValidationError("run task manifest is already frozen with different metadata");
+      const comparable = existing.map(({ write_paths_json, ...task }) => ({ ...task, write_paths: JSON.parse(write_paths_json ?? "[]") }));
+      if (stableJson(comparable) !== stableJson(expected)) throw new ValidationError("run task manifest is already frozen with different metadata");
       return;
     }
-    const insert = this.db.prepare(`INSERT INTO run_tasks(run_id,task_id,ordinal,source_path,source_digest,state,updated_at)
-      VALUES (?,?,?,?,?,'pending',?)`);
+    const insert = this.db.prepare(`INSERT INTO run_tasks(run_id,task_id,ordinal,source_path,source_digest,write_paths_json,state,updated_at)
+      VALUES (?,?,?,?,?,?,'pending',?)`);
     this.db.transaction(() => {
       const now = new Date().toISOString();
-      for (const task of expected) insert.run(runId, task.task_id, task.ordinal, task.source_path, task.source_digest, now);
+      for (const task of expected) insert.run(runId, task.task_id, task.ordinal, task.source_path, task.source_digest, stableJson(task.write_paths), now);
       if (expected.length) this.event(runId, "run.tasks_frozen", { tasks: expected });
     })();
   }
@@ -531,6 +563,7 @@ export class StateStore {
     ordinal: number;
     source_path: string;
     source_digest: string;
+    write_paths_json?: string;
     state: "pending" | "prepared" | "implemented" | "tested" | "committed" | "integrated";
     worktree_id?: string;
     developer_dispatch_id?: string;

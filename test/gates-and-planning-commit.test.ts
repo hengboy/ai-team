@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { EnvironmentService } from "../src/environment.js";
 import { retryTransient, ScopeGate } from "../src/gates.js";
 import { commitPlanningRevision } from "../src/git.js";
-import { StateStore } from "../src/state.js";
+import { frozenTaskWritePathsFromDocument, StateStore } from "../src/state.js";
 
 const exec = promisify(execFile);
 const rawGit = async (cwd: string, args: string[]): Promise<string> => (await exec("git", args, { cwd })).stdout.trim();
@@ -54,19 +54,41 @@ test("planned pre_commit scope is bound to its run-owned worktree", async () => 
   const home = await mkdtemp(join(tmpdir(), "ai-team-planned-gate-"));
   const store = await StateStore.open(home);
   try {
-    store.registerRepository("repo", "/tmp/repo.git", "/tmp/repo");
+    const repository = join(home, "repo");
+    await mkdir(repository);
+    await rawGit(repository, ["init", "-b", "main"]);
+    await rawGit(repository, ["config", "user.name", "AI Team Test"]);
+    await rawGit(repository, ["config", "user.email", "ai-team@example.test"]);
+    await writeFile(join(repository, "README.md"), "fixture\n");
+    await rawGit(repository, ["add", "README.md"]);
+    await rawGit(repository, ["commit", "-m", "fixture"]);
+    store.registerRepository("repo", join(repository, ".git"), repository);
     const run = store.createRun({ repoId: "repo", profile: "coding", mode: "planned", planId: "planned-gate", revision: "001" });
+    assert.throws(() => store.initializeRunTasks(run, [{
+      task_id: "TASK-001", source_path: "TASK-001.md", source_digest: "a".repeat(64), write_paths: ["test/**"],
+    }]), /explicit repository paths/);
     store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
-      .run("worktree_planned_gate", run, "task/planned-gate/planned-gate-001--task-001", "/tmp/repo/.worktrees/tasks/planned-gate/planned-gate-001--task-001", "a".repeat(40), new Date().toISOString());
+      .run("worktree_planned_gate", run, "task/planned-gate/planned-gate-001--task-001", repository, await rawGit(repository, ["rev-parse", "HEAD"]), new Date().toISOString());
     const gate = new ScopeGate(store);
     assert.throws(() => gate.check(run, "pre_write", ["src/**"], "worktree_planned_gate"), /only the pre_commit/);
     assert.throws(() => gate.check(run, "pre_commit", ["src/**"]), /requires a worktree id/);
     const completed = gate.check(run, "pre_commit", ["src/**"], "worktree_planned_gate");
     assert.equal(completed.complete, true);
     assert.deepEqual(gate.check(run, "pre_commit", ["src/**"], "worktree_planned_gate"), completed);
+    assert.throws(() => gate.check(run, "pre_commit", ["test/**"], "worktree_planned_gate"), /run frozen/);
+    const events = store.db.prepare("SELECT type,payload_json FROM run_events WHERE run_id=? AND type LIKE 'scope.pre_commit%' ORDER BY event_id").all(run) as Array<{ type: string; payload_json: string }>;
+    assert.deepEqual(events.map(({ type }) => type), ["scope.pre_commit", "scope.pre_commit_drift"]);
+    assert.deepEqual(JSON.parse(events[0]!.payload_json).paths, ["src/**"]);
+    assert.deepEqual(JSON.parse(events[1]!.payload_json).unauthorized_paths, ["src/**", "test/**"]);
     gate.assertPreCommit(run, ["src/**"], "worktree_planned_gate");
     assert.throws(() => gate.assertPreCommit(run, ["test/**"], "worktree_planned_gate"), /has not passed pre_commit/);
   } finally { store.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("frozen Task write paths reject globs and role descriptions", () => {
+  assert.deepEqual(frozenTaskWritePathsFromDocument("- 允许写入路径：`src/dispatch.ts`\n", "TASK-001.md"), ["src/dispatch.ts"]);
+  assert.throws(() => frozenTaskWritePathsFromDocument("- 允许写入路径：`test/**`\n", "TASK-001.md"), /explicit repository paths/);
+  assert.throws(() => frozenTaskWritePathsFromDocument("- 允许写入路径：`planning/coding角色文件`\n", "TASK-001.md"), /explicit repository paths/);
 });
 
 test("planning commit stages only the immutable revision and includes trailers", async () => {

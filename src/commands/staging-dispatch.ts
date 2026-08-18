@@ -152,6 +152,10 @@ export const registerDispatchCommands = (program: Command, dependencies: Dispatc
       output(await withStore((store) => new DispatchService(store).submit(options.runId, options.dispatchId, options.role, options.resultFile)));
       return;
     }
+    if (options.stagingId && !options.resultFile && !options.inputStdin) {
+      output(await withStore((store) => new DispatchService(store).submitStaging(options.runId, options.dispatchId, options.role, options.stagingId)));
+      return;
+    }
     const retention = await retentionHours();
     output(await withStore(async (store) => {
       const input = await loadJsonInput(store, { file: options.resultFile, stagingId: options.stagingId, inputStdin: options.inputStdin, runId: options.runId, dispatchId: options.dispatchId, role: options.role, kind: "dispatch-result" }, retention);

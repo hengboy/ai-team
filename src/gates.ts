@@ -1,4 +1,5 @@
 import { ValidationError } from "./errors.js";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { StateStore } from "./state.js";
 import { sha256, stableJson } from "./utils.js";
@@ -16,6 +17,21 @@ export const retryTransient = async <T>(failureClass: string, action: (attempt: 
 };
 
 export type ScopeGateStage = "triage" | "pre_write" | "pre_commit";
+
+export const plannedWorktreeSnapshot = (path: string): { head: string; dirty_paths: string[]; diff_digest: string } | null => {
+  try {
+    const head = execFileSync("git", ["-C", path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const status = execFileSync("git", ["-C", path, "status", "--porcelain=v1", "-z", "--untracked-files=all"], { encoding: "utf8" })
+      .split("\0").filter(Boolean);
+    const dirtyPaths = [...new Set(status.map((entry) => entry.slice(3)))].sort();
+    const trackedDiff = execFileSync("git", ["-C", path, "diff", "--binary", "--no-ext-diff", "HEAD"], { encoding: "utf8" });
+    const untracked = status.filter((entry) => entry.startsWith("?? ")).map((entry) => entry.slice(3)).sort();
+    const untrackedObjects = untracked.map((file) => `${file}\0${execFileSync("git", ["-C", path, "hash-object", "--", file], { encoding: "utf8" }).trim()}`);
+    return /^[a-f0-9]{40}$/.test(head)
+      ? { head, dirty_paths: dirtyPaths, diff_digest: sha256(`${trackedDiff}\0${untrackedObjects.join("\0")}`) }
+      : null;
+  } catch { return null; }
+};
 
 export class ScopeGate {
   constructor(readonly store: StateStore) {}
@@ -35,7 +51,7 @@ export class ScopeGate {
       && row.path === join(repository.project_path, ".worktrees", "plans", run.plan_id, planRevision));
   }
 
-  check(runId: string, stage: ScopeGateStage, paths: string[], worktreeId?: string): { digest: string; complete: boolean } {
+  check(runId: string, stage: ScopeGateStage, paths: string[], worktreeId?: string, diagnostics: Record<string, unknown> = {}): { digest: string; complete: boolean } {
     const run = this.store.getRun(runId) as any;
     const direct = (["bug", "feature"] as string[]).includes(run.mode);
     if (!direct && run.mode !== "planned") throw new ValidationError("scope gate applies only to direct or planned coding runs");
@@ -49,14 +65,40 @@ export class ScopeGate {
       const previous = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
         .get(runId, worktreeId) as { payload_json: string } | undefined;
       if (previous) {
-        const existing = JSON.parse(previous.payload_json) as { digest: string };
+        const existing = JSON.parse(previous.payload_json) as { digest: string; paths?: string[]; snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null };
         if (existing.digest !== digest) {
+          const worktree = this.store.db.prepare("SELECT path FROM worktrees WHERE worktree_id=?").get(worktreeId) as { path: string };
+          const snapshot = plannedWorktreeSnapshot(worktree.path);
           this.store.db.prepare("UPDATE runs SET state='frozen',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
-          throw new ValidationError("planned pre_commit scope changed; run frozen");
+          const unauthorized = [...new Set([
+            ...normalized.filter((path) => !(existing.paths ?? []).includes(path)),
+            ...(existing.paths ?? []).filter((path) => !normalized.includes(path)),
+          ])].sort();
+          this.store.event(runId, "scope.pre_commit_drift", {
+            worktree_id: worktreeId,
+            offending_worktree_id: worktreeId,
+            original_paths: existing.paths ?? [],
+            original_digest: existing.digest,
+            attempted_paths: normalized,
+            attempted_digest: digest,
+            unauthorized_paths: unauthorized,
+            original_snapshot: existing.snapshot ?? null,
+            snapshot,
+            ...diagnostics,
+          });
+          throw new ValidationError("planned pre_commit scope changed; run frozen", {
+            ...diagnostics,
+            offending_worktree_id: worktreeId,
+            actual_modified_paths: normalized,
+            pre_commit_paths: existing.paths ?? [],
+            pre_commit_digest: existing.digest,
+            unauthorized_paths: unauthorized,
+          });
         }
         return { digest, complete: true };
       }
-      this.store.event(runId, "scope.pre_commit", { stage, digest, paths: normalized, worktree_id: worktreeId });
+      const worktree = this.store.db.prepare("SELECT path FROM worktrees WHERE worktree_id=?").get(worktreeId) as { path: string };
+      this.store.event(runId, "scope.pre_commit", { stage, digest, paths: normalized, worktree_id: worktreeId, snapshot: plannedWorktreeSnapshot(worktree.path) });
       return { digest, complete: true };
     }
     const previous = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type LIKE 'scope.%' ORDER BY event_id").all(runId) as Array<{ payload_json: string }>;

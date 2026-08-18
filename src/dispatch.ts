@@ -7,11 +7,11 @@ import { checkDecisionInput, checkResultEnvelope, createResultTemplate, resultSc
 import { ValidationError } from "./errors.js";
 import { ROLE_MANIFEST } from "./roles.js";
 import { assertReadablePath, pathMatchesScope } from "./security.js";
-import { StateStore } from "./state.js";
+import { assertExplicitTaskWritePaths, StateStore } from "./state.js";
 import { assertRevisionRunStage } from "./planning.js";
 import { makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
 import type { ReviewFinding, ReviewResult } from "./review.js";
-import { ScopeGate } from "./gates.js";
+import { plannedWorktreeSnapshot, ScopeGate } from "./gates.js";
 import { completedMergeOwnershipPartialEffect, resolveTaskIdentityWorktree, type MergeOwnershipPartialEffect } from "./worktree-ownership.js";
 import { resolveReviewWorktree } from "./worktree-review.js";
 import {
@@ -942,12 +942,107 @@ export class DispatchService {
     return result.value;
   }
 
+  private assertPlannedTaskTestScope(runId: string, dispatchId: string, packet: DispatchPacket): void {
+    const run = this.store.getRun(runId) as { mode?: string };
+    if (run.mode !== "planned" || packet.context.phase !== "task_test") return;
+    const taskId = typeof packet.context.task_id === "string" ? packet.context.task_id : "";
+    const worktreeId = typeof packet.context.worktree_id === "string" ? packet.context.worktree_id : "";
+    const task = this.store.db.prepare("SELECT task_id,worktree_id,developer_dispatch_id,write_paths_json FROM run_tasks WHERE run_id=? AND task_id=?")
+      .get(runId, taskId) as { task_id: string; worktree_id?: string; developer_dispatch_id?: string; write_paths_json?: string } | undefined;
+    if (!task || !task.developer_dispatch_id || task.worktree_id !== worktreeId) {
+      throw new ValidationError("planned Test task/worktree/developer binding does not match frozen run task", {
+        offending_task_id: taskId, offending_test_dispatch_id: dispatchId, offending_worktree_id: worktreeId,
+        frozen_worktree_id: task?.worktree_id ?? null, frozen_developer_dispatch_id: task?.developer_dispatch_id ?? null,
+      });
+    }
+    const developer = this.store.db.prepare("SELECT packet_json,result_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role IN ('frontend-developer','backend-developer') AND state='completed'")
+      .get(runId, task.developer_dispatch_id) as { packet_json: string; result_json?: string } | undefined;
+    if (!developer?.result_json) throw new ValidationError("planned Test requires its completed frozen developer result");
+    const developerPacket = JSON.parse(developer.packet_json) as DispatchPacket;
+    if (developerPacket.context.task_id !== taskId || developerPacket.context.worktree_id !== worktreeId) {
+      throw new ValidationError("planned developer packet does not match frozen run task identity", {
+        offending_task_id: taskId, offending_dispatch_id: task.developer_dispatch_id, offending_worktree_id: worktreeId,
+      });
+    }
+    if (!task.write_paths_json) throw new ValidationError(`legacy frozen Task paths require managed scope recovery: ${taskId}`);
+    const actual = [...new Set((((JSON.parse(developer.result_json) as ResultEnvelope).payload as { modified_paths?: string[] }).modified_paths ?? []))].sort();
+    if (!actual.length) throw new ValidationError("planned Test requires non-empty developer modified_paths");
+    const frozenPaths = JSON.parse(task.write_paths_json) as string[];
+    const scopeRow = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
+      .get(runId, worktreeId) as { payload_json: string } | undefined;
+    if (!scopeRow) throw new ValidationError("planned Test requires an existing immutable pre_commit scope for its worktree", {
+      offending_task_id: taskId, offending_dispatch_id: task.developer_dispatch_id, offending_test_dispatch_id: dispatchId, offending_worktree_id: worktreeId,
+      actual_modified_paths: actual, frozen_task_paths: frozenPaths, developer_allowed_write_paths: developerPacket.allowed_write_paths,
+      pre_commit_paths: [], pre_commit_digest: null, unauthorized_paths: actual,
+    });
+    const scope = JSON.parse(scopeRow.payload_json) as { paths?: string[]; digest?: string; snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null };
+    const preCommitPaths = [...new Set(scope.paths ?? [])].sort();
+    const recoveredSnapshotRow = !scope.snapshot ? this.store.db.prepare(`SELECT payload_json FROM run_events
+      WHERE run_id=? AND type='scope.pre_commit_snapshot_recovered'
+      AND json_extract(payload_json,'$.worktree_id')=? AND json_extract(payload_json,'$.original_scope_digest')=?
+      AND json_extract(payload_json,'$.task_id')=? AND json_extract(payload_json,'$.developer_dispatch_id')=?
+      ORDER BY event_id DESC LIMIT 1`).get(runId, worktreeId, scope.digest, taskId, task.developer_dispatch_id) as { payload_json: string } | undefined : undefined;
+    const recoveredSnapshot = recoveredSnapshotRow
+      ? (JSON.parse(recoveredSnapshotRow.payload_json) as { snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } }).snapshot
+      : undefined;
+    const expectedSnapshot = scope.snapshot ?? recoveredSnapshot ?? null;
+    const worktree = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, worktreeId) as { path: string } | undefined;
+    const snapshot = worktree ? plannedWorktreeSnapshot(worktree.path) : null;
+    const unauthorized = [...new Set([
+      ...actual.filter((path) => !pathMatchesScope(path, frozenPaths)
+        || !pathMatchesScope(path, developerPacket.allowed_write_paths) || !preCommitPaths.includes(path)),
+      ...preCommitPaths.filter((path) => !actual.includes(path)),
+    ])].sort();
+    const snapshotChanged = !expectedSnapshot || !snapshot || stableJson(expectedSnapshot) !== stableJson(snapshot);
+    if (scope.digest !== sha256(stableJson(preCommitPaths)) || unauthorized.length || snapshotChanged) {
+      const details = {
+        offending_task_id: taskId,
+        offending_dispatch_id: task.developer_dispatch_id,
+        offending_test_dispatch_id: dispatchId,
+        offending_worktree_id: worktreeId,
+        actual_modified_paths: actual,
+        frozen_task_paths: frozenPaths,
+        developer_allowed_write_paths: developerPacket.allowed_write_paths,
+        pre_commit_paths: preCommitPaths,
+        pre_commit_digest: scope.digest ?? null,
+        unauthorized_paths: unauthorized,
+        original_snapshot: expectedSnapshot,
+        snapshot,
+        snapshot_changed: snapshotChanged,
+      };
+      this.store.db.transaction(() => {
+        this.store.db.prepare("UPDATE runs SET state='frozen',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+        this.store.event(runId, "scope.pre_commit_drift", details);
+      })();
+      throw new ValidationError("planned developer paths are not authorized by the frozen Task and immutable pre_commit scope; run frozen", details);
+    }
+  }
+
   async submit(runId: string, dispatchId: string, role: Role, path: string): Promise<DispatchSubmission> {
     assertReadablePath(path);
     const info = await stat(path);
     if (info.size > 2 * 1024 * 1024) throw new ValidationError("result file exceeds the 2 MiB limit");
     const source = await readFile(path, "utf8");
     return this.submitValue(runId, dispatchId, role, JSON.parse(source), source);
+  }
+
+  async submitStaging(runId: string, dispatchId: string, role: Role, stagingId: string): Promise<DispatchSubmission & {
+    staging: { staging_id: string; state: string; content_digest: string | null };
+  }> {
+    const binding = { runId, dispatchId, role, kind: "dispatch-result" as const };
+    try {
+      const input = await this.store.readStagingEntry(stagingId, binding);
+      const digest = (this.store.db.prepare("SELECT content_sha256 FROM staging_entries WHERE staging_id=?").get(stagingId) as { content_sha256?: string }).content_sha256 ?? null;
+      const submission = await this.submitValue(runId, dispatchId, role, input.value);
+      const consumed = await this.store.consumeStagingEntry(stagingId, binding);
+      return {
+        ...submission,
+        staging: { staging_id: consumed.stagingId, state: consumed.state, content_digest: digest },
+      };
+    } catch (error) {
+      try { this.store.recordStagingValidationFailure(stagingId, binding, error); } catch { /* preserve the original staging failure */ }
+      throw error;
+    }
   }
 
   async submitValue(runId: string, dispatchId: string, role: Role, value: unknown, source?: string): Promise<DispatchSubmission> {
@@ -1024,6 +1119,7 @@ export class DispatchService {
       if (typeof testedCommit === "string" && /^[a-f0-9]{40}$/.test(testedCommit)) {
         result.payload = { ...result.payload, testedCommit };
       }
+      this.assertPlannedTaskTestScope(runId, dispatchId, packet);
     }
     bindReviewBarrier(result);
     const artifactDirectory = join(this.store.paths.artifacts, runId, dispatchId);
@@ -1230,48 +1326,20 @@ export class DispatchService {
   private plannedTaskRows(runId: string): ReturnType<StateStore["runTasks"]> {
     const run = this.store.getRun(runId) as { mode?: string; repo_id: string; plan_id?: string; revision?: string; plan_digest?: string };
     if (run.mode !== "planned") return [];
-    let tasks = this.store.runTasks(runId);
-    if (tasks.length || !run.plan_id || !run.revision) return tasks;
-    const revision = this.store.db.prepare("SELECT digest,plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
-      .get(run.repo_id, run.plan_id, run.revision) as { digest?: string; plan_commit?: string } | undefined;
-    if (!revision?.plan_commit || !revision.digest) return tasks;
-    if (run.plan_digest !== revision.digest) throw new ValidationError("legacy planned task recovery plan_digest does not match the frozen revision");
-    if (!/^[a-f0-9]{40}$/.test(revision.plan_commit)) throw new ValidationError("legacy planned task recovery requires a frozen plan commit");
-    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
-    if (!repository) throw new ValidationError("legacy planned task recovery repository is not registered");
-    const taskRoot = `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/tasks`;
-    let names: string[] = [];
-    try {
-      names = execFileSync("git", ["-C", repository.project_path, "ls-tree", "-r", "--name-only", revision.plan_commit, "--", taskRoot], { encoding: "utf8" })
-        .trim().split("\n").map((path) => path.slice(path.lastIndexOf("/") + 1)).filter((name) => /^TASK-\d{3}\.md$/.test(name)).sort();
-    } catch { throw new ValidationError("legacy planned task recovery could not read the frozen plan commit"); }
-    this.store.initializeRunTasks(runId, names.map((name) => {
-      const sourcePath = `${taskRoot}/${name}`;
-      const content = execFileSync("git", ["-C", repository.project_path, "show", `${revision.plan_commit}:${sourcePath}`], { encoding: "utf8" });
-      return { task_id: name.slice(0, -3), source_path: sourcePath, source_digest: sha256(content) };
-    }));
-    tasks = this.store.runTasks(runId);
+    const tasks = this.store.runTasks(runId);
+    if (tasks.length && run.plan_id && run.revision) {
+      const revision = this.store.db.prepare("SELECT digest FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+        .get(run.repo_id, run.plan_id, run.revision) as { digest?: string } | undefined;
+      if (revision?.digest && run.plan_digest !== revision.digest) throw new ValidationError("planned task manifest plan_digest does not match the frozen revision");
+    }
     return tasks;
   }
 
   private frozenTaskWritePaths(runId: string, taskId: string): string[] {
     const task = this.plannedTaskRows(runId).find((candidate) => candidate.task_id === taskId);
     if (!task) throw new ValidationError(`unknown frozen run task: ${taskId}`);
-    const run = this.store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string };
-    const revision = this.store.db.prepare("SELECT plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
-      .get(run.repo_id, run.plan_id, run.revision) as { plan_commit?: string } | undefined;
-    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?")
-      .get(run.repo_id) as { project_path: string } | undefined;
-    if (!repository || !revision?.plan_commit) throw new ValidationError("frozen Task write authorization requires the frozen plan commit");
-    let content = "";
-    try {
-      content = execFileSync("git", ["-C", repository.project_path, "show", `${revision.plan_commit}:${task.source_path}`], { encoding: "utf8" });
-    } catch { throw new ValidationError(`could not read frozen Task write authorization: ${task.source_path}`); }
-    if (sha256(content) !== task.source_digest) throw new ValidationError(`frozen Task digest does not match: ${task.source_path}`);
-    const line = content.split(/\r?\n/).find((candidate) => /^-\s*(?:允许写入路径|Allowed write paths)\s*[：:]/i.test(candidate));
-    const paths = line ? [...line.matchAll(/`([^`]+)`/g)].map((match) => match[1]!.trim()).filter(Boolean) : [];
-    if (!paths.length) throw new ValidationError(`frozen Task is missing allowed write paths: ${task.source_path}`);
-    return [...new Set(paths)];
+    if (!task.write_paths_json) throw new ValidationError(`legacy frozen Task paths require managed scope recovery: ${taskId}`);
+    return JSON.parse(task.write_paths_json) as string[];
   }
 
   private testCommandSnapshot(runId: string, worktreePath: string, explorerDispatchId: string): {
@@ -2293,7 +2361,12 @@ export class DispatchService {
     const changedPaths = dirtyWorktreePaths(worktree.path);
     const blockedPaths = changedPaths.filter((path) => !pathMatchesScope(path, developerAllowedWritePaths));
     if (run.mode === "planned" && changedPaths.length && !blockedPaths.length) {
-      new ScopeGate(this.store).check(runId, "pre_commit", developerAllowedWritePaths, worktree.worktree_id);
+      new ScopeGate(this.store).check(runId, "pre_commit", changedPaths, worktree.worktree_id, {
+        offending_dispatch_id: primaryDeveloper.dispatch_id,
+        offending_worktree_id: worktree.worktree_id,
+        actual_modified_paths: changedPaths,
+        developer_allowed_write_paths: developerAllowedWritePaths,
+      });
     }
     const commonContext = {
       decision_id: decision.decision_id,
@@ -2401,18 +2474,41 @@ export class DispatchService {
       for (const developer of developers) {
         const developerPacket = JSON.parse(developer.packet_json) as DispatchPacket;
         const developerResult = JSON.parse(developer.result_json!) as ResultEnvelope;
-        const modifiedPaths = (developerResult.payload as { modified_paths?: string[] }).modified_paths ?? [];
-        const frozenTaskWritePaths = this.frozenTaskWritePaths(runId, String(developerPacket.context.task_id));
-        const unauthorizedPaths = modifiedPaths.filter((path) =>
-          !pathMatchesScope(path, frozenTaskWritePaths) || !pathMatchesScope(path, developerPacket.allowed_write_paths));
-        if (unauthorizedPaths.length) throw new ValidationError("planned developer paths are not authorized by the frozen Task and pre_commit scope", {
+        const modifiedPaths = [...new Set((developerResult.payload as { modified_paths?: string[] }).modified_paths ?? [])].sort();
+        const taskId = String(developerPacket.context.task_id);
+        const worktreeId = String(developerPacket.context.worktree_id);
+        const frozenTask = this.plannedTaskRows(runId).find((task) => task.task_id === taskId);
+        if (!frozenTask || frozenTask.developer_dispatch_id !== developer.dispatch_id || frozenTask.worktree_id !== worktreeId) {
+          throw new ValidationError("planned developer result does not match frozen task/dispatch/worktree identity", {
+            offending_task_id: taskId,
+            offending_dispatch_id: developer.dispatch_id,
+            offending_worktree_id: worktreeId,
+            frozen_developer_dispatch_id: frozenTask?.developer_dispatch_id ?? null,
+            frozen_worktree_id: frozenTask?.worktree_id ?? null,
+          });
+        }
+        const frozenTaskWritePaths = this.frozenTaskWritePaths(runId, taskId);
+        const preCommitRow = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
+          .get(runId, worktreeId) as { payload_json: string } | undefined;
+        const preCommit = preCommitRow ? JSON.parse(preCommitRow.payload_json) as { paths?: string[]; digest?: string } : undefined;
+        const preCommitPaths = preCommit?.paths ?? [];
+        const unauthorizedPaths = [...new Set([
+          ...modifiedPaths.filter((path) => !pathMatchesScope(path, frozenTaskWritePaths)
+            || !pathMatchesScope(path, developerPacket.allowed_write_paths) || !preCommitPaths.includes(path)),
+          ...preCommitPaths.filter((path) => !modifiedPaths.includes(path)),
+        ])].sort();
+        if (!preCommit || unauthorizedPaths.length) throw new ValidationError("planned developer paths are not authorized by the frozen Task and immutable pre_commit scope", {
+          offending_task_id: taskId,
           offending_dispatch_id: developer.dispatch_id,
+          offending_worktree_id: worktreeId,
+          actual_modified_paths: modifiedPaths,
           unauthorized_paths: unauthorizedPaths,
           authorization_source_expected: "frozen Task write paths + developer packet allowed_write_paths + planned pre_commit scope",
           explorer_paths: authorizedPaths,
-          frozen_task_write_paths: frozenTaskWritePaths,
-          developer_write_paths: developerPacket.allowed_write_paths,
-          pre_commit_scope_digest: sha256(stableJson([...new Set(developerPacket.allowed_write_paths)].sort())),
+          frozen_task_paths: frozenTaskWritePaths,
+          developer_allowed_write_paths: developerPacket.allowed_write_paths,
+          pre_commit_paths: preCommitPaths,
+          pre_commit_digest: preCommit?.digest ?? null,
         });
       }
     } else if (changedPaths.some((path) => !pathMatchesScope(path, authorizedPaths as string[]))) {
@@ -2421,15 +2517,21 @@ export class DispatchService {
     const plannedScopeDigests: Array<{ worktree_id: string; digest: string }> = [];
     if (run.mode === "planned") {
       for (const worktreeId of uncommittedWorktreeIds) {
-        const scopes = [...new Set(developers.flatMap((developer) => {
+        const worktreeDevelopers = developers.filter((developer) => {
           try {
             const packet = JSON.parse(developer.packet_json) as DispatchPacket;
-            return packet.context.worktree_id === worktreeId ? packet.allowed_write_paths : [];
-          } catch { return []; }
-        }))];
-        if (!scopes.length) throw new ValidationError("planned pre_commit scope requires frozen developer write paths");
-        const gate = new ScopeGate(this.store).check(runId, "pre_commit", scopes, worktreeId);
-        plannedScopeDigests.push({ worktree_id: worktreeId, digest: gate.digest });
+            return packet.context.worktree_id === worktreeId;
+          } catch { return false; }
+        });
+        const scopes = [...new Set(worktreeDevelopers.flatMap((developer) => {
+          try { return ((JSON.parse(developer.result_json!) as ResultEnvelope).payload as { modified_paths?: string[] }).modified_paths ?? []; }
+          catch { return []; }
+        }))].sort();
+        if (!scopes.length) throw new ValidationError("planned pre_commit scope requires actual developer modified_paths");
+        new ScopeGate(this.store).assertPreCommit(runId, scopes, worktreeId);
+        const scopeRow = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
+          .get(runId, worktreeId) as { payload_json: string };
+        plannedScopeDigests.push({ worktree_id: worktreeId, digest: (JSON.parse(scopeRow.payload_json) as { digest: string }).digest });
       }
     }
     const scope = preCommit ? JSON.parse(preCommit.payload_json) as { digest?: unknown } : undefined;
@@ -2502,6 +2604,155 @@ export class DispatchService {
       const pendingDecision = this.store.db.prepare("SELECT decision_id,dispatch_id,receipt_json FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; dispatch_id?: string; receipt_json?: string } | undefined;
       const pendingOperation = this.store.db.prepare("SELECT 1 FROM operations WHERE run_id=? AND state='pending'").get(runId);
       if (pendingOperation) return;
+      if (run.profile === "coding" && run.state === "frozen" && run.stage === "test") {
+        const driftRow = this.store.db.prepare("SELECT event_id,payload_json,created_at FROM run_events WHERE run_id=? AND type='scope.pre_commit_drift' ORDER BY event_id DESC LIMIT 1")
+          .get(runId) as { event_id: number; payload_json: string; created_at: string } | undefined;
+        const eventsAfterDrift = driftRow ? this.store.db.prepare("SELECT type FROM run_events WHERE run_id=? AND event_id>? ORDER BY event_id")
+          .all(runId, driftRow.event_id) as Array<{ type: string }> : [];
+        const drift = driftRow && eventsAfterDrift.every(({ type }) => type === "staging.validation_failed") ? JSON.parse(driftRow.payload_json) as {
+          offending_test_dispatch_id?: string;
+          offending_worktree_id?: string;
+          original_snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null;
+          snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null;
+        } : undefined;
+        const pendingDispatches = this.store.db.prepare("SELECT dispatch_id,role FROM dispatches WHERE run_id=? AND state IN ('pending','claimed') ORDER BY created_at")
+          .all(runId) as Array<{ dispatch_id: string; role: string }>;
+        const laterOperation = driftRow ? this.store.db.prepare("SELECT 1 FROM operations WHERE run_id=? AND created_at>? LIMIT 1").get(runId, driftRow.created_at) : undefined;
+        const worktree = drift?.offending_worktree_id
+          ? this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, drift.offending_worktree_id) as { path: string } | undefined
+          : undefined;
+        const currentSnapshot = worktree ? plannedWorktreeSnapshot(worktree.path) : null;
+        const driftScopeRow = drift?.offending_worktree_id ? this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
+          .get(runId, drift.offending_worktree_id) as { payload_json: string } | undefined : undefined;
+        const driftScopeSnapshot = driftScopeRow
+          ? (JSON.parse(driftScopeRow.payload_json) as { snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null }).snapshot
+          : undefined;
+        const driftExpectedSnapshot = driftScopeSnapshot ?? drift?.original_snapshot ?? null;
+        const allTasks = this.store.runTasks(runId);
+        const tasks = allTasks.filter((task) => task.developer_dispatch_id && task.worktree_id);
+        const restoredScopes: Array<{ task_id: string; worktree_id: string; paths: string[]; digest: string; write_paths: string[] }> = [];
+        const actualByTask = new Map<string, string[]>();
+        const scopeCreatedByTask = new Map<string, string>();
+        const scopeSnapshotByTask = new Map<string, { head: string; dirty_paths: string[]; diff_digest: string }>();
+        let valid = Boolean(drift?.offending_test_dispatch_id && drift.offending_worktree_id && driftExpectedSnapshot && currentSnapshot
+          && stableJson(driftExpectedSnapshot) === stableJson(currentSnapshot) && !laterOperation && tasks.length
+          && pendingDispatches.length === 1 && pendingDispatches[0]!.role === "test"
+          && pendingDispatches[0]!.dispatch_id === drift.offending_test_dispatch_id);
+        let evidenceValid = Boolean(tasks.length);
+        const recoveryRun = this.store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string; plan_digest?: string };
+        const recoveryRevision = recoveryRun.plan_id && recoveryRun.revision
+          ? this.store.db.prepare("SELECT digest,plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+            .get(recoveryRun.repo_id, recoveryRun.plan_id, recoveryRun.revision) as { digest?: string; plan_commit?: string } | undefined
+          : undefined;
+        const recoveryRepository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(recoveryRun.repo_id) as { project_path: string } | undefined;
+        for (const task of tasks) {
+          const developer = task.developer_dispatch_id ? this.store.db.prepare("SELECT packet_json,result_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role IN ('frontend-developer','backend-developer') AND state='completed'")
+            .get(runId, task.developer_dispatch_id) as { packet_json: string; result_json?: string } | undefined : undefined;
+          const packet = developer ? JSON.parse(developer.packet_json) as DispatchPacket : undefined;
+          const actual = developer?.result_json
+            ? [...new Set((((JSON.parse(developer.result_json) as ResultEnvelope).payload as { modified_paths?: string[] }).modified_paths ?? []))].sort()
+            : [];
+          const scopeRow = task.worktree_id ? this.store.db.prepare("SELECT payload_json,created_at FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
+            .get(runId, task.worktree_id) as { payload_json: string; created_at: string } | undefined : undefined;
+          const scope = scopeRow ? JSON.parse(scopeRow.payload_json) as { paths?: string[]; digest?: string; snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null } : undefined;
+          const scopePaths = [...new Set(scope?.paths ?? [])].sort();
+          let developerAllowedPaths: string[] = [];
+          let frozenPaths: string[] = [];
+          let sourceValid = false;
+          try {
+            developerAllowedPaths = [...new Set(packet?.allowed_write_paths ?? [])].sort();
+            if (!developerAllowedPaths.length || developerAllowedPaths.some((path) => typeof path !== "string" || !path)) throw new Error("missing developer ceiling");
+            frozenPaths = task.write_paths_json
+              ? assertExplicitTaskWritePaths(JSON.parse(task.write_paths_json) as string[], task.source_path)
+              : scopePaths;
+            if (task.write_paths_json) sourceValid = true;
+            else {
+              const source = recoveryRevision?.plan_commit && recoveryRepository
+                ? execFileSync("git", ["-C", recoveryRepository.project_path, "show", `${recoveryRevision.plan_commit}:${task.source_path}`], { encoding: "utf8" })
+                : "";
+              sourceValid = Boolean(recoveryRevision?.digest && recoveryRevision.digest === recoveryRun.plan_digest
+                && /^[a-f0-9]{40}$/.test(recoveryRevision.plan_commit ?? "") && sha256(source) === task.source_digest);
+            }
+          } catch { sourceValid = false; }
+          const taskEvidenceValid = Boolean(task.developer_dispatch_id && task.worktree_id && packet
+            && packet.context.task_id === task.task_id && packet.context.worktree_id === task.worktree_id
+            && actual.length && stableJson(actual) === stableJson(scopePaths)
+            && scope?.digest === sha256(stableJson(scopePaths))
+            && sourceValid
+            && actual.every((path) => pathMatchesScope(path, developerAllowedPaths) && pathMatchesScope(path, frozenPaths)));
+          valid &&= taskEvidenceValid;
+          evidenceValid &&= taskEvidenceValid;
+          actualByTask.set(task.task_id, actual);
+          if (scopeRow) scopeCreatedByTask.set(task.task_id, scopeRow.created_at);
+          if (scope?.snapshot) scopeSnapshotByTask.set(task.task_id, scope.snapshot);
+          if (task.worktree_id && scope?.digest) restoredScopes.push({
+            task_id: task.task_id, worktree_id: task.worktree_id, paths: scopePaths, digest: scope.digest, write_paths: frozenPaths,
+          });
+        }
+        const priorDrift = this.store.db.prepare("SELECT 1 FROM run_events WHERE run_id=? AND type='scope.pre_commit_drift' LIMIT 1").get(runId);
+        const pendingTest = pendingDispatches.length === 1 && pendingDispatches[0]!.role === "test" ? pendingDispatches[0] : undefined;
+        const pendingTestPacket = pendingTest ? this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, pendingTest.dispatch_id) as { packet_json: string } : undefined;
+        const testContext = pendingTestPacket ? (JSON.parse(pendingTestPacket.packet_json) as DispatchPacket).context : {};
+        const currentTask = allTasks.find((task) => task.state !== "integrated");
+        const currentWorktree = currentTask?.worktree_id
+          ? this.store.db.prepare("SELECT path,base_commit FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, currentTask.worktree_id) as { path: string; base_commit: string } | undefined
+          : undefined;
+        const legacySnapshot = currentWorktree ? plannedWorktreeSnapshot(currentWorktree.path) : null;
+        let legacyValid = Boolean(!drift && !priorDrift && !pendingDecision && evidenceValid && pendingTest && allTasks.length && tasks.length === allTasks.length
+          && allTasks.filter((task) => task.state !== "integrated").length === 1
+          && allTasks.every((task) => task.state === "integrated" || task.state === "implemented" || task.state === "tested")
+          && currentTask && currentWorktree && legacySnapshot
+          && testContext.phase === "task_test" && testContext.task_id === currentTask.task_id && testContext.worktree_id === currentTask.worktree_id
+          && legacySnapshot.head === currentWorktree.base_commit
+          && stableJson(legacySnapshot.dirty_paths) === stableJson(actualByTask.get(currentTask.task_id) ?? []));
+        const currentScopeSnapshot = currentTask ? scopeSnapshotByTask.get(currentTask.task_id) : undefined;
+        if (currentScopeSnapshot) legacyValid &&= stableJson(currentScopeSnapshot) === stableJson(legacySnapshot);
+        for (const task of allTasks.filter((candidate) => candidate.state === "integrated")) {
+          const commit = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.commit' AND state='completed' AND json_extract(evidence_json,'$.worktree_id')=? ORDER BY completed_at DESC LIMIT 1")
+            .get(runId, task.worktree_id) as { evidence_json?: string } | undefined;
+          const merge = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.merge.task' AND state='completed' AND json_extract(evidence_json,'$.task_worktree_id')=? ORDER BY completed_at DESC LIMIT 1")
+            .get(runId, task.worktree_id) as { evidence_json?: string } | undefined;
+          const commitEvidence = JSON.parse(commit?.evidence_json ?? "{}") as { commit?: string; paths?: string[] };
+          const mergeEvidence = JSON.parse(merge?.evidence_json ?? "{}") as { commit?: string };
+          legacyValid &&= Boolean(commitEvidence.commit && mergeEvidence.commit
+            && stableJson([...(commitEvidence.paths ?? [])].sort()) === stableJson(actualByTask.get(task.task_id) ?? [])
+            && (!task.implementation_commit || task.implementation_commit === commitEvidence.commit)
+            && (!task.integration_commit || task.integration_commit === mergeEvidence.commit));
+        }
+        const currentScopeCreated = currentTask ? scopeCreatedByTask.get(currentTask.task_id) : undefined;
+        const laterGitOperation = currentScopeCreated ? this.store.db.prepare("SELECT 1 FROM operations WHERE run_id=? AND kind LIKE 'git.%' AND created_at>? LIMIT 1").get(runId, currentScopeCreated) : undefined;
+        legacyValid &&= Boolean(currentScopeCreated && !laterGitOperation);
+        const recovered = valid || legacyValid;
+        if (recovered) {
+          const updateLegacy = this.store.db.prepare("UPDATE run_tasks SET write_paths_json=?,updated_at=? WHERE run_id=? AND task_id=? AND write_paths_json IS NULL");
+          const now = new Date().toISOString();
+          for (const scope of restoredScopes) updateLegacy.run(stableJson(scope.write_paths), now, runId, scope.task_id);
+          if (legacyValid && currentTask && legacySnapshot) {
+            const currentScope = restoredScopes.find(({ task_id }) => task_id === currentTask.task_id)!;
+            this.store.event(runId, "scope.pre_commit_snapshot_recovered", {
+              original_scope_digest: currentScope.digest,
+              original_scope_paths: currentScope.paths,
+              task_id: currentTask.task_id,
+              developer_dispatch_id: currentTask.developer_dispatch_id,
+              worktree_id: currentTask.worktree_id,
+              snapshot: legacySnapshot,
+            });
+          }
+          this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+          this.store.event(runId, valid ? "scope.pre_commit_restored" : "scope.pre_commit_legacy_restored", {
+            test_dispatch_id: drift?.offending_test_dispatch_id ?? pendingTest!.dispatch_id,
+            worktree_snapshot: valid ? currentSnapshot : legacySnapshot,
+            scopes: restoredScopes,
+            ...(legacyValid ? {
+              evidence: "immutable scopes + developer results + integrated operation chains + current tested worktree snapshot",
+              frozen_task_scope_status: "unavailable_or_ambiguous",
+              recovery_authority: "existing immutable pre_commit actual paths",
+            } : {}),
+          });
+          run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
+        }
+      }
+      if (run.state === "frozen") return;
       if (run.profile === "coding") {
         this.reconcileReview(runId);
         this.reconcilePlannedTaskStates(runId);

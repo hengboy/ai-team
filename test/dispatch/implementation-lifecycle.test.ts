@@ -9,6 +9,7 @@ import { DispatchService } from "../../src/dispatch.js";
 import { ScopeGate } from "../../src/gates.js";
 import { GitOrchestrator } from "../../src/git-orchestrator.js";
 import { ReviewService } from "../../src/review.js";
+import { sha256 } from "../../src/utils.js";
 import { completedResult, createRun, dispatchPacket, projectContext, temporaryDirectory, withStore } from "../helpers/dispatch.js";
 import { REVIEW_COMMON_DIR, REVIEW_HEAD } from "../helpers/git.js";
 
@@ -481,6 +482,12 @@ test("planned multi-Task resume handles a premature final Test and prepares the 
       store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,plan_commit,created_at) VALUES (?,?,?,'ready',?,?,?,?)")
         .run("multi-task", "001", "repo-multi-task", "main", planDigest, baseCommit, new Date().toISOString());
       const runId = store.createRun({ repoId: "repo-multi-task", profile: "coding", mode: "planned", planId: "multi-task", revision: "001", baseCommit, targetBranch: "main", planDigest });
+      store.initializeRunTasks(runId, ["TASK-001", "TASK-002", "TASK-003"].map((taskId) => ({
+        task_id: taskId,
+        source_path: `.ai-team/plans/multi-task/revisions/001/tasks/${taskId}.md`,
+        source_digest: sha256(`# ${taskId}\n\n- 允许写入路径：\`src/dispatch.ts\`\n`),
+        write_paths: ["src/dispatch.ts"],
+      })));
       const legacyDispatches = new DispatchService(store) as unknown as { plannedTaskRows(runId: string): unknown };
       store.db.prepare("UPDATE runs SET plan_digest=? WHERE run_id=?").run("e".repeat(64), runId);
       assert.throws(() => legacyDispatches.plannedTaskRows(runId), /plan_digest does not match/);
@@ -591,6 +598,167 @@ test("planned multi-Task resume handles a premature final Test and prepares the 
     } finally {
       await rm(repository, { recursive: true, force: true });
     }
+  });
+});
+
+test("planned Test submit binds pre_commit to developer modified_paths instead of the allowed write ceiling", async () => {
+  await withStore(async (store) => {
+    const repository = await temporaryDirectory();
+    try {
+      execFileSync("git", ["init", "-b", "main"], { cwd: repository });
+      execFileSync("git", ["config", "user.name", "AI Team Tests"], { cwd: repository });
+      execFileSync("git", ["config", "user.email", "ai-team-tests@example.invalid"], { cwd: repository });
+      await mkdir(join(repository, "src"), { recursive: true });
+      await mkdir(join(repository, "test"), { recursive: true });
+      await mkdir(join(repository, ".ai-team", "index"), { recursive: true });
+      const taskPath = ".ai-team/plans/modified-subset/revisions/001/tasks/TASK-001.md";
+      const taskContent = "# TASK-001\n\n- 允许写入路径：planning/coding角色文件 及相关测试，`test/**`\n";
+      await mkdir(join(repository, ".ai-team", "plans", "modified-subset", "revisions", "001", "tasks"), { recursive: true });
+      await writeFile(join(repository, "MEMORY.md"), "# fixture\n");
+      await writeFile(join(repository, ".ai-team", "index", "feature-navigation.md"), "# fixture\n");
+      await writeFile(join(repository, taskPath), taskContent);
+      await writeFile(join(repository, ".ai-team", "plans", "modified-subset", "revisions", "001", "plan.md"), "# plan\n");
+      await writeFile(join(repository, "src", "actual.ts"), "export const value = 1;\n");
+      await writeFile(join(repository, "test", "allowed.test.ts"), "export {};\n");
+      await writeFile(join(repository, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+      execFileSync("git", ["add", "."], { cwd: repository });
+      execFileSync("git", ["commit", "-m", "fixture"], { cwd: repository });
+      const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8" }).trim();
+      const repoId = "repo-modified-subset";
+      store.registerRepository(repoId, join(repository, ".git"), repository);
+      const planDigest = "c".repeat(64);
+      store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,plan_commit,created_at) VALUES (?,?,?,'ready',?,?,?,?)")
+        .run("modified-subset", "001", repoId, "main", planDigest, baseCommit, new Date().toISOString());
+      const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "modified-subset", revision: "001", planDigest });
+      store.initializeRunTasks(runId, [{
+        task_id: "TASK-001", source_path: taskPath, source_digest: sha256(taskContent),
+        write_paths: ["src/actual.ts", "test/allowed.test.ts"],
+      }]);
+      const worktreeId = "worktree_modified_subset";
+      store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+        .run(worktreeId, runId, "task/modified-subset/modified-subset-001--task-001", repository, baseCommit, new Date().toISOString());
+      store.advanceRunTask(runId, "TASK-001", "prepared", { worktree_id: worktreeId });
+      const dispatches = new DispatchService(store);
+      const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+      store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+        .run(JSON.stringify({ ...fileExplorerResult(runId, explorerId), payload: { ...fileExplorerResult(runId, explorerId).payload, allowed_read_paths: ["src/actual.ts", "test/allowed.test.ts", "package.json"] } }), new Date().toISOString(), explorerId);
+      const codingId = dispatches.create(runId, "coding", {
+        ...dispatchPacket(["src/actual.ts", "test/allowed.test.ts", "package.json"]),
+        context: { explorer_dispatch_id: explorerId, task_id: "TASK-001", worktree_id: worktreeId },
+      });
+      dispatches.claim(runId, codingId, "coding");
+      const developerId = dispatches.create(runId, "backend-developer", {
+        ...dispatchPacket(["src/actual.ts", "test/allowed.test.ts", "package.json"]),
+        allowed_write_paths: ["src/actual.ts", "test/allowed.test.ts"],
+        context: { explorer_dispatch_id: explorerId, coordinator_dispatch_id: codingId, task_id: "TASK-001", worktree_id: worktreeId, worktree_path: repository },
+      }, "coding", codingId);
+      await dispatches.submitValue(runId, codingId, "coding", completedResult(runId, codingId, "coding", { actions: ["implemented"] }));
+      dispatches.claim(runId, developerId, "backend-developer");
+      await writeFile(join(repository, "src", "actual.ts"), "export const value = 2;\n");
+      await dispatches.submitValue(runId, developerId, "backend-developer", completedResult(runId, developerId, "backend-developer", {
+        modified_paths: ["src/actual.ts"], self_tests: [{ command: "targeted fixture", outcome: "passed" }],
+      }));
+      new ScopeGate(store).check(runId, "pre_commit", ["src/actual.ts"], worktreeId);
+      store.db.prepare("UPDATE run_events SET payload_json=json_remove(payload_json,'$.snapshot') WHERE run_id=? AND type='scope.pre_commit'").run(runId);
+      const legacyScopePayload = (store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit'").get(runId) as { payload_json: string }).payload_json;
+      store.db.prepare("UPDATE run_tasks SET write_paths_json=NULL WHERE run_id=? AND task_id='TASK-001'").run(runId);
+      const testRow = store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='test' AND state='pending'").get(runId) as { dispatch_id: string; packet_json: string };
+      dispatches.claim(runId, testRow.dispatch_id, "test");
+      const testPacket = JSON.parse(testRow.packet_json);
+      const result = completedResult(runId, testRow.dispatch_id, "test", { checks: testPacket.context.test_commands.map((command: string) => ({ command, outcome: "passed" })) });
+      const staging = await store.createStagingEntry({ runId, dispatchId: testRow.dispatch_id, role: "test", kind: "dispatch-result" });
+      const ready = await store.writeStagingEntry(staging.stagingId, JSON.stringify(result), { runId, dispatchId: testRow.dispatch_id, role: "test", kind: "dispatch-result" });
+      const readyDigest = (store.db.prepare("SELECT content_sha256 FROM staging_entries WHERE staging_id=?").get(ready.stagingId) as { content_sha256: string }).content_sha256;
+      store.db.prepare("UPDATE runs SET state='frozen',stage='test',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+      const resumed = dispatches.resume(runId);
+      assert.equal(resumed.run.state, "active");
+      assert.deepEqual(resumed.pending_dispatches.map(({ dispatch_id }) => dispatch_id), [testRow.dispatch_id]);
+      assert.equal((store.db.prepare("SELECT content_sha256 FROM staging_entries WHERE staging_id=?").get(ready.stagingId) as { content_sha256: string }).content_sha256, readyDigest);
+      const legacyRecovery = store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit_legacy_restored'").get(runId) as { payload_json: string };
+      assert.equal(JSON.parse(legacyRecovery.payload_json).test_dispatch_id, testRow.dispatch_id);
+      const scope = JSON.parse((store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit'").get(runId) as { payload_json: string }).payload_json);
+      assert.equal((store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit'").get(runId) as { payload_json: string }).payload_json, legacyScopePayload);
+      const recoveredSnapshot = store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit_snapshot_recovered'").get(runId) as { payload_json: string };
+      assert.equal(JSON.parse(recoveredSnapshot.payload_json).original_scope_digest, scope.digest);
+      const recoveredTask = store.runTasks(runId)[0]!;
+      assert.deepEqual(JSON.parse(recoveredTask.write_paths_json!), ["src/actual.ts"]);
+      assert.equal(JSON.parse(legacyRecovery.payload_json).frozen_task_scope_status, "unavailable_or_ambiguous");
+      await writeFile(join(repository, "src", "actual.ts"), "export const value = 3;\n");
+      await assert.rejects(dispatches.submitStaging(runId, testRow.dispatch_id, "test", ready.stagingId), /run frozen/);
+      assert.equal(store.getStagingEntry(ready.stagingId).state, "ready");
+      await writeFile(join(repository, "src", "actual.ts"), "export const value = 2;\n");
+      assert.equal(dispatches.resume(runId).run.state, "active");
+      const submission = await dispatches.submitStaging(runId, testRow.dispatch_id, "test", ready.stagingId);
+      assert.equal(submission.staging.staging_id, ready.stagingId);
+      assert.equal(submission.staging.state, "consumed");
+      assert.equal(submission.staging.content_digest, readyDigest);
+      assert.deepEqual(scope.paths, ["src/actual.ts"]);
+      const continuation = submission.continuation.pending_dispatches.find(({ role }) => role === "coding");
+      assert.ok(continuation);
+      const packet = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(continuation.dispatch_id) as { packet_json: string }).packet_json);
+      assert.deepEqual(packet.context.changed_paths, ["src/actual.ts"]);
+    } finally { await rm(repository, { recursive: true, force: true }); }
+  });
+});
+
+test("planned Test submit persists scope drift and leaves its ready staging unchanged", async () => {
+  await withStore(async (store) => {
+    const repository = await temporaryDirectory();
+    try {
+      execFileSync("git", ["init", "-b", "main"], { cwd: repository });
+      execFileSync("git", ["config", "user.name", "AI Team Tests"], { cwd: repository });
+      execFileSync("git", ["config", "user.email", "ai-team-tests@example.invalid"], { cwd: repository });
+      await mkdir(join(repository, "src"), { recursive: true });
+      await mkdir(join(repository, ".ai-team", "index"), { recursive: true });
+      await writeFile(join(repository, "MEMORY.md"), "# fixture\n");
+      await writeFile(join(repository, ".ai-team", "index", "feature-navigation.md"), "# fixture\n");
+      await writeFile(join(repository, "src", "actual.ts"), "export const value = 1;\n");
+      execFileSync("git", ["add", "."], { cwd: repository });
+      execFileSync("git", ["commit", "-m", "fixture"], { cwd: repository });
+      const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8" }).trim();
+      store.registerRepository("repo-submit-drift", join(repository, ".git"), repository);
+      const runId = store.createRun({ repoId: "repo-submit-drift", profile: "coding", mode: "planned", planId: "submit-drift", revision: "001" });
+      store.initializeRunTasks(runId, [{ task_id: "TASK-001", source_path: "TASK-001.md", source_digest: "b".repeat(64), write_paths: ["src/actual.ts", "src/other.ts"] }]);
+      const worktreeId = "worktree_submit_drift";
+      store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+        .run(worktreeId, runId, "task/submit-drift/submit-drift-001--task-001", repository, baseCommit, new Date().toISOString());
+      const dispatches = new DispatchService(store);
+      const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+      store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+        .run(JSON.stringify({ ...fileExplorerResult(runId, explorerId), payload: { ...fileExplorerResult(runId, explorerId).payload, allowed_read_paths: ["src/actual.ts", "src/other.ts"] } }), new Date().toISOString(), explorerId);
+      const codingId = dispatches.create(runId, "coding", { ...dispatchPacket(["src/actual.ts", "src/other.ts"]), context: { explorer_dispatch_id: explorerId, task_id: "TASK-001", worktree_id: worktreeId } });
+      dispatches.claim(runId, codingId, "coding");
+      const developerId = dispatches.create(runId, "backend-developer", {
+        ...dispatchPacket(["src/actual.ts", "src/other.ts"]), allowed_write_paths: ["src/actual.ts", "src/other.ts"],
+        context: { explorer_dispatch_id: explorerId, coordinator_dispatch_id: codingId, task_id: "TASK-001", worktree_id: worktreeId },
+      }, "coding", codingId);
+      store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+        .run(JSON.stringify(completedResult(runId, codingId, "coding", { actions: ["implemented"] })), new Date().toISOString(), codingId);
+      store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+        .run(JSON.stringify(completedResult(runId, developerId, "backend-developer", { modified_paths: ["src/actual.ts"] })), new Date().toISOString(), developerId);
+      store.advanceRunTask(runId, "TASK-001", "prepared", { worktree_id: worktreeId });
+      store.advanceRunTask(runId, "TASK-001", "implemented", { worktree_id: worktreeId, developer_dispatch_id: developerId });
+      await writeFile(join(repository, "src", "actual.ts"), "export const value = 2;\n");
+      new ScopeGate(store).check(runId, "pre_commit", ["src/actual.ts"], worktreeId);
+      await writeFile(join(repository, "src", "actual.ts"), "export const value = 3;\n");
+      const testId = dispatches.create(runId, "test", { ...dispatchPacket(["src/actual.ts"]), context: { phase: "task_test", task_id: "TASK-001", worktree_id: worktreeId } });
+      dispatches.claim(runId, testId, "test");
+      const result = completedResult(runId, testId, "test", { checks: [{ command: "targeted", outcome: "passed" }] });
+      const staging = await store.createStagingEntry({ runId, dispatchId: testId, role: "test", kind: "dispatch-result" });
+      const ready = await store.writeStagingEntry(staging.stagingId, JSON.stringify(result), { runId, dispatchId: testId, role: "test", kind: "dispatch-result" });
+      const readyDigest = (store.db.prepare("SELECT content_sha256 FROM staging_entries WHERE staging_id=?").get(ready.stagingId) as { content_sha256: string }).content_sha256;
+      await assert.rejects(dispatches.submitStaging(runId, testId, "test", ready.stagingId), /run frozen/);
+      assert.equal(store.getRun(runId).state, "frozen");
+      const drift = store.db.prepare("SELECT type FROM run_events WHERE run_id=? AND type='scope.pre_commit_drift' ORDER BY event_id DESC LIMIT 1").get(runId) as { type: string };
+      assert.equal(drift.type, "scope.pre_commit_drift");
+      const unchanged = store.getStagingEntry(ready.stagingId);
+      assert.equal(unchanged.state, "ready");
+      assert.equal((store.db.prepare("SELECT content_sha256 FROM staging_entries WHERE staging_id=?").get(ready.stagingId) as { content_sha256: string }).content_sha256, readyDigest);
+      assert.equal(dispatches.resume(runId).run.state, "frozen");
+      store.db.prepare("DELETE FROM run_events WHERE run_id=? AND type='scope.pre_commit_drift'").run(runId);
+      assert.equal(dispatches.resume(runId).run.state, "frozen");
+      assert.equal((store.db.prepare("SELECT count(*) AS count FROM run_events WHERE run_id=? AND type='scope.pre_commit_legacy_restored'").get(runId) as { count: number }).count, 0);
+    } finally { await rm(repository, { recursive: true, force: true }); }
   });
 });
 

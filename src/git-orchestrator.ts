@@ -405,7 +405,7 @@ export class GitOrchestrator {
     }
     const run = this.store.getRun(runId) as any;
     if ((["bug", "feature"] as string[]).includes(run.mode)) new ScopeGate(this.store).check(runId, "pre_commit", allowedScopes);
-    else if (run.mode === "planned") new ScopeGate(this.store).assertPreCommit(runId, allowedScopes, worktreeId);
+    else if (run.mode === "planned") new ScopeGate(this.store).assertPreCommit(runId, changed, worktreeId);
     const digest = sha256(changed.sort().join("\n"));
     const operation = this.store.beginOperation("git.commit", `commit:${runId}:${worktreeId}:${digest}:${message}`, { message, changed }, runId);
     if (operation.reused) {

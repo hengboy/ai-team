@@ -266,6 +266,7 @@ test("planned resume replaces a clean stale next-Task worktree from current plan
       task_id: taskId,
       source_path: `.ai-team/plans/${planId}/revisions/${revision}/tasks/${taskId}.md`,
       source_digest: String(index + 1).repeat(64),
+      write_paths: [taskId === "TASK-001" ? "task-one.txt" : "task-two.txt"],
     })));
     const plan = await fixture.orchestrator.prepareIntegration(runId);
     const staleSecond = await fixture.orchestrator.prepareTask(runId, "TASK-002");
@@ -346,11 +347,12 @@ test("planned single explicit Task reuses the plan worktree and reaches final Te
     const identity = await repositoryIdentity(fixture.root);
     fixture.store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,plan_commit,created_at) VALUES (?,?,?,'ready',?,?,?,?)")
       .run(planId, revision, identity.repoId, "main", "b".repeat(64), baseCommit, new Date().toISOString());
-    const runId = fixture.store.createRun({ repoId: identity.repoId, profile: "coding", mode: "planned", planId, revision, baseCommit, targetBranch: "main" });
+    const runId = fixture.store.createRun({ repoId: identity.repoId, profile: "coding", mode: "planned", planId, revision, baseCommit, targetBranch: "main", planDigest: "b".repeat(64) });
     fixture.store.initializeRunTasks(runId, [{
       task_id: "TASK-001",
       source_path: `.ai-team/plans/${planId}/revisions/${revision}/tasks/TASK-001.md`,
       source_digest: sha256(taskContent),
+      write_paths: ["single.txt"],
     }]);
     const plan = await fixture.orchestrator.prepareIntegration(runId);
     const dispatches = new DispatchService(fixture.store);
@@ -412,6 +414,7 @@ test("planned single explicit Task reuses the plan worktree and reaches final Te
     const taskTest = dispatches.continuation(runId).pending_dispatches.find(({ role }) => role === "test")!;
     const taskTestPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(taskTest.dispatch_id) as { packet_json: string }).packet_json);
     assert.equal(taskTestPacket.context.phase, "task_test");
+    new ScopeGate(fixture.store).check(runId, "pre_commit", ["single.txt"], plan.worktree_id);
     dispatches.claim(runId, taskTest.dispatch_id, "test");
     await dispatches.submitValue(runId, taskTest.dispatch_id, "test", result(taskTest.dispatch_id, "test", {
       checks: taskTestPacket.context.test_commands.map((command: string) => ({ command, outcome: "passed" })),
@@ -459,7 +462,7 @@ test("planned multi-task run continues from prepare through test and derives the
     const taskContents = new Map([
       ["TASK-001", "# TASK-001\n\n- 允许写入路径：`task-one.txt`\n"],
       ["TASK-002", "# TASK-002\n\n- 允许写入路径：`task-two.txt`\n"],
-      ["TASK-003", "# TASK-003\n\n- 允许写入路径：`test/**`\n"],
+      ["TASK-003", "# TASK-003\n\n- 允许写入路径：`test/generated.test.ts`\n"],
     ]);
     for (const [taskId, content] of taskContents) await writeFile(join(taskRoot, `${taskId}.md`), content);
     await mkdir(join(fixture.root, "test"), { recursive: true });
@@ -479,11 +482,13 @@ test("planned multi-task run continues from prepare through test and derives the
       revision,
       baseCommit,
       targetBranch: "main",
+      planDigest: "a".repeat(64),
     });
     fixture.store.initializeRunTasks(runId, ["TASK-001", "TASK-002", "TASK-003"].map((taskId) => ({
       task_id: taskId,
       source_path: `.ai-team/plans/${planId}/revisions/${revision}/tasks/${taskId}.md`,
       source_digest: sha256(taskContents.get(taskId)!),
+      write_paths: taskId === "TASK-001" ? ["task-one.txt"] : taskId === "TASK-002" ? ["task-two.txt"] : ["test/generated.test.ts"],
     })));
     const plan = await fixture.orchestrator.prepareIntegration(runId);
     const dispatches = new DispatchService(fixture.store);
@@ -549,6 +554,7 @@ test("planned multi-task run continues from prepare through test and derives the
     const taskTestPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(taskTest.dispatch_id) as { packet_json: string }).packet_json);
     assert.equal(taskTestPacket.context.phase, "task_test");
     assert.equal(taskTestPacket.context.task_id, "TASK-001");
+    new ScopeGate(fixture.store).check(runId, "pre_commit", ["task-one.txt"], firstTask.worktree_id);
     dispatches.claim(runId, taskTest.dispatch_id, "test");
     await dispatches.submitValue(runId, taskTest.dispatch_id, "test", result(taskTest.dispatch_id, "test", {
       checks: taskTestPacket.context.test_commands.map((command: string) => ({ command, outcome: "passed" })),
@@ -622,6 +628,7 @@ test("planned multi-task run continues from prepare through test and derives the
       })!;
       const testPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(testDispatch.dispatch_id) as { packet_json: string }).packet_json);
       assert.equal(testPacket.context.phase, "task_test");
+      new ScopeGate(fixture.store).check(runId, "pre_commit", [path], task.worktree_id);
       dispatches.claim(runId, testDispatch.dispatch_id, "test");
       await dispatches.submitValue(runId, testDispatch.dispatch_id, "test", result(testDispatch.dispatch_id, "test", {
         checks: testPacket.context.test_commands.map((command: string) => ({ command, outcome: "passed" })),
@@ -672,7 +679,7 @@ test("planned multi-task run continues from prepare through test and derives the
       operations: [{ command: "ai-team git prepare --task-id TASK-003", outcome: thirdTask.worktree_id }],
     }));
     const thirdContinuationId = taskContinuationId(thirdPrepared.continuation.pending_dispatches, "TASK-003");
-    const thirdMerged = await completeTask("TASK-003", thirdTask, "test/generated.test.ts", thirdContinuationId, ["test/**"], ["test/existing.test.ts"]);
+    const thirdMerged = await completeTask("TASK-003", thirdTask, "test/generated.test.ts", thirdContinuationId, ["test/generated.test.ts"], ["test/existing.test.ts"]);
     const finalTest = dispatches.continuation(runId).pending_dispatches.find(({ role, dispatch_id }) => {
       if (role !== "test") return false;
       const row = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatch_id) as { packet_json: string };

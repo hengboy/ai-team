@@ -2,7 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { currentBranch, currentHead, git, repositoryIdentity, worktreeStatus } from "./git.js";
-import { StateStore } from "./state.js";
+import { frozenTaskWritePathsFromDocument, StateStore } from "./state.js";
 import { DispatchService } from "./dispatch.js";
 import { ValidationError } from "./errors.js";
 import { triageRequest } from "./planning.js";
@@ -134,7 +134,7 @@ export class WorkflowService {
   private async planningSnapshot(project: string, planId: string, revision: string, planCommit?: string): Promise<{
     paths: string[];
     digest: string;
-    tasks: Array<{ task_id: string; source_path: string; source_digest: string }>;
+    tasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[] }>;
   }> {
     const root = join(".ai-team", "plans", planId);
     const revisionRoot = join(root, "revisions", revision);
@@ -165,7 +165,12 @@ export class WorkflowService {
         : await readFile(join(project, path), "utf8");
       const current = documents.find((document) => document.path === path)?.content;
       if (current !== content) throw new ValidationError(`planned Task differs from frozen plan commit: ${path}`);
-      return { task_id: path.slice(path.lastIndexOf("/") + 1, -3), source_path: path, source_digest: sha256(content) };
+      return {
+        task_id: path.slice(path.lastIndexOf("/") + 1, -3),
+        source_path: path,
+        source_digest: sha256(content),
+        write_paths: frozenTaskWritePathsFromDocument(content, path),
+      };
     }));
     return { paths, tasks, digest: sha256(documents.map(({ path, content }) => `${path}\n${content}`).join("\n")) };
   }
@@ -179,7 +184,7 @@ export class WorkflowService {
     let selectedRevision = input.revision;
     let planDigest: string | undefined;
     let planPaths: string[] = [];
-    let planTasks: Array<{ task_id: string; source_path: string; source_digest: string }> = [];
+    let planTasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[] }> = [];
     if (input.mode === "planned") {
       if (!input.planId || input.request) throw new ValidationError("planned mode requires plan-id and forbids request input");
       const rows = this.store.db.prepare("SELECT * FROM revisions WHERE repo_id=? AND plan_id=? AND state='ready'").all(repo.repoId, input.planId) as any[];

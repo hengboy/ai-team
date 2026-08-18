@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import test from "node:test";
 import { createResultTemplate } from "../../src/contracts.js";
 import { DispatchService } from "../../src/dispatch.js";
+import { stagingFilePath } from "../../src/security.js";
 import { StateStore } from "../../src/state.js";
 
 import { cli, cliWithInput, json, makeSandbox } from "../helpers/cli.js";
@@ -427,11 +428,24 @@ test("dispatch bundle and stdin submit preserve frozen assets, retry state, and 
   assert.ok(schemaError.details.cause);
   const schemaCause = schemaError.details.cause as { issues: Array<{ pointer: string; constraint: string; suggestion: string }> };
   assert.ok(schemaCause.issues.some((issue) => issue.pointer.startsWith("/") && issue.constraint && issue.suggestion.includes("Correct")));
-  const failureStore = await StateStore.open(sandbox.aiTeamHome, { readonly: true });
+  const failureStore = await StateStore.open(sandbox.aiTeamHome);
   const failureEvent = failureStore.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='staging.validation_failed' ORDER BY event_id DESC LIMIT 1").get(started.run_id) as { payload_json: string };
-  failureStore.close();
   const eventCause = JSON.parse(failureEvent.payload_json).cause as { issues: Array<{ pointer: string; constraint: string; suggestion: string }> };
   assert.ok(eventCause.issues.some((issue) => issue.pointer.startsWith("/") && issue.constraint && issue.suggestion));
+
+  const invalidReadyJson = "{";
+  const stagingRow = failureStore.db.prepare("SELECT sequence_no,kind,role FROM staging_entries WHERE staging_id=?").get(schemaError.details.staging_id) as { sequence_no: number; kind: "dispatch-result"; role: "file-explorer" };
+  await writeFile(stagingFilePath(failureStore.paths.staging, started.run_id, stagingRow.sequence_no, stagingRow.kind, stagingRow.role), invalidReadyJson);
+  failureStore.db.prepare("UPDATE staging_entries SET content_sha256=?,content_bytes=? WHERE staging_id=?")
+    .run(createHash("sha256").update(invalidReadyJson).digest("hex"), Buffer.byteLength(invalidReadyJson), schemaError.details.staging_id);
+  const failureCount = (failureStore.db.prepare("SELECT count(*) AS count FROM run_events WHERE run_id=? AND type='staging.validation_failed'").get(started.run_id) as { count: number }).count;
+  failureStore.close();
+  const invalidReadyFailure = await cli(sandbox, ["dispatch", "submit", ...identity, "--staging-id", schemaError.details.staging_id]);
+  assert.notEqual(invalidReadyFailure.status, 0);
+  const invalidReadyStore = await StateStore.open(sandbox.aiTeamHome, { readonly: true });
+  assert.equal(invalidReadyStore.getStagingEntry(schemaError.details.staging_id).state, "ready");
+  assert.equal((invalidReadyStore.db.prepare("SELECT count(*) AS count FROM run_events WHERE run_id=? AND type='staging.validation_failed'").get(started.run_id) as { count: number }).count, failureCount + 1);
+  invalidReadyStore.close();
 
   const wrongIdentity = { ...result, run_id: "run_01ARZ3NDEKTSV4RRFFQ69G5FAV" };
   const rewritten = json<{ state: string }>(await cliWithInput(sandbox, [
