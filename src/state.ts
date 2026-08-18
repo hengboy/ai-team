@@ -328,6 +328,39 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "011-dispatch-worktree-bindings",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      db.exec(`
+        CREATE TABLE dispatch_worktree_bindings (
+          dispatch_id TEXT NOT NULL REFERENCES dispatches(dispatch_id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          binding_kind TEXT NOT NULL CHECK(binding_kind IN ('integration','task')),
+          worktree_id TEXT NOT NULL REFERENCES worktrees(worktree_id),
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(dispatch_id,binding_kind,worktree_id)
+        );
+        CREATE UNIQUE INDEX one_integration_binding_per_dispatch
+          ON dispatch_worktree_bindings(dispatch_id) WHERE binding_kind='integration';
+        CREATE INDEX dispatch_worktree_bindings_run ON dispatch_worktree_bindings(run_id,dispatch_id);
+
+        INSERT OR IGNORE INTO dispatch_worktree_bindings(dispatch_id,run_id,binding_kind,worktree_id,created_at)
+          SELECT d.dispatch_id,d.run_id,'integration',json_extract(d.packet_json,'$.context.integration_worktree_id'),d.created_at
+          FROM dispatches d JOIN worktrees w ON w.worktree_id=json_extract(d.packet_json,'$.context.integration_worktree_id')
+          WHERE d.role='git-operator' AND json_type(d.packet_json,'$.context.integration_worktree_id')='text';
+        INSERT OR IGNORE INTO dispatch_worktree_bindings(dispatch_id,run_id,binding_kind,worktree_id,created_at)
+          SELECT d.dispatch_id,d.run_id,'task',json_extract(d.packet_json,'$.context.task_worktree_id'),d.created_at
+          FROM dispatches d JOIN worktrees w ON w.worktree_id=json_extract(d.packet_json,'$.context.task_worktree_id')
+          WHERE d.role='git-operator' AND json_type(d.packet_json,'$.context.task_worktree_id')='text';
+        INSERT OR IGNORE INTO dispatch_worktree_bindings(dispatch_id,run_id,binding_kind,worktree_id,created_at)
+          SELECT d.dispatch_id,d.run_id,'task',tasks.value,d.created_at
+          FROM dispatches d, json_each(d.packet_json,'$.context.task_worktree_ids') tasks
+          JOIN worktrees w ON w.worktree_id=tasks.value
+          WHERE d.role='git-operator' AND tasks.type='text';
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {

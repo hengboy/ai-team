@@ -22,6 +22,21 @@ export interface DispatchPacket {
   context: Record<string, unknown>;
 }
 
+export interface MergeWorktreeBindings {
+  integration_worktree_id: string | null;
+  task_worktree_ids: string[];
+}
+
+const mergeBindingsFromPacket = (role: Role, packet: DispatchPacket): MergeWorktreeBindings | undefined => {
+  if (role !== "git-operator" || !["integrate_implementation", "reconcile_worktree_ownership"].includes(String(packet.context.phase))) return undefined;
+  const integration = typeof packet.context.integration_worktree_id === "string" ? packet.context.integration_worktree_id : null;
+  const taskIds = [
+    ...(Array.isArray(packet.context.task_worktree_ids) ? packet.context.task_worktree_ids.filter((id): id is string => typeof id === "string") : []),
+    ...(typeof packet.context.task_worktree_id === "string" ? [packet.context.task_worktree_id] : []),
+  ];
+  return { integration_worktree_id: integration, task_worktree_ids: [...new Set(taskIds)].sort() };
+};
+
 export interface RunResumeResult {
   run: Record<string, unknown>;
   pending_dispatches: Array<{ dispatch_id: string; role: string; state: string }>;
@@ -377,15 +392,29 @@ export class DispatchService {
     const templateJson = stableJson(template);
     const digests = { packet: sha256(packetJson), schema: sha256(schemaJson), template: sha256(templateJson), prompt: sha256(prompt) };
     const columns = new Set((this.store.db.prepare("PRAGMA table_info(dispatches)").all() as Array<{ name: string }>).map((item) => item.name));
-    if (["packet_digest", "prompt_digest", "schema_digest", "template_digest", "renderer_version"].every((column) => columns.has(column))) {
-      this.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,packet_digest,prompt_digest,schema_digest,template_digest,renderer_version,created_at)
-        VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?)`).run(dispatchId, runId, role, packetJson, "", schemaJson, templateJson, digests.packet, digests.prompt, digests.schema, digests.template, RENDERER_VERSION, new Date().toISOString());
-    } else {
-      this.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,created_at)
-        VALUES (?,?,?,'pending',?,?,?,?,?)`).run(dispatchId, runId, role, packetJson, "", schemaJson, templateJson, new Date().toISOString());
-    }
-    if (replacementFor) this.store.db.prepare("UPDATE dispatches SET replacement_for=? WHERE dispatch_id=?").run(replacementFor, dispatchId);
-    this.store.event(runId, "dispatch.created", { dispatchId, role, replacement_for: replacementFor ?? null, packet_digest: digests.packet, schema_digest: digests.schema, template_digest: digests.template, prompt_digest: digests.prompt, renderer_version: RENDERER_VERSION });
+    this.store.db.transaction(() => {
+      if (["packet_digest", "prompt_digest", "schema_digest", "template_digest", "renderer_version"].every((column) => columns.has(column))) {
+        this.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,packet_digest,prompt_digest,schema_digest,template_digest,renderer_version,created_at)
+          VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?)`).run(dispatchId, runId, role, packetJson, "", schemaJson, templateJson, digests.packet, digests.prompt, digests.schema, digests.template, RENDERER_VERSION, new Date().toISOString());
+      } else {
+        this.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,created_at)
+          VALUES (?,?,?,'pending',?,?,?,?,?)`).run(dispatchId, runId, role, packetJson, "", schemaJson, templateJson, new Date().toISOString());
+      }
+      if (replacementFor) this.store.db.prepare("UPDATE dispatches SET replacement_for=? WHERE dispatch_id=?").run(replacementFor, dispatchId);
+      const bindings = mergeBindingsFromPacket(role, frozenPacket);
+      if (bindings) {
+        if (!bindings.integration_worktree_id || !bindings.task_worktree_ids.length) {
+          throw new ValidationError("merge dispatch requires persisted integration and task worktree bindings");
+        }
+        const insertBinding = this.store.db.prepare(`INSERT INTO dispatch_worktree_bindings(dispatch_id,run_id,binding_kind,worktree_id,created_at)
+          VALUES (?,?,?,?,?)`);
+        const createdAt = new Date().toISOString();
+        insertBinding.run(dispatchId, runId, "integration", bindings.integration_worktree_id, createdAt);
+        for (const worktreeId of bindings.task_worktree_ids) insertBinding.run(dispatchId, runId, "task", worktreeId, createdAt);
+        this.assertMergeWorktreeBindings(runId, dispatchId, bindings.integration_worktree_id, bindings.task_worktree_ids, true, false);
+      }
+      this.store.event(runId, "dispatch.created", { dispatchId, role, replacement_for: replacementFor ?? null, packet_digest: digests.packet, schema_digest: digests.schema, template_digest: digests.template, prompt_digest: digests.prompt, renderer_version: RENDERER_VERSION });
+    })();
     return dispatchId;
   }
 
@@ -527,23 +556,46 @@ export class DispatchService {
 
   private plannedMergePartialEffect(
     runId: string,
-    dispatch: { role: Role; packet_json: string },
+    dispatch: { dispatch_id: string; role: Role; packet_json: string },
   ): MergeOwnershipPartialEffect | undefined {
     if (dispatch.role !== "git-operator") return undefined;
     let context: Record<string, unknown>;
     try { context = (JSON.parse(dispatch.packet_json) as DispatchPacket).context; }
     catch { return undefined; }
-    if (context.phase !== "integrate_implementation" && context.phase !== "reconcile_worktree_ownership"
-      || typeof context.integration_worktree_id !== "string"
-      || !Array.isArray(context.task_worktree_ids)
-      || !context.task_worktree_ids.length
-      || context.task_worktree_ids.some((id) => typeof id !== "string")) return undefined;
+    if (context.phase !== "integrate_implementation" && context.phase !== "reconcile_worktree_ownership") return undefined;
+    const bindings = this.mergeWorktreeBindings(runId, dispatch.dispatch_id);
+    if (!bindings.integration_worktree_id || !bindings.task_worktree_ids.length) return undefined;
     return completedMergeOwnershipPartialEffect(
       this.store,
       runId,
-      context.integration_worktree_id,
-      context.task_worktree_ids as string[],
+      bindings.integration_worktree_id,
+      bindings.task_worktree_ids,
     );
+  }
+
+  mergeWorktreeBindings(runId: string, dispatchId?: string): MergeWorktreeBindings {
+    if (!dispatchId) return { integration_worktree_id: null, task_worktree_ids: [] };
+    const rows = this.store.db.prepare(`SELECT binding_kind,worktree_id FROM dispatch_worktree_bindings
+      WHERE run_id=? AND dispatch_id=? ORDER BY binding_kind,worktree_id`).all(runId, dispatchId) as Array<{ binding_kind: "integration" | "task"; worktree_id: string }>;
+    return {
+      integration_worktree_id: rows.find(({ binding_kind }) => binding_kind === "integration")?.worktree_id ?? null,
+      task_worktree_ids: rows.filter(({ binding_kind }) => binding_kind === "task").map(({ worktree_id }) => worktree_id),
+    };
+  }
+
+  assertMergeWorktreeBindings(runId: string, dispatchId: string, integrationId: string, taskIds: string[], exact = false, requireMergePhase = true): MergeWorktreeBindings {
+    const actual = this.mergeWorktreeBindings(runId, dispatchId);
+    const expected = [integrationId, ...taskIds];
+    const actualIds = [actual.integration_worktree_id, ...actual.task_worktree_ids].filter((id): id is string => Boolean(id));
+    const missing = expected.filter((id) => !actualIds.includes(id));
+    const unexpected = exact ? actualIds.filter((id) => !expected.includes(id)) : [];
+    const dispatch = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+      .get(runId, dispatchId) as { packet_json: string } | undefined;
+    const phase = dispatch ? (JSON.parse(dispatch.packet_json) as DispatchPacket).context.phase : null;
+    if (actual.integration_worktree_id !== integrationId || missing.length || unexpected.length || requireMergePhase && phase !== "integrate_implementation") {
+      throw new ValidationError(`merge-task dispatch ${dispatchId} has invalid managed worktree bindings: constraint=packet_worktree_binding; expected_worktree_ids=${JSON.stringify(expected)}; actual_bound_ids=${JSON.stringify(actualIds)}; missing_bindings=${JSON.stringify(missing)}; unexpected_bindings=${JSON.stringify(unexpected)}; actual_phase=${String(phase)}`);
+    }
+    return actual;
   }
 
   private get(runId: string, dispatchId: string, role: Role): any {
@@ -676,7 +728,7 @@ export class DispatchService {
     let result: { status?: string; side_effect_state?: string };
     try { result = JSON.parse(row.result_json ?? ""); }
     catch { throw new ValidationError("dispatch reconciliation requires a valid retryable result envelope"); }
-    const partialEffect = this.plannedMergePartialEffect(runId, row);
+    const partialEffect = this.plannedMergePartialEffect(runId, { dispatch_id: dispatchId, ...row });
     if (result.status !== "retryable_failure" || (result.side_effect_state !== "completed" && !partialEffect)) {
       throw new ValidationError("dispatch reconciliation requires confirmed completed side effects", [
         { path: "/side_effect_state", pointer: "/side_effect_state", field: "side_effect_state", constraint: "const", message: "must equal completed" },
@@ -812,6 +864,17 @@ export class DispatchService {
     const row = this.get(runId, dispatchId, role) as { state: string };
     if (!["pending", "claimed", "failed", "retryable_failure"].includes(row.state)) throw new ValidationError(`dispatch cannot be ${action} from ${row.state}`);
     assertExplorerAuthorization(this.store, runId, role, packet);
+    const sourceBindings = this.mergeWorktreeBindings(runId, dispatchId);
+    const replacementBindings = mergeBindingsFromPacket(role, packet);
+    if (sourceBindings.integration_worktree_id) {
+      const sourceIds = [sourceBindings.integration_worktree_id, ...sourceBindings.task_worktree_ids].sort();
+      const replacementIds = replacementBindings
+        ? [replacementBindings.integration_worktree_id, ...replacementBindings.task_worktree_ids].filter((id): id is string => Boolean(id)).sort()
+        : [];
+      if (stableJson(sourceIds) !== stableJson(replacementIds)) {
+        throw new ValidationError(`replacement dispatch must preserve managed worktree bindings: expected_worktree_ids=${JSON.stringify(sourceIds)}; actual_bound_ids=${JSON.stringify(replacementIds)}`);
+      }
+    }
     const packetJson = redact(stableJson(packet));
     const existing = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
       .get(runId, dispatchId) as { dispatch_id: string; packet_json: string } | undefined;

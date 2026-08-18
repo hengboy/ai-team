@@ -525,16 +525,26 @@ test("planned merge reconciles completed transfer and adopt before merging exact
     await fixture.orchestrator.transfer(legacyRunId, task.worktree_id);
 
     const dispatches = new DispatchService(fixture.store);
-    const mergeDispatchId = dispatches.create(runId, "git-operator", {
+    const mergePacket = {
       objective: "Restore ownership and merge TASK-001",
       allowed_read_paths: [],
       allowed_write_paths: [],
       acceptance_criteria: ["Merge the task exactly once"],
       context: {
         phase: "integrate_implementation",
+        worktree_id: plan.worktree_id,
         integration_worktree_id: plan.worktree_id,
+        task_id: "TASK-001",
+        task_worktree_id: task.worktree_id,
         task_worktree_ids: [task.worktree_id],
       },
+    };
+    const originalMergeDispatchId = dispatches.create(runId, "git-operator", mergePacket);
+    const superseded = dispatches.supersede(runId, originalMergeDispatchId, "git-operator", "coding", "freeze explicit managed worktree bindings", mergePacket);
+    const mergeDispatchId = superseded.dispatch_id;
+    assert.deepEqual(dispatches.mergeWorktreeBindings(runId, mergeDispatchId), {
+      integration_worktree_id: plan.worktree_id,
+      task_worktree_ids: [task.worktree_id],
     });
     dispatches.claim(runId, mergeDispatchId, "git-operator");
     assert.equal((await fixture.orchestrator.transfer(runId, plan.worktree_id, mergeDispatchId)).reused, false);
@@ -569,7 +579,17 @@ test("planned merge reconciles completed transfer and adopt before merging exact
     const reconciled = dispatches.reconcile(runId, mergeDispatchId, "git-operator", "coding", "ownership completed; merge did not start");
     const replacementRow = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(reconciled.dispatch_id) as { packet_json: string };
     assert.equal(JSON.parse(replacementRow.packet_json).context.phase, "integrate_implementation");
+    assert.deepEqual(dispatches.mergeWorktreeBindings(runId, reconciled.dispatch_id), {
+      integration_worktree_id: plan.worktree_id,
+      task_worktree_ids: [task.worktree_id],
+    });
     dispatches.claim(runId, reconciled.dispatch_id, "git-operator");
+    await assert.rejects(
+      fixture.orchestrator.mergeTask(runId, plan.worktree_id, "worktree_unbound_task", reconciled.dispatch_id),
+      (error: Error) => error.message.includes(`expected_worktree_ids=["${plan.worktree_id}","worktree_unbound_task"]`)
+        && error.message.includes(`actual_bound_ids=["${plan.worktree_id}","${task.worktree_id}"]`)
+        && error.message.includes('missing_bindings=["worktree_unbound_task"]'),
+    );
     const merged = await fixture.orchestrator.mergeTask(runId, plan.worktree_id, task.worktree_id, reconciled.dispatch_id);
     assert.equal((await rawGit(plan.path, ["rev-list", "--parents", "-n", "1", merged])).split(" ").length, 3);
     assert.equal(await fixture.orchestrator.mergeTask(runId, plan.worktree_id, task.worktree_id), merged);

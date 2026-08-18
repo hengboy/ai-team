@@ -105,9 +105,8 @@ export const completedMergeOwnershipPartialEffect = (
     const evidence = JSON.parse(operation.evidence_json ?? "{}");
     return expectedIds.has(request.worktree_id) || expectedIds.has(evidence.worktree_id);
   });
-  if (!matched.length) return undefined;
   return {
     operation_ids: matched.map(({ operation_id }) => operation_id),
-    fact: `ownership transfer/adoption completed for run ${runId}; merge not started for integration ${integrationWorktreeId} and tasks ${taskWorktreeIds.join(",")}`,
+    fact: `managed worktree bindings and ownership are ready for run ${runId}; merge not started for integration ${integrationWorktreeId} and tasks ${taskWorktreeIds.join(",")}`,
   };
 };

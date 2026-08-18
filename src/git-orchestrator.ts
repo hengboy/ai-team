@@ -388,13 +388,7 @@ export class GitOrchestrator {
   async mergeTask(runId: string, integrationId: string, taskId: string, dispatchId?: string): Promise<string> {
     this.assertGitOperator(runId, dispatchId);
     if (dispatchId) {
-      const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
-        .get(runId, dispatchId) as { packet_json: string };
-      const context = (JSON.parse(packetRow.packet_json) as { context?: Record<string, unknown> }).context ?? {};
-      const taskIds = Array.isArray(context.task_worktree_ids) ? context.task_worktree_ids : [];
-      if (context.phase !== "integrate_implementation" || context.integration_worktree_id !== integrationId || !taskIds.includes(taskId)) {
-        throw new ValidationError(`merge-task dispatch does not authorize integration ${integrationId} and task ${taskId}: constraint=packet_worktree_binding`);
-      }
+      new DispatchService(this.store).assertMergeWorktreeBindings(runId, dispatchId, integrationId, [taskId]);
     }
     const integration = this.plannedIntegrationWorktree(runId, integrationId);
     const task = this.worktree(runId, taskId);
@@ -571,15 +565,13 @@ export class GitOrchestrator {
         result.push({ operation_id: operation.operation_id, state: exists ? "completed" : "not_applied", fact: exists ? "owned worktree exists" : "owned worktree absent" });
       } else result.push({ operation_id: operation.operation_id, state: "unknown", fact: "manual evidence required" });
     }
-    const retryable = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='git-operator' AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1")
-      .get(runId) as { packet_json: string } | undefined;
+    const retryable = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator' AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1")
+      .get(runId) as { dispatch_id: string } | undefined;
     if (retryable) {
-      const context = (JSON.parse(retryable.packet_json) as { context?: Record<string, unknown> }).context ?? {};
-      const taskIds = Array.isArray(context.task_worktree_ids) && context.task_worktree_ids.every((id) => typeof id === "string")
-        ? context.task_worktree_ids as string[] : [];
-      if (typeof context.integration_worktree_id === "string" && taskIds.length) {
-        const partial = completedMergeOwnershipPartialEffect(this.store, runId, context.integration_worktree_id, taskIds);
-        if (partial) result.push({ operation_id: partial.operation_ids.at(-1)!, state: "completed", fact: partial.fact });
+      const bindings = new DispatchService(this.store).mergeWorktreeBindings(runId, retryable.dispatch_id);
+      if (bindings.integration_worktree_id && bindings.task_worktree_ids.length) {
+        const partial = completedMergeOwnershipPartialEffect(this.store, runId, bindings.integration_worktree_id, bindings.task_worktree_ids);
+        if (partial) result.push({ operation_id: partial.operation_ids.at(-1) ?? `dispatch-binding:${retryable.dispatch_id}`, state: "completed", fact: partial.fact });
       }
     }
     return result;

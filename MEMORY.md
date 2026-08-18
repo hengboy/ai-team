@@ -35,6 +35,8 @@
 - requirements_final
 - task_split
 - structured validation cause
+- dispatch worktree binding
+- packet worktree binding
 
 ### 仓库约束
 - 要求 Node.js >=22.13.0，并必须通过 npm 验证脚本。
@@ -43,6 +45,7 @@
 - 必须从仓库源码构建和安装，禁止直接编辑全局 dist 文件。
 - 发布验收必须安装真实 npm tarball，且该网络门禁与日常 `verify` 分离。
 - 代理生成的 JSON 必须使用受管 staging CLI；staging 元数据和审计事件不得保存原始 JSON；文件名使用 run 内不可复用序号标识创建顺序和产出阶段。
+- Git Operator merge authorization must use frozen dispatch-worktree bindings
 
 ### 职责
 - `src/cli.ts` 负责绑定命令、恢复操作和规范 JSON 输出。
@@ -64,6 +67,10 @@
 - `src/workflow.ts` 负责显式 direct mode 分诊一致性，并将 frozen coding run 原子关联到 planning run，保留原 task worktree 所有权。
 - `src/dispatch.ts` 负责区分 requirement 编号问题、requirements_final 与 task_split，冻结 File Explorer 结果证据，并管理无 stale Planning dispatch 的 continuation。
 - `src/dispatch.ts` 负责 delegated role 自提交回执、renderer 版本冻结，以及 `verify_existing` 驱动的受审计 `no_change` 规划终态。
+- src/state.ts persists dispatch-worktree binding migrations
+- src/worktree-ownership.ts resolves persisted worktree ownership consumption
+- src/dispatch.ts persists and preserves merge binding lineage for create, supersede, reissue, and reconcile
+- src/git-orchestrator.ts validates merge-task against persisted dispatch bindings
 
 ### 模块边界
 - `src/git-orchestrator.ts` 与 `src/git.ts` 负责 planned revision-scoped plan/task worktree、direct run-scoped integration/task 编排、精确 plan ownership 接受、已有直接子提交 TASK adoption、planned pre_commit worktree scope 与 no-ff merge，并将相关身份写入操作证据。
@@ -78,4 +85,5 @@
 - `run handoff-to-planning` 只接受无 pending operation 的 frozen coding run；规划 revision 提交 ready 后恢复 source run，旧 pending/claimed dispatch 不得继续授权。
 - `src/contracts.ts` 让公开 result schema 与运行时 validator 复用 typed decision shape，并定义无 revision/worktree/Git 副作用的 planning `no_change` payload。
 - `run show` 仅公开协调所需的 run-owned worktree 元数据，不公开其他角色的原始 result 或 staging 内容；submit continuation 只投影 run state/stage、pending dispatches 与 pending decision。
+- dispatch-worktree binding rows are the durable authority for merge-task authorization; packet context remains frozen compatibility evidence
 <!-- ai-team:project-context:end -->

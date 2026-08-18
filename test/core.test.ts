@@ -169,7 +169,7 @@ test("state migration is recorded once and survives reopening", async () => {
   try {
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }],
     );
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
@@ -180,7 +180,7 @@ test("state migration is recorded once and survives reopening", async () => {
     store = await StateStore.open(home);
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }],
     );
   } finally {
     store.close();
@@ -197,7 +197,7 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
     try {
       assert.equal(
         (reader.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count,
-        10,
+        11,
       );
       assert.throws(() => reader.db.prepare("UPDATE runs SET state='failed'").run(), /readonly|read-only/i);
     } finally {
@@ -452,6 +452,56 @@ test("migration 004 preserves legacy revisions and scopes identical revisions by
       { repo_id: "repo-a", state: "ready", target_branch: "main" },
       { repo_id: "repo-b", state: "draft", target_branch: "develop" },
     ]);
+  } finally {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("migration 011 backfills integration and multiple task bindings from frozen dispatch packets", async () => {
+  const home = await temporaryHome();
+  let store = await StateStore.open(home);
+  try {
+    const runId = createRun(store);
+    const createdAt = new Date().toISOString();
+    const worktrees = [
+      ["worktree_binding_integration", "integration/test/main"],
+      ["worktree_binding_task_1", "task/test/task-001"],
+      ["worktree_binding_task_2", "task/test/task-002"],
+    ];
+    for (const [worktreeId, branch] of worktrees) {
+      store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+        .run(worktreeId, runId, branch, `/tmp/${worktreeId}`, "a".repeat(40), createdAt);
+    }
+    const packet = {
+      objective: "Merge both tasks",
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Merge exactly once"],
+      context: {
+        phase: "integrate_implementation",
+        integration_worktree_id: worktrees[0]![0],
+        task_worktree_id: worktrees[1]![0],
+        task_worktree_ids: [worktrees[1]![0], worktrees[2]![0]],
+      },
+    };
+    store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,created_at)
+      VALUES (?,?,?,'pending',?,?,?,?,?)`).run(DISPATCH_ID, runId, "git-operator", JSON.stringify(packet), "", "{}", "{}", createdAt);
+    store.close();
+
+    const database = new Database(join(home, "state", "state.sqlite"));
+    database.exec("DROP TABLE dispatch_worktree_bindings; DELETE FROM schema_migrations WHERE name='011-dispatch-worktree-bindings';");
+    database.close();
+
+    store = await StateStore.open(home);
+    assert.deepEqual(
+      store.db.prepare("SELECT binding_kind,worktree_id FROM dispatch_worktree_bindings WHERE dispatch_id=? ORDER BY binding_kind,worktree_id").all(DISPATCH_ID),
+      [
+        { binding_kind: "integration", worktree_id: worktrees[0]![0] },
+        { binding_kind: "task", worktree_id: worktrees[1]![0] },
+        { binding_kind: "task", worktree_id: worktrees[2]![0] },
+      ],
+    );
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });
