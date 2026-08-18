@@ -472,32 +472,44 @@ export class DispatchService {
       || !Array.isArray(context.task_worktree_ids)
       || context.task_worktree_ids.some((id) => typeof id !== "string")) return undefined;
     const worktreeIds = [...new Set([context.integration_worktree_id, ...(context.task_worktree_ids as string[])])];
-    const rows = worktreeIds.map((worktreeId) => this.store.db.prepare(`SELECT w.worktree_id,w.run_id,w.branch,w.path,r.repo_id
+    const rows = worktreeIds.map((worktreeId) => this.store.db.prepare(`SELECT w.worktree_id,w.run_id,w.branch,w.path,w.base_commit,r.repo_id
       FROM worktrees w JOIN runs r ON r.run_id=w.run_id WHERE w.worktree_id=? AND w.state='active'`).get(worktreeId) as {
-        worktree_id: string; run_id: string; branch: string; path: string; repo_id: string;
+        worktree_id: string; run_id: string; branch: string; path: string; base_commit: string; repo_id: string;
       } | undefined);
     if (rows.some((row) => !row || row.repo_id !== run.repo_id)) return undefined;
-    const foreign = rows.filter((row) => row!.run_id !== runId).map((row) => row!);
-    if (!foreign.length) return undefined;
     const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
     if (!repository) return undefined;
     const planRevision = `${run.plan_id}-${run.revision}`;
     const integration = rows[0]!;
     const expectedPlanPath = join(repository.project_path, ".worktrees", "plans", run.plan_id, planRevision);
     if (integration.branch !== `plan/${run.plan_id}/${planRevision}` || integration.path !== expectedPlanPath) return undefined;
-    if (rows.slice(1).some((row) => !row!.branch.startsWith(`task/${run.plan_id}/${planRevision}--`))) return undefined;
+    const tasks = rows.slice(1).map((row) => row!);
+    if (tasks.some((row) => !row.branch.startsWith(`task/${run.plan_id}/${planRevision}--`))) return undefined;
+    const foreignTasks = tasks.filter((row) => row.run_id !== runId);
+    if (!foreignTasks.length) return undefined;
+    const adoptionTasks = foreignTasks.map((row) => {
+      const commit = execFileSync("git", ["-C", row.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      const parents = execFileSync("git", ["-C", row.path, "rev-list", "--parents", "-n", "1", commit], { encoding: "utf8" }).trim().split(" ");
+      if (parents.length !== 2 || parents[1] !== row.base_commit) return undefined;
+      return { worktree_id: row.worktree_id, path: row.path, branch: row.branch, base_commit: row.base_commit, commit };
+    });
+    if (adoptionTasks.some((task) => !task)) return undefined;
+    const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
+      .get(runId, failed.dispatch_id) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
     const dispatchId = this.insert(runId, "git-operator", validatePacket({
       objective: "Restore this planned run's registered worktree ownership before retrying the frozen task merge.",
       allowed_read_paths: [],
       allowed_write_paths: [],
-      acceptance_criteria: ["Transfer only the listed clean managed worktrees to this run", "Do not perform the task merge in this dispatch"],
+      acceptance_criteria: ["Adopt only the listed clean task worktrees with their existing direct-child commits", "Do not adopt the plan worktree or perform the task merge in this dispatch"],
       context: {
         stage: "git-operator",
         phase: "reconcile_worktree_ownership",
         source_dispatch_id: failed.dispatch_id,
         integration_worktree_id: context.integration_worktree_id,
         task_worktree_ids: context.task_worktree_ids,
-        worktree_ids: foreign.map(({ worktree_id }) => worktree_id),
+        worktree_ids: foreignTasks.map(({ worktree_id }) => worktree_id),
+        task_worktrees: adoptionTasks,
         recovery: {
           replacement_for: failed.dispatch_id,
           source_packet_digest: failed.packet_digest ?? sha256(failed.packet_json),
@@ -507,7 +519,7 @@ export class DispatchService {
     this.store.event(runId, "worktree.ownership_reconcile_created", {
       dispatch_id: dispatchId,
       source_dispatch_id: failed.dispatch_id,
-      worktree_ids: foreign.map(({ worktree_id }) => worktree_id),
+      worktree_ids: foreignTasks.map(({ worktree_id }) => worktree_id),
     });
     return dispatchId;
   }
@@ -577,7 +589,29 @@ export class DispatchService {
   }
 
   reissue(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): ReplacementResult<"reissued"> {
-    const row = this.get(runId, dispatchId, role) as { state: string; packet_json: string };
+    const row = this.get(runId, dispatchId, role) as {
+      state: string; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string;
+    };
+    const run = this.store.getRun(runId) as { state: string };
+    if (row.state === "failed" && run.state === "failed") {
+      this.assertLifecycleActor(runId, actorRole, "dispatch reissue");
+      if (!reason.trim()) throw new ValidationError("dispatch reissue requires a reason");
+      let result: { side_effect_state?: string };
+      try { result = JSON.parse(row.result_json ?? ""); }
+      catch { throw new ValidationError("failed dispatch reissue requires a valid result envelope"); }
+      if (result.side_effect_state !== "none") throw new ValidationError("failed dispatch can be revived only when no side effect occurred");
+      const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
+        .get(runId, dispatchId) as { dispatch_id: string } | undefined;
+      if (existing) return { action: "reissued", dispatch_id: existing.dispatch_id, replacement_for: dispatchId, reused: true };
+      let replacementId = "";
+      this.store.db.transaction(() => {
+        this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+        replacementId = this.plannedOwnershipRecovery(runId, { dispatch_id: dispatchId, role, ...row })
+          ?? this.recoveryReplacement(runId, { dispatch_id: dispatchId, role, ...row });
+        this.store.event(runId, "dispatch.reissued", { dispatchId, replacement_dispatch_id: replacementId, role, actor_role: actorRole, reason, revived_run: true });
+      })();
+      return { action: "reissued", dispatch_id: replacementId, replacement_for: dispatchId, reused: false };
+    }
     return this.replaceDispatch(runId, dispatchId, role, actorRole, reason, "reissued", JSON.parse(row.packet_json) as DispatchPacket);
   }
 
@@ -868,6 +902,12 @@ export class DispatchService {
     }
     if (row.state !== "claimed") throw new ValidationError("dispatch must be claimed before submit");
     const result = this.validateValue(runId, dispatchId, role, value);
+    if (role === "git-operator" && result.status === "failed" && result.side_effect_state === "none") {
+      const phase = ((JSON.parse(row.packet_json) as DispatchPacket).context as { phase?: unknown }).phase;
+      if (phase === "integrate_implementation" || phase === "reconcile_worktree_ownership") {
+        result.status = "retryable_failure";
+      }
+    }
     if (role === "git-operator" && result.status === "completed") {
       this.assertGitPrepareResult(runId, JSON.parse(row.packet_json) as DispatchPacket);
       const context = (JSON.parse(row.packet_json) as DispatchPacket).context;
@@ -1068,8 +1108,8 @@ export class DispatchService {
     if (!repository) return undefined;
     const planRevision = `${run.plan_id}-${run.revision}`;
     const expected = { branch: `plan/${run.plan_id}/${planRevision}`, path: join(repository.project_path, ".worktrees", "plans", run.plan_id, planRevision) };
-    const exact = this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
-      .get(runId, expected.branch, expected.path) as { worktree_id: string; path: string } | undefined;
+    const exact = this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE branch=? AND path=? AND state='active'")
+      .get(expected.branch, expected.path) as { worktree_id: string; path: string } | undefined;
     if (exact) return exact;
 
     const short = runId.slice(-8).toLowerCase();

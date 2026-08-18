@@ -207,6 +207,35 @@ test("planned runs use revision-scoped plan and task worktrees without run-short
   }
 });
 
+test("planned pre_commit accepts the exact plan-owned worktree without changing its owner", async () => {
+  const fixture = await createFixture();
+  try {
+    const planId = "20260818-plan-owned-scope";
+    const identity = await repositoryIdentity(fixture.root);
+    const runId = fixture.store.createRun({
+      repoId: identity.repoId,
+      profile: "coding",
+      mode: "planned",
+      planId,
+      revision: "001",
+      baseCommit: await rawGit(fixture.root, ["rev-parse", "HEAD"]),
+      targetBranch: "main",
+    });
+    const planOwnerRunId = fixture.store.createRun({ repoId: identity.repoId, profile: "coding", mode: "feature", targetBranch: "main" });
+    const plan = await fixture.orchestrator.prepareIntegration(runId);
+    await fixture.orchestrator.transfer(planOwnerRunId, plan.worktree_id);
+    assert.deepEqual(await fixture.orchestrator.prepareIntegration(runId), { ...plan, reused: true });
+
+    await writeFile(join(plan.path, "plan-owned.txt"), "planned change\n");
+    new ScopeGate(fixture.store).check(runId, "pre_commit", ["plan-owned.txt"], plan.worktree_id);
+    const committed = await fixture.orchestrator.commit(runId, plan.worktree_id, "Commit plan-owned implementation", ["plan-owned.txt"]);
+    assert.match(committed.commit, /^[a-f0-9]{40}$/);
+    assert.equal((fixture.store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id=?").get(plan.worktree_id) as { run_id: string }).run_id, planOwnerRunId);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
 test("planned multi-task run continues from prepare through test and derives the next task from the no-ff merge", async () => {
   const fixture = await createFixture();
   try {
@@ -326,7 +355,7 @@ test("planned multi-task run continues from prepare through test and derives the
   }
 });
 
-test("planned merge resumes through managed ownership repair and remains idempotent", async () => {
+test("historical planned merge reissues failed ownership repair, adopts only the task, and remains idempotent", async () => {
   const fixture = await createFixture();
   try {
     const planId = "20260818-ownership-recovery";
@@ -373,38 +402,75 @@ test("planned merge resumes through managed ownership repair and remains idempot
       fixture.orchestrator.mergeTask(runId, plan.worktree_id, task.worktree_id, mergeDispatchId),
       /worktree does not belong to run/,
     );
-    await dispatches.submitValue(runId, mergeDispatchId, "git-operator", {
+    const historicalFailure = {
       ...createResultTemplate(runId, mergeDispatchId, "git-operator"),
-      status: "retryable_failure",
+      status: "failed",
       summary: "Registered worktrees have stale ownership",
       verification: [],
       failure_class: "temporary_tool_failure",
       side_effect_state: "none",
       payload: { operations: [] },
-    });
+    };
+    fixture.store.db.prepare("UPDATE dispatches SET state='failed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(historicalFailure), new Date().toISOString(), mergeDispatchId);
+    fixture.store.db.prepare("UPDATE runs SET state='failed' WHERE run_id=?").run(runId);
+    assert.equal(dispatches.resume(runId).pending_dispatches.length, 0);
 
-    const firstResume = dispatches.resume(runId);
-    assert.equal(firstResume.pending_dispatches.length, 1);
-    const ownershipDispatchId = firstResume.pending_dispatches[0]!.dispatch_id;
+    const revived = dispatches.reissue(runId, mergeDispatchId, "git-operator", "coding", "revive historical no-side-effect failure");
+    assert.equal(fixture.store.getRun(runId).state, "active");
+    const ownershipDispatchId = revived.dispatch_id;
     const ownershipRow = fixture.store.db.prepare("SELECT replacement_for,packet_json FROM dispatches WHERE dispatch_id=?").get(ownershipDispatchId) as { replacement_for: string; packet_json: string };
     const ownershipPacket = JSON.parse(ownershipRow.packet_json);
     assert.equal(ownershipRow.replacement_for, mergeDispatchId);
     assert.equal(ownershipPacket.context.phase, "reconcile_worktree_ownership");
-    assert.deepEqual(ownershipPacket.context.worktree_ids.sort(), [plan.worktree_id, task.worktree_id].sort());
+    const taskCommit = await rawGit(task.path, ["rev-parse", "HEAD"]);
+    assert.deepEqual(ownershipPacket.context.worktree_ids, [task.worktree_id]);
+    assert.deepEqual(ownershipPacket.context.task_worktrees, [{
+      worktree_id: task.worktree_id,
+      path: task.path,
+      branch: task.branch,
+      base_commit: plan.base_commit,
+      commit: taskCommit,
+    }]);
 
     dispatches.claim(runId, ownershipDispatchId, "git-operator");
-    await fixture.orchestrator.transfer(runId, plan.worktree_id, ownershipDispatchId);
-    await fixture.orchestrator.transfer(runId, task.worktree_id, ownershipDispatchId);
-    const repaired = await dispatches.submitValue(runId, ownershipDispatchId, "git-operator", {
+    await assert.rejects(
+      fixture.orchestrator.adopt(runId, plan.path, plan.branch, plan.base_commit, plan.base_commit, ownershipDispatchId),
+      /direct-child commit/,
+    );
+    assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.worktree.adopt'").get(runId) as { count: number }).count, 0);
+    const rejected = await dispatches.submitValue(runId, ownershipDispatchId, "git-operator", {
       ...createResultTemplate(runId, ownershipDispatchId, "git-operator"),
+      status: "failed",
+      summary: "Plan worktree was rejected before Git changed",
+      verification: [],
+      failure_class: "invalid_operation_order",
+      side_effect_state: "none",
+      payload: { operations: [] },
+    });
+    assert.equal(rejected.submission.dispatch_state, "retryable_failure");
+    assert.equal(fixture.store.getRun(runId).state, "retryable_failure");
+
+    const retry = dispatches.resume(runId).pending_dispatches[0]!;
+    dispatches.claim(runId, retry.dispatch_id, "git-operator");
+    const adopted = await fixture.orchestrator.adopt(runId, task.path, task.branch, plan.base_commit, taskCommit, retry.dispatch_id);
+    assert.equal(adopted.worktree_id, task.worktree_id);
+    assert.equal((await fixture.orchestrator.adopt(runId, task.path, task.branch, plan.base_commit, taskCommit, retry.dispatch_id)).reused, true);
+    assert.deepEqual(
+      fixture.store.db.prepare("SELECT run_id,adopted_from_run_id FROM worktrees WHERE worktree_id=?").get(task.worktree_id),
+      { run_id: runId, adopted_from_run_id: legacyRunId },
+    );
+    assert.equal((fixture.store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id=?").get(plan.worktree_id) as { run_id: string }).run_id, legacyRunId);
+    const repaired = await dispatches.submitValue(runId, retry.dispatch_id, "git-operator", {
+      ...createResultTemplate(runId, retry.dispatch_id, "git-operator"),
       summary: "Ownership restored",
-      verification: [{ command: "ai-team git transfer", outcome: "plan and task worktrees transferred" }],
-      payload: { operations: [{ command: "ai-team git transfer", outcome: "completed" }] },
+      verification: [{ command: "ai-team git adopt", outcome: "TASK-001 adopted" }],
+      payload: { operations: [{ command: "ai-team git adopt", outcome: "completed" }] },
     });
     const replacement = repaired.continuation.pending_dispatches.find(({ role }) => role === "git-operator")!;
     assert.notEqual(replacement.dispatch_id, mergeDispatchId);
     const replacementRow = fixture.store.db.prepare("SELECT replacement_for,packet_json FROM dispatches WHERE dispatch_id=?").get(replacement.dispatch_id) as { replacement_for: string; packet_json: string };
-    assert.equal(replacementRow.replacement_for, ownershipDispatchId);
+    assert.equal(replacementRow.replacement_for, retry.dispatch_id);
     assert.equal(JSON.parse(replacementRow.packet_json).context.phase, "integrate_implementation");
 
     dispatches.claim(runId, replacement.dispatch_id, "git-operator");
@@ -420,6 +486,7 @@ test("planned merge resumes through managed ownership repair and remains idempot
     dispatches.resume(runId);
     assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.merge.task'").get(runId) as { count: number }).count, 1);
     assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND json_extract(packet_json,'$.context.phase')='integrate_implementation'").get(runId) as { count: number }).count, 2);
+    assert.equal((fixture.store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id=?").get(plan.worktree_id) as { run_id: string }).run_id, legacyRunId);
   } finally {
     await fixture.dispose();
   }

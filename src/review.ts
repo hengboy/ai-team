@@ -77,8 +77,8 @@ export class ReviewService {
       const planRevision = `${run.plan_id}-${run.revision}`;
       const branch = `plan/${run.plan_id}/${planRevision}`;
       const planPath = join(repository.project_path, ".worktrees", "plans", run.plan_id, planRevision);
-      integration = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
-        .get(runId, branch, planPath) as { path: string } | undefined;
+      integration = this.store.db.prepare("SELECT path FROM worktrees WHERE branch=? AND path=? AND state='active'")
+        .get(branch, planPath) as { path: string } | undefined;
       if (!integration) {
         const short = runId.slice(-8).toLowerCase();
         const legacyBranch = `integration/${run.plan_id}/${short}`;

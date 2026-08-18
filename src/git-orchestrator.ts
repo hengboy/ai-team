@@ -72,8 +72,8 @@ export class GitOrchestrator {
       return this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1").get(runId) as any;
     }
     const expected = worktreeNames(root, run, runId);
-    const exact = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
-      .get(runId, expected.branch, expected.path) as any;
+    const exact = this.store.db.prepare("SELECT * FROM worktrees WHERE branch=? AND path=? AND state='active'")
+      .get(expected.branch, expected.path) as any;
     if (exact) return exact;
 
     const legacy = legacyIntegrationNames(root, run, runId);
@@ -160,11 +160,43 @@ export class GitOrchestrator {
     } else if (head !== baseCommit) {
       throw new ValidationError("clean worktree adoption without --commit requires HEAD to equal base-commit");
     }
-    if (run.base_commit && run.base_commit !== baseCommit) throw new ValidationError("adopted base commit does not match run base commit");
+    if (isPlannedRun(run)) {
+      const taskPrefix = `task/${run.plan_id}/${run.plan_id}-${run.revision}--`;
+      if (!commit || !branch.startsWith(taskPrefix)) throw new ValidationError("planned adoption accepts only an existing task commit");
+      const expected = worktreeNames(root, run, runId);
+      const integration = this.store.db.prepare("SELECT * FROM worktrees WHERE branch=? AND path=? AND state='active'")
+        .get(expected.branch, expected.path) as any;
+      if (!integration || await currentHead(integration.path) !== baseCommit) {
+        throw new ValidationError("adopted task base does not match the current plan worktree HEAD");
+      }
+    } else if (run.base_commit && run.base_commit !== baseCommit) {
+      throw new ValidationError("adopted base commit does not match run base commit");
+    }
+    if (dispatchId) {
+      const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+        .get(runId, dispatchId) as { packet_json: string };
+      const context = (JSON.parse(packetRow.packet_json) as { context?: Record<string, unknown> }).context ?? {};
+      if (context.phase === "reconcile_worktree_ownership") {
+        const tasks = Array.isArray(context.task_worktrees) ? context.task_worktrees as Array<Record<string, unknown>> : [];
+        const authorized = tasks.some((task) => task.path === canonical && task.branch === branch && task.base_commit === baseCommit && task.commit === head);
+        if (!authorized) throw new ValidationError("ownership reconciliation may adopt only its listed task worktree");
+      }
+    }
     const existing = this.store.db.prepare("SELECT * FROM worktrees WHERE path=? OR branch=? ORDER BY created_at DESC LIMIT 1").get(canonical, branch) as any;
     if (existing?.state === "active") {
-      if (existing.run_id !== runId) throw new ValidationError(`worktree belongs to another run; use git transfer: ${existing.run_id}`);
-      return { worktree_id: existing.worktree_id, branch, path: canonical, base_commit: baseCommit, reused: true };
+      if (existing.run_id === runId) return { worktree_id: existing.worktree_id, branch, path: canonical, base_commit: baseCommit, reused: true };
+      const sourceRun = this.store.getRun(existing.run_id) as { repo_id: string };
+      if (!isPlannedRun(run) || sourceRun.repo_id !== run.repo_id) throw new ValidationError(`worktree belongs to another run; use git transfer: ${existing.run_id}`);
+      const key = `worktree:adopt:${runId}:${canonical}:${branch}:${head}`;
+      const operation = this.store.beginOperation("git.worktree.adopt", key, { path: canonical, branch, base: baseCommit, commit: head }, runId);
+      if (operation.reused && operation.state !== "completed") throw new ValidationError("adopt operation has unknown side effect; reconcile required");
+      if (!operation.reused) {
+        this.store.db.prepare("UPDATE worktrees SET run_id=?,adopted_from_run_id=? WHERE worktree_id=? AND run_id=?")
+          .run(runId, existing.run_id, existing.worktree_id, existing.run_id);
+        this.store.finishOperation(operation.operationId, { worktree_id: existing.worktree_id, head, adopted: true, implementation_revision: head, adopted_from_run_id: existing.run_id });
+        this.store.event(runId, "worktree.adopted", { worktreeId: existing.worktree_id, path: canonical, branch, baseCommit, head, implementation_revision: head, adopted_from_run_id: existing.run_id });
+      }
+      return { worktree_id: existing.worktree_id, branch, path: canonical, base_commit: baseCommit, reused: operation.reused };
     }
     const key = `worktree:adopt:${runId}:${canonical}:${branch}:${head}`;
     const operation = this.store.beginOperation("git.worktree.adopt", key, { path: canonical, branch, base: baseCommit, commit: head }, runId);
@@ -245,6 +277,10 @@ export class GitOrchestrator {
     const existing = named ?? (isPlannedRun(run) ? this.activeIntegrationWorktree(runId, root, run) : undefined);
     const key = `integration:create:${runId}:${base}`;
     if (existing) {
+      if (isPlannedRun(run) && existing.run_id !== runId) {
+        if (existing.base_commit !== base) throw new ValidationError("planned plan worktree base does not match run base commit");
+        return { worktree_id: existing.worktree_id, branch: existing.branch, path: existing.path, base_commit: base, reused: true };
+      }
       const operation = this.store.beginOperation("git.integration.create", key, { branch: existing.branch, path: existing.path, base }, runId);
       if (operation.state !== "completed") throw new ValidationError("integration operation has unknown side effect; reconcile required");
       return { worktree_id: existing.worktree_id, branch: existing.branch, path: existing.path, base_commit: base, reused: true };
@@ -284,9 +320,28 @@ export class GitOrchestrator {
     return row;
   }
 
+  private plannedIntegrationWorktree(runId: string, worktreeId: string): any {
+    const { root, run } = this.repositoryForRun(runId);
+    if (!isPlannedRun(run)) return this.worktree(runId, worktreeId);
+    const expected = worktreeNames(root, run, runId);
+    const row = this.store.db.prepare("SELECT * FROM worktrees WHERE worktree_id=? AND branch=? AND path=? AND state='active'")
+      .get(worktreeId, expected.branch, expected.path);
+    if (!row) throw new ValidationError("planned integration worktree does not belong to plan revision");
+    return row;
+  }
+
+  private worktreeForCommit(runId: string, worktreeId: string): any {
+    try { return this.worktree(runId, worktreeId); }
+    catch (error) {
+      const run = this.store.getRun(runId) as any;
+      if (!isPlannedRun(run)) throw error;
+      return this.plannedIntegrationWorktree(runId, worktreeId);
+    }
+  }
+
   async commit(runId: string, worktreeId: string, message: string, allowedScopes: string[], dispatchId?: string): Promise<{ commit: string; paths: string[]; reused: boolean }> {
     this.assertGitOperator(runId, dispatchId);
-    const worktree = this.worktree(runId, worktreeId);
+    const worktree = this.worktreeForCommit(runId, worktreeId);
     const changed = (await git(worktree.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3));
     if (!changed.length) throw new ValidationError("implementation has no changes to commit");
     if (dispatchId) {
@@ -325,7 +380,7 @@ export class GitOrchestrator {
 
   async mergeTask(runId: string, integrationId: string, taskId: string, dispatchId?: string): Promise<string> {
     this.assertGitOperator(runId, dispatchId);
-    const integration = this.worktree(runId, integrationId);
+    const integration = this.plannedIntegrationWorktree(runId, integrationId);
     const task = this.worktree(runId, taskId);
     const taskCommit = await currentHead(task.path);
     const operation = this.store.beginOperation("git.merge.task", `merge-task:${runId}:${integration.branch}:${task.branch}:${taskCommit}`, { integration: integration.branch, task: task.branch }, runId);
@@ -356,7 +411,7 @@ export class GitOrchestrator {
         return evidence.commit;
       }
     }
-    const integration = this.worktree(runId, integrationId);
+    const integration = this.plannedIntegrationWorktree(runId, integrationId);
     const targetStatus = await worktreeStatus(root);
     const unmanagedUntracked = targetStatus.untracked.filter((path) => path !== ".worktrees/" && !path.startsWith(".worktrees/"));
     if (targetStatus.staged.length || targetStatus.unstaged.length || unmanagedUntracked.length) {
@@ -419,7 +474,7 @@ export class GitOrchestrator {
 
   async continueConflict(runId: string, integrationId: string, allowedScopes: string[], dispatchId?: string): Promise<string> {
     this.assertGitOperator(runId, dispatchId);
-    const integration = this.worktree(runId, integrationId);
+    const integration = this.plannedIntegrationWorktree(runId, integrationId);
     try { await git(integration.path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]); }
     catch { throw new ValidationError("worktree has no merge conflict in progress"); }
     const unresolved = (await git(integration.path, ["diff", "--name-only", "--diff-filter=U"])).stdout.split("\n").filter(Boolean);

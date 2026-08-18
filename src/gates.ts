@@ -1,4 +1,5 @@
 import { ValidationError } from "./errors.js";
+import { join } from "node:path";
 import { StateStore } from "./state.js";
 import { sha256, stableJson } from "./utils.js";
 import { DispatchService } from "./dispatch.js";
@@ -19,6 +20,21 @@ export type ScopeGateStage = "triage" | "pre_write" | "pre_commit";
 export class ScopeGate {
   constructor(readonly store: StateStore) {}
 
+  private plannedWorktreeIsAuthorized(runId: string, worktreeId: string): boolean {
+    const run = this.store.getRun(runId) as { mode?: string; repo_id: string; plan_id?: string; revision?: string };
+    const row = this.store.db.prepare("SELECT run_id,branch,path,state FROM worktrees WHERE worktree_id=?").get(worktreeId) as {
+      run_id: string; branch: string; path: string; state: string;
+    } | undefined;
+    if (!row || row.state !== "active") return false;
+    if (row.run_id === runId) return true;
+    if (run.mode !== "planned" || !run.plan_id || !run.revision) return false;
+    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
+    const planRevision = `${run.plan_id}-${run.revision}`;
+    return Boolean(repository
+      && row.branch === `plan/${run.plan_id}/${planRevision}`
+      && row.path === join(repository.project_path, ".worktrees", "plans", run.plan_id, planRevision));
+  }
+
   check(runId: string, stage: ScopeGateStage, paths: string[], worktreeId?: string): { digest: string; complete: boolean } {
     const run = this.store.getRun(runId) as any;
     const direct = (["bug", "feature"] as string[]).includes(run.mode);
@@ -29,8 +45,7 @@ export class ScopeGate {
     if (!direct) {
       if (stage !== "pre_commit") throw new ValidationError("planned runs support only the pre_commit scope gate");
       if (!worktreeId) throw new ValidationError("planned pre_commit scope requires a worktree id");
-      const owned = this.store.db.prepare("SELECT 1 FROM worktrees WHERE worktree_id=? AND run_id=? AND state='active'").get(worktreeId, runId);
-      if (!owned) throw new ValidationError("planned pre_commit worktree does not belong to run");
+      if (!this.plannedWorktreeIsAuthorized(runId, worktreeId)) throw new ValidationError("planned pre_commit worktree does not belong to run or plan revision");
       const previous = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
         .get(runId, worktreeId) as { payload_json: string } | undefined;
       if (previous) {
