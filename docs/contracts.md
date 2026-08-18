@@ -1,8 +1,9 @@
 # AI Team v1 Contracts
 
-The implementation contract is represented by `COMMAND_CONTRACT` in
-`src/contracts.ts`; `ai-team contract` prints its SHA-256 digest. Unknown result
-fields are rejected.
+Public command syntax is defined by `COMMAND_SYNTAX` in `src/command-contract.ts`.
+`src/contracts.ts` defines result schemas, the composed installed contract, and
+its SHA-256 digest; `ai-team contract` prints that digest. Unknown result fields
+are rejected.
 
 ## Identifiers
 

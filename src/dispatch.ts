@@ -6,13 +6,28 @@ import type { Role } from "./constants.js";
 import { checkDecisionInput, checkResultEnvelope, createResultTemplate, resultSchemaForRole, type ResultEnvelope } from "./contracts.js";
 import { ValidationError } from "./errors.js";
 import { ROLE_MANIFEST } from "./roles.js";
-import { assertReadablePath, assertWritablePath, pathMatchesScope } from "./security.js";
+import { assertReadablePath, pathMatchesScope } from "./security.js";
 import { StateStore } from "./state.js";
 import { assertRevisionRunStage } from "./planning.js";
-import { assertRelativePosixPath, makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
+import { makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
 import type { ReviewFinding, ReviewResult } from "./review.js";
 import { ScopeGate } from "./gates.js";
 import { completedMergeOwnershipPartialEffect, type MergeOwnershipPartialEffect } from "./worktree-ownership.js";
+import { resolveReviewWorktree } from "./worktree-review.js";
+import {
+  dispatchPacketSchema as packetSchema,
+  dispatchPacketTemplate as packetTemplate,
+  EXPLORER_CONTEXT_PATHS as PACKET_EXPLORER_CONTEXT_PATHS,
+  mergeBindingsFromPacket as packetMergeBindings,
+  promptFor as renderPrompt,
+  promptForV2 as renderPromptV2,
+  promptForV3 as renderPromptV3,
+  RENDERER_VERSION as PACKET_RENDERER_VERSION,
+  validatePacket as validateDispatchPacket,
+} from "./dispatch/packet.js";
+import { buildContinueTestingPacket, buildReviewPacket as assembleReviewPacket, buildTestPacket, IMPLEMENTATION_TEST_COMMANDS as TEST_COMMANDS } from "./dispatch/implementation.js";
+import { assertPlanningTransition, planningContinuationPacket, planningSubmissionIntent } from "./dispatch/planning.js";
+import { isManagedPlannedRecovery, livenessRecoveryIntent, managedCleanupPacket, reconciliationIntent, reissuePacket, retryableResultHasNoSideEffects } from "./dispatch/recovery.js";
 
 export interface DispatchPacket {
   objective: string;
@@ -28,13 +43,7 @@ export interface MergeWorktreeBindings {
 }
 
 const mergeBindingsFromPacket = (role: Role, packet: DispatchPacket): MergeWorktreeBindings | undefined => {
-  if (role !== "git-operator" || !["integrate_implementation", "reconcile_worktree_ownership"].includes(String(packet.context.phase))) return undefined;
-  const integration = typeof packet.context.integration_worktree_id === "string" ? packet.context.integration_worktree_id : null;
-  const taskIds = [
-    ...(Array.isArray(packet.context.task_worktree_ids) ? packet.context.task_worktree_ids.filter((id): id is string => typeof id === "string") : []),
-    ...(typeof packet.context.task_worktree_id === "string" ? [packet.context.task_worktree_id] : []),
-  ];
-  return { integration_worktree_id: integration, task_worktree_ids: [...new Set(taskIds)].sort() };
+  return packetMergeBindings(role, packet);
 };
 
 export interface RunResumeResult {
@@ -102,63 +111,16 @@ interface ReviewBarrierRow {
   standards_dispatch_id?: string;
 }
 
-const RENDERER_VERSION = "dispatch-renderer-v5";
-const EXPLORER_CONTEXT_PATHS = ["MEMORY.md", ".ai-team/index/feature-navigation.md"] as const;
-const IMPLEMENTATION_TEST_COMMANDS = [
-  "npm run test -- src/components/AiRoutingGateway/AiRoutingGateway.test.tsx",
-  "npm run test",
-  "npm run lint",
-  "npm run build",
-] as const;
-
-const packetContextRequirements = (role: Role, phase?: unknown, taskId?: unknown): string[] => {
-  if (phase === "continue_implementation") {
-    return ["phase", "explorer_dispatch_id", "coordinator_dispatch_id", "prepare_git_dispatch_id", "task_id", "worktree_id", "worktree_path"];
-  }
-  if (phase === "prepare_implementation_worktree") {
-    return /^TASK-\d{3}$/.test(String(taskId ?? ""))
-      ? ["phase", "task_id", "explorer_dispatch_id", "coordinator_dispatch_id"]
-      : ["phase", "task_id"];
-  }
-  if (role === "frontend-developer" || role === "backend-developer") return ["explorer_dispatch_id", "worktree_id"];
-  return [];
-};
+const RENDERER_VERSION = PACKET_RENDERER_VERSION;
+const EXPLORER_CONTEXT_PATHS = PACKET_EXPLORER_CONTEXT_PATHS;
+const IMPLEMENTATION_TEST_COMMANDS = TEST_COMMANDS;
 
 export const dispatchPacketSchema = (role: Role, phase?: unknown, taskId?: unknown): Record<string, unknown> => {
-  const contextRequired = packetContextRequirements(role, phase, taskId);
-  const contextProperties = Object.fromEntries(contextRequired.map((key) => [key, {
-    type: "string",
-    ...(key === "task_id" ? { pattern: phase === "continue_implementation" ? "^TASK-[0-9]{3}$" : "^(?:TASK-[0-9]{3}|implementation)$" } : {}),
-  }]));
-  return {
-    $schema: "https://json-schema.org/draft/2020-12/schema",
-    type: "object",
-    additionalProperties: false,
-    required: ["objective", "allowed_read_paths", "allowed_write_paths", "acceptance_criteria", "context"],
-    properties: {
-      objective: { type: "string", minLength: 1 },
-      allowed_read_paths: { type: "array", items: { type: "string", minLength: 1 } },
-      allowed_write_paths: { type: "array", items: { type: "string", minLength: 1 } },
-      acceptance_criteria: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
-      context: {
-        type: "object",
-        additionalProperties: true,
-        ...(contextRequired.length ? { required: contextRequired } : {}),
-        properties: contextProperties,
-      },
-    },
-  };
+  return packetSchema(role, phase, taskId);
 };
 
 export const dispatchPacketTemplate = (role: Role, packet: DispatchPacket): DispatchPacket => {
-  const required = packetContextRequirements(role, packet.context.phase, packet.context.task_id);
-  return {
-    objective: packet.objective,
-    allowed_read_paths: [...packet.allowed_read_paths],
-    allowed_write_paths: [...packet.allowed_write_paths],
-    acceptance_criteria: [...packet.acceptance_criteria],
-    context: { ...packet.context, ...Object.fromEntries(required.map((key) => [key, packet.context[key] ?? ""])) },
-  };
+  return packetTemplate(role, packet);
 };
 
 interface ImplementationSnapshot {
@@ -187,71 +149,18 @@ const dirtyWorktreePaths = (worktreePath: string): string[] => {
   return [...new Set([...tracked, ...untracked])].sort();
 };
 
-const promptLines = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string[] => [
-  `Role: ${role}`,
-  `Run: ${runId}`,
-  `Dispatch: ${dispatchId}`,
-  `Objective: ${packet.objective}`,
-  `Allowed read paths: ${packet.allowed_read_paths.join(", ") || "none"}`,
-  `Allowed write paths: ${packet.allowed_write_paths.join(", ") || "none"}`,
-  `Acceptance criteria: ${packet.acceptance_criteria.join("; ")}`,
-  `Context: ${stableJson(packet.context)}`,
-];
 const promptForV2 = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
-  ...promptLines(runId, dispatchId, role, packet),
-  "Return only the frozen result envelope and role payload schema.",
-].join("\n");
+  renderPromptV2(runId, dispatchId, role, packet),
+].join("");
 const promptForV3 = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
-  ...promptLines(runId, dispatchId, role, packet),
-  "Build the frozen result envelope from the template and schema, then submit it exactly once with dispatch submit --input-stdin.",
-  "Return the CLI submission receipt containing submission and continuation; do not return an unsubmitted envelope.",
-].join("\n");
+  renderPromptV3(runId, dispatchId, role, packet),
+].join("");
 const promptFor = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
-  ...promptLines(runId, dispatchId, role, packet),
-  "Create a dispatch-result staging entry, write the frozen result envelope with staging write --run-id <run-id> --role <role> --staging-id <staging-id> --input-stdin, validate it, then submit it exactly once with dispatch submit --staging-id <staging-id>.",
-  "Return the CLI submission receipt containing submission and continuation; do not return an unsubmitted envelope.",
-  "Do not claim a workflow action in the final output unless it is recorded by the returned artifact, decision, or run event.",
-].join("\n");
+  renderPrompt(runId, dispatchId, role, packet),
+].join("");
 
 const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
-  if (!packet || typeof packet !== "object" || Array.isArray(packet)) throw new ValidationError("dispatch packet must be an object");
-  const value = packet as Record<string, unknown>;
-  const allowed = new Set(["objective", "allowed_read_paths", "allowed_write_paths", "acceptance_criteria", "context"]);
-  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
-  if (unknown.length) throw new ValidationError("dispatch packet has unknown fields", unknown.map((key) => ({
-    path: `/${key}`, pointer: `/${key}`, field: key, constraint: "additionalProperties", message: "unknown field",
-  })));
-  if (typeof value.objective !== "string" || !value.objective.trim()) throw new ValidationError("dispatch packet objective must be a non-empty string", ["/objective"]);
-  for (const key of ["allowed_read_paths", "allowed_write_paths", "acceptance_criteria"] as const) {
-    if (!Array.isArray(value[key]) || value[key].some((item) => typeof item !== "string" || !item.trim())) {
-      throw new ValidationError(`dispatch packet ${key} must contain non-empty strings`, [`/${key}`]);
-    }
-  }
-  if (!(value.context && typeof value.context === "object" && !Array.isArray(value.context))) throw new ValidationError("dispatch packet context must be an object", ["/context"]);
-  const context = value.context as Record<string, unknown>;
-  const enforcedContext = context.phase === "continue_implementation" || context.phase === "prepare_implementation_worktree"
-    ? packetContextRequirements(role, context.phase, context.task_id)
-    : [];
-  const missingContext = enforcedContext.filter((key) => typeof context[key] !== "string" || !(context[key] as string).trim());
-  if (missingContext.length) throw new ValidationError("dispatch packet context is incomplete for role and phase", missingContext.map((key) => ({
-    path: `/context/${key}`, pointer: `/context/${key}`, field: key, constraint: "required", message: "required context field is missing",
-  })));
-  if (typeof context.task_id === "string" && context.task_id !== "implementation" && !/^TASK-\d{3}$/.test(context.task_id)) {
-    throw new ValidationError("dispatch packet context.task_id is invalid", [{ path: "/context/task_id", pointer: "/context/task_id", field: "task_id", constraint: "pattern", message: "must match TASK- followed by three digits" }]);
-  }
-  if (!(value.acceptance_criteria as string[]).length) throw new ValidationError("dispatch packet requires acceptance criteria", ["/acceptance_criteria"]);
-  const reads = role === "file-explorer"
-    ? [...new Set([...EXPLORER_CONTEXT_PATHS, ...(value.allowed_read_paths as string[])])]
-    : value.allowed_read_paths as string[];
-  const writes = value.allowed_write_paths as string[];
-  for (const path of [...reads, ...writes]) {
-    if (path !== "." && path !== "**") assertRelativePosixPath(path);
-  }
-  for (const path of reads) if (path !== "." && path !== "**") assertReadablePath(path);
-  for (const path of writes) assertWritablePath(path);
-  const broad = reads.filter((path) => path === "**" || path === "." || path.endsWith("/**"));
-  if (role !== "file-explorer" && broad.length) throw new ValidationError(`${role} requires exact allowed_read_paths`);
-  return { ...value, allowed_read_paths: reads } as unknown as DispatchPacket;
+  return validateDispatchPacket(packet, role);
 };
 
 const validateReviewResult = (result: ReviewResult): void => {
@@ -1192,33 +1101,7 @@ export class DispatchService {
   }
 
   private activeIntegrationWorktree(runId: string): { worktree_id: string; path: string } | undefined {
-    const run = this.store.getRun(runId) as { mode?: string; plan_id?: string; revision?: string; repo_id: string };
-    if (run.mode !== "planned") {
-      return this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE run_id=? AND branch LIKE 'integration/%' AND state='active' ORDER BY created_at DESC LIMIT 1")
-        .get(runId) as { worktree_id: string; path: string } | undefined;
-    }
-    if (!run.plan_id || !run.revision) return undefined;
-    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
-    if (!repository) return undefined;
-    const planRevision = `${run.plan_id}-${run.revision}`;
-    const expected = { branch: `plan/${run.plan_id}/${planRevision}`, path: join(repository.project_path, ".worktrees", "plans", run.plan_id, planRevision) };
-    const exact = this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE branch=? AND path=? AND state='active'")
-      .get(expected.branch, expected.path) as { worktree_id: string; path: string } | undefined;
-    if (exact) return exact;
-
-    const short = runId.slice(-8).toLowerCase();
-    const legacy = { branch: `integration/${run.plan_id}/${short}`, path: join(repository.project_path, ".worktrees", "integration", run.plan_id, short) };
-    const row = this.store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
-      .get(runId, legacy.branch, legacy.path) as { worktree_id: string; path: string } | undefined;
-    if (!row) return undefined;
-    const created = this.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='run.created' ORDER BY event_id LIMIT 1")
-      .get(runId) as { payload_json: string } | undefined;
-    const operation = this.store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.integration.create' AND state='completed'
-      AND json_extract(request_json,'$.branch')=? AND json_extract(request_json,'$.path')=?`).get(runId, legacy.branch, legacy.path);
-    try {
-      if (JSON.parse(created?.payload_json ?? "{}").mode === "planned" && operation) return row;
-    } catch { /* malformed legacy provenance is not ownership evidence */ }
-    return undefined;
+    return resolveReviewWorktree(this.store, runId);
   }
 
   private createPlannedCodingDispatch(runId: string, explorerDispatchId: string | undefined, gitDispatchId: string): string {
@@ -1466,30 +1349,7 @@ export class DispatchService {
   }
 
   private testPacket(snapshot: ImplementationSnapshot, coordinatorDispatchId?: string): DispatchPacket {
-    return validatePacket({
-      objective: `Independently verify implementation commit ${snapshot.implementationCommit}.`,
-      allowed_read_paths: snapshot.authorizedPaths,
-      allowed_write_paths: [],
-      acceptance_criteria: ["Run every frozen test command", "Bind evidence to the implementation commit"],
-      context: {
-        stage: "test",
-        ...(snapshot.explorerDispatchId ? { explorer_dispatch_id: snapshot.explorerDispatchId } : {}),
-        plan_id: snapshot.planId,
-        revision: snapshot.revision,
-        plan_digest: snapshot.planDigest,
-        worktree_id: snapshot.worktreeId,
-        worktree_path: snapshot.worktreePath,
-        integration_worktree_id: snapshot.worktreeId,
-        implementation_dispatch_id: snapshot.implementationDispatchId,
-        implementation_artifact: snapshot.implementationArtifact,
-        implementation_artifacts: snapshot.implementationArtifacts,
-        implementation_commit: snapshot.implementationCommit,
-        implementation_committed: snapshot.implementationCommitted,
-        changed_paths: snapshot.changedPaths,
-        test_commands: [...IMPLEMENTATION_TEST_COMMANDS],
-        ...(coordinatorDispatchId ? { coordinator_dispatch_id: coordinatorDispatchId } : {}),
-      },
-    }, "test");
+    return validatePacket(buildTestPacket(snapshot, coordinatorDispatchId), "test");
   }
 
   private createTestDispatch(runId: string, snapshot: ImplementationSnapshot, coordinatorDispatchId?: string): string {
@@ -1675,21 +1535,12 @@ export class DispatchService {
       ORDER BY a.created_at,a.artifact_id`).all(runId) as Array<{ artifact_id: string; dispatch_id: string; kind: string; path: string; sha256: string; role: string }>;
     const evidenceDigest = sha256(stableJson({ test_dispatch_id: test.dispatch_id, test_evidence_digest: testEvidenceDigest, artifact_digests: artifacts.map((artifact) => artifact.sha256) }));
     const revisionDigest = sha256(stableJson({ plan_id: run.plan_id ?? null, revision: run.revision ?? null, base_commit: baseCommit, revision_sha: revisionSha, document_digest: documentDigest, diff_digest: diffDigest, evidence_digest: evidenceDigest }));
-    const allowedReadPaths = [...new Set([...changedPaths, ...existingPlanningPaths])];
-    return validatePacket({
-      objective: `Create the review barrier for frozen integration commit ${revisionSha}.`,
-      allowed_read_paths: allowedReadPaths,
-      allowed_write_paths: [],
-      acceptance_criteria: ["Review the frozen integration commit", "Preserve all revision, document, diff, and test bindings"],
-      context: {
-        stage: "code-reviewer", implementation_commit: revisionSha, revision_sha: revisionSha, base_commit: baseCommit,
-        plan_id: run.plan_id ?? null, revision: run.revision ?? null, plan_digest: run.plan_digest ?? null,
-        changed_paths: changedPaths, document_digest: documentDigest,
-        committed_diff: committedDiff, diff_digest: diffDigest, test_dispatch_id: test.dispatch_id, test_evidence: frozenTestResult,
-        test_evidence_digest: testEvidenceDigest, testedCommit, artifacts, evidence_digest: evidenceDigest, revision_digest: revisionDigest,
-        ...(reissue ? { reissue: { decision_id: reissue.decision_id, dispatch_id: reissue.dispatch_id }, resolved_decision: reissue.resolved_decision ?? null } : {}),
-      },
-    }, "code-reviewer");
+    return validatePacket(assembleReviewPacket({
+      revisionSha, baseCommit, planId: run.plan_id ?? null, revision: run.revision ?? null, planDigest: run.plan_digest ?? null,
+      changedPaths, planningPaths: existingPlanningPaths, documentDigest, committedDiff, diffDigest,
+      testDispatchId: test.dispatch_id, testEvidence: frozenTestResult, testEvidenceDigest, testedCommit,
+      artifacts, evidenceDigest, revisionDigest, ...(reissue ? { reissue } : {}),
+    }), "code-reviewer");
   }
 
   private advancePlanning(runId: string, result: ResultEnvelope): void {
@@ -1700,16 +1551,7 @@ export class DispatchService {
       no_change?: { decision_id: string; conclusion: string; repository_evidence: Array<{ command: string; outcome: string }> };
     };
     const run = this.store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string; stage: string };
-    const transitions: Record<string, string[]> = {
-      planning: ["requirements"],
-      requirements: ["requirements", "requirements_confirmed", "no_change"],
-      requirements_confirmed: ["spec_ready"],
-      spec_ready: ["plan_ready"],
-      plan_ready: ["tasks_preview", "ready"],
-      tasks_preview: ["tasks_preview", "ready"],
-      ready: [],
-    };
-    if (!transitions[run.stage]?.includes(payload.stage)) throw new ValidationError(`invalid planning stage transition: ${run.stage} -> ${payload.stage}`);
+    assertPlanningTransition(run.stage, payload.stage);
     if (payload.stage === "no_change") {
       if (!payload.no_change) throw new ValidationError("planning no_change requires repository evidence and a decision receipt");
       const decision = this.store.db.prepare("SELECT status,choice,receipt_json FROM decisions WHERE run_id=? AND decision_id=?")
@@ -1742,36 +1584,15 @@ export class DispatchService {
       if (!revision) throw new ValidationError("bound planning revision not found");
       assertRevisionRunStage(revision.state, payload.stage);
     }
-    if (payload.pending_questions.length && !["requirements", "plan_ready", "tasks_preview"].includes(payload.stage)) {
-      throw new ValidationError(`planning stage ${payload.stage} cannot have pending questions`);
-    }
-    const needsDecision = payload.decision !== null;
-    const choiceIds = payload.decision?.choices.map(({ id }) => id).sort() ?? [];
-    const finalConfirmation = payload.stage === "requirements" && choiceIds.length === 2 && choiceIds[0] === "confirm" && choiceIds[1] === "revise";
-    const taskSplit = payload.stage === "plan_ready" && choiceIds.length === 2 && choiceIds[0] === "no_split" && choiceIds[1] === "split";
-    if ((finalConfirmation || taskSplit) && payload.pending_questions.length) {
-      throw new ValidationError(`${finalConfirmation ? "requirements_final" : "task_split"} decision must not use functional pending_questions`);
-    }
-    if (needsDecision && payload.stage === "plan_ready" && !taskSplit) {
-      throw new ValidationError("plan_ready decision choices must be split and no_split");
-    }
-    if (needsDecision && payload.stage === "tasks_preview") {
-      const choices = payload.decision?.choices.map(({ id }) => id).sort();
-      if (!choices || choices.length !== 2 || choices[0] !== "approve" || choices[1] !== "revise") {
-        throw new ValidationError("task preview decision choices must be approve and revise");
-      }
-    }
+    const requirementDecisionCount = (this.store.db.prepare("SELECT COUNT(*) AS count FROM decisions WHERE run_id=? AND decision_type='requirement'").get(runId) as { count: number }).count;
+    const intent = planningSubmissionIntent(payload.stage, payload.pending_questions, payload.decision, requirementDecisionCount);
+    const needsDecision = intent.needsDecision;
     this.store.db.prepare("UPDATE runs SET stage=?,state=?,updated_at=? WHERE run_id=?")
       .run(payload.stage, needsDecision ? "needs_decision" : "active", new Date().toISOString(), runId);
     this.store.event(runId, "planning.stage_changed", { stage: payload.stage });
     if (needsDecision) {
       if (!payload.decision) throw new ValidationError("planning pending question requires one matching decision");
-      const requirementQuestion = payload.stage === "requirements" && !finalConfirmation;
-      const question = requirementQuestion
-        ? `问题 ${((this.store.db.prepare("SELECT COUNT(*) AS count FROM decisions WHERE run_id=? AND decision_type='requirement'").get(runId) as { count: number }).count) + 1}、${payload.decision.question.replace(/^问题\s*\d+、\s*/, "")}`
-        : payload.decision.question;
-      const decisionType = requirementQuestion ? "requirement" : finalConfirmation ? "requirements_final" : taskSplit ? "task_split" : payload.stage === "tasks_preview" ? "task_preview" : "workflow";
-      this.store.createDecision(runId, question, payload.decision.choices, payload.decision.recommendation, decisionType, result.dispatch_id);
+      this.store.createDecision(runId, intent.question!, payload.decision.choices, payload.decision.recommendation, intent.decisionType!, result.dispatch_id);
     } else if (payload.stage !== "ready") {
       this.continuePlanning(runId);
     }
@@ -1785,11 +1606,7 @@ export class DispatchService {
     const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='planning' AND state IN ('pending','claimed') ORDER BY created_at DESC LIMIT 1")
       .get(runId) as { dispatch_id: string } | undefined;
     if (existing) return existing.dispatch_id;
-    return this.create(runId, "planning", {
-      objective: "Continue the planning workflow from the current stage, asking at most one highest-priority question.",
-      allowed_read_paths: ["package.json"], allowed_write_paths: [".ai-team/plans/**"],
-      acceptance_criteria: ["Return the next planning stage", "Return at most one pending question"], context: { stage: run.stage },
-    }, "planning");
+    return this.create(runId, "planning", planningContinuationPacket(run.stage), "planning");
   }
 
   resolvePlanningDecision(runId: string, decisionId: string, choice: string, note?: string): string {
@@ -1834,9 +1651,7 @@ export class DispatchService {
       if (choice === existingDecision.choice && receipt.successor_dispatch_id) return receipt.successor_dispatch_id;
       throw new ValidationError("decision is unknown, stale, or already resolved");
     }
-    const managedPlannedRecovery = run.mode === "planned"
-      && (existingDecision?.decision_type === "planned_run_binding" && choice === "repair-recreate"
-        || existingDecision?.decision_type === "planned_run_recovery_gap" && choice === "managed-reconcile");
+    const managedPlannedRecovery = isManagedPlannedRecovery(run.mode, existingDecision?.decision_type, choice);
     if (managedPlannedRecovery) {
       if (!run.repo_id || !run.plan_id || !run.revision || !existingDecision?.dispatch_id) throw new ValidationError("managed planned recovery requires a bound planned run and dispatch");
       const pendingOperation = this.store.db.prepare("SELECT operation_id FROM operations WHERE run_id=? AND state='pending' ORDER BY created_at LIMIT 1").get(runId) as { operation_id: string } | undefined;
@@ -1852,23 +1667,10 @@ export class DispatchService {
         if (!blocked || blocked.role !== "coding") throw new ValidationError("managed planned recovery requires a blocked Coding dispatch");
         this.store.decide(runId, decisionId, choice, note);
         this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?").run(new Date().toISOString(), blocked.dispatch_id);
-        dispatchId = this.insert(runId, "git-operator", validatePacket({
-          objective: "Clean every obsolete worktree owned by the anomalous planned run before recreating it.",
-          allowed_read_paths: [],
-          allowed_write_paths: [],
-          acceptance_criteria: ["Remove only clean worktrees owned by the source run", "Release plan and obsolete task branches", "Preserve reconciliation events for every failed replacement run"],
-          context: {
-            stage: "git-operator",
-            phase: "cancel_cleanup",
-            worktree_ids: worktrees.map(({ worktree_id }) => worktree_id),
-            reconciliation: {
-              decision_id: decisionId,
-              choice,
-              conflicting_run_ids: conflicts.map(({ run_id }) => run_id),
-              restart: { plan_id: run.plan_id, revision: run.revision },
-            },
-          },
-        }, "git-operator"), blocked.dispatch_id);
+        dispatchId = this.insert(runId, "git-operator", validatePacket(managedCleanupPacket({
+          worktreeIds: worktrees.map(({ worktree_id }) => worktree_id), decisionId, choice,
+          conflictingRunIds: conflicts.map(({ run_id }) => run_id), planId: run.plan_id!, revision: run.revision!,
+        }), "git-operator"), blocked.dispatch_id);
         this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND dispatch_id<>? AND state IN ('pending','claimed')")
           .run(new Date().toISOString(), runId, dispatchId);
         this.store.db.prepare("UPDATE runs SET state='active',stage='canceling',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
@@ -1910,17 +1712,7 @@ export class DispatchService {
         if (blocked.role === "code-reviewer" && !reviewPacket) {
           throw new ValidationError("review reissue requires complete current integration and test evidence");
         }
-        packet = reviewPacket ?? validatePacket({
-          objective: `Reissue the ${blocked.role} stage after resolving decision ${decisionId}.`,
-          allowed_read_paths: [],
-          allowed_write_paths: [],
-          acceptance_criteria: ["Use the resolved decision", "Return fresh evidence for the current run state"],
-          context: {
-            stage: blocked.role,
-            resolved_decision: resolvedDecision,
-            reissue: { decision_id: decisionId, dispatch_id: blocked.dispatch_id },
-          },
-        }, blocked.role);
+        packet = reviewPacket ?? validatePacket(reissuePacket(blocked.role, decisionId, blocked.dispatch_id, resolvedDecision), blocked.role);
       } else {
         dispatchId = this.recoveryReplacement(runId, blocked, resolvedDecision);
         packet = JSON.parse((this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatchId) as { packet_json: string }).packet_json) as DispatchPacket;
@@ -2132,32 +1924,7 @@ export class DispatchService {
     if (existing) return existing.dispatch_id;
     const snapshot = this.implementationSnapshot(runId);
     if (!snapshot) return undefined;
-    const packet = validatePacket({
-      objective: "Continue the completed implementation by dispatching its frozen independent Test packet. Do not repeat implementation work.",
-      allowed_read_paths: snapshot.authorizedPaths,
-      allowed_write_paths: [],
-      acceptance_criteria: ["Dispatch exactly one Test role", "Do not modify implementation", "Preserve the frozen plan, worktree, implementation artifact, and test commands"],
-      context: {
-        stage: "coding",
-        phase: "continue_testing",
-        ...(snapshot.explorerDispatchId ? { explorer_dispatch_id: snapshot.explorerDispatchId } : {}),
-        coordinator_dispatch_id: snapshot.coordinatorDispatchId,
-        developer_dispatch_ids: snapshot.developerDispatchIds,
-        plan_id: snapshot.planId,
-        revision: snapshot.revision,
-        plan_digest: snapshot.planDigest,
-        worktree_id: snapshot.worktreeId,
-        worktree_path: snapshot.worktreePath,
-        implementation_dispatch_id: snapshot.implementationDispatchId,
-        implementation_artifact: snapshot.implementationArtifact,
-        implementation_artifacts: snapshot.implementationArtifacts,
-        implementation_commit: snapshot.implementationCommit,
-        implementation_committed: snapshot.implementationCommitted,
-        changed_paths: snapshot.changedPaths,
-        test_commands: [...IMPLEMENTATION_TEST_COMMANDS],
-        permitted_delegate_role: "test",
-      },
-    }, "coding");
+    const packet = validatePacket(buildContinueTestingPacket(snapshot), "coding");
     assertExplorerAuthorization(this.store, runId, "coding", packet);
     const dispatchId = this.insert(runId, "coding", packet, snapshot.coordinatorDispatchId);
     const orphanedStaging = this.store.db.prepare(`SELECT staging_id FROM staging_entries
@@ -2172,23 +1939,14 @@ export class DispatchService {
 
   private ensureActiveLivenessDecision(runId: string): void {
     const run = this.store.getRun(runId) as { profile: Role; state: string; stage: string };
-    if (run.state !== "active") return;
     const pendingDispatch = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId);
     const pendingDecision = this.store.db.prepare("SELECT 1 FROM decisions WHERE run_id=? AND status='pending'").get(runId);
     const pendingOperation = this.store.db.prepare("SELECT 1 FROM operations WHERE run_id=? AND state='pending'").get(runId);
-    if (pendingDispatch || pendingDecision || pendingOperation) return;
-    const dispatchId = this.insert(runId, run.profile, validatePacket({
-      objective: `Recover the active ${run.stage} stage that has no durable continuation.`,
-      allowed_read_paths: [],
-      allowed_write_paths: [],
-      acceptance_criteria: ["Choose whether to retry the frozen stage or stop the run"],
-      context: { stage: run.stage, phase: "resume_recovery" },
-    }, run.profile));
+    const intent = livenessRecoveryIntent(run.profile, run.state, run.stage, Boolean(pendingDispatch || pendingDecision || pendingOperation));
+    if (!intent) return;
+    const dispatchId = this.insert(runId, run.profile, validatePacket(intent.packet, run.profile));
     this.store.db.prepare("UPDATE dispatches SET state='needs_decision' WHERE dispatch_id=?").run(dispatchId);
-    this.store.createDecision(runId, "The active run has no pending continuation. How should it recover?", [
-      { id: "retry", label: "Retry stage", impact: "Reissue the frozen stage from its current evidence" },
-      { id: "abort", label: "Abort run", impact: "Stop this run without creating more work" },
-    ], "retry", "active_run_recovery", dispatchId);
+    this.store.createDecision(runId, intent.decision.question, intent.decision.choices, intent.decision.recommendation, intent.decision.type, dispatchId);
     this.store.db.prepare("UPDATE runs SET state='needs_decision',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
     this.store.event(runId, "run.recovery_decision_created", { dispatch_id: dispatchId, stage: run.stage });
   }
@@ -2224,13 +1982,7 @@ export class DispatchService {
         if (pendingDispatch) return;
         if (run.profile === "coding" && this.ensurePlannedTaskContinuation(runId)) return;
       }
-      let retryableHasNoSideEffects = false;
-      if (retryableDispatch?.result_json) {
-        try {
-          const result = JSON.parse(retryableDispatch.result_json) as { status?: string; side_effect_state?: string };
-          retryableHasNoSideEffects = result.status === "retryable_failure" && result.side_effect_state === "none";
-        } catch { /* corrupt legacy results remain blocked */ }
-      }
+      const retryableHasNoSideEffects = retryableResultHasNoSideEffects(retryableDispatch?.result_json);
       if (retryableDispatch && retryableHasNoSideEffects && !mergePartialEffect) {
         this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
           .run(new Date().toISOString(), retryableDispatch.dispatch_id);
@@ -2262,21 +2014,13 @@ export class DispatchService {
       : undefined;
     let recovery: RunResumeResult["recovery"] = null;
     if (blockedRetryable?.result_json) {
-      try {
-        const result = JSON.parse(blockedRetryable.result_json) as { side_effect_state?: "completed" | "unknown" };
-        const partialEffect = this.plannedMergePartialEffect(runId, blockedRetryable);
-        if (result.side_effect_state === "completed" || result.side_effect_state === "unknown" || partialEffect) {
-          const sideEffectState = partialEffect ? "completed" : result.side_effect_state as "completed" | "unknown";
-          recovery = {
-            state: "action_required",
-            dispatch_id: blockedRetryable.dispatch_id,
-            side_effect_state: sideEffectState,
-            next_command: sideEffectState === "completed"
-              ? `ai-team dispatch reconcile --run-id ${runId} --dispatch-id ${blockedRetryable.dispatch_id} --role ${blockedRetryable.role} --actor-role ${resumedRun.profile} --reason "reconcile confirmed completed side effect"`
-              : null,
-          };
-        }
-      } catch { /* corrupt legacy results remain diagnostic-only */ }
+      const intent = reconciliationIntent(blockedRetryable.result_json, Boolean(this.plannedMergePartialEffect(runId, blockedRetryable)));
+      if (intent) recovery = {
+        state: "action_required", dispatch_id: blockedRetryable.dispatch_id, side_effect_state: intent.sideEffectState,
+        next_command: intent.sideEffectState === "completed"
+          ? `ai-team dispatch reconcile --run-id ${runId} --dispatch-id ${blockedRetryable.dispatch_id} --role ${blockedRetryable.role} --actor-role ${resumedRun.profile} --reason "reconcile confirmed completed side effect"`
+          : null,
+      };
     }
     return {
       run: resumedRun,

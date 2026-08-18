@@ -6,6 +6,11 @@ Claude Code 与 OpenCode 代理，支持可审计的规划和编码工作流。
 代理结果，并以事务方式生成平台原生的代理定义。
 它不会启动 AI 客户端进程，也不使用 MCP。
 
+源码按职责分层：`src/commands/` 注册 CLI 命令，`src/dispatch/` 计算冻结 packet、
+规划、实现和恢复 intent，`src/staging.ts` 管理 JSON staging 生命周期，
+`src/worktree-review.ts` 统一只读评审 worktree 定位；`src/cli.ts`、
+`src/dispatch.ts` 与 `src/state.ts` 保留公共 facade、事务和输出边界。
+
 ## 环境要求
 
 - macOS
@@ -55,7 +60,8 @@ worktree。计划内编码启动时会创建一个由运行拥有、名为
 `<plan-id>-<revision>` 的计划 worktree；拆分任务直接使用该计划 worktree，
 除非冻结修订包含多个明确的 `TASK-*.md` 文件。多任务修订使用
 `<plan-id>-<revision>--<task-id>`，并合并回计划 worktree。
-直接 bug 和功能运行保留其运行范围内的集成与任务名称。
+直接 bug 和功能运行使用各自 run-scoped integration/task worktree，与主工作树及
+其他运行隔离。
 
 客户端会话结束后，使用以下恢复命令：
 
@@ -192,6 +198,9 @@ worktree，并要求进行协调处理。
 
 ## 开发
 
+`agent-build/` 是受管角色定义和渲染输入的事实源；生成产物必须从仓库源码构建，
+不得直接修改已安装的 `dist` 或平台代理文件。
+
 ```sh
 npm install
 npm run verify
@@ -199,7 +208,8 @@ npm run verify:packed
 npm pack --dry-run
 ```
 
-`verify:packed` 是联网的发布门禁。它会在不运行生命周期脚本的情况下打包，将
+日常 `verify` 覆盖类型、lint、测试与构建。`verify:packed` 是联网的发布门禁，
+仅在 package/publish/install 变化时运行；它会在不运行生命周期脚本的情况下打包，将
 tarball 安装到隔离的外部消费者中，并且只校验已安装的 CLI 和已打包资源。它有意
 与日常的 `verify` 命令分开。
 

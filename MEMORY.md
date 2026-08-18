@@ -48,18 +48,18 @@
 - Git Operator merge authorization must use frozen dispatch-worktree bindings
 
 ### 职责
-- `src/cli.ts` 负责绑定命令、恢复操作和规范 JSON 输出。
+- `src/cli.ts` 保留规范输出、全局错误处理和注册组合；`src/commands/` 按项目、规划运行、staging/dispatch、Git/review 与环境职责注册命令。
 - `src/workflow.ts` 负责 coding run 启动、主工作树 clean gate、实现基线冻结、planned plan worktree 创建，以及生成受管取消清理 dispatch。
-- `src/dispatch.ts` 负责校验、提交、规划生命周期、恢复和提交调度门禁。
+- `src/dispatch.ts` 保留事务 facade、提交、规划生命周期、恢复和后继调度门禁；`src/dispatch/` 提供 packet、planning、implementation 与 recovery 的纯计算。
 - `src/dispatch.ts` 同时负责 retryable replacement lineage、无副作用 Git 失败 reissue、planned merge 前置 TASK worktree adoption 恢复、dispatch-bound typed decision、planned recovery decision 到 Git cleanup 的转换、planned Git-before-Coding 依赖、integration commit 门禁和冻结 review packet。
-- `src/state.ts` 负责 SQLite 的读写打开路径、前向迁移、锁、运行、决策、replacement 和操作记录。
+- `src/state.ts` 负责 SQLite 打开、前向迁移、锁、运行、决策、replacement 和操作记录；`src/staging.ts` 负责 staging persistence、文件迁移与生命周期，并由 StateStore 保留兼容 facade。
 - `src/planning.ts` 负责校验完整修订文档以及修订与运行阶段的一致性。
 - `src/contracts.ts` 负责结果信封和角色载荷 schema。
 - `src/command-contract.ts` 负责公共命令和代理命令的精确语法。
 - `src/constants.ts` 从安装包 `package.json` 严格读取 CLI 版本。
 - `src/environment.ts` 负责解析环境模型，并解释整对象 default/override 来源和环境间语义差异。
 - `scripts/verify-packed-install.ts` 负责在隔离 consumer 中验证真实 npm tarball。
-- `src/security.ts` 与 `src/state.ts` 负责 staging 文件系统安全、run 内序号分配、可读文件名迁移、生命周期元数据、保留和清理。
+- `src/security.ts` 与 `src/staging.ts` 负责 staging 文件系统安全、run 内序号分配、可读文件名迁移、生命周期元数据、保留和清理。
 - `skills/setup-ai-team` 负责在目标 Git 项目中初始化 AI Team，委派 File Explorer 基于仓库证据生成结构化项目上下文，并写入、校验真实功能导航。
 - `skills/switch-ai-team-env` 负责预检并切换 AI Team 全局环境配置的可复用 Codex 工作流。
 - `src/dispatch.ts` 将已完成的评审叶子汇总到所属 barrier，并幂等创建唯一的 review resolution 或最终 Git Operator continuation。
@@ -78,9 +78,9 @@
 - `src/context.ts` 仅以 `.ai-team/index/feature-navigation.md` 为权威导航路径，并负责 schema/renderer 版本记录及旧格式迁移。
 - `src/environment.ts` 与 `agent-build/roles` 负责受管角色生成、能力定义及只读环境查询。
 - `src/cli.ts` 为受管 JSON 命令提供 file、`--staging-id` 与 `--input-stdin` 输入；新 dispatch prompt 固定走显式 staging，planning commit 会关闭遗留 Planning dispatch。
-- `src/dispatch.ts` 以 v4 renderer 生成显式 staging prompt，并按历史 renderer/digest 恢复旧 dispatch；claim bundle 与 submit continuation 保持只读投影。
+- `src/dispatch/packet.ts` 以 v5 renderer 生成显式 staging prompt，并由 `src/dispatch.ts` 按历史 renderer/digest 恢复旧 dispatch；claim bundle 与 submit continuation 保持只读投影。
 - `skills/setup-ai-team` 封装公共初始化命令、File Explorer 上下文采集、`context update` 与校验，`skills/switch-ai-team-env` 封装公共环境切换和状态命令；两者均不改变 CLI 行为。
-- `test/*.test.ts` 包含单元测试、CLI 端到端测试、锁测试、契约测试和工作流回归测试。
+- `test/**/*.test.ts` 包含单元测试、CLI 端到端测试、锁测试、契约测试和工作流回归测试。
 - `src/review.ts` 负责 formal review 绑定和公共状态查询，`src/dispatch.ts` 负责叶子汇总、恢复和 run 阶段推进。
 - `run handoff-to-planning` 只接受无 pending operation 的 frozen coding run；规划 revision 提交 ready 后恢复 source run，旧 pending/claimed dispatch 不得继续授权。
 - `src/contracts.ts` 让公开 result schema 与运行时 validator 复用 typed decision shape，并定义无 revision/worktree/Git 副作用的 planning `no_change` payload。

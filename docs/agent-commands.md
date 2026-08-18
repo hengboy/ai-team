@@ -18,10 +18,17 @@ Operator 以新提交继续合并，`test` 执行完整最终门禁，不再创�
 
 创建或修改状态的命令即使出现在 CLI 帮助中，也属于内部代理命令。平台渲染器
 只输出角色 manifest 允许的命令。普通叶子代理不能创建调度，也不能执行 Git 变更。
+Planning 和 Coding 拥有协调与后继调度权；Git Operator 独占 Git 副作用，叶子角色
+只提交自身已领取 dispatch 的结果。
+
+Planning 的 typed-decision 顺序为需求问题、`requirements_final`、`task_split` 和
+`task_preview`；每个阶段最多保留一个待处理决策，解决后只创建一个 continuation。
 
 仓库探索仅由 File Explorer 执行。其他代理使用 packet 中的路径，发现未知依赖时
-请求支持。Researcher 从 File Explorer 接收项目上下文，并以 `fact`、`inference`
-或 `recommendation` 类型写入带引用的结论；它不搜索目标仓库。
+请求支持。Planning 或 Coding 可在 File Explorer 提供精确上下文后调度 Researcher；
+Researcher 以 `fact`、`inference` 或 `recommendation` 类型写入带引用的结论，不搜索
+目标仓库。planned 研究归档到修订的 `research/<topic>.md`，direct 研究保存在 run
+artifact 中。
 
 File Explorer 还会返回 `payload.project_context`，其中包含项目形态、四组受管
 MEMORY 条目、模块边界、导航条目和维护状态。开发代理通过 `context update`
