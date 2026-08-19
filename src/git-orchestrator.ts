@@ -27,6 +27,13 @@ export interface WorktreeStatus {
   clean: boolean | null;
 }
 
+export interface SyncConflictEvidence {
+  integration_worktree_id: string;
+  conflict_paths: string[];
+  integration_head_before: string;
+  target_head: string;
+}
+
 const safeSegment = (value: string): string => {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) throw new ValidationError(`unsafe Git name segment: ${value}`);
   return value;
@@ -474,6 +481,11 @@ export class GitOrchestrator {
     const targetStatus = await worktreeStatus(root);
     const unmanagedUntracked = targetStatus.untracked.filter((path) => path !== ".worktrees/" && !path.startsWith(".worktrees/"));
     if (targetStatus.staged.length || targetStatus.unstaged.length || unmanagedUntracked.length) {
+      this.store.event(runId, "git.target_dirty_blocked", {
+        target_branch: run.target_branch,
+        snapshot: { ...targetStatus, untracked: unmanagedUntracked },
+        protection: { strategy: "reject_without_mutation", stash_created: false, cleanup_performed: false },
+      });
       throw new ValidationError("target worktree must be clean before integration", { ...targetStatus, untracked: unmanagedUntracked });
     }
     if (await currentBranch(root) !== run.target_branch) throw new ValidationError("target branch changed before integration");
@@ -481,13 +493,25 @@ export class GitOrchestrator {
     if (current !== run.base_commit) {
       const count = this.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.sync' AND state='completed'").get(runId) as { count: number };
       if (count.count >= 3) throw new ValidationError("target branch drift exceeded 3 synchronization attempts");
-      const sync = this.store.beginOperation("git.sync", `sync:${runId}:${integration.branch}:${current}`, { target: current }, runId);
+      const integrationHeadBefore = await currentHead(integration.path);
+      const sync = this.store.beginOperation("git.sync", `sync:${runId}:${integration.branch}:${current}`, {
+        target: current,
+        target_branch: run.target_branch,
+        target_snapshot_before: targetStatus,
+        integration_worktree_id: integrationId,
+        integration_path: integration.path,
+        integration_head_before: integrationHeadBefore,
+      }, runId);
       if (sync.reused) {
         if (sync.state !== "completed") throw new ValidationError("target synchronization has unknown side effect; reconcile required");
       } else {
         try {
           const synced = await mergeNoFastForward(integration.path, run.target_branch, `Sync ${run.target_branch} into ${integration.branch}`);
-          this.store.finishOperation(sync.operationId, { commit: synced });
+          this.store.finishOperation(sync.operationId, {
+            commit: synced,
+            target_snapshot_before: targetStatus,
+            target_snapshot_after: await worktreeStatus(root),
+          });
           new DispatchService(this.store).create(runId, "test", {
             objective: "Run the complete final verification after synchronizing target branch changes.",
             allowed_read_paths: ["package.json", "test"],
@@ -496,6 +520,15 @@ export class GitOrchestrator {
             context: { synchronization_commit: synced, target_commit: current },
           });
         } catch (error) {
+          const conflictPaths = await git(integration.path, ["diff", "--name-only", "--diff-filter=U"])
+            .then(({ stdout }) => stdout.split("\n").filter(Boolean), () => [] as string[]);
+          this.store.recordPendingOperationEvidence(sync.operationId, {
+            state: "conflicted",
+            conflict_paths: conflictPaths,
+            integration_head_before: integrationHeadBefore,
+            target_head: current,
+          });
+          this.store.event(runId, "git.sync_conflicted", { operation_id: sync.operationId, integration_worktree_id: integrationId, conflict_paths: conflictPaths });
           throw new ValidationError("target synchronization conflicted; developer resolution required", { cause: String(error) });
         }
       }
@@ -538,22 +571,63 @@ export class GitOrchestrator {
     catch { throw new ValidationError("worktree has no merge conflict in progress"); }
     const unresolved = (await git(integration.path, ["diff", "--name-only", "--diff-filter=U"])).stdout.split("\n").filter(Boolean);
     if (unresolved.length) throw new ValidationError("merge still has unresolved paths", unresolved);
-    const changed = (await git(integration.path, ["status", "--porcelain=v1", "-z"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3));
+    const changed = [...new Set((await git(integration.path, ["status", "--porcelain=v1", "-z"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3)))];
     if (!changed.length) throw new ValidationError("no conflict resolution changes are present");
-    for (const path of changed) {
+    const sync = this.store.db.prepare("SELECT operation_id,request_json,evidence_json FROM operations WHERE run_id=? AND kind='git.sync' AND state='pending' ORDER BY created_at DESC LIMIT 1")
+      .get(runId) as { operation_id: string; request_json: string; evidence_json?: string } | undefined;
+    if (!sync) throw new ValidationError("conflict continuation requires its pending git.sync operation");
+    const request = JSON.parse(sync.request_json) as { target?: string; integration_head_before?: string; integration_worktree_id?: string; target_snapshot_before?: unknown };
+    const syncEvidence = JSON.parse(sync.evidence_json ?? "{}") as Partial<SyncConflictEvidence>;
+    const syncIntegrationId = request.integration_worktree_id ?? syncEvidence.integration_worktree_id;
+    const integrationHeadBefore = request.integration_head_before ?? syncEvidence.integration_head_before;
+    const targetHead = request.target ?? syncEvidence.target_head;
+    if (syncIntegrationId !== integrationId || !targetHead || !integrationHeadBefore) {
+      throw new ValidationError("pending git.sync operation is missing conflict lineage");
+    }
+    const conflictPaths = [...new Set(syncEvidence.conflict_paths ?? [])].sort();
+    if (!conflictPaths.length) throw new ValidationError("pending git.sync operation has no recorded conflict paths");
+    for (const path of conflictPaths) {
       assertWritablePath(path);
       if (!pathMatchesScope(path, allowedScopes)) throw new ValidationError(`conflict resolution changed path outside allowed scope: ${path}`);
       await canonicalizeInside(integration.path, path, true);
     }
-    const operation = this.store.beginOperation("git.merge.continue", `merge-continue:${runId}:${integrationId}:${sha256(changed.sort().join("\n"))}`, { changed }, runId);
+    const mergeBase = (await git(integration.path, ["merge-base", integrationHeadBefore, targetHead])).stdout;
+    const targetChanged = new Set((await git(integration.path, ["diff", "--name-only", mergeBase, targetHead, "--"])).stdout.split("\n").filter(Boolean));
+    const integrationChanged = new Set((await git(integration.path, ["diff", "--name-only", mergeBase, integrationHeadBefore, "--"])).stdout.split("\n").filter(Boolean));
+    const inheritedPaths = changed.filter((path) => !conflictPaths.includes(path));
+    const unauthorizedInherited: string[] = [];
+    for (const path of inheritedPaths) {
+      if (!targetChanged.has(path) || integrationChanged.has(path)) { unauthorizedInherited.push(path); continue; }
+      const matchesTarget = await git(integration.path, ["diff", "--quiet", "--cached", targetHead, "--", path]).then(() => true, () => false);
+      if (!matchesTarget) unauthorizedInherited.push(path);
+    }
+    if (unauthorizedInherited.length) throw new ValidationError("merge contains paths without conflict or target-sync lineage", {
+      unauthorized_paths: unauthorizedInherited,
+      conflict_paths: conflictPaths,
+      target_inherited_paths: inheritedPaths.filter((path) => !unauthorizedInherited.includes(path)),
+    });
+    const operation = this.store.beginOperation("git.merge.continue", `merge-continue:${runId}:${integrationId}:${sha256(changed.sort().join("\n"))}`, {
+      changed,
+      conflict_paths: conflictPaths,
+      target_inherited_paths: inheritedPaths,
+      sync_operation_id: sync.operation_id,
+    }, runId);
     if (operation.reused) {
       if (operation.state !== "completed") throw new ValidationError("merge continuation side effect is unknown; reconcile required");
       return currentHead(integration.path);
     }
-    await git(integration.path, ["add", "--", ...changed]);
+    await git(integration.path, ["add", "--", ...conflictPaths]);
     await git(integration.path, ["commit", "--no-edit"]);
     const commit = await currentHead(integration.path);
     this.store.finishOperation(operation.operationId, { commit, changed });
+    this.store.finishOperation(sync.operation_id, {
+      commit,
+      conflict_paths: conflictPaths,
+      target_inherited_paths: inheritedPaths,
+      continued_by: operation.operationId,
+      target_snapshot_before: request.target_snapshot_before ?? null,
+      target_snapshot_after: await worktreeStatus(this.repositoryForRun(runId).root),
+    });
     new DispatchService(this.store).create(runId, "test", {
       objective: "Run the complete final verification after conflict resolution.",
       allowed_read_paths: ["package.json", "test"],
@@ -562,6 +636,51 @@ export class GitOrchestrator {
       context: { conflict_resolution_commit: commit },
     });
     return commit;
+  }
+
+  async reconcileSyncConflict(runId: string, operationId: string, evidence: unknown, dispatchId?: string): Promise<Array<{ operation_id: string; state: string; fact: string; next_command?: string }>> {
+    this.assertGitOperator(runId, dispatchId);
+    const value = evidence && typeof evidence === "object" && !Array.isArray(evidence) ? evidence as Record<string, unknown> : {};
+    const issues: Array<{ pointer: string; constraint: string; message: string }> = [];
+    const integrationId = value.integration_worktree_id;
+    const conflictPaths = value.conflict_paths;
+    const integrationHeadBefore = value.integration_head_before;
+    const targetHead = value.target_head;
+    if (typeof integrationId !== "string" || !integrationId) issues.push({ pointer: "/integration_worktree_id", constraint: "non-empty string", message: "integration_worktree_id is required" });
+    if (!Array.isArray(conflictPaths) || !conflictPaths.length || conflictPaths.some((path) => typeof path !== "string" || !path)) {
+      issues.push({ pointer: "/conflict_paths", constraint: "non-empty string array", message: "conflict_paths must list the explicitly authorized conflict paths" });
+    }
+    if (typeof integrationHeadBefore !== "string" || !/^[a-f0-9]{40}$/.test(integrationHeadBefore)) issues.push({ pointer: "/integration_head_before", constraint: "40-character commit SHA", message: "integration_head_before must identify the pre-sync integration HEAD" });
+    if (typeof targetHead !== "string" || !/^[a-f0-9]{40}$/.test(targetHead)) issues.push({ pointer: "/target_head", constraint: "40-character commit SHA", message: "target_head must identify the synchronized target HEAD" });
+    if (issues.length) throw new ValidationError("conflicted git.sync reconciliation evidence is invalid", issues);
+
+    const normalized: SyncConflictEvidence = {
+      integration_worktree_id: integrationId as string,
+      conflict_paths: [...new Set(conflictPaths as string[])].sort(),
+      integration_head_before: integrationHeadBefore as string,
+      target_head: targetHead as string,
+    };
+    for (const path of normalized.conflict_paths) assertWritablePath(path);
+    const operation = this.store.db.prepare("SELECT run_id,kind,state,request_json FROM operations WHERE operation_id=?").get(operationId) as { run_id: string; kind: string; state: string; request_json: string } | undefined;
+    if (!operation || operation.run_id !== runId) throw new ValidationError("git reconciliation operation does not belong to run");
+    if (operation.kind !== "git.sync" || operation.state !== "pending") throw new ValidationError("conflicted reconciliation requires a pending git.sync operation");
+    const request = JSON.parse(operation.request_json) as { target?: string };
+    if (request.target && request.target !== normalized.target_head) throw new ValidationError("conflicted reconciliation target_head does not match the sync request");
+    const worktree = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, normalized.integration_worktree_id) as { path: string } | undefined;
+    if (!worktree) throw new ValidationError("conflicted reconciliation integration worktree is not active for the run");
+    if (await currentHead(worktree.path) !== normalized.integration_head_before) throw new ValidationError("integration worktree HEAD does not match integration_head_before");
+    const mergeHead = await git(worktree.path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).then(({ stdout }) => stdout, () => "");
+    if (mergeHead !== normalized.target_head) throw new ValidationError("integration worktree MERGE_HEAD does not match target_head");
+
+    this.store.db.transaction(() => {
+      this.store.recordPendingOperationEvidence(operationId, { state: "conflicted", ...normalized });
+      const run = this.store.getRun(runId) as { state: string };
+      if (run.state === "failed" || run.state === "retryable_failure") {
+        this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+      }
+      this.store.event(runId, "run.git_sync_conflict_reconciled", { dispatch_id: dispatchId ?? null, operation_id: operationId, ...normalized });
+    })();
+    return this.reconcile(runId);
   }
 
   async cleanup(runId: string, dispatchId?: string): Promise<string[]> {
@@ -592,10 +711,10 @@ export class GitOrchestrator {
     return removed;
   }
 
-  async reconcile(runId: string): Promise<Array<{ operation_id: string; state: string; fact: string }>> {
+  async reconcile(runId: string): Promise<Array<{ operation_id: string; state: string; fact: string; next_command?: string }>> {
     const { root } = this.repositoryForRun(runId);
     const pending = this.store.db.prepare("SELECT * FROM operations WHERE run_id=? AND state='pending'").all(runId) as any[];
-    const result: Array<{ operation_id: string; state: string; fact: string }> = [];
+    const result: Array<{ operation_id: string; state: string; fact: string; next_command?: string }> = [];
     for (const operation of pending) {
       const request = JSON.parse(operation.request_json);
       if (operation.kind === "git.cleanup") {
@@ -603,6 +722,25 @@ export class GitOrchestrator {
         const branchExists = await git(root, ["show-ref", "--verify", `refs/heads/${request.branch}`]).then(() => true, () => false);
         const exists = listed.includes(`worktree ${request.path}`) || branchExists;
         result.push({ operation_id: operation.operation_id, state: exists ? "unknown" : "completed", fact: exists ? "cleanup is partially applied" : "owned worktree and branch are absent" });
+      } else if (operation.kind === "git.sync") {
+        const evidence = JSON.parse(operation.evidence_json ?? "{}") as Partial<SyncConflictEvidence> & { state?: string };
+        const integrationWorktreeId = request.integration_worktree_id ?? evidence.integration_worktree_id;
+        const integrationHeadBefore = request.integration_head_before ?? evidence.integration_head_before;
+        const integrationRow = typeof integrationWorktreeId === "string"
+          ? this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, integrationWorktreeId) as { path: string } | undefined
+          : undefined;
+        const integration = integrationRow?.path ?? request.integration_path as string | undefined;
+        const mergeHead = integration ? await git(integration, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).then(() => true, () => false) : false;
+        const dispatch = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator' AND state='claimed' ORDER BY claimed_at DESC LIMIT 1").get(runId) as { dispatch_id: string } | undefined;
+        const recordedConflict = evidence.state === "conflicted" && Boolean(evidence.conflict_paths?.length);
+        if ((mergeHead || recordedConflict) && integrationWorktreeId) {
+          const scope = (evidence.conflict_paths ?? []).join(",");
+          result.push({ operation_id: operation.operation_id, state: "conflicted", fact: "target synchronization has an unresolved merge continuation", ...(dispatch ? { next_command: `ai-team git continue-conflict --run-id ${runId} --dispatch-id ${dispatch.dispatch_id} --integration-id ${integrationWorktreeId} --scope ${scope}` } : {}) });
+        } else if (integration && integrationHeadBefore && await currentHead(integration).then((head) => head === integrationHeadBefore, () => false)) {
+          result.push({ operation_id: operation.operation_id, state: "not_applied", fact: "target synchronization did not change the integration worktree", ...(dispatch ? { next_command: `ai-team git reconcile --run-id ${runId} --dispatch-id ${dispatch.dispatch_id} --operation-id ${operation.operation_id} --state not_applied --evidence-file <json>` } : {}) });
+        } else {
+          result.push({ operation_id: operation.operation_id, state: "unknown", fact: "target synchronization state requires explicit evidence" });
+        }
       } else if (operation.kind.includes("worktree") || operation.kind.includes("integration.create")) {
         const listed = (await git(root, ["worktree", "list", "--porcelain"])).stdout;
         const exists = listed.includes(`worktree ${request.path}`) && listed.includes(`branch refs/heads/${request.branch}`);

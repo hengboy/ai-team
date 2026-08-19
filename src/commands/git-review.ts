@@ -1,7 +1,7 @@
 import { Command, Option } from "commander";
 import type { Role, StagingKind } from "../constants.js";
 import { ArgumentError, ValidationError } from "../errors.js";
-import { REVIEW_RESULT_SCHEMA, ReviewService, type FindingResolution, type ReviewResult } from "../review.js";
+import { REVIEW_RESOLUTION_SCHEMA, REVIEW_RESOLUTION_TEMPLATE, REVIEW_RESULT_SCHEMA, ReviewService, type ReviewResult } from "../review.js";
 import type { StateStore, StagingBinding, StagingEntry } from "../state.js";
 import { validateCommand } from "../command-contract.js";
 import { DispatchService } from "../dispatch.js";
@@ -63,7 +63,7 @@ export const registerGitCommands = (program: Command, dependencies: GitDependenc
   gitCommand.command("merge-task").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--task-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).mergeTask(options.runId, options.integrationId, options.taskId, options.dispatchId)) }));
   gitCommand.command("continue-conflict").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--scope <paths>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).continueConflict(options.runId, options.integrationId, options.scope.split(","), options.dispatchId)) }));
   gitCommand.command("integrate").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).integrateTarget(options.runId, options.integrationId, options.dispatchId)) }));
-  jsonOptions(gitCommand.command("reconcile").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--operation-id <id>").option("--state <state>"), "--evidence-file").action(async (options) => {
+  jsonOptions(gitCommand.command("reconcile").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--operation-id <id>").addOption(new Option("--state <state>", "completed, not_applied, or conflicted; conflicted evidence requires integration_worktree_id, conflict_paths, integration_head_before, and target_head").choices(["completed", "not_applied", "conflicted"])), "--evidence-file").action(async (options) => {
     const retention = await retentionHours();
     output(await withStore(async (store) => {
     const hasJsonInput = Boolean(options.evidenceFile || options.stagingId || options.inputStdin);
@@ -75,12 +75,24 @@ export const registerGitCommands = (program: Command, dependencies: GitDependenc
       const evidence = input.value;
       const operation = store.db.prepare("SELECT operation_id,run_id,idempotency_key,kind,state,request_json,evidence_json FROM operations WHERE operation_id=?")
         .get(options.operationId) as any;
+      if (!operation || operation.run_id !== options.runId) throw new ValidationError("git reconciliation operation does not belong to run");
       if (operation?.kind === "planning.revision.commit") {
         if (!["completed", "not_applied"].includes(options.state)) throw new ValidationError("planning commit reconciliation state must be completed or not_applied");
         const result = reconcilePlanningCommit(store, operation, options.runId, options.dispatchId, options.state, evidence);
         return withStagingResult(result, await input.consume());
       }
-      store.reconcileOperation(options.operationId, options.state, evidence);
+      if (options.state === "conflicted") {
+        const result = await new GitOrchestrator(store).reconcileSyncConflict(options.runId, options.operationId, evidence, options.dispatchId);
+        return withStagingResult(result, await input.consume());
+      }
+      store.db.transaction(() => {
+        store.reconcileOperation(options.operationId, options.state, evidence);
+        const run = store.getRun(options.runId) as { state: string };
+        if (run.state === "failed" || run.state === "retryable_failure") {
+          store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), options.runId);
+          store.event(options.runId, "run.git_reconciliation_activated", { dispatch_id: options.dispatchId, operation_id: options.operationId, reconciliation_state: options.state });
+        }
+      })();
       return withStagingResult(new GitOrchestrator(store).reconcile(options.runId), await input.consume());
       } catch (error) { input.validationFailed(error); }
     } else if (options.operationId || options.state) {
@@ -100,6 +112,8 @@ export const registerReviewCommands = (program: Command, dependencies: ReviewDep
   const { output, withStore, jsonOptions, retentionHours, loadJsonInput, withStagingResult } = dependencies;
   const review = program.command("review");
   registerReviewSchema(review, output);
+  review.command("resolution-schema").description("Print the P0/P1 review resolution array schema").action(() => output(REVIEW_RESOLUTION_SCHEMA));
+  review.command("resolution-template").description("Print a review resolution array template; omit P2/P3 findings").action(() => output(REVIEW_RESOLUTION_TEMPLATE));
   review.command("create").requiredOption("--run-id <id>").requiredOption("--revision-sha <sha>").option("--formal").action(async (options) => {
     validateCommand("review.create", { runId: options.runId, revisionSha: options.revisionSha, formal: options.formal });
     output(await withStore((store) => new ReviewService(store).create(options.runId, options.revisionSha, options.formal)));
@@ -123,12 +137,12 @@ export const registerReviewCommands = (program: Command, dependencies: ReviewDep
       } catch (error) { input.validationFailed(error); }
     }));
   });
-  jsonOptions(review.command("resolve").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>"), "--resolution-file").action(async (options) => {
+  jsonOptions(review.command("resolve").description("Resolve blocking P0/P1 findings from a resolution array; do not include P2/P3 findings").requiredOption("--run-id <id>").requiredOption("--barrier-id <id>"), "--resolution-file").action(async (options) => {
     const retention = await retentionHours();
     output(await withStore(async (store) => {
       const input = await loadJsonInput(store, { file: options.resolutionFile, stagingId: options.stagingId, inputStdin: options.inputStdin, runId: options.runId, role: "coding", kind: "review-resolution" }, retention);
       try {
-        const result = new ReviewService(store).resolve(options.runId, options.barrierId, input.value as FindingResolution[]);
+        const result = new ReviewService(store).resolve(options.runId, options.barrierId, input.value);
         return withStagingResult(result, await input.consume());
       } catch (error) { input.validationFailed(error); }
     }));

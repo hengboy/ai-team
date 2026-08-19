@@ -26,7 +26,17 @@ export const mergeBindingsFromPacket = (role: Role, packet: DispatchPacket): Mer
     ...(Array.isArray(packet.context.task_worktree_ids) ? packet.context.task_worktree_ids.filter((id): id is string => typeof id === "string") : []),
     ...(typeof packet.context.task_worktree_id === "string" ? [packet.context.task_worktree_id] : []),
   ];
-  return { integration_worktree_id: integration, task_worktree_ids: [...new Set(taskIds)].sort() };
+  const taskWorktreeIds = [...new Set(taskIds)].sort();
+  if (integration && taskWorktreeIds.includes(integration)) {
+    throw new ValidationError("integration worktree cannot also be a task worktree", [{
+      path: "/context/task_worktree_ids",
+      pointer: "/context/task_worktree_ids",
+      field: "task_worktree_ids",
+      constraint: "disjoint",
+      message: `worktree ${integration} is already the integration worktree`,
+    }]);
+  }
+  return { integration_worktree_id: integration, task_worktree_ids: taskWorktreeIds };
 };
 
 const packetContextRequirements = (role: Role, phase?: unknown, taskId?: unknown): string[] => {

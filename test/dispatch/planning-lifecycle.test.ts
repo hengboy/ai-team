@@ -495,6 +495,35 @@ test("run resume recovers planning idempotently without crossing decisions or op
   });
 });
 
+test("active run recovery retries the last durable stage instead of creating an acknowledgement loop", async () => {
+  await withStore((store) => {
+    const runId = createRun(store, "coding");
+    const dispatches = new DispatchService(store);
+    const originalId = dispatches.create(runId, "coding", {
+      objective: "Continue the frozen coding stage",
+      allowed_read_paths: ["src/dispatch.ts"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Restore the original continuation"],
+      context: { stage: "coding", phase: "continue_testing" },
+    });
+    store.db.prepare("UPDATE dispatches SET state='completed',completed_at=? WHERE dispatch_id=?")
+      .run(new Date().toISOString(), originalId);
+    store.db.prepare("UPDATE runs SET state='active',stage='coding' WHERE run_id=?").run(runId);
+
+    dispatches.resume(runId);
+    const decision = store.db.prepare("SELECT decision_id FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string };
+    const replacementId = dispatches.resolveDecision(runId, decision.decision_id, "retry");
+    const replacement = store.db.prepare("SELECT replacement_for,packet_json FROM dispatches WHERE dispatch_id=?").get(replacementId) as { replacement_for: string; packet_json: string };
+    assert.equal(replacement.replacement_for, originalId);
+    assert.equal(JSON.parse(replacement.packet_json).objective, "Continue the frozen coding stage");
+
+    const resumed = dispatches.resume(runId);
+    assert.equal(resumed.pending_dispatches.length, 1);
+    assert.equal(resumed.pending_dispatches[0]?.dispatch_id, replacementId);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='active_run_recovery'").get(runId) as { count: number }).count, 1);
+  });
+});
+
 test("run resume repairs a stale planning retryable failure without crossing blockers or profiles", async () => {
   await withStore(async (store, home) => {
     const dispatches = new DispatchService(store);

@@ -701,6 +701,41 @@ test("planned Test submit binds pre_commit to developer modified_paths instead o
   });
 });
 
+test("frozen planned new paths authorize downstream reads before the file exists", async () => {
+  await withStore((store) => {
+    const runId = createRun(store, "coding", { planId: "planned-new-path", revision: "001" });
+    const dispatches = new DispatchService(store);
+    store.initializeRunTasks(runId, [{
+      task_id: "TASK-001",
+      source_path: ".ai-team/plans/planned-new-path/revisions/001/tasks/TASK-001.md",
+      source_digest: "1".repeat(64),
+      write_paths: ["src/planned-new.ts"],
+    }]);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?").run(JSON.stringify({
+      ...fileExplorerResult(runId, explorerId),
+      payload: { ...fileExplorerResult(runId, explorerId).payload, allowed_read_paths: ["MEMORY.md", ".ai-team/index/feature-navigation.md"] },
+    }), new Date().toISOString(), explorerId);
+
+    assert.doesNotThrow(() => dispatches.create(runId, "test", {
+      objective: "Read the planned new implementation path",
+      allowed_read_paths: ["src/planned-new.ts"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["The frozen Task authorizes the path"],
+      context: { explorer_dispatch_id: explorerId },
+    }));
+    assert.throws(() => dispatches.create(runId, "test", {
+      objective: "Reject an unrelated path",
+      allowed_read_paths: ["src/not-planned.ts"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Report the exact unauthorized path"],
+      context: { explorer_dispatch_id: explorerId },
+    }), (error: unknown) => error instanceof Error
+      && /not authorized/.test(error.message)
+      && JSON.stringify((error as { details?: unknown }).details).includes("src/not-planned.ts"));
+  });
+});
+
 test("planned Test submit persists scope drift and leaves its ready staging unchanged", async () => {
   await withStore(async (store) => {
     const repository = await temporaryDirectory();

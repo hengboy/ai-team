@@ -4,7 +4,7 @@ import { existsSync, realpathSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { Role } from "./constants.js";
 import { checkDecisionInput, checkResultEnvelope, createResultTemplate, resultSchemaForRole, type ResultEnvelope } from "./contracts.js";
-import { ValidationError } from "./errors.js";
+import { ValidationError, validationCause } from "./errors.js";
 import { ROLE_MANIFEST } from "./roles.js";
 import { assertReadablePath, pathMatchesScope } from "./security.js";
 import { assertExplicitTaskWritePaths, StateStore } from "./state.js";
@@ -57,6 +57,7 @@ export interface RunResumeResult {
     dispatch_id: string;
     side_effect_state: "completed" | "unknown";
     next_command: string | null;
+    evidence_template?: Record<string, unknown>;
   } | null;
 }
 
@@ -106,6 +107,8 @@ interface ReviewBarrierRow {
   revision_sha: string;
   formal: number;
   state: string;
+  repair_commit?: string;
+  verification_evidence?: string;
   axes_json?: string;
   spec_dispatch_id?: string;
   standards_dispatch_id?: string;
@@ -188,16 +191,25 @@ const assertExplorerAuthorization = (store: StateStore, runId: string, role: Rol
   const explorer = store.db.prepare("SELECT state,role,result_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, context.explorer_dispatch_id) as { state: string; role: string; result_json?: string } | undefined;
   if (!explorer || explorer.role !== "file-explorer" || explorer.state !== "completed" || !explorer.result_json) throw new ValidationError("downstream dispatch requires a completed Explorer dispatch");
   const payload = JSON.parse(explorer.result_json) as { payload?: { allowed_read_paths?: string[] } };
-  const authorized = [...(payload.payload?.allowed_read_paths ?? []), ...(context.path_authorization ?? [])];
+  const plannedPaths = (store.db.prepare("SELECT write_paths_json FROM run_tasks WHERE run_id=? AND write_paths_json IS NOT NULL").all(runId) as Array<{ write_paths_json: string }>)
+    .flatMap(({ write_paths_json }) => JSON.parse(write_paths_json) as string[]);
+  const authorized = [...(payload.payload?.allowed_read_paths ?? []), ...(context.path_authorization ?? []), ...plannedPaths];
   const unauthorized = packet.allowed_read_paths.filter((path) => !pathMatchesScope(path, authorized));
-  if (unauthorized.length) throw new ValidationError("downstream read paths are not authorized by Explorer evidence", unauthorized);
+  if (unauthorized.length) throw new ValidationError("downstream read paths are not authorized by Explorer evidence", unauthorized.map((path) => ({
+    path: "/allowed_read_paths",
+    pointer: "/allowed_read_paths",
+    field: "allowed_read_paths",
+    constraint: "authorization",
+    message: `unauthorized path: ${path}`,
+  })));
 };
 
 export class DispatchService {
   constructor(readonly store: StateStore) {}
 
   create(runId: string, role: Role, packet: DispatchPacket, actorRole?: Role, actorDispatchId?: string): string {
-    const run = this.store.getRun(runId) as { profile: Role };
+    const run = this.store.getRun(runId) as { profile: Role; state: string };
+    if (run.state !== "active") throw new ValidationError(`run must be active before dispatch creation: ${run.state}`);
     const actor = actorRole ?? run.profile;
     const reviewerActor = run.profile === "coding" && actor === "code-reviewer" && (role === "code-reviewer" || role === "review-spec" || role === "review-standards");
     if (actorRole && actorRole !== run.profile && !reviewerActor) throw new ValidationError(`${actorRole} cannot act for ${run.profile} run`);
@@ -224,6 +236,18 @@ export class DispatchService {
     }
     if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "continue_implementation") {
       this.assertContinueImplementationDelegation(runId, actorDispatchId!, role, actorPacket, validated);
+    }
+    if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "review_resolution"
+      && (role === "frontend-developer" || role === "backend-developer")) {
+      const barrierId = (actorPacket.context as { barrier_id?: unknown }).barrier_id;
+      const integration = this.activeIntegrationWorktree(runId);
+      if (typeof barrierId !== "string" || validated.context.barrier_id !== barrierId
+        || !integration || validated.context.worktree_id !== integration.worktree_id) {
+        throw new ValidationError("review repair developer packet must preserve the barrier and plan worktree identity", [
+          "/context/barrier_id", "/context/worktree_id",
+        ]);
+      }
+      validated.context.phase = "review_repair";
     }
     if (role === "file-explorer") {
       const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get((this.store.getRun(runId) as { repo_id: string }).repo_id) as { project_path: string } | undefined;
@@ -574,6 +598,8 @@ export class DispatchService {
 
   claim(runId: string, dispatchId: string, role: Role): { reused: boolean; packet: DispatchPacket } {
     const row = this.get(runId, dispatchId, role);
+    const run = this.store.getRun(runId) as { state: string };
+    if (run.state !== "active") throw new ValidationError(`run must be active before dispatch claim: ${run.state}`);
     if (!["pending", "claimed"].includes(row.state)) throw new ValidationError(`dispatch cannot be claimed from ${row.state}`);
     const reused = row.state === "claimed";
     if (!reused) this.store.db.prepare("UPDATE dispatches SET state='claimed',claimed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), dispatchId);
@@ -740,9 +766,9 @@ export class DispatchService {
 
   assertFinalizingCleanup(runId: string, dispatchId: string): void {
     const context = this.finalizationContext(runId, dispatchId);
-    const barrier = this.store.db.prepare("SELECT state,revision_sha FROM review_barriers WHERE run_id=? AND barrier_id=?")
-      .get(runId, context.barrier_id) as { state: string; revision_sha: string } | undefined;
-    if (!barrier || !["passed", "resolved"].includes(barrier.state) || barrier.revision_sha !== context.revision_sha) {
+    const barrier = this.store.db.prepare("SELECT state,revision_sha,repair_commit FROM review_barriers WHERE run_id=? AND barrier_id=?")
+      .get(runId, context.barrier_id) as { state: string; revision_sha: string; repair_commit?: string } | undefined;
+    if (!barrier || !["passed", "resolved"].includes(barrier.state) || (barrier.repair_commit ?? barrier.revision_sha) !== context.revision_sha) {
       throw new ValidationError("finalization review barrier is not passed for the requested revision");
     }
     const operation = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.integrate' AND state='completed' ORDER BY completed_at DESC LIMIT 1")
@@ -762,9 +788,9 @@ export class DispatchService {
     const run = this.store.getRun(runId) as { repo_id: string; target_branch: string };
     const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
     if (!repository) throw new ValidationError("run repository is not registered");
-    const barrier = this.store.db.prepare("SELECT state,revision_sha FROM review_barriers WHERE run_id=? AND barrier_id=?")
-      .get(runId, context.barrier_id) as { state: string; revision_sha: string } | undefined;
-    if (!barrier || !["passed", "resolved"].includes(barrier.state) || barrier.revision_sha !== context.revision_sha) {
+    const barrier = this.store.db.prepare("SELECT state,revision_sha,repair_commit FROM review_barriers WHERE run_id=? AND barrier_id=?")
+      .get(runId, context.barrier_id) as { state: string; revision_sha: string; repair_commit?: string } | undefined;
+    if (!barrier || !["passed", "resolved"].includes(barrier.state) || (barrier.repair_commit ?? barrier.revision_sha) !== context.revision_sha) {
       throw new ValidationError("finalization barrier and revision binding could not be verified");
     }
     const operation = this.store.db.prepare("SELECT operation_id,request_json,evidence_json FROM operations WHERE run_id=? AND kind='git.integrate' AND state='completed' ORDER BY completed_at DESC LIMIT 1")
@@ -823,8 +849,12 @@ export class DispatchService {
     packet: DispatchPacket,
   ): ReplacementResult<Action> {
     this.assertLifecycleActor(runId, actorRole, `dispatch ${action === "reissued" ? "reissue" : "supersede"}`);
+    const run = this.store.getRun(runId) as { state: string };
     if (!reason.trim()) throw new ValidationError(`dispatch ${action} requires a reason`);
     const row = this.get(runId, dispatchId, role) as { state: string; packet_json: string };
+    if (run.state !== "active" && !(run.state === "retryable_failure" && row.state === "retryable_failure")) {
+      throw new ValidationError(`run must be active before dispatch ${action}: ${run.state}`);
+    }
     if (!["pending", "claimed", "failed", "retryable_failure"].includes(row.state)) throw new ValidationError(`dispatch cannot be ${action} from ${row.state}`);
     assertExplorerAuthorization(this.store, runId, role, packet);
     const sourceBindings = this.mergeWorktreeBindings(runId, dispatchId);
@@ -1041,7 +1071,12 @@ export class DispatchService {
       };
     } catch (error) {
       try { this.store.recordStagingValidationFailure(stagingId, binding, error); } catch { /* preserve the original staging failure */ }
-      throw error;
+      const entry = this.store.getStagingEntry(stagingId);
+      throw new ValidationError(error instanceof Error ? error.message : String(error), {
+        staging_id: stagingId,
+        state: entry.state,
+        cause: validationCause(error),
+      });
     }
   }
 
@@ -1073,7 +1108,7 @@ export class DispatchService {
     const result = this.validateValue(runId, dispatchId, role, value);
     if (role === "git-operator" && result.status === "failed" && result.side_effect_state === "none") {
       const phase = ((JSON.parse(row.packet_json) as DispatchPacket).context as { phase?: unknown }).phase;
-      if (phase === "integrate_implementation" || phase === "reconcile_worktree_ownership") {
+      if (phase === "integrate_implementation" || phase === "reconcile_worktree_ownership" || phase === "finalize_integration") {
         result.status = "retryable_failure";
       }
     }
@@ -1273,6 +1308,36 @@ export class DispatchService {
         this.recoveryReplacement(runId, failed, undefined, result.dispatch_id, result.verification);
         return;
       }
+      if (context.phase === "review_repair_commit") {
+        const worktreeId = (context as { worktree_id?: unknown }).worktree_id;
+        const barrierId = (context as { barrier_id?: unknown }).barrier_id;
+        if (typeof worktreeId !== "string" || typeof barrierId !== "string") throw new ValidationError("review repair commit is missing its barrier or worktree identity");
+        const operation = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.commit' AND state='completed' AND json_extract(evidence_json,'$.worktree_id')=? ORDER BY completed_at DESC LIMIT 1")
+          .get(runId, worktreeId) as { evidence_json?: string } | undefined;
+        const evidence = JSON.parse(operation?.evidence_json ?? "{}") as { commit?: string; paths?: string[] };
+        if (!evidence.commit) throw new ValidationError("completed review repair Git Operator result has no bound commit operation");
+        const developerId = (context as { developer_dispatch_id?: unknown }).developer_dispatch_id;
+        const developer = typeof developerId === "string" ? this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, developerId) as { packet_json: string } | undefined : undefined;
+        const developerPacket = developer ? JSON.parse(developer.packet_json) as DispatchPacket : undefined;
+        const explorer = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='file-explorer' AND state='completed' ORDER BY completed_at DESC,created_at DESC LIMIT 1")
+          .get(runId) as { dispatch_id: string } | undefined;
+        const worktree = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, worktreeId) as { path: string } | undefined;
+        if (!developerPacket || !explorer || !worktree) throw new ValidationError("review repair Test evidence could not be frozen");
+        const frozen = this.testCommandSnapshot(runId, worktree.path, explorer.dispatch_id);
+        const testId = this.insert(runId, "test", validatePacket({
+          objective: `Independently verify review repair commit ${evidence.commit}.`,
+          allowed_read_paths: developerPacket.allowed_read_paths,
+          allowed_write_paths: [],
+          acceptance_criteria: ["Run every frozen test command", "Bind the Test artifact to the repair commit"],
+          context: {
+            stage: "test", phase: "review_repair_test", barrier_id: barrierId, worktree_id: worktreeId,
+            implementation_commit: evidence.commit, implementation_committed: true, changed_paths: evidence.paths ?? [],
+            test_commands: frozen.commands, test_command_provenance: frozen.provenance,
+          },
+        }, "test"), result.dispatch_id);
+        this.changeStage(runId, "test", testId);
+        return;
+      }
       if (context.phase === "cancel_cleanup") {
         this.store.db.prepare("UPDATE runs SET state='canceled',stage='canceled',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
         this.store.event(runId, "run.canceled", { cleanup_dispatch_id: result.dispatch_id, reconciliation: context.reconciliation ?? null });
@@ -1290,6 +1355,22 @@ export class DispatchService {
     if (run.mode === "planned" && (role === "frontend-developer" || role === "backend-developer")) {
       const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string };
       const packet = JSON.parse(packetRow.packet_json) as DispatchPacket;
+      if (packet.context.phase === "review_repair" && typeof packet.context.barrier_id === "string" && typeof packet.context.worktree_id === "string") {
+        const modifiedPaths = Array.isArray((result.payload as { modified_paths?: unknown }).modified_paths)
+          ? (result.payload as { modified_paths: string[] }).modified_paths : [];
+        const dispatchId = this.insert(runId, "git-operator", validatePacket({
+          objective: `Commit the repair for review barrier ${packet.context.barrier_id} in its existing plan worktree.`,
+          allowed_read_paths: [],
+          allowed_write_paths: [],
+          acceptance_criteria: ["Commit only the Developer-authored repair paths", "Do not create Task integration for the plan worktree"],
+          context: {
+            stage: "git-operator", phase: "review_repair_commit", barrier_id: packet.context.barrier_id,
+            worktree_id: packet.context.worktree_id, developer_dispatch_id: result.dispatch_id, changed_paths: modifiedPaths,
+          },
+        }, "git-operator"), result.dispatch_id);
+        this.changeStage(runId, "git-operator", dispatchId);
+        return;
+      }
       const taskId = typeof packet.context.task_id === "string" ? packet.context.task_id : undefined;
       if (taskId && this.plannedTaskRows(runId).some((task) => task.task_id === taskId)) {
         this.store.advanceRunTask(runId, taskId, "implemented", { worktree_id: String(packet.context.worktree_id), developer_dispatch_id: result.dispatch_id });
@@ -1300,6 +1381,15 @@ export class DispatchService {
     if (run.mode === "planned" && role === "test") {
       const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string };
       const packet = JSON.parse(packetRow.packet_json) as DispatchPacket;
+      if (packet.context.phase === "review_repair_test") {
+        this.changeStage(runId, "coding", result.dispatch_id);
+        this.store.event(runId, "review.repair_verified", {
+          barrier_id: packet.context.barrier_id,
+          repair_commit: packet.context.implementation_commit,
+          test_dispatch_id: result.dispatch_id,
+        });
+        return;
+      }
       if (packet.context.phase === "task_test" && typeof packet.context.task_id === "string") {
         this.store.advanceRunTask(runId, packet.context.task_id, "tested", { worktree_id: String(packet.context.worktree_id), test_dispatch_id: result.dispatch_id });
         this.changeStage(runId, "coding", result.dispatch_id);
@@ -2059,20 +2149,28 @@ export class DispatchService {
   }
 
   private ensureFinalGitDispatch(runId: string, barrier: ReviewBarrierRow): string {
+    const effectiveHead = barrier.repair_commit ?? barrier.revision_sha;
     const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator'
       AND json_extract(packet_json,'$.context.phase')='finalize_integration'
-      AND json_extract(packet_json,'$.context.barrier_id')=? LIMIT 1`).get(runId, barrier.barrier_id) as { dispatch_id: string } | undefined;
+      AND json_extract(packet_json,'$.context.barrier_id')=?
+      AND json_extract(packet_json,'$.context.revision_sha')=? LIMIT 1`).get(runId, barrier.barrier_id, effectiveHead) as { dispatch_id: string } | undefined;
     if (existing) return existing.dispatch_id;
+    const run = this.store.getRun(runId) as { state: string };
+    if (run.state !== "active") return "";
     const integration = this.activeIntegrationWorktree(runId);
     if (!integration) throw new ValidationError("passed review requires an active integration worktree");
+    const integrationHead = execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    if (integrationHead !== effectiveHead) throw new ValidationError("finalize integration packet head does not match the plan worktree HEAD", {
+      effective_reviewed_head: effectiveHead,
+      integration_head: integrationHead,
+    });
     const dispatchId = this.insert(runId, "git-operator", validatePacket({
-      objective: `Merge reviewed integration commit ${barrier.revision_sha} into the target branch and clean up owned worktrees.`,
+      objective: `Merge reviewed integration commit ${effectiveHead} into the target branch and clean up owned worktrees.`,
       allowed_read_paths: [],
       allowed_write_paths: [],
       acceptance_criteria: ["Merge the reviewed integration worktree into the target branch", "Clean up all run-owned worktrees after integration"],
-      context: { stage: "git-operator", phase: "finalize_integration", barrier_id: barrier.barrier_id, revision_sha: barrier.revision_sha, integration_worktree_id: integration.worktree_id, actions: ["integrate", "cleanup"] },
+      context: { stage: "git-operator", phase: "finalize_integration", barrier_id: barrier.barrier_id, revision_sha: effectiveHead, original_review_head: barrier.revision_sha, integration_worktree_id: integration.worktree_id, actions: ["integrate", "cleanup"] },
     }, "git-operator"));
-    const run = this.store.getRun(runId) as { state: string };
     if (run.state === "active") this.changeStage(runId, "git-operator", dispatchId);
     return dispatchId;
   }
@@ -2227,7 +2325,7 @@ export class DispatchService {
   }
 
   resolveDecision(runId: string, decisionId: string, choice: string, note?: string): string {
-    const run = this.store.getRun(runId) as { profile: string; mode?: string; repo_id?: string; plan_id?: string; revision?: string };
+    const run = this.store.getRun(runId) as { profile: string; state: string; stage: string; mode?: string; repo_id?: string; plan_id?: string; revision?: string };
     if (run.profile === "planning") return this.resolvePlanningDecision(runId, decisionId, choice, note);
     const existingDecision = this.store.db.prepare("SELECT status,choice,receipt_json,dispatch_id,decision_type FROM decisions WHERE run_id=? AND decision_id=?").get(runId, decisionId) as { status: string; choice?: string; receipt_json?: string; dispatch_id?: string; decision_type: string } | undefined;
     if (existingDecision?.status === "resolved") {
@@ -2271,6 +2369,42 @@ export class DispatchService {
         this.changeStage(runId, "canceling", dispatchId);
       })();
       return dispatchId;
+    }
+    if (existingDecision?.decision_type === "active_run_recovery") {
+      if (!existingDecision.dispatch_id) throw new ValidationError("active run recovery decision is not bound to its recovery dispatch");
+      if (choice === "abort") {
+        this.store.db.transaction(() => {
+          this.store.decide(runId, decisionId, choice, note);
+          this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
+            .run(new Date().toISOString(), existingDecision.dispatch_id);
+          this.store.db.prepare("UPDATE runs SET state='canceled',stage='canceled',updated_at=? WHERE run_id=?")
+            .run(new Date().toISOString(), runId);
+        })();
+        return existingDecision.dispatch_id;
+      }
+      if (choice !== "retry") throw new ValidationError(`unsupported active run recovery choice: ${choice}`);
+      const source = this.store.db.prepare(`SELECT dispatch_id,role,packet_json,packet_digest,result_json,replacement_for
+        FROM dispatches WHERE run_id=? AND dispatch_id<>? AND state='completed'
+        AND json_extract(packet_json,'$.context.phase') IS NOT 'resume_recovery'
+        ORDER BY COALESCE(completed_at,created_at) DESC,created_at DESC LIMIT 1`)
+        .get(runId, existingDecision.dispatch_id) as { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string } | undefined;
+      if (!source) throw new ValidationError("active run recovery has no durable stage dispatch to retry");
+      let replacementId = "";
+      this.store.db.transaction(() => {
+        this.store.decide(runId, decisionId, choice, note);
+        const receipt = this.store.db.prepare("SELECT receipt_json FROM decisions WHERE decision_id=?").get(decisionId) as { receipt_json: string };
+        const resolvedDecision = JSON.parse(receipt.receipt_json) as Record<string, unknown>;
+        this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
+          .run(new Date().toISOString(), existingDecision.dispatch_id);
+        this.store.db.prepare("UPDATE runs SET state='active',stage=?,updated_at=? WHERE run_id=?")
+          .run(source.role, new Date().toISOString(), runId);
+        replacementId = this.recoveryReplacement(runId, source, resolvedDecision);
+        const successor = this.store.db.prepare("SELECT packet_digest FROM dispatches WHERE dispatch_id=?").get(replacementId) as { packet_digest?: string };
+        this.store.db.prepare("UPDATE decisions SET receipt_json=? WHERE decision_id=?")
+          .run(stableJson({ ...resolvedDecision, successor_dispatch_id: replacementId, successor_packet_digest: successor.packet_digest ?? null }), decisionId);
+        this.store.event(runId, "run.recovery_stage_reissued", { decision_id: decisionId, source_dispatch_id: source.dispatch_id, successor_dispatch_id: replacementId });
+      })();
+      return replacementId;
     }
     let dispatchId = "";
     this.store.db.transaction(() => {
@@ -2602,8 +2736,24 @@ export class DispatchService {
     this.store.db.transaction(() => {
       let run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
       const pendingDecision = this.store.db.prepare("SELECT decision_id,dispatch_id,receipt_json FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; dispatch_id?: string; receipt_json?: string } | undefined;
-      const pendingOperation = this.store.db.prepare("SELECT 1 FROM operations WHERE run_id=? AND state='pending'").get(runId);
-      if (pendingOperation) return;
+      const pendingOperation = this.store.db.prepare("SELECT operation_id,kind,evidence_json FROM operations WHERE run_id=? AND state='pending' ORDER BY created_at LIMIT 1")
+        .get(runId) as { operation_id: string; kind: string; evidence_json?: string } | undefined;
+      if (pendingOperation) {
+        const evidence = JSON.parse(pendingOperation.evidence_json ?? "{}") as { state?: string; conflict_paths?: unknown[] };
+        const claimed = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator' AND state='claimed' ORDER BY claimed_at DESC LIMIT 1")
+          .get(runId) as { dispatch_id: string } | undefined;
+        const recoverableConflict = run.state === "failed" && pendingOperation.kind === "git.sync"
+          && evidence.state === "conflicted" && Boolean(evidence.conflict_paths?.length) && claimed;
+        if (!recoverableConflict) return;
+        this.store.db.prepare("UPDATE runs SET state='active',stage='git-operator',updated_at=? WHERE run_id=?")
+          .run(new Date().toISOString(), runId);
+        this.store.event(runId, "run.git_conflict_recovery_activated", {
+          operation_id: pendingOperation.operation_id,
+          dispatch_id: claimed.dispatch_id,
+          conflict_paths: evidence.conflict_paths,
+        });
+        run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
+      }
       if (run.profile === "coding" && run.state === "frozen" && run.stage === "test") {
         const driftRow = this.store.db.prepare("SELECT event_id,payload_json,created_at FROM run_events WHERE run_id=? AND type='scope.pre_commit_drift' ORDER BY event_id DESC LIMIT 1")
           .get(runId) as { event_id: number; payload_json: string; created_at: string } | undefined;
@@ -2819,6 +2969,37 @@ export class DispatchService {
           ? `ai-team dispatch reconcile --run-id ${runId} --dispatch-id ${blockedRetryable.dispatch_id} --role ${blockedRetryable.role} --actor-role ${resumedRun.profile} --reason "reconcile confirmed completed side effect"`
           : null,
       };
+    }
+    if (!recovery) {
+      const operation = this.store.db.prepare("SELECT operation_id,kind,request_json,evidence_json FROM operations WHERE run_id=? AND state='pending' ORDER BY created_at LIMIT 1")
+        .get(runId) as { operation_id: string; kind: string; request_json: string; evidence_json?: string } | undefined;
+      const claimed = operation ? this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator' AND state='claimed' ORDER BY claimed_at DESC LIMIT 1")
+        .get(runId) as { dispatch_id: string } | undefined : undefined;
+      if (operation && claimed) {
+        const request = JSON.parse(operation.request_json) as { integration_worktree_id?: string };
+        const evidence = JSON.parse(operation.evidence_json ?? "{}") as {
+          state?: string; conflict_paths?: string[]; integration_worktree_id?: string;
+          integration_head_before?: string; target_head?: string;
+        };
+        const integrationWorktreeId = request.integration_worktree_id ?? evidence.integration_worktree_id;
+        if (operation.kind === "git.sync" && evidence.state === "conflicted" && integrationWorktreeId) {
+          recovery = {
+            state: "action_required", dispatch_id: claimed.dispatch_id, side_effect_state: "unknown",
+            next_command: `ai-team git continue-conflict --run-id ${runId} --dispatch-id ${claimed.dispatch_id} --integration-id ${integrationWorktreeId} --scope ${(evidence.conflict_paths ?? []).join(",")}`,
+          };
+        } else if (operation.kind === "git.sync") {
+          recovery = {
+            state: "action_required", dispatch_id: claimed.dispatch_id, side_effect_state: "unknown",
+            next_command: `ai-team git reconcile --run-id ${runId} --dispatch-id ${claimed.dispatch_id} --operation-id ${operation.operation_id} --state conflicted --input-stdin`,
+            evidence_template: {
+              integration_worktree_id: "<worktree-id>", conflict_paths: ["<repository-relative-conflict-path>"],
+              integration_head_before: "<40-character-commit-sha>", target_head: "<40-character-commit-sha>",
+            },
+          };
+        } else {
+          recovery = { state: "action_required", dispatch_id: claimed.dispatch_id, side_effect_state: "unknown", next_command: `ai-team git reconcile --run-id ${runId} --dispatch-id ${claimed.dispatch_id}` };
+        }
+      }
     }
     return {
       run: resumedRun,

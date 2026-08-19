@@ -12,7 +12,7 @@ import { repositoryIdentity } from "../src/git.js";
 import { assertCoverage, validateCoverage, writeRevision } from "../src/planning.js";
 import { initializeProject, planProjectInit } from "../src/project.js";
 import { validateResearchConclusions, type ResearchConclusion } from "../src/research.js";
-import { REVIEW_RESULT_SCHEMA, ReviewService, type ReviewResult } from "../src/review.js";
+import { REVIEW_RESOLUTION_SCHEMA, REVIEW_RESOLUTION_TEMPLATE, REVIEW_RESULT_SCHEMA, ReviewService, checkReviewResolutions, type ReviewResult } from "../src/review.js";
 import { StateStore } from "../src/state.js";
 import { WorkflowService } from "../src/workflow.js";
 import { GitOrchestrator } from "../src/git-orchestrator.js";
@@ -51,7 +51,7 @@ const commitPlanRevision = async (repository: { directory: string; head: string 
   await writeFile(path.join(planRoot, "plan.yaml"), `plan_id: ${planId}\nactive_revision: ${revision}\n`);
   await writeFile(path.join(revisionRoot, "spec.md"), `# ${planId} ${revision} spec\n`);
   await writeFile(path.join(revisionRoot, "plan.md"), `# ${planId} ${revision} plan\n`);
-  for (const taskId of taskIds) await writeFile(path.join(revisionRoot, "tasks", `${taskId}.md`), `# ${taskId}\n`);
+  for (const taskId of taskIds) await writeFile(path.join(revisionRoot, "tasks", `${taskId}.md`), `# ${taskId}\n\n- Allowed write paths: \`src/${taskId.toLowerCase()}.ts\`\n`);
   await git(repository.directory, "add", "--", path.relative(repository.directory, planRoot));
   await git(repository.directory, "commit", "-m", `freeze ${planId} ${revision}`);
   repository.head = await git(repository.directory, "rev-parse", "HEAD");
@@ -485,7 +485,7 @@ test("blocked review resolution maps every P0 and P1 finding exactly", async () 
         { finding_id: "FIND-SEC-001", change_evidence: "commit", verification_evidence: "test" },
       ]),
       (error: unknown) => error instanceof ValidationError
-        && assert.deepEqual(error.details, { missing: ["FIND-CODE-002"], unknown: [] }) === undefined,
+        && JSON.stringify(error.details).includes("missing blocking P0/P1 resolution: FIND-CODE-002"),
     );
     assert.throws(
       () => reviews.resolve(runId, barrier.barrier_id, [
@@ -512,6 +512,18 @@ test("blocked review resolution maps every P0 and P1 finding exactly", async () 
     store.close();
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("review resolution exposes an array schema and rejects non-array input structurally", () => {
+  assert.equal(REVIEW_RESOLUTION_SCHEMA.type, "array");
+  assert.deepEqual(REVIEW_RESOLUTION_TEMPLATE, [{
+    finding_id: "FIND-AXIS-001",
+    change_evidence: "repair commit or change evidence",
+    verification_evidence: "Test artifact and verification evidence",
+  }]);
+  const invalid = checkReviewResolutions({});
+  assert.equal(invalid.valid, false);
+  assert.ok(!invalid.valid && invalid.errors.some((error) => error.pointer === "/" && error.constraint === "type"));
 });
 
 test("review gate requires both a completed test dispatch and a passed review", async () => {

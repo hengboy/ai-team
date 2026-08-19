@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { DispatchService } from "./dispatch.js";
+import { type ValidationDetail } from "./contracts.js";
 import { ValidationError } from "./errors.js";
 import { StateStore } from "./state.js";
 import { redact, sha256, stableJson } from "./utils.js";
@@ -10,6 +11,55 @@ export interface ReviewFinding { finding_id: string; severity: Severity; title: 
 export interface ReviewResult { axis: "spec" | "standards"; summary: string; findings: ReviewFinding[]; }
 export interface FindingResolution { finding_id: string; change_evidence: string; verification_evidence: string; }
 export interface ReviewCreateResult { barrier_id: string; axes: string[]; spec_dispatch_id: string | null; standards_dispatch_id: string; reused: boolean; }
+
+export const REVIEW_RESOLUTION_SCHEMA = {
+  type: "array",
+  description: "Map only blocking P0/P1 findings. P2/P3 findings must not be included.",
+  items: {
+    type: "object",
+    additionalProperties: false,
+    required: ["finding_id", "change_evidence", "verification_evidence"],
+    properties: {
+      finding_id: { type: "string", pattern: "^FIND-[A-Z]+-[0-9]{3}$" },
+      change_evidence: { type: "string", minLength: 1 },
+      verification_evidence: { type: "string", minLength: 1 },
+    },
+  },
+} as const;
+
+export const REVIEW_RESOLUTION_TEMPLATE: FindingResolution[] = [{
+  finding_id: "FIND-AXIS-001",
+  change_evidence: "repair commit or change evidence",
+  verification_evidence: "Test artifact and verification evidence",
+}];
+
+export const checkReviewResolutions = (value: unknown): { valid: true; value: FindingResolution[] } | { valid: false; errors: ValidationDetail[] } => {
+  if (!Array.isArray(value)) return { valid: false, errors: [{ path: "/", pointer: "/", field: "$", constraint: "type", message: "must be an array" }] };
+  const errors: ValidationDetail[] = [];
+  value.forEach((item, index) => {
+    const pointer = `/${index}`;
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      errors.push({ path: pointer, pointer, field: String(index), constraint: "type", message: "must be an object" });
+      return;
+    }
+    const row = item as Record<string, unknown>;
+    for (const field of ["finding_id", "change_evidence", "verification_evidence"] as const) {
+      if (typeof row[field] !== "string" || !row[field].trim()) {
+        const fieldPointer = `${pointer}/${field}`;
+        errors.push({ path: fieldPointer, pointer: fieldPointer, field, constraint: "minLength", message: "must be a non-empty string" });
+      }
+    }
+    for (const field of Object.keys(row).filter((field) => !["finding_id", "change_evidence", "verification_evidence"].includes(field))) {
+      const fieldPointer = `${pointer}/${field}`;
+      errors.push({ path: fieldPointer, pointer: fieldPointer, field, constraint: "additionalProperties", message: "unknown field" });
+    }
+    if (typeof row.finding_id === "string" && !/^FIND-[A-Z]+-\d{3}$/.test(row.finding_id)) {
+      const fieldPointer = `${pointer}/finding_id`;
+      errors.push({ path: fieldPointer, pointer: fieldPointer, field: "finding_id", constraint: "pattern", message: "must match FIND-<AXIS>-<NNN>" });
+    }
+  });
+  return errors.length ? { valid: false, errors } : { valid: true, value: value as FindingResolution[] };
+};
 
 export const REVIEW_FINDING_SCHEMA = {
   type: "object",
@@ -201,18 +251,66 @@ export class ReviewService {
     return { state: reconciled?.state ?? barrier.state, blocking: reconciled?.blocking ?? [] };
   }
 
-  resolve(runId: string, barrierId: string, resolutions: FindingResolution[]): { state: "resolved" } {
+  resolve(runId: string, barrierId: string, input: unknown): { state: "resolved" } {
+    const checked = checkReviewResolutions(input);
+    if (!checked.valid) throw new ValidationError("review resolution input is invalid", checked.errors);
+    const resolutions = checked.value;
     const barrier = this.barrier(runId, barrierId);
-    if (barrier.state !== "blocked") throw new ValidationError("only a blocked review can be resolved");
+    if (barrier.state !== "blocked" && barrier.state !== "resolved") throw new ValidationError("only a blocked review can be resolved", [{ path: "/", pointer: "/", field: "$", constraint: "state", message: `barrier state must be blocked or resolved for idempotent repair evidence recovery, got ${barrier.state}` }]);
     const blocking = this.results(barrierId).flatMap((item) => item.findings).filter((finding) => finding.severity === "P0" || finding.severity === "P1");
     const byId = new Map(resolutions.map((item) => [item.finding_id, item]));
     const missing = blocking.filter((finding) => !byId.get(finding.finding_id)?.change_evidence || !byId.get(finding.finding_id)?.verification_evidence).map((finding) => finding.finding_id);
     const unknown = resolutions.filter((item) => !blocking.some((finding) => finding.finding_id === item.finding_id)).map((item) => item.finding_id);
-    if (missing.length || unknown.length) throw new ValidationError("finding resolution mapping is incomplete", { missing, unknown });
+    if (missing.length || unknown.length) throw new ValidationError("finding resolution mapping is incomplete", [
+      ...missing.map((findingId) => ({ path: "/", pointer: "/", field: "$", constraint: "required", message: `missing blocking P0/P1 resolution: ${findingId}` })),
+      ...unknown.map((findingId) => {
+        const index = resolutions.findIndex((item) => item.finding_id === findingId);
+        const pointer = `/${index}/finding_id`;
+        return { path: pointer, pointer, field: "finding_id", constraint: "blocking", message: `${findingId} is not a blocking P0/P1 finding; P2/P3 findings must not be mapped` };
+      }),
+    ]);
+    const worktree = resolveReviewWorktree(this.store, runId);
+    if (!worktree) throw new ValidationError("review repair worktree is no longer active", [{ path: "/", pointer: "/", field: "$", constraint: "worktree", message: "the reviewed integration or plan worktree must remain active until resolution" }]);
+    const worktreeHead = execFileSync("git", ["-C", worktree.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const effectiveHead = barrier.state === "resolved" && barrier.repair_commit ? barrier.repair_commit : worktreeHead;
+    let verification: Record<string, unknown> | null = null;
+    if (effectiveHead !== barrier.revision_sha) {
+      try { execFileSync("git", ["-C", worktree.path, "merge-base", "--is-ancestor", barrier.revision_sha, effectiveHead], { stdio: "ignore" }); }
+      catch { throw new ValidationError("review repair commit must descend from the reviewed head", [{ path: "/", pointer: "/", field: "$", constraint: "ancestor", message: `${effectiveHead} is not a descendant of ${barrier.revision_sha}` }]); }
+      const test = (this.store.db.prepare("SELECT dispatch_id,packet_json,result_json FROM dispatches WHERE run_id=? AND role='test' AND state='completed' ORDER BY completed_at DESC,created_at DESC").all(runId) as Array<{ dispatch_id: string; packet_json: string; result_json?: string }>)
+        .find(({ packet_json, result_json }) => {
+          const packet = JSON.parse(packet_json) as { context?: Record<string, unknown> };
+          const result = JSON.parse(result_json ?? "{}") as { payload?: { testedCommit?: unknown } };
+          return [packet.context?.implementation_commit, packet.context?.conflict_resolution_commit, result.payload?.testedCommit].includes(effectiveHead);
+        });
+      const artifact = test ? this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result' ORDER BY created_at DESC LIMIT 1")
+        .get(runId, test.dispatch_id) as { artifact_id: string; sha256: string } | undefined : undefined;
+      if (!test || !artifact) throw new ValidationError("review repair requires a completed Test artifact bound to the repair commit", {
+        repair_commit: effectiveHead,
+        reviewed_commit: barrier.revision_sha,
+      });
+      verification = { dispatch_id: test.dispatch_id, artifact_id: artifact.artifact_id, digest: artifact.sha256, tested_commit: effectiveHead };
+    }
     const insert = this.store.db.prepare("INSERT INTO finding_resolutions(barrier_id,finding_id,change_evidence,verification_evidence,created_at) VALUES (?,?,?,?,?)");
     const transaction = this.store.db.transaction(() => {
-      for (const item of resolutions) insert.run(barrierId, item.finding_id, redact(item.change_evidence).slice(0, 16_384), redact(item.verification_evidence).slice(0, 16_384), new Date().toISOString());
-      this.store.db.prepare("UPDATE review_barriers SET state='resolved' WHERE barrier_id=?").run(barrierId);
+      if (barrier.state === "blocked") {
+        for (const item of resolutions) insert.run(barrierId, item.finding_id, redact(item.change_evidence).slice(0, 16_384), redact(item.verification_evidence).slice(0, 16_384), new Date().toISOString());
+      } else {
+        const stored = this.store.db.prepare("SELECT finding_id,change_evidence,verification_evidence FROM finding_resolutions WHERE barrier_id=? ORDER BY finding_id")
+          .all(barrierId) as FindingResolution[];
+        const normalized = resolutions.map((item) => ({
+          finding_id: item.finding_id,
+          change_evidence: redact(item.change_evidence).slice(0, 16_384),
+          verification_evidence: redact(item.verification_evidence).slice(0, 16_384),
+        })).sort((left, right) => left.finding_id.localeCompare(right.finding_id));
+        if (stableJson(stored) !== stableJson(normalized)) {
+          throw new ValidationError("resolved review evidence does not match its persisted finding resolutions", [{
+            path: "/", pointer: "/", field: "$", constraint: "const", message: "idempotent repair recovery requires the original P0/P1 resolution mappings",
+          }]);
+        }
+      }
+      this.store.db.prepare("UPDATE review_barriers SET state='resolved',repair_commit=?,verification_evidence=? WHERE barrier_id=?")
+        .run(effectiveHead === barrier.revision_sha ? null : effectiveHead, verification ? stableJson(verification) : null, barrierId);
     });
     transaction();
     new DispatchService(this.store).reconcileReview(runId, barrierId);
@@ -233,6 +331,7 @@ export class ReviewService {
     });
     return {
       ...barrier,
+      effective_reviewed_head: barrier.repair_commit ?? barrier.revision_sha,
       formal: Boolean(barrier.formal),
       axes,
       aggregate,
@@ -250,22 +349,23 @@ export class ReviewService {
 
   assertGate(runId: string, frozenHead?: string): void {
     const test = this.store.db.prepare("SELECT state FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string } | undefined;
-    const review = this.store.db.prepare("SELECT state,revision_sha,test_evidence_digest FROM review_barriers WHERE run_id=? ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; revision_sha: string; test_evidence_digest?: string } | undefined;
+    const review = this.store.db.prepare("SELECT state,revision_sha,repair_commit,test_evidence_digest FROM review_barriers WHERE run_id=? ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; revision_sha: string; repair_commit?: string; test_evidence_digest?: string } | undefined;
     if (!test || test.state !== "completed") throw new ValidationError("latest independent test dispatch has not completed");
     if (!review || !["passed", "resolved"].includes(review.state)) throw new ValidationError("review gate has not passed");
-    if (frozenHead && frozenHead !== review.revision_sha) {
+    const effectiveHead = review.repair_commit ?? review.revision_sha;
+    if (frozenHead && frozenHead !== effectiveHead) {
       const operation = this.store.db.prepare("SELECT kind,evidence_json,completed_at FROM operations WHERE run_id=? AND kind IN ('git.sync','git.merge.continue') AND state='completed' ORDER BY completed_at DESC LIMIT 1").get(runId) as { kind: string; evidence_json: string; completed_at: string } | undefined;
       const evidence = operation ? JSON.parse(operation.evidence_json) as { commit?: string } : undefined;
       const latestTest = this.store.db.prepare("SELECT state,completed_at FROM dispatches WHERE run_id=? AND role='test' ORDER BY created_at DESC LIMIT 1").get(runId) as { state: string; completed_at?: string } | undefined;
       let equivalentIntegratedTree = false;
       try {
         const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=(SELECT repo_id FROM runs WHERE run_id=?)").get(runId) as { project_path: string };
-        execFileSync("git", ["-C", repository.project_path, "merge-base", "--is-ancestor", review.revision_sha, frozenHead], { stdio: "ignore" });
-        execFileSync("git", ["-C", repository.project_path, "diff", "--quiet", review.revision_sha, frozenHead], { stdio: "ignore" });
+        execFileSync("git", ["-C", repository.project_path, "merge-base", "--is-ancestor", effectiveHead, frozenHead], { stdio: "ignore" });
+        execFileSync("git", ["-C", repository.project_path, "diff", "--quiet", effectiveHead, frozenHead], { stdio: "ignore" });
         equivalentIntegratedTree = true;
       } catch { /* a changed tree requires a new review */ }
       if (!equivalentIntegratedTree && (!operation || evidence?.commit !== frozenHead || latestTest?.state !== "completed" || !latestTest.completed_at || latestTest.completed_at < operation.completed_at)) {
-        throw new ValidationError("review is stale for the current integration HEAD", { reviewed: review.revision_sha, current: frozenHead });
+        throw new ValidationError("review is stale for the current integration HEAD", { reviewed: effectiveHead, current: frozenHead });
       }
     }
   }

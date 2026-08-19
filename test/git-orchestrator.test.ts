@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +13,7 @@ import { createResultTemplate } from "../src/contracts.js";
 import { StateStore } from "../src/state.js";
 import { ScopeGate } from "../src/gates.js";
 import { sha256 } from "../src/utils.js";
+import { ValidationError } from "../src/errors.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1259,6 +1260,72 @@ test("review rejects a task commit and binds the tested integration commit", asy
   }
 });
 
+test("resolved review persists the repair commit and Test artifact as the effective final head", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun("20260819-review-repair-head");
+    const integration = await fixture.orchestrator.prepareIntegration(runId);
+    await writeFile(join(integration.path, "reviewed.txt"), "reviewed\n");
+    await rawGit(integration.path, ["add", "reviewed.txt"]);
+    await rawGit(integration.path, ["commit", "-m", "Reviewed implementation"]);
+    const reviewed = await rawGit(integration.path, ["rev-parse", "HEAD"]);
+    completeFrozenTest(fixture.store, runId, reviewed);
+    const reviews = new ReviewService(fixture.store);
+    const barrier = reviews.create(runId, reviewed, false);
+    const finding = {
+      finding_id: "FIND-CODE-001", severity: "P1" as const, title: "Repair required", source: "standards",
+      source_file: "reviewed.txt", source_line: 1, evidence: "reviewed", impact: "incorrect behavior", recommendation: "repair",
+    };
+    const leaf = fixture.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='review-standards'").get(runId) as { dispatch_id: string };
+    fixture.store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?").run(JSON.stringify({
+      ...createResultTemplate(runId, leaf.dispatch_id, "review-standards"), summary: "blocked", findings: [finding],
+      verification: [{ command: "review", outcome: "completed" }], payload: { finding_ids: [finding.finding_id] },
+    }), new Date().toISOString(), leaf.dispatch_id);
+    assert.equal(reviews.submit(runId, barrier.barrier_id, { axis: "standards", summary: "blocked", findings: [finding] }).state, "blocked");
+
+    await writeFile(join(integration.path, "reviewed.txt"), "repaired\n");
+    await rawGit(integration.path, ["add", "reviewed.txt"]);
+    await rawGit(integration.path, ["commit", "-m", "Repair review finding"]);
+    const repair = await rawGit(integration.path, ["rev-parse", "HEAD"]);
+    const dispatches = new DispatchService(fixture.store);
+    const testId = dispatches.create(runId, "test", {
+      objective: "Verify repair", allowed_read_paths: ["reviewed.txt"], allowed_write_paths: [], acceptance_criteria: ["pass"],
+      context: { implementation_commit: repair, implementation_committed: true, changed_paths: ["reviewed.txt"] },
+    });
+    dispatches.claim(runId, testId, "test");
+    const submission = await dispatches.submitValue(runId, testId, "test", {
+      ...createResultTemplate(runId, testId, "test"), summary: "repair passed",
+      verification: [{ command: "test", outcome: "passed" }], payload: { checks: [{ command: "test", outcome: "passed" }] },
+    });
+    const resolutions = [{ finding_id: finding.finding_id, change_evidence: repair, verification_evidence: submission.submission.artifact_id }];
+    reviews.resolve(runId, barrier.barrier_id, resolutions);
+    const status = reviews.status(runId, barrier.barrier_id) as { repair_commit: string; effective_reviewed_head: string; verification_evidence: string };
+    assert.equal(status.repair_commit, repair);
+    assert.equal(status.effective_reviewed_head, repair);
+    assert.equal(JSON.parse(status.verification_evidence).artifact_id, submission.submission.artifact_id);
+    const final = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='git-operator' AND json_extract(packet_json,'$.context.phase')='finalize_integration'").get(runId) as { packet_json: string };
+    assert.equal(JSON.parse(final.packet_json).context.revision_sha, repair);
+
+    fixture.store.db.prepare("UPDATE review_barriers SET repair_commit=NULL,verification_evidence=NULL WHERE barrier_id=?").run(barrier.barrier_id);
+    fixture.store.db.prepare("UPDATE runs SET state='failed',stage='git-operator' WHERE run_id=?").run(runId);
+    reviews.resolve(runId, barrier.barrier_id, resolutions);
+    const recovered = reviews.status(runId, barrier.barrier_id) as { repair_commit: string; effective_reviewed_head: string; verification_evidence: string };
+    assert.equal(recovered.repair_commit, repair);
+    assert.equal(recovered.effective_reviewed_head, repair);
+    assert.equal(JSON.parse(recovered.verification_evidence).artifact_id, submission.submission.artifact_id);
+    assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM finding_resolutions WHERE barrier_id=?").get(barrier.barrier_id) as { count: number }).count, 1);
+    assert.equal((fixture.store.getRun(runId) as { state: string }).state, "failed");
+
+    await writeFile(join(integration.path, "target-sync.txt"), "later sync\n");
+    await rawGit(integration.path, ["add", "target-sync.txt"]);
+    await rawGit(integration.path, ["commit", "-m", "Later synchronization"]);
+    reviews.resolve(runId, barrier.barrier_id, resolutions);
+    assert.equal((reviews.status(runId, barrier.barrier_id) as { repair_commit: string }).repair_commit, repair);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
 test("target drift sync runs once and requires a newer final test before integration", async () => {
   const fixture = await createFixture();
   try {
@@ -1296,6 +1363,144 @@ test("target drift sync runs once and requires a newer final test before integra
     assert.deepEqual(syncOperations, [{ state: "completed" }]);
     const testCount = fixture.store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='test'").get(runId) as { count: number };
     assert.equal(testCount.count, 2);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("dirty target precondition records a snapshot and preserves untracked user files", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun("20260819-dirty-target");
+    const integration = await fixture.orchestrator.prepareIntegration(runId);
+    const userFile = join(fixture.root, "opencode.json");
+    await writeFile(userFile, "{\"preserve\":true}\n");
+
+    await assert.rejects(fixture.orchestrator.integrateTarget(runId, integration.worktree_id), /target worktree must be clean/);
+    assert.match(await rawGit(fixture.root, ["status", "--porcelain=v1", "--untracked-files=all"]), /\?\? opencode\.json/);
+    const event = fixture.store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='git.target_dirty_blocked' ORDER BY event_id DESC LIMIT 1")
+      .get(runId) as { payload_json: string };
+    assert.deepEqual(JSON.parse(event.payload_json).snapshot.untracked, ["opencode.json"]);
+    assert.equal((await readFile(userFile, "utf8")).trim(), "{\"preserve\":true}");
+    assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind IN ('git.sync','git.integrate')").get(runId) as { count: number }).count, 0);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("conflict continuation scopes developer resolutions while accepting target-only inherited paths", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun("20260819-conflict-lineage");
+    const dispatches = new DispatchService(fixture.store);
+    const recoveryDispatchId = dispatches.create(runId, "git-operator", {
+      objective: "Recover target synchronization",
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Continue only the recorded conflict"],
+      context: { stage: "git-operator", phase: "sync_recovery" },
+    });
+    dispatches.claim(runId, recoveryDispatchId, "git-operator");
+    const integration = await fixture.orchestrator.prepareIntegration(runId);
+    await writeFile(join(integration.path, "README.md"), "integration side\n");
+    await rawGit(integration.path, ["add", "README.md"]);
+    await rawGit(integration.path, ["commit", "-m", "Integration change"]);
+
+    await writeFile(join(fixture.root, "README.md"), "target side\n");
+    await mkdir(join(fixture.root, ".ai-team", "plans", "target-only"), { recursive: true });
+    const inherited = ".ai-team/plans/target-only/plan.yaml";
+    await writeFile(join(fixture.root, inherited), "plan_id: target-only\n");
+    await rawGit(fixture.root, ["add", "README.md", inherited]);
+    await rawGit(fixture.root, ["commit", "-m", "Advance target with inherited plan"]);
+
+    await assert.rejects(fixture.orchestrator.integrateTarget(runId, integration.worktree_id), /synchronization conflicted/);
+    assert.match(await rawGit(integration.path, ["rev-parse", "MERGE_HEAD"]), /^[a-f0-9]{40}$/);
+    const pendingSync = fixture.store.db.prepare("SELECT request_json FROM operations WHERE run_id=? AND kind='git.sync' AND state='pending'").get(runId) as { request_json: string };
+    assert.equal(JSON.parse(pendingSync.request_json).integration_worktree_id, integration.worktree_id);
+    fixture.store.db.prepare("UPDATE runs SET state='failed',stage='git-operator' WHERE run_id=?").run(runId);
+    const resumed = dispatches.resume(runId);
+    assert.equal((resumed.run as { state: string }).state, "active");
+    assert.equal(resumed.recovery?.next_command, `ai-team git continue-conflict --run-id ${runId} --dispatch-id ${recoveryDispatchId} --integration-id ${integration.worktree_id} --scope README.md`);
+    const reconcile = await fixture.orchestrator.reconcile(runId);
+    assert.equal(reconcile[0]?.state, "conflicted");
+    await writeFile(join(integration.path, "README.md"), "resolved\n");
+    await rawGit(integration.path, ["add", "README.md"]);
+    const commit = await fixture.orchestrator.continueConflict(runId, integration.worktree_id, ["README.md"], recoveryDispatchId);
+    assert.equal((await rawGit(integration.path, ["rev-list", "--parents", "-n", "1", commit])).split(" ").length, 3);
+    assert.equal(await rawGit(integration.path, ["show", `${commit}:${inherited}`]), "plan_id: target-only");
+    const operation = fixture.store.db.prepare("SELECT state,evidence_json FROM operations WHERE run_id=? AND kind='git.sync'").get(runId) as { state: string; evidence_json: string };
+    assert.equal(operation.state, "completed");
+    assert.deepEqual(JSON.parse(operation.evidence_json).target_inherited_paths, [inherited]);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("legacy git.sync conflict evidence restores a failed run and its claimed dispatch", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun("20260819-legacy-sync-recovery");
+    const dispatches = new DispatchService(fixture.store);
+    const recoveryDispatchId = dispatches.create(runId, "git-operator", {
+      objective: "Recover legacy target synchronization",
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Continue the explicitly evidenced conflict"],
+      context: { stage: "git-operator", phase: "sync_recovery" },
+    });
+    dispatches.claim(runId, recoveryDispatchId, "git-operator");
+    const integration = await fixture.orchestrator.prepareIntegration(runId);
+    await writeFile(join(integration.path, "README.md"), "integration side\n");
+    await rawGit(integration.path, ["add", "README.md"]);
+    await rawGit(integration.path, ["commit", "-m", "Integration change"]);
+    const integrationHeadBefore = await rawGit(integration.path, ["rev-parse", "HEAD"]);
+
+    await writeFile(join(fixture.root, "README.md"), "target side\n");
+    await rawGit(fixture.root, ["add", "README.md"]);
+    await rawGit(fixture.root, ["commit", "-m", "Advance target"]);
+    const targetHead = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    await assert.rejects(fixture.orchestrator.integrateTarget(runId, integration.worktree_id), /synchronization conflicted/);
+
+    const operation = fixture.store.db.prepare("SELECT operation_id FROM operations WHERE run_id=? AND kind='git.sync' AND state='pending'").get(runId) as { operation_id: string };
+    fixture.store.db.prepare("UPDATE operations SET request_json=?,evidence_json=NULL WHERE operation_id=?").run(JSON.stringify({ target: targetHead }), operation.operation_id);
+    fixture.store.db.prepare("UPDATE runs SET state='failed',stage='git-operator' WHERE run_id=?").run(runId);
+    const evidence = {
+      integration_worktree_id: integration.worktree_id,
+      conflict_paths: ["README.md"],
+      integration_head_before: integrationHeadBefore,
+      target_head: targetHead,
+    };
+
+    const legacyResume = dispatches.resume(runId);
+    assert.equal((legacyResume.run as { state: string }).state, "failed");
+    assert.equal(legacyResume.recovery?.next_command, `ai-team git reconcile --run-id ${runId} --dispatch-id ${recoveryDispatchId} --operation-id ${operation.operation_id} --state conflicted --input-stdin`);
+    assert.deepEqual(legacyResume.recovery?.evidence_template, {
+      integration_worktree_id: "<worktree-id>", conflict_paths: ["<repository-relative-conflict-path>"],
+      integration_head_before: "<40-character-commit-sha>", target_head: "<40-character-commit-sha>",
+    });
+
+    await assert.rejects(
+      fixture.orchestrator.reconcileSyncConflict(runId, operation.operation_id, {}, recoveryDispatchId),
+      (error: unknown) => {
+        const details = error instanceof ValidationError ? error.details : undefined;
+        return error instanceof Error && error.message === "conflicted git.sync reconciliation evidence is invalid"
+          && Array.isArray(details) && details.length === 4;
+      },
+    );
+    const reconciled = await fixture.orchestrator.reconcileSyncConflict(runId, operation.operation_id, evidence, recoveryDispatchId);
+    assert.equal((fixture.store.getRun(runId) as { state: string }).state, "active");
+    assert.equal((fixture.store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(recoveryDispatchId) as { state: string }).state, "claimed");
+    const pending = fixture.store.db.prepare("SELECT state,evidence_json,request_json FROM operations WHERE operation_id=?").get(operation.operation_id) as { state: string; evidence_json: string; request_json: string };
+    assert.equal(pending.state, "pending");
+    assert.deepEqual(JSON.parse(pending.request_json), { target: targetHead });
+    assert.deepEqual(JSON.parse(pending.evidence_json), { state: "conflicted", ...evidence });
+    assert.equal(reconciled[0]?.next_command, `ai-team git continue-conflict --run-id ${runId} --dispatch-id ${recoveryDispatchId} --integration-id ${integration.worktree_id} --scope README.md`);
+
+    await writeFile(join(integration.path, "README.md"), "resolved\n");
+    await rawGit(integration.path, ["add", "README.md"]);
+    const commit = await fixture.orchestrator.continueConflict(runId, integration.worktree_id, ["README.md"], recoveryDispatchId);
+    assert.equal((await rawGit(integration.path, ["rev-list", "--parents", "-n", "1", commit])).split(" ").length, 3);
+    assert.equal((fixture.store.db.prepare("SELECT state FROM operations WHERE operation_id=?").get(operation.operation_id) as { state: string }).state, "completed");
   } finally {
     await fixture.dispose();
   }

@@ -633,12 +633,27 @@ export class StateStore {
     this.db.prepare("UPDATE operations SET state='completed',evidence_json=?,completed_at=? WHERE operation_id=?").run(serialized, new Date().toISOString(), operationId);
   }
 
+  recordPendingOperationEvidence(operationId: string, evidence: unknown): void {
+    const serialized = redact(stableJson(evidence));
+    if (serialized.length > 128 * 1024) throw new ValidationError("operation evidence exceeds the 128 KiB limit");
+    const updated = this.db.prepare("UPDATE operations SET evidence_json=? WHERE operation_id=? AND state='pending'").run(serialized, operationId);
+    if (updated.changes !== 1) throw new ValidationError("pending operation was not found for evidence recording");
+  }
+
   reconcileOperation(operationId: string, state: "completed" | "not_applied" | "unknown", evidence: unknown): void {
     if (state === "unknown") throw new ValidationError("unknown side effect cannot be marked reconciled without external evidence");
-    const serialized = redact(stableJson({ reconciliation: state, evidence }));
+    const normalized = state === "completed" && evidence && typeof evidence === "object" && !Array.isArray(evidence)
+      ? { ...(evidence as Record<string, unknown>), reconciliation: state }
+      : { reconciliation: state, evidence };
+    const serialized = redact(stableJson(normalized));
     if (serialized.length > 128 * 1024) throw new ValidationError("reconciliation evidence exceeds the 128 KiB limit");
-    this.db.prepare("UPDATE operations SET state=?,evidence_json=?,completed_at=? WHERE operation_id=? AND state='pending'")
-      .run(state === "completed" ? "completed" : "failed", serialized, new Date().toISOString(), operationId);
+    const targetState = state === "completed" ? "completed" : "failed";
+    const updated = this.db.prepare("UPDATE operations SET state=?,evidence_json=?,completed_at=? WHERE operation_id=? AND state='pending'")
+      .run(targetState, serialized, new Date().toISOString(), operationId);
+    if (updated.changes !== 1) {
+      const existing = this.db.prepare("SELECT state FROM operations WHERE operation_id=?").get(operationId) as { state: string } | undefined;
+      if (existing?.state !== targetState) throw new ValidationError("operation is unknown or cannot be reconciled from its current state");
+    }
   }
 
   createDecision(runId: string, question: string, choices: Array<{ id: string; label: string; impact: string }>, recommendation?: string, type = "workflow", dispatchId?: string): string {

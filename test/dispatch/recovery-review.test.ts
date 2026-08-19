@@ -108,10 +108,7 @@ test("reconcileOperation persists completed and not-applied states while rejecti
     store.reconcileOperation(completed.operationId, "completed", { fact: "owned worktree exists" });
     assert.deepEqual(
       store.db.prepare("SELECT state,evidence_json FROM operations WHERE operation_id=?").get(completed.operationId),
-      {
-        state: "completed",
-        evidence_json: '{"evidence":{"fact":"owned worktree exists"},"reconciliation":"completed"}',
-      },
+      { state: "completed", evidence_json: '{"fact":"owned worktree exists","reconciliation":"completed"}' },
     );
 
     const notApplied = store.beginOperation("git.worktree", `worktree:${runId}:absent`, {}, runId);
@@ -133,6 +130,58 @@ test("reconcileOperation persists completed and not-applied states while rejecti
       (store.db.prepare("SELECT state FROM operations WHERE operation_id=?").get(unresolved.operationId) as { state: string }).state,
       "pending",
     );
+  });
+});
+
+test("merge dispatch creation rejects a plan worktree bound as its own task worktree", async () => {
+  await withStore((store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    assert.throws(() => dispatches.create(runId, "git-operator", {
+      objective: "Invalid self integration",
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Must be rejected before creation"],
+      context: {
+        stage: "git-operator",
+        phase: "integrate_implementation",
+        integration_worktree_id: "worktree_same",
+        task_worktree_ids: ["worktree_same"],
+      },
+    }), /integration worktree cannot also be a task worktree/);
+  });
+});
+
+test("final integration precondition failures are retryable and failed runs cannot create or claim work", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const finalId = dispatches.create(runId, "git-operator", {
+      objective: "Finalize reviewed integration",
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Retry a no-side-effect precondition failure"],
+      context: { stage: "git-operator", phase: "finalize_integration", barrier_id: "review_fixture", revision_sha: REVIEW_HEAD, integration_worktree_id: "worktree_fixture" },
+    });
+    dispatches.claim(runId, finalId, "git-operator");
+    await dispatches.submitValue(runId, finalId, "git-operator", {
+      ...createResultTemplate(runId, finalId, "git-operator"),
+      status: "failed",
+      summary: "target worktree is dirty",
+      verification: [],
+      payload: {},
+      failure_class: "dirty_target",
+      side_effect_state: "none",
+    });
+    assert.equal(store.getRun(runId).state, "retryable_failure");
+    const resumed = dispatches.resume(runId);
+    assert.equal((resumed.run as { state: string }).state, "active");
+    assert.equal(resumed.pending_dispatches.length, 1);
+
+    const blockedId = resumed.pending_dispatches[0]!.dispatch_id;
+    store.db.prepare("UPDATE runs SET state='failed' WHERE run_id=?").run(runId);
+    assert.throws(() => dispatches.create(runId, "test", dispatchPacket()), /run must be active before dispatch creation/);
+    assert.throws(() => dispatches.claim(runId, blockedId, "git-operator"), /run must be active before dispatch claim/);
   });
 });
 

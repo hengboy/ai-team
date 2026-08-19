@@ -42,7 +42,7 @@ export const COMMAND_PARAMETER_TYPES = Object.freeze({
   commit: "string; exactly 40 lowercase hexadecimal characters",
   "opaque-id": "string; CLI-issued identifier",
   branch: "string; Git branch name",
-  state: "enum; planning or reconciliation state",
+  state: "enum; planning state, or Git reconciliation state completed, not_applied, or conflicted",
   stage: "enum; triage, pre_write, or pre_commit",
   paths: "comma-separated repository-relative POSIX paths",
   boolean: "boolean; presence of the flag means true",
@@ -91,6 +91,8 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "scope check": ["ai-team scope check --run-id <run-id> --stage <stage> --paths <paths> [--worktree-id <worktree-id>]"],
   "review create": ["ai-team review create --run-id <run-id> --revision-sha <commit> [--formal]"],
   "review schema": ["ai-team review schema"],
+  "review resolution-schema": ["ai-team review resolution-schema"],
+  "review resolution-template": ["ai-team review resolution-template"],
   "review submit": ["ai-team review submit --run-id <run-id> --barrier-id <opaque-id> ((--result-file <json> | --staging-id <staging-id>) | --role <role> --input-stdin)"],
   "review resolve": ["ai-team review resolve --run-id <run-id> --barrier-id <opaque-id> (--resolution-file <json> | --staging-id <staging-id> | --input-stdin)"],
   "review status": ["ai-team review status --run-id <run-id> (--barrier-id <opaque-id> | --revision-sha <commit>)"],
@@ -142,7 +144,7 @@ const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>
 });
 
 const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run cancel", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
-const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch packet-schema", "dispatch packet-template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolve", "review status"] as const;
+const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch packet-schema", "dispatch packet-template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolution-schema", "review resolution-template", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */
 export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.freeze({
