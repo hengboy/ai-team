@@ -381,6 +381,15 @@ export class GitOrchestrator {
   async commit(runId: string, worktreeId: string, message: string, allowedScopes: string[], dispatchId?: string): Promise<{ commit: string; paths: string[]; reused: boolean }> {
     this.assertGitOperator(runId, dispatchId);
     const worktree = this.worktreeForCommit(runId, worktreeId);
+    const integratedTask = this.store.db.prepare("SELECT task_id FROM run_tasks WHERE run_id=? AND worktree_id=? AND state='integrated' ORDER BY ordinal LIMIT 1")
+      .get(runId, worktreeId) as { task_id: string } | undefined;
+    if (integratedTask) {
+      throw new ValidationError(`integrated task worktree is read-only: task_id=${integratedTask.task_id}; worktree_id=${worktreeId}`, {
+        reason: "integrated_task_worktree_read_only",
+        task_id: integratedTask.task_id,
+        worktree_id: worktreeId,
+      });
+    }
     const changed = (await git(worktree.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3));
     if (!changed.length) throw new ValidationError("implementation has no changes to commit");
     if (dispatchId) {

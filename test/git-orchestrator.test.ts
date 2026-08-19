@@ -1072,6 +1072,85 @@ test("commit accepts changed files in scope and rejects files outside it", async
   }
 });
 
+test("commit keeps integrated task worktrees read-only without side effects", async () => {
+  const fixture = await createFixture();
+  try {
+    const revision = "001";
+    const planIds = ["20260819-integrated-multi", "20260819-integrated-single"];
+    const taskIds = [["TASK-001", "TASK-002"], ["TASK-001"]];
+    for (let index = 0; index < planIds.length; index += 1) {
+      const taskRoot = join(fixture.root, ".ai-team", "plans", planIds[index]!, "revisions", revision, "tasks");
+      await mkdir(taskRoot, { recursive: true });
+      for (const taskId of taskIds[index]!) await writeFile(join(taskRoot, `${taskId}.md`), `# ${taskId}\n`);
+    }
+    await rawGit(fixture.root, ["add", ".ai-team"]);
+    await rawGit(fixture.root, ["commit", "-m", "Freeze integrated task fixtures"]);
+    const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    const identity = await repositoryIdentity(fixture.root);
+
+    const assertReadOnly = async (runId: string, taskId: string, worktreeId: string, path: string): Promise<void> => {
+      const snapshot = async () => ({
+        head: await rawGit(path, ["rev-parse", "HEAD"]),
+        dirty: await rawGit(path, ["status", "--porcelain=v1", "--untracked-files=all"]),
+        operations: fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=?").get(runId),
+        events: fixture.store.db.prepare("SELECT count(*) AS count FROM run_events WHERE run_id=?").get(runId),
+        worktree: fixture.store.db.prepare("SELECT * FROM worktrees WHERE worktree_id=?").get(worktreeId),
+      });
+      const before = await snapshot();
+      let rejected: unknown;
+      try {
+        await fixture.orchestrator.commit(runId, worktreeId, `Retry ${taskId}`, ["**"]);
+      } catch (error) {
+        rejected = error;
+      }
+      assert.ok(rejected instanceof Error);
+      assert.equal(rejected.message, `integrated task worktree is read-only: task_id=${taskId}; worktree_id=${worktreeId}`);
+      assert.deepEqual((rejected as Error & { details?: unknown }).details, {
+        reason: "integrated_task_worktree_read_only",
+        task_id: taskId,
+        worktree_id: worktreeId,
+      });
+      assert.deepEqual(await snapshot(), before);
+    };
+
+    const multiRun = fixture.store.createRun({
+      repoId: identity.repoId, profile: "coding", mode: "planned", planId: planIds[0]!, revision, baseCommit, targetBranch: "main",
+    });
+    fixture.store.initializeRunTasks(multiRun, taskIds[0]!.map((taskId, index) => ({
+      task_id: taskId,
+      source_path: `.ai-team/plans/${planIds[0]}/revisions/${revision}/tasks/${taskId}.md`,
+      source_digest: String(index + 1).repeat(64),
+      write_paths: [`task-${index + 1}.txt`],
+    })));
+    await fixture.orchestrator.prepareIntegration(multiRun);
+    const multiWorktrees = await Promise.all(taskIds[0]!.map((taskId) => fixture.orchestrator.prepareTask(multiRun, taskId)));
+    await writeFile(join(multiWorktrees[0]!.path, "task-1.txt"), "dirty integrated task\n");
+    for (let index = 0; index < multiWorktrees.length; index += 1) {
+      const task = multiWorktrees[index]!;
+      fixture.store.db.prepare("UPDATE run_tasks SET state='integrated',worktree_id=? WHERE run_id=? AND task_id=?")
+        .run(task.worktree_id, multiRun, taskIds[0]![index]);
+      await assertReadOnly(multiRun, taskIds[0]![index]!, task.worktree_id, task.path);
+    }
+
+    const singleRun = fixture.store.createRun({
+      repoId: identity.repoId, profile: "coding", mode: "planned", planId: planIds[1]!, revision, baseCommit, targetBranch: "main",
+    });
+    fixture.store.initializeRunTasks(singleRun, [{
+      task_id: "TASK-001",
+      source_path: `.ai-team/plans/${planIds[1]}/revisions/${revision}/tasks/TASK-001.md`,
+      source_digest: "3".repeat(64),
+      write_paths: ["single.txt"],
+    }]);
+    const plan = await fixture.orchestrator.prepareIntegration(singleRun);
+    await writeFile(join(plan.path, "single.txt"), "dirty integrated single task\n");
+    fixture.store.db.prepare("UPDATE run_tasks SET state='integrated',worktree_id=? WHERE run_id=? AND task_id='TASK-001'")
+      .run(plan.worktree_id, singleRun);
+    await assertReadOnly(singleRun, "TASK-001", plan.worktree_id, plan.path);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
 test("integration uses no-ff merges and cleanup removes owned worktrees", async () => {
   const fixture = await createFixture();
   try {
