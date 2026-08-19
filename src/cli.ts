@@ -249,6 +249,7 @@ export const main = async (argv = process.argv): Promise<void> => {
   process.on("SIGTERM", onSignal);
   try { await buildProgram().parseAsync(argv); }
   catch (error) {
+    if (receivedSignal) return;
     if (error instanceof AiTeamError) {
       const failure = { ok: false, error: error.message, details: error.details ?? null, code: error.code };
       process.stderr.write(`${humanOutput ? renderHuman(failure) : JSON.stringify(failure)}\n`);

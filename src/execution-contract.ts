@@ -31,6 +31,7 @@ export interface ExecutionPacketFields {
 }
 
 const approvalRank: Record<ApprovalPolicy, number> = { never: 0, on_request: 1, always: 2 };
+const cwdKinds = new Set<ExecutionCwdKind>(["project", "worktree", "ai_team_home"]);
 
 const boundWorktreeId = (context: Record<string, unknown>): string | undefined => {
   for (const key of ["worktree_id", "task_worktree_id", "implementation_worktree_id", "integration_worktree_id"]) {
@@ -44,19 +45,34 @@ const validateRequest = (request: ExecutionRequest, role: Role): void => {
   const unknown = Object.keys(request).filter((key) => !allowed.has(key));
   if (unknown.length) throw new ValidationError("execution_request has unknown fields", unknown.map((key) => `/execution_request/${key}`));
   const policy = ROLE_MANIFEST[role].execution;
-  if (request.tools) {
+  if (request.tools !== undefined) {
     if (!Array.isArray(request.tools) || !request.tools.length || new Set(request.tools).size !== request.tools.length) {
       throw new ValidationError("execution_request.tools must contain unique tools", ["/execution_request/tools"]);
     }
     const outside = request.tools.filter((tool) => !policy.ceiling.tools.includes(tool));
     if (outside.length) throw new ValidationError("execution_request exceeds the role tool ceiling", outside.map((tool) => `/execution_request/tools/${tool}`));
   }
-  if (request.approval_policy && (!policy.ceiling.approval_policies.includes(request.approval_policy)
+  if (request.approval_policy !== undefined && (!policy.ceiling.approval_policies.includes(request.approval_policy)
     || approvalRank[request.approval_policy] < approvalRank[policy.default.approval_policy])) {
     throw new ValidationError("execution_request cannot weaken the role approval policy", ["/execution_request/approval_policy"]);
   }
-  if (request.cwd && !policy.ceiling.cwd.includes(request.cwd.kind)) {
-    throw new ValidationError("execution_request exceeds the role cwd ceiling", ["/execution_request/cwd/kind"]);
+  if (request.cwd !== undefined) {
+    if (!request.cwd || typeof request.cwd !== "object" || Array.isArray(request.cwd)) {
+      throw new ValidationError("execution_request.cwd must be an object", ["/execution_request/cwd"]);
+    }
+    const unknownCwd = Object.keys(request.cwd).filter((key) => key !== "kind" && key !== "worktree_id");
+    if (unknownCwd.length) {
+      throw new ValidationError("execution_request.cwd has unknown fields", unknownCwd.map((key) => `/execution_request/cwd/${key}`));
+    }
+    if (!cwdKinds.has(request.cwd.kind) || !policy.ceiling.cwd.includes(request.cwd.kind)) {
+      throw new ValidationError("execution_request exceeds the role cwd ceiling", ["/execution_request/cwd/kind"]);
+    }
+    if (request.cwd.worktree_id !== undefined && (typeof request.cwd.worktree_id !== "string" || !request.cwd.worktree_id)) {
+      throw new ValidationError("execution_request.cwd.worktree_id must be a non-empty string", ["/execution_request/cwd/worktree_id"]);
+    }
+    if (request.cwd.kind !== "worktree" && request.cwd.worktree_id !== undefined) {
+      throw new ValidationError("execution_request.cwd.worktree_id is only valid for worktree cwd", ["/execution_request/cwd/worktree_id"]);
+    }
   }
 };
 
@@ -72,10 +88,17 @@ export const freezeExecutionContract = <T extends ExecutionPacketFields>(role: R
   });
   const requestedCwd = request?.cwd;
   const sourceCwd = sourceContract?.cwd;
-  const cwd = requestedCwd ?? sourceCwd ?? { kind: policy.default.cwd, ...(policy.default.cwd === "worktree" ? { worktree_id: boundWorktreeId(packet.context) } : {}) };
   const worktreeId = boundWorktreeId(packet.context);
-  if (cwd.kind === "worktree" && cwd.worktree_id && cwd.worktree_id !== worktreeId) {
-    throw new ValidationError("execution cwd must use the dispatch-bound worktree", ["/execution_request/cwd/worktree_id"]);
+  const selectedCwd = requestedCwd ?? sourceCwd ?? { kind: policy.default.cwd };
+  let cwd: ExecutionContract["cwd"] = { kind: selectedCwd.kind };
+  if (selectedCwd.kind === "worktree") {
+    if (!worktreeId && requestedCwd) {
+      throw new ValidationError("execution worktree cwd requires a dispatch-bound worktree", ["/context/worktree_id"]);
+    }
+    if (selectedCwd.worktree_id && selectedCwd.worktree_id !== worktreeId) {
+      throw new ValidationError("execution cwd must use the dispatch-bound worktree", ["/execution_request/cwd/worktree_id"]);
+    }
+    cwd = { kind: "worktree", ...(worktreeId ? { worktree_id: worktreeId } : {}) };
   }
   if (sourceCwd && (cwd.kind !== sourceCwd.kind && !(sourceCwd.kind === "project" && cwd.kind === "worktree" && cwd.worktree_id === worktreeId))) {
     throw new ValidationError("replacement execution cwd may only stay fixed or narrow to the bound worktree", ["/execution_request/cwd"]);

@@ -123,10 +123,24 @@ export const nextActionsForRun = (store: StateStore, runId: string): NextAction[
     blocked_by: [],
     details: { state: dispatch.state },
   });
-  const interrupted = store.db.prepare("SELECT command_id,payload_json,created_at FROM run_events WHERE run_id=? AND type='command.interrupted'").all(runId) as Array<{
-    command_id: string; payload_json: string; created_at: string;
+  const interrupted = store.db.prepare(`SELECT event_id,command_id,correlation_id,dispatch_id,operation_id,payload_json,created_at
+    FROM run_events WHERE run_id=? AND type='command.interrupted'`).all(runId) as Array<{
+    event_id: number; command_id: string; correlation_id?: string; dispatch_id?: string; operation_id?: string; payload_json: string; created_at: string;
   }>;
   for (const event of interrupted) {
+    if (event.operation_id) {
+      const operation = store.db.prepare("SELECT state FROM operations WHERE run_id=? AND operation_id=?").get(runId, event.operation_id) as { state: string } | undefined;
+      if (operation?.state !== "pending") continue;
+    }
+    if (event.dispatch_id) {
+      const dispatch = store.db.prepare("SELECT state FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, event.dispatch_id) as { state: string } | undefined;
+      if (!dispatch || !["pending", "claimed", "retryable_failure"].includes(dispatch.state)) continue;
+    }
+    if (event.correlation_id) {
+      const superseded = store.db.prepare(`SELECT 1 FROM run_events WHERE run_id=? AND event_id>? AND correlation_id=?
+        AND type IN ('command.completed','command.failed') LIMIT 1`).get(runId, event.event_id, event.correlation_id);
+      if (superseded) continue;
+    }
     const payload = parseObject(event.payload_json);
     actions.push({
       id: `command:${event.command_id}`,

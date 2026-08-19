@@ -4,6 +4,7 @@ import { chmod, link, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unl
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { checkResultEnvelope, createResultTemplate } from "../src/contracts.js";
 import { ROLES } from "../src/constants.js";
 import { COMMAND_CONTRACT_BASE, COMMAND_PARAMETER_TYPES, COMMAND_SYNTAX, commandContractFor } from "../src/command-contract.js";
@@ -643,7 +644,7 @@ test("execution requests are server-frozen and replacements can only narrow the 
       allowed_read_paths: ["src/a.ts"],
       allowed_write_paths: ["src/a.ts"],
       acceptance_criteria: ["Limits are frozen"],
-      context: {},
+      context: { worktree_id: "worktree_bound" },
       execution_request: { tools: ["filesystem.read", "process.exec"], approval_policy: "on_request" },
     };
     const dispatchId = dispatches.create(runId, "backend-developer", packet);
@@ -652,6 +653,46 @@ test("execution requests are server-frozen and replacements can only narrow the 
     assert.deepEqual(claimed.execution_contract?.tools, ["filesystem.read", "process.exec"]);
     assert.equal(claimed.execution_contract?.approval_policy, "on_request");
     assert.equal(claimed.execution_contract?.source.kind, "dispatch_request");
+    assert.deepEqual(claimed.execution_contract?.cwd, { kind: "worktree", worktree_id: "worktree_bound" });
+    assert.throws(() => dispatches.create(runId, "backend-developer", {
+      objective: packet.objective,
+      allowed_read_paths: packet.allowed_read_paths,
+      allowed_write_paths: packet.allowed_write_paths,
+      acceptance_criteria: packet.acceptance_criteria,
+      context: packet.context,
+      execution_contract: claimed.execution_contract!,
+    }), /server-generated/);
+    assert.throws(() => dispatches.supersede(runId, dispatchId, "backend-developer", "coding", "reject client contract", {
+      objective: packet.objective,
+      allowed_read_paths: packet.allowed_read_paths,
+      allowed_write_paths: packet.allowed_write_paths,
+      acceptance_criteria: packet.acceptance_criteria,
+      context: packet.context,
+      execution_contract: claimed.execution_contract!,
+    }), /server-generated/);
+
+    const schema = dispatchPacketSchema("backend-developer");
+    const validatePacketSchema = new Ajv2020({ strict: false }).compile(schema);
+    const schemaPacket = { ...packet, context: { ...packet.context, explorer_dispatch_id: "dispatch_explorer" } };
+    assert.equal(validatePacketSchema(schemaPacket), true, JSON.stringify(validatePacketSchema.errors));
+
+    const derivedCwdId = dispatches.create(runId, "backend-developer", {
+      ...packet,
+      execution_request: { cwd: { kind: "worktree" }, tools: ["filesystem.read"] },
+    });
+    assert.deepEqual(
+      dispatches.claim(runId, derivedCwdId, "backend-developer").packet.execution_contract?.cwd,
+      { kind: "worktree", worktree_id: "worktree_bound" },
+    );
+    assert.throws(() => dispatches.create(runId, "backend-developer", {
+      ...packet,
+      context: {},
+      execution_request: { cwd: { kind: "worktree" } },
+    }), /dispatch-bound worktree/);
+    assert.throws(() => dispatches.create(runId, "backend-developer", {
+      ...packet,
+      execution_request: { cwd: { kind: "worktree", unexpected: true } as never },
+    }), /unknown fields/);
 
     const replacement = dispatches.supersede(runId, dispatchId, "backend-developer", "coding", "narrow tools", {
       ...packet,
@@ -705,11 +746,11 @@ test("legacy claim bundles remain byte-preserving and manifest mismatch blocks r
 test("command lifecycle is terminal once and recovery actions are stable and blocked by priority", async () => {
   await withStore((store) => {
     const runId = createRun(store);
-    const commandId = store.startCommand(runId, "git cleanup");
-    store.terminalCommand(commandId, "interrupted", { command: `ai-team run resume ${runId}`, retry_safe: true }, () => {});
-    assert.throws(() => store.terminalCommand(commandId, "completed", {}, () => {}), /already terminal/);
     const operation = store.beginOperation("git.cleanup", "timeline-operation", {}, runId);
     assert.equal(operation.state, "pending");
+    const command = store.db.prepare("SELECT command_id FROM run_events WHERE operation_id=? AND type='command.started'").get(operation.operationId) as { command_id: string };
+    store.terminalCommand(command.command_id, "interrupted", { command: `ai-team run resume ${runId}`, retry_safe: true }, () => {});
+    assert.throws(() => store.terminalCommand(command.command_id, "completed", {}, () => {}), /already terminal/);
     store.createDecision(runId, "Choose", [
       { id: "continue", label: "Continue", impact: "Resume work" },
       { id: "stop", label: "Stop", impact: "Leave the run blocked" },
@@ -729,6 +770,11 @@ test("command lifecycle is terminal once and recovery actions are stable and blo
     assert.equal(projection.next_actions[0]?.command, null);
     assert.ok(projection.timeline.some(({ type }) => type === "command.interrupted"));
     assert.ok(projection.timeline.some(({ source, type }) => source === "authoritative_row" && type === "operation.current"));
+
+    store.reconcileOperation(operation.operationId, "not_applied", { checked: true });
+    const recovered = recoveryProjection(store, runId);
+    assert.ok(!recovered.next_actions.some(({ id }) => id === `operation:${operation.operationId}`));
+    assert.ok(!recovered.next_actions.some(({ id }) => id === `command:${command.command_id}`));
   });
 });
 

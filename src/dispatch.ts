@@ -233,6 +233,7 @@ export class DispatchService {
     if (role !== actor && !definition.delegates.includes(role)) {
       throw new ValidationError(`${actor} cannot delegate to ${role}`);
     }
+    if (packet.execution_contract) throw new ValidationError("execution_contract is server-generated", ["/execution_contract"]);
     let validated = validatePacket(packet, role);
     if (actorRole === "coding" && role === "git-operator" && validated.context.phase === "prepare_implementation_worktree" && /^TASK-\d{3}$/.test(String(validated.context.task_id ?? ""))) {
       if (validated.context.coordinator_dispatch_id !== actorDispatchId) {
@@ -257,13 +258,7 @@ export class DispatchService {
       }
       validated.context.phase = "review_repair";
     }
-    if (validated.execution_contract) {
-      const requestPacket = { ...validated };
-      delete requestPacket.execution_contract;
-      validated = freezeExecutionContract(role, requestPacket);
-    } else {
-      validated = freezeExecutionContract(role, validated);
-    }
+    validated = freezeExecutionContract(role, validated);
     if (role === "file-explorer") {
       const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get((this.store.getRun(runId) as { repo_id: string }).repo_id) as { project_path: string } | undefined;
       const missing = repository ? EXPLORER_CONTEXT_PATHS.filter((path) => !existsSync(join(repository.project_path, path))) : [...EXPLORER_CONTEXT_PATHS];
@@ -697,6 +692,7 @@ export class DispatchService {
   }
 
   supersede(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string, packet: DispatchPacket): ReplacementResult<"superseded"> {
+    if (packet.execution_contract) throw new ValidationError("execution_contract is server-generated", ["/execution_contract"]);
     return this.replaceDispatch(runId, dispatchId, role, actorRole, reason, "superseded", validatePacket(packet, role));
   }
 

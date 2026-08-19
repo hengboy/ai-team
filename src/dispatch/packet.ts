@@ -1,4 +1,4 @@
-import type { Role } from "../constants.js";
+import { ROLES, type Role } from "../constants.js";
 import { ValidationError } from "../errors.js";
 import { assertReadablePath, assertWritablePath } from "../security.js";
 import { assertRelativePosixPath, stableJson } from "../utils.js";
@@ -68,8 +68,63 @@ export const dispatchPacketSchema = (role: Role, phase?: unknown, taskId?: unkno
       allowed_write_paths: { type: "array", items: { type: "string", minLength: 1 } },
       acceptance_criteria: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
       context: { type: "object", additionalProperties: true, ...(contextRequired.length ? { required: contextRequired } : {}), properties: contextProperties },
-      execution_request: { type: "object", additionalProperties: false },
-      execution_contract: { type: "object", additionalProperties: true },
+      execution_request: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          cwd: {
+            type: "object",
+            additionalProperties: false,
+            required: ["kind"],
+            properties: {
+              kind: { enum: ["project", "worktree", "ai_team_home"] },
+              worktree_id: { type: "string", minLength: 1 },
+            },
+          },
+          tools: {
+            type: "array",
+            minItems: 1,
+            uniqueItems: true,
+            items: { enum: ["filesystem.read", "filesystem.write", "process.exec", "git.read", "git.write", "network"] },
+          },
+          approval_policy: { enum: ["never", "on_request", "always"] },
+        },
+      },
+      execution_contract: {
+        type: "object",
+        readOnly: true,
+        additionalProperties: false,
+        required: ["schema_version", "cwd", "tools", "approval_policy", "source"],
+        properties: {
+          schema_version: { const: 1 },
+          cwd: {
+            type: "object",
+            additionalProperties: false,
+            required: ["kind"],
+            properties: {
+              kind: { enum: ["project", "worktree", "ai_team_home"] },
+              worktree_id: { type: "string", minLength: 1 },
+            },
+          },
+          tools: {
+            type: "array",
+            minItems: 1,
+            uniqueItems: true,
+            items: { enum: ["filesystem.read", "filesystem.write", "process.exec", "git.read", "git.write", "network"] },
+          },
+          approval_policy: { enum: ["never", "on_request", "always"] },
+          source: {
+            type: "object",
+            additionalProperties: false,
+            required: ["kind", "role", "role_manifest_digest"],
+            properties: {
+              kind: { enum: ["role_default", "dispatch_request", "source_contract"] },
+              role: { enum: [...ROLES] },
+              role_manifest_digest: { type: "string", pattern: "^[a-f0-9]{64}$" },
+            },
+          },
+        },
+      },
     },
   };
 };
