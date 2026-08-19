@@ -70,3 +70,18 @@ test("role manifests declare staging ownership separately from project writes", 
   assert.ok(build.roles["environment-operator"].commands.includes("env explain"));
   assert.ok(build.roles["environment-operator"].commands.includes("env diff"));
 });
+
+test("planning templates enforce immutable specs and checkable task completion", async () => {
+  const spec = await readFile(join(sourceRoot, "templates", "spec.md"), "utf8");
+  const plan = await readFile(join(sourceRoot, "templates", "plan.md"), "utf8");
+  const task = await readFile(join(sourceRoot, "templates", "task.md"), "utf8");
+  const goalSection = spec.match(/## 目标\n\n([\s\S]*?)(?=\n## )/)?.[1] ?? "";
+  const taskHeadings = [...task.matchAll(/^### (.+TASK-\d{3}：.+)$/gm)].map((match) => match[1] ?? "");
+
+  assert.doesNotMatch(goalSection, /^\s*- \[[ x]\]/m);
+  assert.match(spec, /写入 revision 后即冻结，不得修改/);
+  assert.match(plan, /^### STEP-001：/m);
+  assert.ok(taskHeadings.length > 0);
+  assert.ok(taskHeadings.every((heading) => heading.startsWith("[ ] TASK-")));
+  assert.match(task, /全部验收标准通过且证据齐全后，才能改为“### \[x\] TASK-/);
+});
