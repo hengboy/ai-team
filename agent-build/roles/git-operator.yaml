@@ -24,3 +24,12 @@ commands:
   - staging show
 discovery: false
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }
+execution:
+  default:
+    cwd: project
+    tools: [filesystem.read, process.exec, git.read, git.write]
+    approval_policy: on_request
+  ceiling:
+    cwd: [project, worktree]
+    tools: [filesystem.read, filesystem.write, process.exec, git.read, git.write]
+    approval_policies: [on_request, always]

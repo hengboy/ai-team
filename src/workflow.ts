@@ -28,14 +28,20 @@ export class WorkflowService {
     this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
     const branch = await currentBranch(repo.root);
     const runId = this.store.createRun({ repoId: repo.repoId, profile: "planning", mode: "planned", targetBranch: branch, request, clientPlatform: clientPlatform() });
-    const dispatchId = this.dispatches.create(runId, "file-explorer", {
-      objective: "Explore the repository for the planning request. Read existing MEMORY.md and .ai-team/index/feature-navigation.md first, then return entry points, constraints, risks, test locations, and project_context.",
-      allowed_read_paths: ["."],
-      allowed_write_paths: [],
-      acceptance_criteria: ["Repository facts are supported by file paths", "Unknowns are explicit"],
-      context: { request },
-    }, "planning");
-    return { run_id: runId, dispatch_id: dispatchId };
+    const commandId = this.store.startCommand(runId, "planning start");
+    try {
+      const dispatchId = this.store.terminalCommand(commandId, "completed", { command: "planning start", retry_safe: false }, () => this.dispatches.create(runId, "file-explorer", {
+        objective: "Explore the repository for the planning request. Read existing MEMORY.md and .ai-team/index/feature-navigation.md first, then return entry points, constraints, risks, test locations, and project_context.",
+        allowed_read_paths: ["."],
+        allowed_write_paths: [],
+        acceptance_criteria: ["Repository facts are supported by file paths", "Unknowns are explicit"],
+        context: { request },
+      }, "planning"));
+      return { run_id: runId, dispatch_id: dispatchId };
+    } catch (error) {
+      this.store.terminalCommand(commandId, "failed", { command: "planning start", cause: error instanceof Error ? error.message : String(error), retry_safe: false }, () => {});
+      throw error;
+    }
   }
 
   handoffToPlanning(sourceRunId: string, request: string): { run_id: string; dispatch_id: string; source_run_id: string; reused: boolean } {
@@ -209,6 +215,7 @@ export class WorkflowService {
     }
     this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
     const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}), clientPlatform: clientPlatform(), ...(planDigest ? { planDigest } : {}) });
+    const commandId = this.store.startCommand(runId, "coding start");
     if (input.mode === "planned") {
       this.store.initializeRunTasks(runId, planTasks);
       try {
@@ -217,22 +224,31 @@ export class WorkflowService {
       } catch (error) {
         const cause = error instanceof Error ? error.message : String(error);
         const retry = "Resolve the reported branch/worktree collision or reconcile the failed run, then start a new planned coding run.";
-        this.store.db.transaction(() => {
+        this.store.terminalCommand(commandId, "failed", { command: "coding start", phase: "prepare_plan_worktree", cause, retry_safe: false }, () => {
           this.store.db.prepare("UPDATE runs SET state='failed',stage='git-operator',updated_at=? WHERE run_id=? AND state='active'")
             .run(new Date().toISOString(), runId);
           this.store.event(runId, "run.start_failed", { phase: "prepare_plan_worktree", cause, retry });
-        })();
+        });
         throw new ValidationError("planned coding start failed to prepare its plan worktree; the run was marked failed", { run_id: runId, cause, retry });
       }
     }
-    const dispatchId = this.dispatches.create(runId, "file-explorer", {
-      objective: "Re-explore the repository at the implementation base. Read existing MEMORY.md and .ai-team/index/feature-navigation.md first, then return exact implementation and test scope plus project_context.",
-      allowed_read_paths: ["."],
-      allowed_write_paths: [],
-      acceptance_criteria: ["Scope is exhaustive", "Current HEAD and test entry points are reported"],
-      context: { mode: input.mode, plan_id: input.planId ?? null, revision: selectedRevision ?? null, request: input.request ?? null, implementation_base_commit: head },
-    }, "coding");
-    return { run_id: runId, dispatch_id: dispatchId, role: "file-explorer", depends_on: [] };
+    try {
+      const dispatchId = this.store.terminalCommand(commandId, "completed", { command: "coding start", retry_safe: false }, () => this.dispatches.create(runId, "file-explorer", {
+        objective: "Re-explore the repository at the implementation base. Read existing MEMORY.md and .ai-team/index/feature-navigation.md first, then return exact implementation and test scope plus project_context.",
+        allowed_read_paths: ["."],
+        allowed_write_paths: [],
+        acceptance_criteria: ["Scope is exhaustive", "Current HEAD and test entry points are reported"],
+        context: { mode: input.mode, plan_id: input.planId ?? null, revision: selectedRevision ?? null, request: input.request ?? null, implementation_base_commit: head },
+      }, "coding"));
+      return { run_id: runId, dispatch_id: dispatchId, role: "file-explorer", depends_on: [] };
+    } catch (error) {
+      const terminal = this.store.db.prepare("SELECT 1 FROM run_events WHERE command_id=? AND type IN ('command.completed','command.failed','command.interrupted')").get(commandId);
+      if (!terminal) this.store.terminalCommand(commandId, "failed", { command: "coding start", cause: error instanceof Error ? error.message : String(error), retry_safe: false }, () => {
+        this.store.db.prepare("UPDATE runs SET state='failed',updated_at=? WHERE run_id=? AND state='active'").run(new Date().toISOString(), runId);
+        this.store.event(runId, "run.start_failed", { phase: "create_explorer_dispatch", cause: error instanceof Error ? error.message : String(error) });
+      });
+      throw error;
+    }
   }
 
   async codingStartAuto(project: string, request?: string, planId?: string, revision?: string): Promise<{ triage: "planned" | "bug" | "feature" | "planning"; run_id?: string; dispatch_id?: string; role?: Role; depends_on?: string[] }> {

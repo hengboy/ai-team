@@ -85,6 +85,11 @@ ai-team dispatch reconcile --run-id <run-id> --dispatch-id <dispatch-id> --role 
 `dispatch reconcile` 命令，以创建经过审计的替代项，同时保留原始 dispatch
 谱系和验证证据。
 
+`run show` 额外返回完整 `timeline`、按优先级稳定排序的 `next_actions` 和首个
+`next_action`；`run resume` 返回最后 20 条 `timeline_tail`。timeline 将历史事件与
+标记为 `authoritative_row` 的当前状态分开，后者不是伪造的历史 transition。
+`run show.events` 和 `run resume.last_event` 继续只包含原有 domain events。
+
 ## 环境管理
 
 AI Team 将全局状态存储在 `~/.config/ai-team` 下，或在设置时使用
@@ -112,6 +117,11 @@ ai-team env doctor --probe
 安装；高于已验证范围的版本会产生警告。不受支持的硬平台能力会阻止生成，而不会
 被静默降级。
 
+`env show <name> --resolved` 在原有 environment/resolved 之外返回
+`effective_config`、逐角色/平台 provenance 和 contract/role/agent-build digests。
+配置中禁用的平台仍保留在 resolved 模型中，并通过 `platform_status` 标记；该命令
+只读取 `client_versions`，不会探测或启动外部进程。
+
 ## 代理命令
 
 生成的主代理使用 `dispatch`、`decision`、`planning revision`、`git` 和
@@ -127,8 +137,14 @@ ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role <rol
 ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --staging-id <staging-id>
 ```
 
-bundle 包含 packet、prompt、schema、template、它们的摘要和渲染器版本。被委派的
-角色负责自身提交：它只提交一次 envelope，并返回 CLI 回执，而非未提交的 envelope。
+bundle 包含 packet、prompt、schema、template、它们的摘要、渲染器版本和
+`execution_enforcement`。新 dispatch 的 packet 冻结服务端生成的
+`execution_contract`；角色 YAML 是 tool、cwd 和 approval default/ceiling 的事实源。
+replacement 只能缩小 tool、提高 approval，或从项目目录收紧到该 run 绑定的
+worktree。实际执行约束仍明确标记为 instruction/delegated/unverified，不宣称提供
+原生 OS sandbox。legacy packet 不会被重写，bundle 会标记
+`contract_status=legacy_unspecified`。被委派的角色负责自身提交：它只提交一次
+envelope，并返回 CLI 回执，而非未提交的 envelope。
 回执包含提交状态、工件 ID/路径、摘要，以及一个只读续接信息，其中包含当前运行
 状态/阶段、待处理 dispatch 和待处理决策。收到 `submission.state=\"submitted\"`
 的协调器不得创建新的 staging 条目或再次提交该 dispatch。重复提交仍具幂等性。
@@ -192,6 +208,13 @@ AI Team 拒绝凭证路径、`.env*`、`.ai-team/runtime` 和通过符号链接�
 Git 命令以固定参数数组传递。不提供 push、tag、rebase、reset、clean、stash、
 squash、cherry-pick、amend、远端变更和发布操作。失败或不确定的操作会保留
 worktree，并要求进行协调处理。
+
+CLI 使用 invocation-scoped resource registry 管理本次打开的 store、AbortSignal、
+异步 finalizer 和注册的子进程。首次 SIGINT/SIGTERM 停止新阶段并最多等待 5 秒释放
+数据库与锁；第二次信号或超时只强制终止本 invocation 注册的子进程组。SIGINT 和
+SIGTERM 分别返回 130 和 143。`--human` 对 status、resolved environment、environment
+诊断、run 投影与错误使用无颜色的稳定 renderer；默认 JSON 和 `--legacy-output`
+保持原契约。
 
 重新生成或安装代理前，请升级兼容的 CLI。AI Team 不会扫描、迁移或删除历史
 `$TMPDIR/opencode` 文件。

@@ -51,6 +51,9 @@ export const COMMAND_PARAMETER_TYPES = Object.freeze({
 
 /** Exact command spellings. This is the only syntax table used by renderers. */
 export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  init: ["ai-team init <path> [--yes]"],
+  status: ["ai-team status [--project <path>]"],
+  contract: ["ai-team contract"],
   "planning start": ["ai-team planning start --project <path> (--request-file <file> | --request-stdin)"],
   "context update": ["ai-team context update --project <path> (--context-file <json> | --run-id <run-id> (--staging-id <staging-id> | --input-stdin))"],
   "context validate": ["ai-team context validate --project <path>"],
@@ -86,6 +89,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "staging cleanup": ["ai-team staging cleanup --expired", "ai-team staging cleanup --run-id <run-id> [--staging-id <staging-id>] --all"],
   "run show": ["ai-team run show <run-id>"],
   "run resume": ["ai-team run resume <run-id>"],
+  "run handoff-to-planning": ["ai-team run handoff-to-planning <run-id> (--request-file <file> | --request-stdin)"],
   "run cancel": ["ai-team run cancel <run-id> --reason <text>"],
   "run decide": ["ai-team run decide --run-id <run-id> --decision-id <opaque-id> --choice <text> [--note-file <file>]"],
   "scope check": ["ai-team scope check --run-id <run-id> --stage <stage> --paths <paths> [--worktree-id <worktree-id>]"],
@@ -143,17 +147,20 @@ const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>
   "research archive": ["ai-team research archive --run-id <run-id> --project <path> --topic <text> --input-stdin"],
 });
 
-const PUBLIC_COMMANDS = ["init", "install", "status", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run cancel", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
+const PUBLIC_COMMANDS = ["init", "install", "status", "contract", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run handoff-to-planning", "run cancel", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
 const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch packet-schema", "dispatch packet-template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolution-schema", "review resolution-template", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */
 export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.freeze({
+  status: { required: [], optional: ["project"], syntax: COMMAND_SYNTAX.status! },
+  contract: { required: [], optional: [], syntax: COMMAND_SYNTAX.contract! },
   "context.update": { required: ["project"], optional: ["contextFile", "stagingId", "inputStdin", "runId"], exclusive: [["contextFile", "stagingId", "inputStdin"]], patterns: { stagingId: IDS.stagingId, runId: IDS.runId }, ...((COMMAND_SYNTAX["context update"]) ? { syntax: COMMAND_SYNTAX["context update"] } : {}) },
   "context.validate": { required: ["project"], optional: [], ...((COMMAND_SYNTAX["context validate"]) ? { syntax: COMMAND_SYNTAX["context validate"] } : {}) },
   "planning.start": { required: ["project"], optional: ["requestFile", "requestStdin"], exclusive: [["requestFile", "requestStdin"]], ...((COMMAND_SYNTAX["planning start"]) ? { syntax: COMMAND_SYNTAX["planning start"] } : {}) },
   "coding.start": { required: ["project"], optional: ["mode", "planId", "revision", "requestFile", "requestStdin"], patterns: { planId: IDS.planId, revision: IDS.revision }, ...((COMMAND_SYNTAX["coding start"]) ? { syntax: COMMAND_SYNTAX["coding start"] } : {}) },
   "dispatch.identity": { required: ["runId", "dispatchId", "role"], optional: [], patterns: { runId: IDS.runId, dispatchId: IDS.dispatchId }, syntax: ["ai-team dispatch <claim|prompt|schema|template|packet-schema|packet-template|validate|submit> --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"] },
   "run.identity": { required: ["runId"], optional: [], patterns: { runId: IDS.runId }, syntax: ["ai-team run <show|resume> <run-id>"] },
+  "run.handoff-to-planning": { required: ["runId"], optional: ["requestFile", "requestStdin"], exclusive: [["requestFile", "requestStdin"]], patterns: { runId: IDS.runId }, syntax: COMMAND_SYNTAX["run handoff-to-planning"]! },
   "review.create": { required: ["runId", "revisionSha"], optional: ["formal"], patterns: { runId: IDS.runId, revisionSha: IDS.commit }, ...((COMMAND_SYNTAX["review create"]) ? { syntax: COMMAND_SYNTAX["review create"] } : {}) },
 });
 

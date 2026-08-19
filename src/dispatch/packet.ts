@@ -2,6 +2,7 @@ import type { Role } from "../constants.js";
 import { ValidationError } from "../errors.js";
 import { assertReadablePath, assertWritablePath } from "../security.js";
 import { assertRelativePosixPath, stableJson } from "../utils.js";
+import type { ExecutionContract, ExecutionRequest } from "../execution-contract.js";
 
 export interface DispatchPacket {
   objective: string;
@@ -9,6 +10,8 @@ export interface DispatchPacket {
   allowed_write_paths: string[];
   acceptance_criteria: string[];
   context: Record<string, unknown>;
+  execution_request?: ExecutionRequest;
+  execution_contract?: ExecutionContract;
 }
 
 export interface MergeWorktreeBindings {
@@ -65,6 +68,8 @@ export const dispatchPacketSchema = (role: Role, phase?: unknown, taskId?: unkno
       allowed_write_paths: { type: "array", items: { type: "string", minLength: 1 } },
       acceptance_criteria: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
       context: { type: "object", additionalProperties: true, ...(contextRequired.length ? { required: contextRequired } : {}), properties: contextProperties },
+      execution_request: { type: "object", additionalProperties: false },
+      execution_contract: { type: "object", additionalProperties: true },
     },
   };
 };
@@ -77,6 +82,7 @@ export const dispatchPacketTemplate = (role: Role, packet: DispatchPacket): Disp
     allowed_write_paths: [...packet.allowed_write_paths],
     acceptance_criteria: [...packet.acceptance_criteria],
     context: { ...packet.context, ...Object.fromEntries(required.map((key) => [key, packet.context[key] ?? ""])) },
+    ...(packet.execution_contract ? { execution_contract: structuredClone(packet.execution_contract) } : {}),
   };
 };
 
@@ -107,7 +113,7 @@ export const promptFor = (runId: string, dispatchId: string, role: Role, packet:
 export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   if (!packet || typeof packet !== "object" || Array.isArray(packet)) throw new ValidationError("dispatch packet must be an object");
   const value = packet as Record<string, unknown>;
-  const allowed = new Set(["objective", "allowed_read_paths", "allowed_write_paths", "acceptance_criteria", "context"]);
+  const allowed = new Set(["objective", "allowed_read_paths", "allowed_write_paths", "acceptance_criteria", "context", "execution_request", "execution_contract"]);
   const unknown = Object.keys(value).filter((key) => !allowed.has(key));
   if (unknown.length) throw new ValidationError("dispatch packet has unknown fields", unknown.map((key) => ({ path: `/${key}`, pointer: `/${key}`, field: key, constraint: "additionalProperties", message: "unknown field" })));
   if (typeof value.objective !== "string" || !value.objective.trim()) throw new ValidationError("dispatch packet objective must be a non-empty string", ["/objective"]);
@@ -115,6 +121,12 @@ export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
     if (!Array.isArray(value[key]) || value[key].some((item) => typeof item !== "string" || !item.trim())) throw new ValidationError(`dispatch packet ${key} must contain non-empty strings`, [`/${key}`]);
   }
   if (!(value.context && typeof value.context === "object" && !Array.isArray(value.context))) throw new ValidationError("dispatch packet context must be an object", ["/context"]);
+  for (const key of ["execution_request", "execution_contract"] as const) {
+    if (value[key] !== undefined && (!value[key] || typeof value[key] !== "object" || Array.isArray(value[key]))) {
+      throw new ValidationError(`dispatch packet ${key} must be an object`, [`/${key}`]);
+    }
+  }
+  if (value.execution_request && value.execution_contract) throw new ValidationError("dispatch packet cannot contain both execution_request and execution_contract");
   const context = value.context as Record<string, unknown>;
   const enforcedContext = context.phase === "continue_implementation" || context.phase === "prepare_implementation_worktree" ? packetContextRequirements(role, context.phase, context.task_id) : [];
   const missingContext = enforcedContext.filter((key) => typeof context[key] !== "string" || !(context[key] as string).trim());

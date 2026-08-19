@@ -17,17 +17,18 @@ import { registerProjectCommands } from "./commands/project.js";
 import { reconcilePlanningCommit, registerDecisionResearchCommands, registerPlanningCommands, registerRunCommands } from "./commands/planning-run.js";
 import { jsonOptions, registerDispatchCommands, registerStagingCommands } from "./commands/staging-dispatch.js";
 import { registerGitCommands, registerReviewCommands } from "./commands/git-review.js";
+import { InvocationResources, setInvocationResources, type ShutdownSignal } from "./resource-registry.js";
+import { EVENT_SCHEMA_VERSION } from "./state.js";
+import { EXECUTION_CONTRACT_SCHEMA_VERSION } from "./execution-contract.js";
+import { HUMAN_RENDERER_VERSION, renderHuman } from "./human-renderer.js";
+import { validateCommand } from "./command-contract.js";
 
 let humanOutput = false;
 let legacyOutput = false;
-const humanize = (value: unknown): string => {
-  if (value === null || typeof value !== "object") return String(value ?? "");
-  if (Array.isArray(value)) return value.map((item) => humanize(item)).join("\n");
-  return Object.entries(value as Record<string, unknown>).map(([key, item]) => `${key}: ${typeof item === "string" ? item : JSON.stringify(item)}`).join("\n");
-};
+let invocation: InvocationResources | undefined;
 const output = (value: unknown, options: { legacyRaw?: boolean } = {}): void => {
   if (legacyOutput && options.legacyRaw) { process.stdout.write(`${String(value)}\n`); return; }
-  if (humanOutput) { process.stdout.write(`${humanize(value)}\n`); return; }
+  if (humanOutput) { process.stdout.write(`${renderHuman(value)}\n`); return; }
   const envelope = {
     ok: true,
     data: value,
@@ -36,8 +37,13 @@ const output = (value: unknown, options: { legacyRaw?: boolean } = {}): void => 
   process.stdout.write(`${JSON.stringify(envelope, null, 2)}\n`);
 };
 const withStore = async <T>(action: (store: StateStore) => Promise<T> | T, options: { readonly?: boolean } = {}): Promise<T> => {
+  invocation?.assertRunning();
   const store = await StateStore.open(undefined, options);
-  try { return await action(store); } finally { store.close(); }
+  const unregister = invocation?.registerStore(store);
+  try { return await action(store); } finally {
+    if (invocation?.quiescing) await invocation.quiesce(); else await store.closeAsync();
+    unregister?.();
+  }
 };
 
 
@@ -211,29 +217,58 @@ export const buildProgram = (): Command => {
 
   registerEnvironmentCommands(program, output);
 
-  program.command("contract").description("Print the installed contract metadata").action(() => output({ contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST, agent_build_digest: AGENT_BUILD.digest, template_version: AGENT_BUILD.templateVersion, roles: ROLES }));
+  program.command("contract").description("Print the installed contract metadata").action(() => {
+    validateCommand("contract", {});
+    output({
+    contract_digest: CONTRACT_DIGEST,
+    role_manifest_digest: ROLE_MANIFEST_DIGEST,
+    agent_build_digest: AGENT_BUILD.digest,
+    template_version: AGENT_BUILD.templateVersion,
+    event_schema_version: EVENT_SCHEMA_VERSION,
+    execution_contract_schema_version: EXECUTION_CONTRACT_SCHEMA_VERSION,
+    human_renderer_version: HUMAN_RENDERER_VERSION,
+    roles: ROLES,
+    });
+  });
   return program;
 };
 
 export const main = async (argv = process.argv): Promise<void> => {
   humanOutput = argv.includes("--human");
   legacyOutput = argv.includes("--legacy-output");
+  invocation = new InvocationResources();
+  setInvocationResources(invocation);
+  let receivedSignal: ShutdownSignal | undefined;
+  const onSignal = (signal: ShutdownSignal): void => {
+    if (receivedSignal) { invocation?.force(); return; }
+    receivedSignal = signal;
+    process.exitCode = signal === "SIGINT" ? 130 : 143;
+    void invocation?.quiesce();
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
   try { await buildProgram().parseAsync(argv); }
   catch (error) {
     if (error instanceof AiTeamError) {
       const failure = { ok: false, error: error.message, details: error.details ?? null, code: error.code };
-      process.stderr.write(`${humanOutput ? humanize(failure) : JSON.stringify(failure)}\n`);
+      process.stderr.write(`${humanOutput ? renderHuman(failure) : JSON.stringify(failure)}\n`);
       process.exitCode = error.code; return;
     }
     const commander = error as { code?: string; exitCode?: number; message?: string };
     if (commander.code?.startsWith("commander.")) {
       if (commander.exitCode === EXIT.ok) return;
       const failure = { ok: false, error: commander.message ?? commander.code, details: null, code: EXIT.args };
-      process.stderr.write(`${humanOutput ? humanize(failure) : JSON.stringify(failure)}\n`);
+      process.stderr.write(`${humanOutput ? renderHuman(failure) : JSON.stringify(failure)}\n`);
       process.exitCode = EXIT.args; return;
     }
     const failure = { ok: false, error: error instanceof Error ? error.message : String(error), details: null, code: EXIT.internal };
-    process.stderr.write(`${humanOutput ? humanize(failure) : JSON.stringify(failure)}\n`); process.exitCode = EXIT.internal;
+    process.stderr.write(`${humanOutput ? renderHuman(failure) : JSON.stringify(failure)}\n`); process.exitCode = EXIT.internal;
+  } finally {
+    await invocation.close();
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    setInvocationResources(undefined);
+    invocation = undefined;
   }
 };
 

@@ -4,8 +4,8 @@ import { existsSync, realpathSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { Role } from "./constants.js";
 import { checkDecisionInput, checkResultEnvelope, createResultTemplate, resultSchemaForRole, type ResultEnvelope } from "./contracts.js";
-import { ValidationError, validationCause } from "./errors.js";
-import { ROLE_MANIFEST } from "./roles.js";
+import { IncompatibleError, ValidationError, validationCause } from "./errors.js";
+import { ROLE_MANIFEST, ROLE_MANIFEST_DIGEST } from "./roles.js";
 import { assertReadablePath, pathMatchesScope } from "./security.js";
 import { assertExplicitTaskWritePaths, StateStore } from "./state.js";
 import { assertRevisionRunStage } from "./planning.js";
@@ -28,6 +28,8 @@ import {
 import { buildContinueTestingPacket, buildReviewPacket as assembleReviewPacket, buildTestPacket } from "./dispatch/implementation.js";
 import { assertPlanningTransition, planningContinuationPacket, planningSubmissionIntent } from "./dispatch/planning.js";
 import { isManagedPlannedRecovery, livenessRecoveryIntent, managedCleanupPacket, reconciliationIntent, reissuePacket, retryableResultHasNoSideEffects } from "./dispatch/recovery.js";
+import { executionEnforcement, freezeExecutionContract, type ExecutionContract, type ExecutionRequest } from "./execution-contract.js";
+import { recoveryProjection, type NextAction, type TimelineEntry } from "./run-recovery.js";
 
 export interface DispatchPacket {
   objective: string;
@@ -35,6 +37,8 @@ export interface DispatchPacket {
   allowed_write_paths: string[];
   acceptance_criteria: string[];
   context: Record<string, unknown>;
+  execution_request?: ExecutionRequest;
+  execution_contract?: ExecutionContract;
 }
 
 export interface MergeWorktreeBindings {
@@ -59,6 +63,9 @@ export interface RunResumeResult {
     next_command: string | null;
     evidence_template?: Record<string, unknown>;
   } | null;
+  timeline_tail: TimelineEntry[];
+  next_actions: NextAction[];
+  next_action: NextAction | null;
 }
 
 export interface DispatchContinuation {
@@ -91,6 +98,7 @@ export interface DispatchBundle {
   packet_template: DispatchPacket;
   digests: { packet: string; prompt: string; schema: string; template: string };
   renderer_version: string;
+  execution_enforcement: Record<string, unknown>;
 }
 
 type ReplacementAction = "reissued" | "superseded" | "reconciled";
@@ -225,7 +233,7 @@ export class DispatchService {
     if (role !== actor && !definition.delegates.includes(role)) {
       throw new ValidationError(`${actor} cannot delegate to ${role}`);
     }
-    const validated = validatePacket(packet, role);
+    let validated = validatePacket(packet, role);
     if (actorRole === "coding" && role === "git-operator" && validated.context.phase === "prepare_implementation_worktree" && /^TASK-\d{3}$/.test(String(validated.context.task_id ?? ""))) {
       if (validated.context.coordinator_dispatch_id !== actorDispatchId) {
         throw new ValidationError("planned task prepare packet must preserve its Coding coordinator identity", ["/context/coordinator_dispatch_id"]);
@@ -248,6 +256,13 @@ export class DispatchService {
         ]);
       }
       validated.context.phase = "review_repair";
+    }
+    if (validated.execution_contract) {
+      const requestPacket = { ...validated };
+      delete requestPacket.execution_contract;
+      validated = freezeExecutionContract(role, requestPacket);
+    } else {
+      validated = freezeExecutionContract(role, validated);
     }
     if (role === "file-explorer") {
       const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get((this.store.getRun(runId) as { repo_id: string }).repo_id) as { project_path: string } | undefined;
@@ -325,10 +340,12 @@ export class DispatchService {
       AND json_extract(packet_json,'$.context.plan_id')=? AND json_extract(packet_json,'$.context.revision')=?`)
       .get(runId, run.plan_id, run.revision) as { dispatch_id: string } | undefined;
     if (existing) return existing.dispatch_id;
-    return this.insert(runId, "git-operator", validatePacket(packet, "git-operator"));
+    if (packet.execution_contract) throw new ValidationError("execution_contract is server-generated", ["/execution_contract"]);
+    return this.insert(runId, "git-operator", freezeExecutionContract("git-operator", validatePacket(packet, "git-operator")));
   }
 
   private insert(runId: string, role: Role, packet: DispatchPacket, replacementFor?: string): string {
+    packet = packet.execution_contract ? packet : freezeExecutionContract(role, packet);
     const dispatchId = makeId("dispatch");
     const packetJson = redact(stableJson(packet));
     const frozenPacket = JSON.parse(packetJson) as DispatchPacket;
@@ -632,7 +649,8 @@ export class DispatchService {
         schema: row.schema_digest ?? sha256(row.schema_json),
         template: row.template_digest ?? sha256(row.template_json),
       },
-      renderer_version: row.renderer_version ?? RENDERER_VERSION,
+      renderer_version: row.renderer_version ?? "dispatch-renderer-v2",
+      execution_enforcement: executionEnforcement(claimed.packet.execution_contract),
     };
   }
 
@@ -683,6 +701,18 @@ export class DispatchService {
   }
 
   reconcile(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): ReplacementResult<"reconciled"> & { resumed_finalization?: boolean } {
+    const commandId = this.store.startCommand(runId, "dispatch reconcile", { dispatchId, correlationId: dispatchId });
+    try {
+      const result = this.reconcileWithCommand(runId, dispatchId, role, actorRole, reason, commandId);
+      const terminal = this.store.db.prepare("SELECT 1 FROM run_events WHERE command_id=? AND type IN ('command.completed','command.failed','command.interrupted')").get(commandId);
+      return terminal ? result : this.store.terminalCommand(commandId, "completed", { command: "dispatch reconcile", retry_safe: true }, () => result);
+    } catch (error) {
+      this.store.terminalCommand(commandId, "failed", { command: "dispatch reconcile", cause: error instanceof Error ? error.message : String(error), retry_safe: true }, () => {});
+      throw error;
+    }
+  }
+
+  private reconcileWithCommand(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string, commandId: string): ReplacementResult<"reconciled"> & { resumed_finalization?: boolean } {
     this.assertLifecycleActor(runId, actorRole, "dispatch reconcile");
     if (!reason.trim()) throw new ValidationError("dispatch reconciliation requires a reason");
     const row = this.get(runId, dispatchId, role) as {
@@ -707,10 +737,10 @@ export class DispatchService {
     const run = this.store.getRun(runId) as { state: string };
     if (row.state === "claimed" && run.state === "completed") {
       this.verifyFinalization(runId, dispatchId, true);
-      this.store.db.transaction(() => {
+      this.store.terminalCommand(commandId, "completed", { command: "dispatch reconcile", resumed_finalization: true, retry_safe: true }, () => {
         this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
         this.store.event(runId, "dispatch.reconciled", { dispatchId, role, actor_role: actorRole, reason, verified_side_effects: true, resumed_finalization: true });
-      })();
+      });
       return { action: "reconciled", dispatch_id: dispatchId, replacement_for: dispatchId, reused: false, resumed_finalization: true };
     }
     if (row.state !== "retryable_failure") throw new ValidationError(`dispatch cannot be reconciled from ${row.state}`);
@@ -724,7 +754,7 @@ export class DispatchService {
       ]);
     }
     let replacementId = "";
-    this.store.db.transaction(() => {
+    this.store.terminalCommand(commandId, "completed", { command: "dispatch reconcile", retry_safe: true }, () => {
       this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
         .run(new Date().toISOString(), dispatchId);
       this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
@@ -738,7 +768,7 @@ export class DispatchService {
         side_effect_state: "completed",
         ...(partialEffect ? { ownership_operation_ids: partialEffect.operation_ids, merge_pending: true } : {}),
       });
-    })();
+    });
     return { action: "reconciled", dispatch_id: replacementId, replacement_for: dispatchId, reused: false };
   }
 
@@ -885,6 +915,17 @@ export class DispatchService {
         throw new ValidationError(`replacement dispatch must preserve managed worktree bindings: expected_worktree_ids=${JSON.stringify(sourceIds)}; actual_bound_ids=${JSON.stringify(replacementIds)}`);
       }
     }
+    const sourceContract = sourcePacket.execution_contract;
+    if (!sourceContract) {
+      const frozen = this.store.getRun(runId) as { role_manifest_digest?: string };
+      if (frozen.role_manifest_digest !== ROLE_MANIFEST_DIGEST) throw new IncompatibleError("legacy dispatch role manifest does not match the current role manifest", {
+        reason_code: "role_manifest_mismatch",
+        next_action: "start_new_run",
+      });
+    }
+    const requestedPacket = { ...packet };
+    delete requestedPacket.execution_contract;
+    packet = freezeExecutionContract(role, requestedPacket, sourceContract);
     const packetJson = redact(stableJson(packet));
     const existing = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
       .get(runId, dispatchId) as { dispatch_id: string; packet_json: string } | undefined;
@@ -1081,6 +1122,17 @@ export class DispatchService {
   }
 
   async submitValue(runId: string, dispatchId: string, role: Role, value: unknown, source?: string): Promise<DispatchSubmission> {
+    const commandId = this.store.startCommand(runId, "dispatch submit", { dispatchId, correlationId: dispatchId });
+    try {
+      return await this.submitValueWithCommand(runId, dispatchId, role, value, commandId, source);
+    } catch (error) {
+      const terminal = this.store.db.prepare("SELECT 1 FROM run_events WHERE command_id=? AND type IN ('command.completed','command.failed','command.interrupted')").get(commandId);
+      if (!terminal) this.store.terminalCommand(commandId, "failed", { command: "dispatch submit", cause: error instanceof Error ? error.message : String(error), retry_safe: false }, () => {});
+      throw error;
+    }
+  }
+
+  private async submitValueWithCommand(runId: string, dispatchId: string, role: Role, value: unknown, commandId: string, source?: string): Promise<DispatchSubmission> {
     const row = this.get(runId, dispatchId, role);
     const bindReviewBarrier = (result: ResultEnvelope): void => {
       if ((role !== "review-spec" && role !== "review-standards") || result.status !== "completed") return;
@@ -1097,12 +1149,12 @@ export class DispatchService {
       const artifact = this.store.db.prepare("SELECT artifact_id,path,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'")
         .get(runId, dispatchId) as { artifact_id: string; path: string; sha256: string } | undefined;
       if (!artifact) throw new ValidationError("submitted dispatch result artifact is missing");
-      return {
+      return this.store.terminalCommand(commandId, "completed", { command: "dispatch submit", reused: true, retry_safe: true }, () => ({
         reused: true,
         artifact: artifact.path,
         submission: { state: "submitted", dispatch_state: row.state, artifact_id: artifact.artifact_id, artifact: artifact.path, digest: artifact.sha256 },
         continuation: this.continuation(runId),
-      };
+      }));
     }
     if (row.state !== "claimed") throw new ValidationError("dispatch must be claimed before submit");
     const result = this.validateValue(runId, dispatchId, role, value);
@@ -1195,7 +1247,7 @@ export class DispatchService {
           .run(result.status === "needs_decision" || result.status === "retryable_failure" && result.decisions_needed.length === 1 ? "needs_decision" : result.status === "retryable_failure" ? "retryable_failure" : "failed", new Date().toISOString(), runId);
       }
     });
-    transaction();
+    this.store.terminalCommand(commandId, "completed", { command: "dispatch submit", dispatch_state: dispatchState, retry_safe: true }, () => transaction());
     return {
       reused: false,
       artifact,
@@ -2757,7 +2809,7 @@ export class DispatchService {
       if (run.profile === "coding" && run.state === "frozen" && run.stage === "test") {
         const driftRow = this.store.db.prepare("SELECT event_id,payload_json,created_at FROM run_events WHERE run_id=? AND type='scope.pre_commit_drift' ORDER BY event_id DESC LIMIT 1")
           .get(runId) as { event_id: number; payload_json: string; created_at: string } | undefined;
-        const eventsAfterDrift = driftRow ? this.store.db.prepare("SELECT type FROM run_events WHERE run_id=? AND event_id>? ORDER BY event_id")
+        const eventsAfterDrift = driftRow ? this.store.db.prepare("SELECT type FROM run_events WHERE run_id=? AND event_id>? AND type NOT LIKE 'command.%' ORDER BY event_id")
           .all(runId, driftRow.event_id) as Array<{ type: string }> : [];
         const drift = driftRow && eventsAfterDrift.every(({ type }) => type === "staging.validation_failed") ? JSON.parse(driftRow.payload_json) as {
           offending_test_dispatch_id?: string;
@@ -3006,8 +3058,12 @@ export class DispatchService {
       pending_dispatches: this.store.db.prepare("SELECT dispatch_id,role,state FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").all(runId) as RunResumeResult["pending_dispatches"],
       pending_decision: (this.store.db.prepare("SELECT * FROM decisions WHERE run_id=? AND status='pending'").get(runId) as Record<string, unknown> | undefined) ?? null,
       pending_operations: this.store.db.prepare("SELECT operation_id,kind,state FROM operations WHERE run_id=? AND state='pending'").all(runId) as RunResumeResult["pending_operations"],
-      last_event: (this.store.db.prepare("SELECT type,payload_json,created_at FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT 1").get(runId) as Record<string, unknown> | undefined) ?? null,
+      last_event: (this.store.db.prepare("SELECT type,payload_json,created_at FROM run_events WHERE run_id=? AND type NOT LIKE 'command.%' ORDER BY event_id DESC LIMIT 1").get(runId) as Record<string, unknown> | undefined) ?? null,
       recovery,
+      ...(() => {
+        const projection = recoveryProjection(this.store, runId);
+        return { timeline_tail: projection.timeline.slice(-20), next_actions: projection.next_actions, next_action: projection.next_action };
+      })(),
     };
   }
 

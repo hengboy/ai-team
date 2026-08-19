@@ -34,3 +34,12 @@ commands:
   - git status
 discovery: false
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }
+execution:
+  default:
+    cwd: project
+    tools: [filesystem.read, process.exec]
+    approval_policy: never
+  ceiling:
+    cwd: [project, worktree]
+    tools: [filesystem.read, process.exec]
+    approval_policies: [never, on_request, always]

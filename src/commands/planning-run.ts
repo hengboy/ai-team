@@ -4,6 +4,7 @@ import { checkDecisionInput, DECISION_INPUT_SCHEMA, DECISION_INPUT_TEMPLATE } fr
 import type { Role } from "../constants.js";
 import { DispatchService, type DispatchPacket } from "../dispatch.js";
 import { ValidationError } from "../errors.js";
+import { recoveryProjection } from "../run-recovery.js";
 import { commitPlanningRevision, repositoryIdentity } from "../git.js";
 import { assertRevisionCreateRunStage, assertRevisionDocuments, assertRevisionRunStage, hasTaskDocuments, nextPlanState, preflightRevision, writeRevision, type RevisionDocuments } from "../planning.js";
 import { ReviewService } from "../review.js";
@@ -411,14 +412,16 @@ export const registerRunCommands = (program: Command, dependencies: PlanningRunD
   run.command("show").argument("<run-id>").action(async (runId) => output(await withStore((store) => ({
     run: store.getRun(runId),
     review_barrier: new ReviewService(store).current(runId),
-    events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? ORDER BY event_id").all(runId),
+    events: store.db.prepare("SELECT * FROM run_events WHERE run_id=? AND type NOT LIKE 'command.%' ORDER BY event_id").all(runId),
     decisions: store.db.prepare("SELECT * FROM decisions WHERE run_id=? ORDER BY created_at").all(runId),
     dispatches: store.db.prepare("SELECT dispatch_id,role,state,claimed_at,completed_at,created_at FROM dispatches WHERE run_id=? ORDER BY created_at").all(runId),
     tasks: store.runTasks(runId),
     worktrees: store.db.prepare("SELECT worktree_id,branch,path,base_commit,state,adopted_from_run_id FROM worktrees WHERE run_id=? ORDER BY created_at,worktree_id").all(runId),
     ...new DispatchService(store).runShowProjection(runId),
+    ...recoveryProjection(store, runId),
   }), { readonly: true })));
   requestOptions(run.command("handoff-to-planning").argument("<run-id>")).action(async (runId, options) => {
+    validateCommand("run.handoff-to-planning", { runId, requestFile: options.requestFile, requestStdin: options.requestStdin });
     const request = await WorkflowService.requestFrom(options.requestFile, options.requestStdin);
     output(await withStore((store) => new WorkflowService(store).handoffToPlanning(runId, request)));
   });

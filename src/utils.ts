@@ -23,7 +23,7 @@ export const stableJson = (value: unknown): string => {
   return JSON.stringify(normalize(value));
 };
 
-export const makeId = (kind: "run" | "dispatch" | "staging"): string => `${kind}_${ulid()}`;
+export const makeId = (kind: "run" | "dispatch" | "staging" | "command"): string => `${kind}_${ulid()}`;
 
 export const makePlanId = (slug: string, now = new Date()): string => {
   const normalized = slug

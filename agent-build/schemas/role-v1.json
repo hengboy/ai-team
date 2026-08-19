@@ -4,7 +4,7 @@
   "title": "AI Team agent-build role",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "purpose", "writes", "staging", "delegates", "commands", "discovery", "enforcement"],
+  "required": ["id", "purpose", "writes", "staging", "delegates", "commands", "discovery", "enforcement", "execution"],
   "properties": {
     "id": { "$ref": "#/$defs/role" },
     "purpose": { "type": "string", "minLength": 1 },
@@ -49,6 +49,15 @@
         "read_scope": { "$ref": "#/$defs/enforcementLevel" },
         "write_scope": { "$ref": "#/$defs/enforcementLevel" }
       }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default", "ceiling"],
+      "properties": {
+        "default": { "$ref": "#/$defs/executionDefault" },
+        "ceiling": { "$ref": "#/$defs/executionCeiling" }
+      }
     }
   },
   "$defs": {
@@ -68,6 +77,29 @@
         "researcher"
       ]
     },
-    "enforcementLevel": { "enum": ["mechanical", "instruction", "unsupported"] }
+    "enforcementLevel": { "enum": ["mechanical", "instruction", "unsupported"] },
+    "tool": { "enum": ["filesystem.read", "filesystem.write", "process.exec", "git.read", "git.write", "network"] },
+    "cwd": { "enum": ["project", "worktree", "ai_team_home"] },
+    "approvalPolicy": { "enum": ["never", "on_request", "always"] },
+    "executionDefault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cwd", "tools", "approval_policy"],
+      "properties": {
+        "cwd": { "$ref": "#/$defs/cwd" },
+        "tools": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/tool" } },
+        "approval_policy": { "$ref": "#/$defs/approvalPolicy" }
+      }
+    },
+    "executionCeiling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cwd", "tools", "approval_policies"],
+      "properties": {
+        "cwd": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/cwd" } },
+        "tools": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/tool" } },
+        "approval_policies": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/approvalPolicy" } }
+      }
+    }
   }
 }

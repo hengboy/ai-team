@@ -23,8 +23,7 @@ export const registerEnvironmentCommands = (program: Command, output: Output): v
   env.command("list").action(async () => output(await new EnvironmentService().list()));
   env.command("show").argument("<name>").option("--resolved").action(async (name, options) => {
     const service = new EnvironmentService();
-    const value = await service.load(name);
-    output(options.resolved ? { environment: value, resolved: (await import("../environment.js")).resolveEnvironment(value) } : value);
+    output(options.resolved ? await service.resolved(name) : await service.load(name));
   });
   env.command("validate").argument("<name>").action(async (name) => output(await new EnvironmentService().validate(name)));
   env.command("explain").argument("<name>")

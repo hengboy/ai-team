@@ -8,11 +8,14 @@ import { checkResultEnvelope, createResultTemplate } from "../src/contracts.js";
 import { ROLES } from "../src/constants.js";
 import { COMMAND_CONTRACT_BASE, COMMAND_PARAMETER_TYPES, COMMAND_SYNTAX, commandContractFor } from "../src/command-contract.js";
 import { DispatchService, dispatchPacketSchema, dispatchPacketTemplate, type DispatchPacket } from "../src/dispatch.js";
-import { ValidationError } from "../src/errors.js";
+import { IncompatibleError, ValidationError } from "../src/errors.js";
 import { assertCoverage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, triage, validateCoverage } from "../src/planning.js";
 import { StateStore } from "../src/state.js";
 import { legacyStagingFilePath, pathMatchesScope, stagingFilePath } from "../src/security.js";
 import { makePlanId, sha256 } from "../src/utils.js";
+import { recoveryProjection } from "../src/run-recovery.js";
+import { execFileForInvocation, InvocationResources, setInvocationResources } from "../src/resource-registry.js";
+import { renderHuman } from "../src/human-renderer.js";
 
 const RUN_ID = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const DISPATCH_ID = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -169,7 +172,7 @@ test("state migration is recorded once and survives reopening", async () => {
   try {
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }],
     );
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
@@ -180,7 +183,7 @@ test("state migration is recorded once and survives reopening", async () => {
     store = await StateStore.open(home);
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }],
     );
   } finally {
     store.close();
@@ -197,7 +200,7 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
     try {
       assert.equal(
         (reader.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count,
-        13,
+        14,
       );
       assert.throws(() => reader.db.prepare("UPDATE runs SET state='failed'").run(), /readonly|read-only/i);
     } finally {
@@ -531,6 +534,11 @@ test("operations reuse an idempotency key and expose completed state", async () 
     };
     assert.equal(row.request_json, '{"version":1}');
     assert.equal(row.evidence_json, '{"files":["agents.md"],"ok":true}');
+    const lifecycle = store.db.prepare("SELECT type,operation_id FROM run_events WHERE operation_id=? ORDER BY event_id").all(first.operationId);
+    assert.deepEqual(lifecycle, [
+      { type: "command.started", operation_id: first.operationId },
+      { type: "command.completed", operation_id: first.operationId },
+    ]);
   });
 });
 
@@ -583,8 +591,12 @@ test("dispatch claim is idempotent and enforces run and role identity", async ()
     };
     const dispatchId = dispatches.create(runId, "backend-developer", packet);
 
-    assert.deepEqual(dispatches.claim(runId, dispatchId, "backend-developer"), { reused: false, packet });
-    assert.deepEqual(dispatches.claim(runId, dispatchId, "backend-developer"), { reused: true, packet });
+    const first = dispatches.claim(runId, dispatchId, "backend-developer");
+    assert.deepEqual({ ...first.packet, execution_contract: undefined }, { ...packet, execution_contract: undefined });
+    assert.equal(first.reused, false);
+    assert.equal(first.packet.execution_contract?.source.kind, "role_default");
+    assert.equal(first.packet.execution_contract?.source.role, "backend-developer");
+    assert.deepEqual(dispatches.claim(runId, dispatchId, "backend-developer"), { ...first, reused: true });
     assert.throws(
       () => dispatches.claim(runId, dispatchId, "test"),
       (error: unknown) => error instanceof ValidationError && error.message.includes("identity does not match"),
@@ -607,7 +619,9 @@ test("dispatch claim bundle returns the same frozen assets and digests idempoten
 
     const first = dispatches.claimBundle(runId, dispatchId, "backend-developer");
     assert.equal(first.reused, false);
-    assert.deepEqual(first.packet, packet);
+    assert.deepEqual({ ...first.packet, execution_contract: undefined }, { ...packet, execution_contract: undefined });
+    assert.equal(first.packet.execution_contract?.schema_version, 1);
+    assert.equal(first.execution_enforcement.contract_status, "specified");
     assert.equal(first.prompt, dispatches.prompt(runId, dispatchId, "backend-developer"));
     assert.deepEqual(first.schema, dispatches.schema(runId, dispatchId, "backend-developer"));
     assert.deepEqual(first.template, dispatches.template(runId, dispatchId, "backend-developer"));
@@ -617,6 +631,137 @@ test("dispatch claim bundle returns the same frozen assets and digests idempoten
 
     const second = dispatches.claimBundle(runId, dispatchId, "backend-developer");
     assert.deepEqual(second, { ...first, reused: true });
+  });
+});
+
+test("execution requests are server-frozen and replacements can only narrow the source contract", async () => {
+  await withStore((store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const packet: DispatchPacket = {
+      objective: "Freeze execution limits",
+      allowed_read_paths: ["src/a.ts"],
+      allowed_write_paths: ["src/a.ts"],
+      acceptance_criteria: ["Limits are frozen"],
+      context: {},
+      execution_request: { tools: ["filesystem.read", "process.exec"], approval_policy: "on_request" },
+    };
+    const dispatchId = dispatches.create(runId, "backend-developer", packet);
+    const claimed = dispatches.claim(runId, dispatchId, "backend-developer").packet;
+    assert.equal(claimed.execution_request, undefined);
+    assert.deepEqual(claimed.execution_contract?.tools, ["filesystem.read", "process.exec"]);
+    assert.equal(claimed.execution_contract?.approval_policy, "on_request");
+    assert.equal(claimed.execution_contract?.source.kind, "dispatch_request");
+
+    const replacement = dispatches.supersede(runId, dispatchId, "backend-developer", "coding", "narrow tools", {
+      ...packet,
+      execution_request: { tools: ["filesystem.read"], approval_policy: "always" },
+    });
+    const replacementPacket = dispatches.claim(runId, replacement.dispatch_id, "backend-developer").packet;
+    assert.deepEqual(replacementPacket.execution_contract?.tools, ["filesystem.read"]);
+    assert.equal(replacementPacket.execution_contract?.approval_policy, "always");
+    assert.equal(replacementPacket.execution_contract?.source.kind, "source_contract");
+
+    assert.throws(() => dispatches.create(runId, "backend-developer", {
+      ...packet,
+      execution_request: { tools: ["network"] },
+    }), /tool ceiling/);
+    assert.throws(() => dispatches.create(runId, "git-operator", {
+      ...packet,
+      allowed_write_paths: [],
+      execution_request: { tools: ["filesystem.read", "filesystem.write", "process.exec", "git.read", "git.write"] },
+    }, "coding"), /non-empty allowed_write_paths/);
+  });
+});
+
+test("legacy claim bundles remain byte-preserving and manifest mismatch blocks replacement", async () => {
+  await withStore((store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const packet: DispatchPacket = {
+      objective: "Legacy packet",
+      allowed_read_paths: ["src/a.ts"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Remain unchanged"],
+      context: {},
+    };
+    const dispatchId = dispatches.create(runId, "backend-developer", packet);
+    store.db.prepare("UPDATE dispatches SET packet_json=?,packet_digest=NULL,prompt_digest=NULL,renderer_version=NULL WHERE dispatch_id=?")
+      .run(JSON.stringify(packet), dispatchId);
+    const bundle = dispatches.claimBundle(runId, dispatchId, "backend-developer");
+    assert.deepEqual(bundle.packet, packet);
+    assert.equal(bundle.renderer_version, "dispatch-renderer-v2");
+    assert.equal(bundle.execution_enforcement.contract_status, "legacy_unspecified");
+
+    store.db.prepare("UPDATE runs SET role_manifest_digest='legacy' WHERE run_id=?").run(runId);
+    assert.throws(
+      () => dispatches.supersede(runId, dispatchId, "backend-developer", "coding", "replace legacy", packet),
+      (error: unknown) => error instanceof IncompatibleError && error.code === 4
+        && (error.details as { reason_code?: string }).reason_code === "role_manifest_mismatch",
+    );
+  });
+});
+
+test("command lifecycle is terminal once and recovery actions are stable and blocked by priority", async () => {
+  await withStore((store) => {
+    const runId = createRun(store);
+    const commandId = store.startCommand(runId, "git cleanup");
+    store.terminalCommand(commandId, "interrupted", { command: `ai-team run resume ${runId}`, retry_safe: true }, () => {});
+    assert.throws(() => store.terminalCommand(commandId, "completed", {}, () => {}), /already terminal/);
+    const operation = store.beginOperation("git.cleanup", "timeline-operation", {}, runId);
+    assert.equal(operation.state, "pending");
+    store.createDecision(runId, "Choose", [
+      { id: "continue", label: "Continue", impact: "Resume work" },
+      { id: "stop", label: "Stop", impact: "Leave the run blocked" },
+    ]);
+    new DispatchService(store).create(runId, "backend-developer", {
+      objective: "Pending work",
+      allowed_read_paths: ["src/a.ts"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Complete"],
+      context: {},
+    });
+
+    const projection = recoveryProjection(store, runId);
+    assert.deepEqual(projection.next_actions.map(({ priority }) => priority), [10, 20, 40, 50]);
+    assert.equal(projection.next_action?.priority, 10);
+    assert.deepEqual(projection.next_actions[1]?.blocked_by, [projection.next_actions[0]?.id]);
+    assert.equal(projection.next_actions[0]?.command, null);
+    assert.ok(projection.timeline.some(({ type }) => type === "command.interrupted"));
+    assert.ok(projection.timeline.some(({ source, type }) => source === "authoritative_row" && type === "operation.current"));
+  });
+});
+
+test("invocation resources quiesce once and human fallback renders nested values without object coercion", async () => {
+  const resources = new InvocationResources(50);
+  let finalized = 0;
+  resources.registerFinalizer(async () => { finalized += 1; });
+  await Promise.all([resources.close(), resources.close()]);
+  assert.equal(resources.signal.aborted, true);
+  assert.equal(finalized, 1);
+  assert.throws(() => resources.registerFinalizer(async () => {}), /shutting down/);
+  const rendered = renderHuman({ empty: [], nested: { value: 1 } });
+  assert.match(rendered, /Empty:\n {2}None/);
+  assert.match(rendered, /Nested:\n {2}Value: 1/);
+  assert.doesNotMatch(rendered, /\[object Object\]/);
+});
+
+test("invocation quiesce aborts registered child processes and interrupts pending operation commands", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const resources = new InvocationResources(500);
+    setInvocationResources(resources);
+    try {
+      const operation = store.beginOperation("git.cleanup", "interrupt-operation", {}, runId);
+      const child = execFileForInvocation(process.execPath, ["-e", "setTimeout(() => {}, 10000)"]);
+      const shutdown = resources.quiesce();
+      await assert.rejects(child);
+      await shutdown;
+      const lifecycle = store.db.prepare("SELECT type FROM run_events WHERE operation_id=? ORDER BY event_id").all(operation.operationId);
+      assert.deepEqual(lifecycle, [{ type: "command.started" }, { type: "command.interrupted" }]);
+    } finally {
+      setInvocationResources(undefined);
+    }
   });
 });
 

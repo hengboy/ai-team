@@ -53,6 +53,7 @@ export const registerProjectCommands = (program: Command, dependencies: ProjectD
     output(await validateProjectContext(options.project));
   });
   program.command("status").option("--project <path>", "project path", process.cwd()).action(async ({ project }) => {
+    validateCommand("status", { project });
     const repo = await repositoryIdentity(project);
     output({ repository: repo, worktree: await worktreeStatus(repo.root), contract_digest: CONTRACT_DIGEST, role_manifest_digest: ROLE_MANIFEST_DIGEST });
   });

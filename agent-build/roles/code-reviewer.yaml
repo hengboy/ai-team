@@ -6,3 +6,12 @@ delegates: [review-spec, review-standards]
 commands: [dispatch create, dispatch claim, dispatch prompt, dispatch schema, dispatch template, dispatch validate, dispatch submit, review submit, review resolve, staging create, staging write, staging show]
 discovery: false
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }
+execution:
+  default:
+    cwd: worktree
+    tools: [filesystem.read, process.exec, git.read]
+    approval_policy: never
+  ceiling:
+    cwd: [worktree]
+    tools: [filesystem.read, process.exec, git.read]
+    approval_policies: [never, on_request, always]

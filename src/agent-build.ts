@@ -9,8 +9,15 @@ import { sha256 } from "./utils.js";
 
 export type AgentBuildPlatform = "codex" | "claude" | "opencode";
 export type Enforcement = "mechanical" | "instruction" | "unsupported";
+export type ExecutionTool = "filesystem.read" | "filesystem.write" | "process.exec" | "git.read" | "git.write" | "network";
+export type ExecutionCwdKind = "project" | "worktree" | "ai_team_home";
+export type ApprovalPolicy = "never" | "on_request" | "always";
+export interface RoleExecutionPolicy {
+  default: { cwd: ExecutionCwdKind; tools: ExecutionTool[]; approval_policy: ApprovalPolicy };
+  ceiling: { cwd: ExecutionCwdKind[]; tools: ExecutionTool[]; approval_policies: ApprovalPolicy[] };
+}
 export interface AgentBuildManifest { schema_version: number; template_version: number; roles: string[]; platforms: AgentBuildPlatform[]; instructions: string; role_directory: string; environment_directory: string; template_directory: string; }
-export interface AgentBuildRole { id: Role; purpose: string; writes: string[]; staging: { owned_entries: StagingKind[] }; delegates: Role[]; commands: string[]; discovery: boolean; enforcement: Record<string, Enforcement>; body: string; }
+export interface AgentBuildRole { id: Role; purpose: string; writes: string[]; staging: { owned_entries: StagingKind[] }; delegates: Role[]; commands: string[]; discovery: boolean; enforcement: Record<string, Enforcement>; execution: RoleExecutionPolicy; body: string; }
 export interface EnvironmentFile { name: string; platforms: AgentBuildPlatform[]; defaults: Record<string, Record<string, unknown>>; overrides?: Record<string, Record<string, Record<string, unknown>>>; }
 export interface AgentBuild { root: string; manifest: AgentBuildManifest; roles: Record<Role, AgentBuildRole>; environments: Record<string, EnvironmentFile>; templates: Record<string, string>; instructions: string; digest: string; templateVersion: number; }
 export interface RenderContext { role: Role; purpose: string; allowed_commands: string; delegates: string; discovery: string; stop_conditions: string; platform: AgentBuildPlatform; environment: string; contract_digest: string; role_manifest_digest: string; template_version: number; spec_template: string; plan_template: string; task_template: string; }
@@ -140,7 +147,7 @@ function parseAndValidate(root: string): AgentBuild {
     const yamlPath = join(manifest.role_directory, `${role}.yaml`); const mdPath = join(manifest.role_directory, `${role}.md`);
     const value = YAML.parse(readText(root, yamlPath)) as AgentBuildRole;
     assertSchema(validators.role, value, yamlPath);
-    if (!value || value.id !== role || typeof value.purpose !== "string" || !Array.isArray(value.writes) || !Array.isArray(value.staging?.owned_entries) || !Array.isArray(value.delegates) || !Array.isArray(value.commands) || typeof value.discovery !== "boolean" || !value.enforcement) fail(`invalid role configuration: ${role}`);
+    if (!value || value.id !== role || typeof value.purpose !== "string" || !Array.isArray(value.writes) || !Array.isArray(value.staging?.owned_entries) || !Array.isArray(value.delegates) || !Array.isArray(value.commands) || typeof value.discovery !== "boolean" || !value.enforcement || !value.execution) fail(`invalid role configuration: ${role}`);
     if (value.staging.owned_entries.some((item) => !STAGING_KINDS.includes(item))) fail(`unknown staging kind in role: ${role}`);
     if (value.delegates.some((item) => !ROLES.includes(item as Role))) fail(`unknown delegate in role: ${role}`);
     if (value.commands.some((item) => typeof item !== "string" || !item.trim() || !supportedCommandPrefixes.some((prefix) => item === prefix || item.startsWith(prefix)))) fail(`unknown command in role: ${role}`);

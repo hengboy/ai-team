@@ -1,8 +1,6 @@
-import { execFile } from "node:child_process";
 import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
 import semver from "semver";
 import lockfile from "proper-lockfile";
 import YAML from "yaml";
@@ -17,8 +15,7 @@ import { ROLES, STAGING_DEFAULT_RETENTION_HOURS, type Role } from "./constants.j
 import { sha256, stableJson } from "./utils.js";
 import { commandContractFor, recommendedCommandSyntaxFor } from "./command-contract.js";
 import { assertReadablePath, assertWritablePath } from "./security.js";
-
-const execFileAsync = promisify(execFile);
+import { execFileForInvocation } from "./resource-registry.js";
 export type Platform = "codex" | "claude" | "opencode";
 export const PLATFORMS: Platform[] = ["codex", "claude", "opencode"];
 const REASONING = ["low", "medium", "high", "xhigh"] as const;
@@ -382,6 +379,23 @@ interface EnvironmentManifest { environment: string; agent_build_digest?: string
 export interface GenerationPlan { writes: Array<{ path: string; content: string; kind: "agent" | "instructions" }>; backups: Array<{ source: string; destination: string }>; removals: string[]; blocked: string[]; }
 interface EnvironmentConfig { state_schema_epoch: number; active_environment: string; enabled_platforms: Platform[]; client_versions: Record<Platform, { command: string; minimum: string; verified: string; detected_version?: string }>; staging: { retention_hours: number }; }
 
+export interface ResolvedEnvironment {
+  environment: EnvironmentFile;
+  resolved: Record<Role, Record<Platform, ModelConfig>>;
+  effective_config: {
+    active_environment: string;
+    selected_environment: string;
+    is_active: boolean;
+    enabled_platforms: Platform[];
+    platform_status: Record<Platform, "enabled" | "disabled_by_config" | "not_selected">;
+    client_versions: EnvironmentConfig["client_versions"];
+    staging: EnvironmentConfig["staging"];
+    state_schema_epoch: number;
+  };
+  provenance: Record<Role, Partial<Record<Platform, EnvironmentSource>>>;
+  digests: { contract: string; role_manifest: string; agent_build: string };
+}
+
 export class EnvironmentService {
   readonly paths;
   constructor(readonly aiTeamHome?: string, readonly userHome = homedir()) { this.paths = getHomePaths(aiTeamHome); }
@@ -428,6 +442,35 @@ export class EnvironmentService {
   }
 
   async active(): Promise<string> { return (await this.config()).active_environment; }
+
+  async resolved(name: string): Promise<ResolvedEnvironment> {
+    const [environment, config] = await Promise.all([this.load(name), this.config()]);
+    const resolved = resolveEnvironment(environment);
+    const file = join(this.paths.environments, `${name}.yaml`);
+    const provenance = {} as Record<Role, Partial<Record<Platform, EnvironmentSource>>>;
+    for (const role of ROLES) {
+      provenance[role] = {};
+      for (const platform of environment.platforms) provenance[role][platform] = explainEnvironment(environment, file, role, platform).source;
+    }
+    return {
+      environment,
+      resolved,
+      effective_config: {
+        active_environment: config.active_environment,
+        selected_environment: name,
+        is_active: config.active_environment === name,
+        enabled_platforms: environment.platforms.filter((platform) => config.enabled_platforms.includes(platform)),
+        platform_status: Object.fromEntries(PLATFORMS.map((platform) => [platform,
+          !environment.platforms.includes(platform) ? "not_selected" : config.enabled_platforms.includes(platform) ? "enabled" : "disabled_by_config",
+        ])) as ResolvedEnvironment["effective_config"]["platform_status"],
+        client_versions: structuredClone(config.client_versions),
+        staging: { ...config.staging },
+        state_schema_epoch: config.state_schema_epoch,
+      },
+      provenance,
+      digests: { contract: CONTRACT_DIGEST, role_manifest: ROLE_MANIFEST_DIGEST, agent_build: AGENT_BUILD.digest },
+    };
+  }
 
   async validate(name: string): Promise<{ name: string; roles: number; platforms: number; digest: string }> {
     const environment = await this.load(name);
@@ -681,7 +724,7 @@ export class EnvironmentService {
     const results = await Promise.all(PLATFORMS.filter((platform) => config.enabled_platforms.includes(platform)).map(async (platform) => {
       if (!probe) return { platform, status: "not-probed" };
       try {
-        const { stdout } = await execFileAsync(CLIENT_VERSIONS[platform].command, ["--version"]);
+        const { stdout } = await execFileForInvocation(CLIENT_VERSIONS[platform].command, ["--version"]);
         const version = stdout.match(/\d+\.\d+\.\d+/)?.[0];
         if (!version) return { platform, status: "unknown-version" };
         if (semver.lt(version, CLIENT_VERSIONS[platform].minimum)) return { platform, status: "blocked", version };

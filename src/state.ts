@@ -16,11 +16,28 @@ import {
 } from "./constants.js";
 import { ensureManagedDirectory } from "./security.js";
 import { migrateStagingFiles, StagingStore, type StagingBinding, type StagingCleanupSelector, type StagingEntry } from "./staging.js";
+import { registerInvocationFinalizer } from "./resource-registry.js";
 
 export type { StagingBinding, StagingCleanupSelector, StagingEntry } from "./staging.js";
 
 /** Increment when persisted state contracts change incompatibly. */
 export const STATE_SCHEMA_EPOCH = 2;
+export const EVENT_SCHEMA_VERSION = 1;
+
+const operationCommand = (kind: string): string => ({
+  "git.worktree.replace": "git prepare",
+  "git.worktree.create": "git prepare",
+  "git.integration.create": "git prepare",
+  "git.worktree.adopt": "git adopt",
+  "git.worktree.transfer": "git transfer",
+  "git.commit": "git commit",
+  "git.merge.task": "git merge-task",
+  "git.sync": "git integrate",
+  "git.merge.continue": "git continue-conflict",
+  "git.integrate": "git integrate",
+  "git.cleanup": "git cleanup",
+  "planning.revision.commit": "planning revision commit",
+}[kind] ?? kind);
 
 export const assertExplicitTaskWritePaths = (paths: string[], sourcePath: string): string[] => {
   const normalized = [...new Set(paths)].sort();
@@ -347,13 +364,37 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "014-command-lifecycle",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      const columns = new Set((db.prepare("PRAGMA table_info(run_events)").all() as Array<{ name: string }>).map(({ name }) => name));
+      for (const [name, type] of [
+        ["command_id", "TEXT"], ["correlation_id", "TEXT"], ["dispatch_id", "TEXT"], ["operation_id", "TEXT"],
+      ] as const) if (!columns.has(name)) db.exec(`ALTER TABLE run_events ADD COLUMN ${name} ${type};`);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS run_events_command ON run_events(run_id,command_id,event_id);
+        CREATE INDEX IF NOT EXISTS run_events_correlation ON run_events(run_id,correlation_id,event_id);
+        CREATE INDEX IF NOT EXISTS run_events_dispatch ON run_events(run_id,dispatch_id,event_id);
+        CREATE INDEX IF NOT EXISTS run_events_operation ON run_events(run_id,operation_id,event_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS one_command_started ON run_events(run_id,command_id)
+          WHERE command_id IS NOT NULL AND type='command.started';
+        CREATE UNIQUE INDEX IF NOT EXISTS one_command_terminal ON run_events(run_id,command_id)
+          WHERE command_id IS NOT NULL AND type IN ('command.completed','command.failed','command.interrupted');
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
   readonly paths: HomePaths;
   readonly db: Database.Database;
 
-  private constructor(paths: HomePaths, db: Database.Database, private readonly releaseLock: () => void) {
+  private closed = false;
+  private closePromise?: Promise<void>;
+  private readonly commandFinalizers = new Map<string, () => void>();
+
+  private constructor(paths: HomePaths, db: Database.Database, private readonly releaseLock: () => void | Promise<void>) {
     this.paths = paths;
     this.db = db;
   }
@@ -474,7 +515,27 @@ export class StateStore {
     return new StateStore(paths, db, releaseLock);
   }
 
-  close(): void { this.db.close(); this.releaseLock(); }
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const unregister of this.commandFinalizers.values()) unregister();
+    this.commandFinalizers.clear();
+    this.db.close();
+    void this.releaseLock();
+  }
+
+  closeAsync(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = (async () => {
+      if (this.closed) return;
+      this.closed = true;
+      for (const unregister of this.commandFinalizers.values()) unregister();
+      this.commandFinalizers.clear();
+      this.db.close();
+      await this.releaseLock();
+    })();
+    return this.closePromise;
+  }
 
   registerRepository(repoId: string, commonDir: string, projectPath: string): void {
     this.db.prepare(`INSERT INTO repositories(repo_id, common_dir, project_path, created_at) VALUES (?, ?, ?, ?)
@@ -616,21 +677,89 @@ export class StateStore {
     this.db.prepare("INSERT INTO run_events(run_id,type,payload_json,created_at) VALUES (?,?,?,?)").run(runId, type, serialized, new Date().toISOString());
   }
 
+  startCommand(runId: string, command: string, references: {
+    correlationId?: string;
+    dispatchId?: string;
+    operationId?: string;
+  } = {}): string {
+    const commandId = makeId("command");
+    const payload = redact(stableJson({ command, schema_version: EVENT_SCHEMA_VERSION }));
+    this.db.prepare(`INSERT INTO run_events(run_id,type,payload_json,created_at,command_id,correlation_id,dispatch_id,operation_id)
+      VALUES (?,'command.started',?,?,?,?,?,?)`).run(
+      runId, payload, new Date().toISOString(), commandId, references.correlationId ?? null,
+      references.dispatchId ?? null, references.operationId ?? null,
+    );
+    return commandId;
+  }
+
+  terminalCommand<T>(commandId: string, outcome: "completed" | "failed" | "interrupted", payload: unknown, commit: () => T): T {
+    return this.db.transaction(() => {
+      const started = this.db.prepare(`SELECT run_id,correlation_id,dispatch_id,operation_id FROM run_events
+        WHERE command_id=? AND type='command.started'`).get(commandId) as {
+        run_id: string;
+        correlation_id?: string;
+        dispatch_id?: string;
+        operation_id?: string;
+      } | undefined;
+      if (!started) throw new ValidationError(`unknown command lifecycle: ${commandId}`);
+      const existing = this.db.prepare(`SELECT type FROM run_events WHERE command_id=?
+        AND type IN ('command.completed','command.failed','command.interrupted')`).get(commandId) as { type: string } | undefined;
+      if (existing) throw new ValidationError(`command lifecycle is already terminal: ${commandId}`);
+      const result = commit();
+      const serialized = redact(stableJson({ ...((payload && typeof payload === "object" && !Array.isArray(payload)) ? payload as Record<string, unknown> : { value: payload }), schema_version: EVENT_SCHEMA_VERSION }));
+      if (serialized.length > 128 * 1024) throw new ValidationError("event payload exceeds the 128 KiB limit");
+      this.db.prepare(`INSERT INTO run_events(run_id,type,payload_json,created_at,command_id,correlation_id,dispatch_id,operation_id)
+        VALUES (?,?,?,?,?,?,?,?)`).run(
+        started.run_id, `command.${outcome}`, serialized, new Date().toISOString(), commandId,
+        started.correlation_id ?? null, started.dispatch_id ?? null, started.operation_id ?? null,
+      );
+      return result;
+    })();
+  }
+
   beginOperation(kind: string, key: string, request: unknown, runId?: string): { operationId: string; reused: boolean; state: string } {
     const existing = this.db.prepare("SELECT operation_id,state FROM operations WHERE idempotency_key=?").get(key) as { operation_id: string; state: string } | undefined;
     if (existing) return { operationId: existing.operation_id, reused: true, state: existing.state };
     const operationId = `op_${sha256(key).slice(0, 26)}`;
     const serialized = redact(stableJson(request));
     if (serialized.length > 128 * 1024) throw new ValidationError("operation request exceeds the 128 KiB limit");
-    this.db.prepare("INSERT INTO operations(operation_id,run_id,idempotency_key,kind,state,request_json,created_at) VALUES (?,?,?,?, 'pending', ?,?)")
-      .run(operationId, runId ?? null, key, kind, serialized, new Date().toISOString());
+    let commandId: string | undefined;
+    this.db.transaction(() => {
+      this.db.prepare("INSERT INTO operations(operation_id,run_id,idempotency_key,kind,state,request_json,created_at) VALUES (?,?,?,?, 'pending', ?,?)")
+        .run(operationId, runId ?? null, key, kind, serialized, new Date().toISOString());
+      if (runId) {
+        const value = request && typeof request === "object" && !Array.isArray(request) ? request as Record<string, unknown> : {};
+        commandId = this.startCommand(runId, operationCommand(kind), {
+          operationId,
+          ...(typeof value.dispatch_id === "string" ? { dispatchId: value.dispatch_id } : {}),
+          correlationId: operationId,
+        });
+      }
+    })();
+    if (commandId) {
+      const id = commandId;
+      const unregister = registerInvocationFinalizer(async () => {
+        if (this.closed) return;
+        const terminal = this.db.prepare("SELECT 1 FROM run_events WHERE command_id=? AND type IN ('command.completed','command.failed','command.interrupted')").get(id);
+        if (!terminal) this.terminalCommand(id, "interrupted", { command: operationCommand(kind), retry_safe: false }, () => {});
+        this.commandFinalizers.delete(id);
+      });
+      this.commandFinalizers.set(id, unregister);
+    }
     return { operationId, reused: false, state: "pending" };
   }
 
   finishOperation(operationId: string, evidence: unknown): void {
     const serialized = redact(stableJson(evidence));
     if (serialized.length > 128 * 1024) throw new ValidationError("operation evidence exceeds the 128 KiB limit");
-    this.db.prepare("UPDATE operations SET state='completed',evidence_json=?,completed_at=? WHERE operation_id=?").run(serialized, new Date().toISOString(), operationId);
+    const command = this.openCommandForOperation(operationId);
+    const finish = (): void => {
+      this.db.prepare("UPDATE operations SET state='completed',evidence_json=?,completed_at=? WHERE operation_id=?").run(serialized, new Date().toISOString(), operationId);
+    };
+    if (command) this.terminalCommand(command.command_id, "completed", { command: command.command, retry_safe: true }, finish);
+    else finish();
+    this.commandFinalizers.get(command?.command_id ?? "")?.();
+    if (command) this.commandFinalizers.delete(command.command_id);
   }
 
   recordPendingOperationEvidence(operationId: string, evidence: unknown): void {
@@ -648,12 +777,29 @@ export class StateStore {
     const serialized = redact(stableJson(normalized));
     if (serialized.length > 128 * 1024) throw new ValidationError("reconciliation evidence exceeds the 128 KiB limit");
     const targetState = state === "completed" ? "completed" : "failed";
-    const updated = this.db.prepare("UPDATE operations SET state=?,evidence_json=?,completed_at=? WHERE operation_id=? AND state='pending'")
-      .run(targetState, serialized, new Date().toISOString(), operationId);
+    let updated!: { changes: number };
+    const reconcile = (): void => {
+      updated = this.db.prepare("UPDATE operations SET state=?,evidence_json=?,completed_at=? WHERE operation_id=? AND state='pending'")
+        .run(targetState, serialized, new Date().toISOString(), operationId);
+    };
+    const command = this.openCommandForOperation(operationId);
+    if (command) this.terminalCommand(command.command_id, state === "completed" ? "completed" : "failed", { command: command.command, reconciled: true, retry_safe: true }, reconcile);
+    else reconcile();
+    this.commandFinalizers.get(command?.command_id ?? "")?.();
+    if (command) this.commandFinalizers.delete(command.command_id);
     if (updated.changes !== 1) {
       const existing = this.db.prepare("SELECT state FROM operations WHERE operation_id=?").get(operationId) as { state: string } | undefined;
       if (existing?.state !== targetState) throw new ValidationError("operation is unknown or cannot be reconciled from its current state");
     }
+  }
+
+  private openCommandForOperation(operationId: string): { command_id: string; command: string } | undefined {
+    const row = this.db.prepare(`SELECT command_id,payload_json FROM run_events started WHERE operation_id=? AND type='command.started'
+      AND NOT EXISTS (SELECT 1 FROM run_events terminal WHERE terminal.command_id=started.command_id
+        AND terminal.type IN ('command.completed','command.failed','command.interrupted')) ORDER BY event_id DESC LIMIT 1`).get(operationId) as { command_id: string; payload_json: string } | undefined;
+    if (!row) return undefined;
+    const payload = JSON.parse(row.payload_json) as { command?: string };
+    return { command_id: row.command_id, command: payload.command ?? "operation reconcile" };
   }
 
   createDecision(runId: string, question: string, choices: Array<{ id: string; label: string; impact: string }>, recommendation?: string, type = "workflow", dispatchId?: string): string {

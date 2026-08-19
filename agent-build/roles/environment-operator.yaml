@@ -19,3 +19,12 @@ commands:
   - uninstall
 discovery: false
 enforcement: { command_scope: mechanical, read_scope: instruction, write_scope: instruction }
+execution:
+  default:
+    cwd: ai_team_home
+    tools: [filesystem.read, filesystem.write, process.exec]
+    approval_policy: on_request
+  ceiling:
+    cwd: [ai_team_home]
+    tools: [filesystem.read, filesystem.write, process.exec]
+    approval_policies: [on_request, always]

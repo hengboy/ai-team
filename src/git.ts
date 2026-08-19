@@ -1,10 +1,7 @@
-import { execFile } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
-import { promisify } from "node:util";
 import { GitGateError } from "./errors.js";
 import { sha256 } from "./utils.js";
-
-const execFileAsync = promisify(execFile);
+import { execFileForInvocation } from "./resource-registry.js";
 
 /** Commands used by the orchestrator. Keep this allowlist intentionally small:
  * callers cannot turn the low-level wrapper into an arbitrary git shell. */
@@ -35,7 +32,7 @@ export const git = async (cwd: string, args: readonly string[]): Promise<GitResu
     throw new GitGateError(`forbidden Git operation: ${args.join(" ")}`);
   }
   try {
-    const result = await execFileAsync("git", [...args], { cwd, maxBuffer: 10 * 1024 * 1024 });
+    const result = await execFileForInvocation("git", args, { cwd, maxBuffer: 10 * 1024 * 1024 });
     return { stdout: result.stdout.replace(/[\r\n]+$/, ""), stderr: result.stderr.replace(/[\r\n]+$/, "") };
   } catch (error) {
     const detail = error as { stderr?: string; message?: string };

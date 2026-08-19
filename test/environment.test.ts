@@ -64,6 +64,30 @@ test("resolveEnvironment applies platform defaults and role overrides", () => {
   assert.equal(Object.keys(resolved).length, ROLES.length);
 });
 
+test("resolved environments expose provenance and disabled platforms without probing clients", async (t) => {
+  const { aiTeamHome, userHome } = await makeHomes(t);
+  const service = new EnvironmentService(aiTeamHome, userHome);
+  await service.bootstrap();
+  const configPath = join(service.paths.root, "config.yaml");
+  const config = YAML.parse(await readFile(configPath, "utf8"));
+  config.enabled_platforms = ["codex"];
+  await writeFile(configPath, YAML.stringify(config));
+  const before = await readFile(configPath, "utf8");
+
+  const value = await service.resolved("quality");
+
+  assert.equal(value.effective_config.active_environment, "balanced");
+  assert.equal(value.effective_config.selected_environment, "quality");
+  assert.equal(value.effective_config.is_active, false);
+  assert.deepEqual(value.effective_config.enabled_platforms, ["codex"]);
+  assert.equal(value.effective_config.platform_status.claude, "disabled_by_config");
+  assert.ok(value.resolved.planning.claude);
+  assert.equal(value.provenance.planning.codex?.kind, "override");
+  assert.equal(value.provenance.planning.codex?.pointer, "/overrides/planning/codex");
+  assert.match(value.digests.contract, /^[a-f0-9]{64}$/);
+  assert.equal(await readFile(configPath, "utf8"), before);
+});
+
 test("environment overrides configure each role independently", () => {
   const environment = balancedEnvironment();
   environment.overrides = {

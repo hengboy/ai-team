@@ -37,6 +37,11 @@
 - structured validation cause
 - dispatch worktree binding
 - packet worktree binding
+- execution contract
+- command lifecycle
+- recovery timeline
+- next action
+- human renderer
 
 ### 仓库约束
 - 要求 Node.js >=22.13.0，并必须通过 npm 验证脚本。
@@ -71,6 +76,11 @@
 - src/worktree-ownership.ts resolves persisted worktree ownership consumption
 - src/dispatch.ts persists and preserves merge binding lineage for create, supersede, reissue, and reconcile
 - src/git-orchestrator.ts validates merge-task against persisted dispatch bindings
+- `src/execution-contract.ts` 从角色 YAML default/ceiling 冻结 dispatch execution contract，并校验 replacement 只能收紧。
+- `src/run-recovery.ts` 将 command/domain events 与权威当前行投影为 timeline，并稳定计算 next actions 和 blocked_by。
+- `src/resource-registry.ts` 管理 invocation-scoped AbortSignal、store、finalizer 与已注册子进程；`StateStore.closeAsync()` 等待数据库锁释放。
+- `src/human-renderer.ts` 负责受支持命令的生产级 human 输出和无单行嵌套 JSON 的递归 fallback。
+- `src/environment.ts` 在不探测客户端的前提下组合 resolved environment、effective config、provenance 与 digests。
 
 ### 模块边界
 - `src/git-orchestrator.ts` 与 `src/git.ts` 负责 planned revision-scoped plan/task worktree、direct run-scoped integration/task 编排、精确 plan ownership 接受、已有直接子提交 TASK adoption、planned pre_commit worktree scope 与 no-ff merge，并将相关身份写入操作证据。
@@ -86,4 +96,7 @@
 - `src/contracts.ts` 让公开 result schema 与运行时 validator 复用 typed decision shape，并定义无 revision/worktree/Git 副作用的 planning `no_change` payload。
 - `run show` 仅公开协调所需的 run-owned worktree 元数据，不公开其他角色的原始 result 或 staging 内容；submit continuation 只投影 run state/stage、pending dispatches 与 pending decision。
 - dispatch-worktree binding rows are the durable authority for merge-task authorization; packet context remains frozen compatibility evidence
+- `run_events` 的 command lifecycle 仅用于审计和恢复投影；runs、dispatches、decisions、operations 仍是权威状态，副作用幂等仅由 `operations.idempotency_key` 决定。
+- `run show.events` 与 `run resume.last_event` 排除 `command.%` 以保持旧 domain event 语义；timeline 中 authoritative row 明确标记为当前投影。
+- role YAML execution policy 是 default/ceiling 的事实源；legacy dispatch packet 与 digest 不回写，manifest 不匹配的 replacement 必须启动新 run。
 <!-- ai-team:project-context:end -->
