@@ -24,6 +24,7 @@ export type { StagingBinding, StagingCleanupSelector, StagingEntry } from "./sta
 /** Increment when persisted state contracts change incompatibly. */
 export const STATE_SCHEMA_EPOCH = 2;
 export const EVENT_SCHEMA_VERSION = 1;
+const STATE_BACKUP_RETENTION_COUNT = 10;
 
 const operationCommand = (kind: string): string => ({
   "git.worktree.replace": "git prepare",
@@ -476,6 +477,21 @@ export class StateStore {
     for (const suffix of ["", "-wal", "-shm", "-journal"]) await rm(`${database}${suffix}`, { force: true });
   }
 
+  private static async pruneDatabaseBackups(paths: HomePaths): Promise<void> {
+    const backups = (await readdir(paths.backups))
+      .map((name) => {
+        const match = /^state-(\d+)\.sqlite$/.exec(name);
+        return match ? { name, timestamp: Number(match[1]) } : undefined;
+      })
+      .filter((backup): backup is { name: string; timestamp: number } => backup !== undefined)
+      .sort((left, right) => right.timestamp - left.timestamp);
+    await Promise.all(backups.slice(STATE_BACKUP_RETENTION_COUNT).flatMap(({ name }) => [
+      rm(join(paths.backups, name), { force: true }),
+      rm(join(paths.backups, `${name}-config.yaml`), { force: true }),
+      rm(join(paths.backups, `${name}-manifest.json`), { force: true }),
+    ]));
+  }
+
   private static async requiresEpochReset(database: string, root: string): Promise<boolean> {
     let db: Database.Database | undefined;
     try {
@@ -564,6 +580,8 @@ export class StateStore {
       releaseLock();
       throw error;
     }
+    try { await StateStore.pruneDatabaseBackups(paths); }
+    catch { /* Retention cleanup is retried on the next writable open. */ }
     return new StateStore(paths, db, releaseLock);
   }
 

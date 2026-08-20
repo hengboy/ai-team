@@ -270,6 +270,36 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
   }
 });
 
+test("writer state opens retain only the ten most recent database backups", async () => {
+  const home = await temporaryHome();
+  const initial = await StateStore.open(home);
+  initial.close();
+  try {
+    const backups = join(home, "backups");
+    for (let timestamp = 1; timestamp <= 12; timestamp += 1) {
+      const snapshot = join(backups, `state-${timestamp}.sqlite`);
+      await writeFile(snapshot, "snapshot");
+      await writeFile(`${snapshot}-config.yaml`, "config");
+      await writeFile(`${snapshot}-manifest.json`, "manifest");
+    }
+    await writeFile(join(backups, "manual-preserved"), "manual backup");
+
+    const writer = await StateStore.open(home);
+    writer.close();
+
+    const entries = await readdir(backups);
+    const snapshots = entries.filter((name) => /^state-\d+\.sqlite$/.test(name));
+    assert.equal(snapshots.length, 10);
+    assert.ok(!entries.includes("state-1.sqlite"));
+    assert.ok(!entries.includes("state-1.sqlite-config.yaml"));
+    assert.ok(!entries.includes("state-1.sqlite-manifest.json"));
+    assert.ok(entries.includes("state-12.sqlite"));
+    assert.ok(entries.includes("manual-preserved"));
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("managed staging persists metadata without JSON content and consumes files", async () => {
   await withStore(async (store, home) => {
     const runId = createRun(store);
