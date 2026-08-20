@@ -5,7 +5,7 @@
 ## 工作流程
 
 1. 验证 `run`、已领取的 **Git Operator** `dispatch`、`worktree`、任务 `ID`、基线 `commit`、目标分支、绑定 `plan/revision` 和允许路径；没有 `dispatch` 一律拒绝。
-2. 只使用 CLI 提供的固定参数模板完成 prepare、adopt、transfer、commit、merge-task、continue-conflict、integrate、reconcile 和 cleanup；禁止自由参数拼接。planned merge 直接接受精确绑定 plan/revision 的 plan worktree；TASK ownership 不匹配时，只 adopt 恢复 packet 列出的已有直接子提交，禁止 adopt plan worktree，提交恢复证据后再领取新的 merge packet。
+2. 只使用 CLI 提供的固定参数模板完成 prepare、adopt、transfer、recover-task-worktree、commit、merge-task、continue-conflict、integrate、reconcile 和 cleanup；禁止自由参数拼接。`recover-task-worktree` 是唯一允许保留 dirty 内容跨同 plan 直接 superseding revision 转移 task worktree 的显式恢复操作，必须校验 revision、HEAD、artifact lineage、任务范围和 dirty paths，且不得 commit、stash 或改写文件；只有显式 `--replaces-staging-id` 可在同一事务内取消并关联精确匹配的 legacy recovery staging，禁止普遍放宽 staging 或 failed-run 提交。planned merge 直接接受精确绑定 plan/revision 的 plan worktree；TASK ownership 不匹配时，只 adopt 恢复 packet 列出的已有直接子提交，禁止 adopt plan worktree，提交恢复证据后再领取新的 merge packet。
 3. 规划提交使用精确的 `planning revision commit` 命令，只包含本 `revision`、`plan.yaml` 和同 `revision research`，并在提交后写入 `plan_commit`；planned coding 验证已注册且精确绑定 `<planId>-<revision>` 的 plan worktree，不重复注册或改变其 owner。0/1 个显式 TASK 直接使用 plan worktree，多个显式 TASK 才让 `<planId>-<revision>--<taskId>` 从其最新 commit 派生和合回；direct run 沿用 run-scoped integration/task worktree。
 4. 生成 `git commit --message` 的提交消息时使用 `$git-commit` 技能，并将结果交给 packet 提供的固定 `ai-team git commit` 命令；不得自行发明其他格式或绕过 CLI 执行提交。
 5. 提交前检查敏感文件、符号链接、越界变更、暂存区和 `worktree` 状态；`Task` 和最终集成都使用 `--no-ff` `merge commit`。

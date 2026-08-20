@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { git, repositoryIdentity } from "../src/git.js";
@@ -14,6 +14,8 @@ import { StateStore } from "../src/state.js";
 import { ScopeGate } from "../src/gates.js";
 import { sha256 } from "../src/utils.js";
 import { ValidationError } from "../src/errors.js";
+import { resolveMergeTaskWorktree, resolveTaskIdentityWorktree } from "../src/worktree-ownership.js";
+import { stagingFilePath } from "../src/security.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1051,6 +1053,156 @@ test("managed adopt binds a direct-child commit and transfer changes only the re
       (fixture.store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id=?").get(adoptedCommit.worktree_id) as { run_id: string }).run_id,
       commitRun,
     );
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("recoverTaskWorktree atomically carries a dirty managed Task into its direct superseding revision", async () => {
+  const fixture = await createFixture();
+  try {
+    const planId = "20260820-worktree-recovery";
+    const identity = await repositoryIdentity(fixture.root);
+    const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    const sourceDigest = "1".repeat(64);
+    const targetDigest = "2".repeat(64);
+    fixture.store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,plan_commit,created_at) VALUES (?,?,?,'ready','main',?,?,?)")
+      .run(planId, "001", identity.repoId, sourceDigest, baseCommit, new Date().toISOString());
+    fixture.store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,plan_commit,supersedes,created_at) VALUES (?,?,?,'ready','main',?,?,?,?)")
+      .run(planId, "002", identity.repoId, targetDigest, baseCommit, "001", new Date().toISOString());
+    const sourceRun = fixture.store.createRun({ repoId: identity.repoId, profile: "coding", mode: "planned", planId, revision: "001", baseCommit, targetBranch: "main", planDigest: sourceDigest });
+    const targetRun = fixture.store.createRun({ repoId: identity.repoId, profile: "coding", mode: "planned", planId, revision: "002", baseCommit, targetBranch: "main", planDigest: targetDigest });
+    fixture.store.initializeRunTasks(sourceRun, [{ task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "a".repeat(64), write_paths: ["README.md", "untracked.txt"] }]);
+    fixture.store.initializeRunTasks(targetRun, [{ task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "b".repeat(64), write_paths: ["README.md", "test/core.test.ts", "untracked.txt"] }]);
+
+    const worktreePath = join(fixture.root, ".worktrees", "tasks", planId, `${planId}-001--task-001`);
+    const branch = `task/${planId}/${planId}-001--task-001`;
+    await mkdir(join(worktreePath, ".."), { recursive: true });
+    await rawGit(fixture.root, ["worktree", "add", "-b", branch, worktreePath, baseCommit]);
+    const worktreeId = "worktree_recover_dirty_task";
+    fixture.store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run(worktreeId, sourceRun, branch, worktreePath, baseCommit, new Date().toISOString());
+    const developerId = "dispatch_source_developer";
+    fixture.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,completed_at,created_at)
+      VALUES (?,?,'backend-developer','completed',?,'fixture','{}','{}',?,?)`)
+      .run(developerId, sourceRun, JSON.stringify({ context: { task_id: "TASK-001", worktree_id: worktreeId } }), new Date().toISOString(), new Date().toISOString());
+    fixture.store.db.prepare("UPDATE run_tasks SET state='implemented',worktree_id=?,developer_dispatch_id=? WHERE run_id=? AND task_id='TASK-001'")
+      .run(worktreeId, developerId, sourceRun);
+    const artifactId = "artifact_source_task_001";
+    const artifactDigest = "d".repeat(64);
+    fixture.store.db.prepare("INSERT INTO artifacts(artifact_id,run_id,dispatch_id,kind,path,sha256,redacted,created_at) VALUES (?,?,?,'result',?,?,1,?)")
+      .run(artifactId, sourceRun, developerId, "/managed/source-result.json", artifactDigest, new Date().toISOString());
+
+    await writeFile(join(worktreePath, "README.md"), "staged\n");
+    await rawGit(worktreePath, ["add", "README.md"]);
+    await writeFile(join(worktreePath, "README.md"), "staged\nunstaged\n");
+    await writeFile(join(worktreePath, "untracked.txt"), "untracked bytes\n");
+    const before = {
+      head: await rawGit(worktreePath, ["rev-parse", "HEAD"]),
+      branch: await rawGit(worktreePath, ["branch", "--show-current"]),
+      staged: await rawGit(worktreePath, ["diff", "--cached", "--binary"]),
+      unstaged: await rawGit(worktreePath, ["diff", "--binary"]),
+      untracked: await readFile(join(worktreePath, "untracked.txt"), "utf8"),
+    };
+
+    const request = {
+      project: fixture.root, worktreeId, fromPlanId: planId, fromRevision: "001", toPlanId: planId,
+      toRevision: "002", toRunId: targetRun, taskId: "TASK-001", expectedHead: baseCommit,
+      expectedSourceArtifact: artifactId,
+    };
+    const assertNoRecoverySideEffects = () => {
+      assert.equal((fixture.store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id=?").get(worktreeId) as { run_id: string }).run_id, sourceRun);
+      assert.equal((fixture.store.db.prepare("SELECT worktree_id FROM run_tasks WHERE run_id=? AND task_id='TASK-001'").get(targetRun) as { worktree_id?: string }).worktree_id, null);
+      assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE kind='git.worktree.recover'").get() as { count: number }).count, 0);
+    };
+
+    fixture.store.db.prepare("UPDATE revisions SET supersedes='000' WHERE repo_id=? AND plan_id=? AND revision='002'").run(identity.repoId, planId);
+    await assert.rejects(fixture.orchestrator.recoverTaskWorktree(request), /directly supersede/);
+    assertNoRecoverySideEffects();
+    fixture.store.db.prepare("UPDATE revisions SET supersedes='001' WHERE repo_id=? AND plan_id=? AND revision='002'").run(identity.repoId, planId);
+    await assert.rejects(fixture.orchestrator.recoverTaskWorktree({ ...request, expectedHead: "f".repeat(40) }), /HEAD does not match/);
+    assertNoRecoverySideEffects();
+    await assert.rejects(fixture.orchestrator.recoverTaskWorktree({ ...request, expectedSourceArtifact: "artifact_wrong" }), /artifact does not match/);
+    assertNoRecoverySideEffects();
+    await writeFile(join(worktreePath, "outside-scope.txt"), "must be rejected\n");
+    await assert.rejects(fixture.orchestrator.recoverTaskWorktree(request), /dirty path is outside target task scope: outside-scope.txt/);
+    assertNoRecoverySideEffects();
+    await rm(join(worktreePath, "outside-scope.txt"));
+
+    const holderId = "dispatch_active_recovery_holder";
+    fixture.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,claimed_at,created_at)
+      VALUES (?,?,'git-operator','claimed','{}','fixture','{}','{}',?,?)`).run(holderId, sourceRun, new Date().toISOString(), new Date().toISOString());
+    fixture.store.db.prepare("INSERT INTO dispatch_worktree_bindings(dispatch_id,run_id,binding_kind,worktree_id,created_at) VALUES (?,?,'task',?,?)")
+      .run(holderId, sourceRun, worktreeId, new Date().toISOString());
+    await assert.rejects(fixture.orchestrator.recoverTaskWorktree(request), /held by another active dispatch/);
+    assertNoRecoverySideEffects();
+    fixture.store.db.prepare("UPDATE dispatches SET state='failed' WHERE dispatch_id=?").run(holderId);
+
+    const legacyDispatchId = "dispatch_legacy_recovery_task_001";
+    const legacyPacket = (sourceWorktreeId: string) => JSON.stringify({ context: {
+      phase: "recover_implementation_worktree", task_id: "TASK-001", source_worktree_id: sourceWorktreeId, source_run_id: sourceRun,
+    } });
+    fixture.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,claimed_at,created_at)
+      VALUES (?,?,'git-operator','claimed',?,'fixture','{}','{}',?,?)`)
+      .run(legacyDispatchId, targetRun, legacyPacket("worktree_wrong_source"), new Date().toISOString(), new Date().toISOString());
+    fixture.store.db.prepare("INSERT INTO dispatch_worktree_bindings(dispatch_id,run_id,binding_kind,worktree_id,created_at) VALUES (?,?,'task',?,?)")
+      .run(legacyDispatchId, targetRun, worktreeId, new Date().toISOString());
+    const stagingId = "staging_legacy_recovery_task_001";
+    const stagingBytes = "{\"legacy\":\"recovery result bytes\"}\n";
+    const stagingDigest = sha256(stagingBytes);
+    const stagingPath = stagingFilePath(fixture.store.paths.staging, targetRun, 1, "dispatch-result", "git-operator");
+    await mkdir(dirname(stagingPath), { recursive: true });
+    await writeFile(stagingPath, stagingBytes);
+    const now = new Date().toISOString();
+    fixture.store.db.prepare(`INSERT INTO staging_entries(staging_id,run_id,sequence_no,dispatch_id,role,kind,state,content_sha256,content_bytes,created_at,updated_at,expires_at)
+      VALUES (?,?,1,?,'git-operator','dispatch-result','ready',?,?,?,?,?)`)
+      .run(stagingId, targetRun, legacyDispatchId, stagingDigest, Buffer.byteLength(stagingBytes), now, now, "9999-12-31T23:59:59.999Z");
+    const replacementRequest = { ...request, replacesStagingId: stagingId };
+    await assert.rejects(fixture.orchestrator.recoverTaskWorktree(replacementRequest), /does not match the legacy task worktree recovery lineage/);
+    assertNoRecoverySideEffects();
+    assert.deepEqual(fixture.store.db.prepare("SELECT state,replaced_by_operation_id FROM staging_entries WHERE staging_id=?").get(stagingId), {
+      state: "ready", replaced_by_operation_id: null,
+    });
+    assert.equal(await readFile(stagingPath, "utf8"), stagingBytes);
+    fixture.store.db.prepare("UPDATE dispatches SET packet_json=? WHERE dispatch_id=?").run(legacyPacket(worktreeId), legacyDispatchId);
+
+    fixture.store.db.exec(`CREATE TEMP TRIGGER fail_recovery_audit BEFORE INSERT ON run_events
+      WHEN NEW.type='worktree.recovered' BEGIN SELECT RAISE(ABORT, 'injected recovery audit failure'); END;`);
+    await assert.rejects(fixture.orchestrator.recoverTaskWorktree(replacementRequest), /injected recovery audit failure/);
+    assertNoRecoverySideEffects();
+    assert.deepEqual(fixture.store.db.prepare("SELECT state,replaced_by_operation_id FROM staging_entries WHERE staging_id=?").get(stagingId), {
+      state: "ready", replaced_by_operation_id: null,
+    });
+    fixture.store.db.exec("DROP TRIGGER fail_recovery_audit");
+
+    const recovered = await fixture.orchestrator.recoverTaskWorktree(replacementRequest);
+    assert.equal(recovered.reused, false);
+    assert.equal(recovered.worktree_id, worktreeId);
+    assert.deepEqual(recovered.dirty_paths, ["README.md", "untracked.txt"]);
+    assert.deepEqual(recovered.replaced_staging, {
+      staging_id: stagingId, dispatch_id: legacyDispatchId, digest: stagingDigest,
+      before_state: "ready", after_state: "canceled", operation_id: recovered.recovery_id,
+    });
+    assert.deepEqual(fixture.store.db.prepare("SELECT run_id,adopted_from_run_id FROM worktrees WHERE worktree_id=?").get(worktreeId), {
+      run_id: targetRun, adopted_from_run_id: sourceRun,
+    });
+    assert.deepEqual(fixture.store.db.prepare("SELECT state,worktree_id FROM run_tasks WHERE run_id=? AND task_id='TASK-001'").get(targetRun), {
+      state: "prepared", worktree_id: worktreeId,
+    });
+    assert.equal(resolveTaskIdentityWorktree(fixture.store, targetRun, "TASK-001").branch, branch);
+    assert.equal(resolveMergeTaskWorktree(fixture.store, targetRun, worktreeId).branch, branch);
+    assert.deepEqual(fixture.store.db.prepare("SELECT state,replaced_by_operation_id FROM staging_entries WHERE staging_id=?").get(stagingId), {
+      state: "canceled", replaced_by_operation_id: recovered.recovery_id,
+    });
+    assert.equal(await readFile(stagingPath, "utf8"), stagingBytes);
+    assert.deepEqual({
+      head: await rawGit(worktreePath, ["rev-parse", "HEAD"]),
+      branch: await rawGit(worktreePath, ["branch", "--show-current"]),
+      staged: await rawGit(worktreePath, ["diff", "--cached", "--binary"]),
+      unstaged: await rawGit(worktreePath, ["diff", "--binary"]),
+      untracked: await readFile(join(worktreePath, "untracked.txt"), "utf8"),
+    }, before);
+    assert.deepEqual(await fixture.orchestrator.recoverTaskWorktree(replacementRequest), { ...recovered, reused: true });
   } finally {
     await fixture.dispose();
   }

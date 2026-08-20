@@ -4,7 +4,7 @@ import { ValidationError } from "./errors.js";
 import { commitPaths, createWorktree, currentBranch, currentHead, git, mergeNoFastForward, worktreeStatus } from "./git.js";
 import { assertWritablePath, canonicalizeInside, pathMatchesScope } from "./security.js";
 import { StateStore } from "./state.js";
-import { sha256, toPosix } from "./utils.js";
+import { sha256, stableJson, toPosix } from "./utils.js";
 import { ScopeGate } from "./gates.js";
 import { DispatchService } from "./dispatch.js";
 import {
@@ -25,6 +25,43 @@ export interface WorktreeStatus {
   head: string | null;
   state: string;
   clean: boolean | null;
+}
+
+export interface TaskWorktreeRecoveryRequest {
+  project: string;
+  worktreeId: string;
+  fromPlanId: string;
+  fromRevision: string;
+  toPlanId: string;
+  toRevision: string;
+  toRunId: string;
+  taskId: string;
+  expectedHead: string;
+  expectedSourceArtifact: string;
+  dispatchId?: string;
+  replacesStagingId?: string;
+}
+
+export interface TaskWorktreeRecoveryReceipt {
+  recovery_id: string;
+  worktree_id: string;
+  path: string;
+  branch: string;
+  head: string;
+  task_id: string;
+  from_run_id: string;
+  to_run_id: string;
+  source_artifact: { artifact_id: string; digest: string };
+  dirty_paths: string[];
+  replaced_staging?: {
+    staging_id: string;
+    dispatch_id: string;
+    digest: string;
+    before_state: "ready";
+    after_state: "canceled";
+    operation_id: string;
+  };
+  reused: boolean;
 }
 
 export interface SyncConflictEvidence {
@@ -320,6 +357,173 @@ export class GitOrchestrator {
     }
     resolveTransferredWorktree(this.store, runId, worktreeId);
     return { worktree_id: worktreeId, branch: row.branch, path: canonical, base_commit: row.base_commit, reused: operation.reused };
+  }
+
+  async recoverTaskWorktree(request: TaskWorktreeRecoveryRequest): Promise<TaskWorktreeRecoveryReceipt> {
+    const target = this.repositoryForRun(request.toRunId);
+    if (!isPlannedRun(target.run) || target.run.plan_id !== request.toPlanId || target.run.revision !== request.toRevision) {
+      throw new ValidationError("target run does not match the requested planned revision");
+    }
+    if (request.fromPlanId !== request.toPlanId) throw new ValidationError("task worktree recovery requires the same plan");
+    if (!/^[a-f0-9]{40}$/.test(request.expectedHead)) throw new ValidationError("expected HEAD must be a full commit SHA");
+    if (await realpath(request.project) !== await realpath(target.root)) throw new ValidationError("recovery project does not match the target run repository");
+
+    const key = `worktree:recover:${request.fromPlanId}:${request.fromRevision}:${request.toRevision}:${request.toRunId}:${request.taskId}:${request.worktreeId}:${request.expectedHead}:${request.expectedSourceArtifact}:${request.replacesStagingId ?? "none"}`;
+    const completed = this.store.db.prepare("SELECT operation_id,evidence_json FROM operations WHERE idempotency_key=? AND kind='git.worktree.recover' AND state='completed'")
+      .get(key) as { operation_id: string; evidence_json: string } | undefined;
+    if (completed) return { ...(JSON.parse(completed.evidence_json) as TaskWorktreeRecoveryReceipt), reused: true };
+
+    const sourceRevision = this.store.db.prepare("SELECT state,digest,plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+      .get(target.run.repo_id, request.fromPlanId, request.fromRevision) as { state: string; digest?: string; plan_commit?: string } | undefined;
+    const targetRevision = this.store.db.prepare("SELECT state,digest,plan_commit,supersedes FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
+      .get(target.run.repo_id, request.toPlanId, request.toRevision) as { state: string; digest?: string; plan_commit?: string; supersedes?: string } | undefined;
+    if (!sourceRevision || !targetRevision || targetRevision.supersedes !== request.fromRevision) {
+      throw new ValidationError("target revision must directly supersede the source revision in the same repository");
+    }
+    if (targetRevision.state !== "ready") throw new ValidationError("target superseding revision is not plan-ready");
+    if (!targetRevision.digest || target.run.plan_digest !== targetRevision.digest) throw new ValidationError("target run plan digest does not match the superseding revision");
+
+    const row = this.store.db.prepare("SELECT * FROM worktrees WHERE worktree_id=? AND state='active'").get(request.worktreeId) as any;
+    if (!row) throw new ValidationError("active managed task worktree was not found");
+    const sourceRun = this.store.getRun(row.run_id) as any;
+    if (!isPlannedRun(sourceRun) || sourceRun.repo_id !== target.run.repo_id || sourceRun.plan_id !== request.fromPlanId || sourceRun.revision !== request.fromRevision) {
+      throw new ValidationError("worktree owner does not match the requested source revision");
+    }
+    const sourceTask = this.store.db.prepare("SELECT * FROM run_tasks WHERE run_id=? AND task_id=?").get(row.run_id, request.taskId) as any;
+    const targetTask = this.store.db.prepare("SELECT * FROM run_tasks WHERE run_id=? AND task_id=?").get(request.toRunId, request.taskId) as any;
+    if (!sourceTask || !targetTask) throw new ValidationError("task ID must exist in both source and target revisions");
+    if (sourceTask.worktree_id !== request.worktreeId) throw new ValidationError("source task is not bound to the requested worktree");
+    if (targetTask.worktree_id && targetTask.worktree_id !== request.worktreeId) throw new ValidationError("target task is already bound to another worktree");
+    const sourceScopes = JSON.parse(sourceTask.write_paths_json ?? "[]") as string[];
+    const targetScopes = JSON.parse(targetTask.write_paths_json ?? "[]") as string[];
+    if (sourceScopes.some((scope) => !targetScopes.includes(scope))) throw new ValidationError("target task scope must equal or extend the source task scope");
+
+    const canonical = await realpath(row.path);
+    const relativePath = toPosix(relative(target.root, canonical));
+    if (!relativePath.startsWith(".worktrees/")) throw new ValidationError("recovery requires an existing managed worktree path");
+    const head = await currentHead(canonical);
+    if (head !== request.expectedHead) throw new ValidationError("worktree HEAD does not match expected HEAD", { expected: request.expectedHead, actual: head });
+    const branch = await currentBranch(canonical);
+    if (branch !== row.branch) throw new ValidationError("worktree branch does not match its managed registration");
+    const statusEntries = (await git(canonical, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout.split("\0").filter(Boolean);
+    const dirty = new Set<string>();
+    for (let index = 0; index < statusEntries.length; index += 1) {
+      const entry = statusEntries[index]!;
+      const code = entry.slice(0, 2);
+      dirty.add(entry.slice(3));
+      if (/[RC]/.test(code)) dirty.add(statusEntries[++index]!);
+    }
+    const dirtyPaths = [...dirty].sort();
+    for (const path of dirtyPaths) {
+      assertWritablePath(path);
+      if (!pathMatchesScope(path, targetScopes)) throw new ValidationError(`dirty path is outside target task scope: ${path}`);
+      await canonicalizeInside(canonical, path, true);
+    }
+
+    const replacementStaging = request.replacesStagingId
+      ? this.store.db.prepare(`SELECT s.staging_id,s.run_id,s.dispatch_id,s.role,s.kind,s.state,s.content_sha256,d.role AS dispatch_role,d.state AS dispatch_state,d.packet_json
+        FROM staging_entries s JOIN dispatches d ON d.dispatch_id=s.dispatch_id AND d.run_id=s.run_id WHERE s.staging_id=?`)
+        .get(request.replacesStagingId) as any
+      : undefined;
+    let recoveryDispatchId = request.dispatchId;
+    if (request.replacesStagingId) {
+      if (!replacementStaging || replacementStaging.run_id !== request.toRunId || replacementStaging.role !== "git-operator"
+        || replacementStaging.kind !== "dispatch-result" || replacementStaging.state !== "ready" || !replacementStaging.content_sha256
+        || replacementStaging.dispatch_role !== "git-operator" || replacementStaging.dispatch_state !== "claimed") {
+        throw new ValidationError("replacement staging is not a ready claimed Git Operator dispatch result for the target run");
+      }
+      const context = (JSON.parse(replacementStaging.packet_json) as { context?: Record<string, unknown> }).context ?? {};
+      if (context.phase !== "recover_implementation_worktree" || context.task_id !== request.taskId
+        || context.source_worktree_id !== request.worktreeId || context.source_run_id !== row.run_id) {
+        throw new ValidationError("replacement staging does not match the legacy task worktree recovery lineage");
+      }
+      if (request.dispatchId && request.dispatchId !== replacementStaging.dispatch_id) {
+        throw new ValidationError("replacement staging dispatch does not match --dispatch-id");
+      }
+      recoveryDispatchId = replacementStaging.dispatch_id;
+    }
+    if (recoveryDispatchId) {
+      new DispatchService(this.store).assertClaimed(request.toRunId, recoveryDispatchId, "git-operator");
+      const dispatch = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=? AND run_id=?").get(recoveryDispatchId, request.toRunId) as { packet_json: string };
+      const context = (JSON.parse(dispatch.packet_json) as { context?: Record<string, unknown> }).context ?? {};
+      const legacyReplacement = Boolean(request.replacesStagingId) && context.phase === "recover_implementation_worktree"
+        && context.source_worktree_id === request.worktreeId;
+      if ((!legacyReplacement && !(["recover_task_worktree", "reconcile_worktree_ownership"] as unknown[]).includes(context.phase))
+        || context.task_id !== request.taskId
+        || (!legacyReplacement && ![context.worktree_id, context.task_worktree_id, context.implementation_worktree_id].includes(request.worktreeId))) {
+        throw new ValidationError("Git Operator dispatch is not bound to this task worktree recovery");
+      }
+    }
+    const activeHolder = this.store.db.prepare(`SELECT d.dispatch_id FROM dispatch_worktree_bindings b
+      JOIN dispatches d ON d.dispatch_id=b.dispatch_id AND d.run_id=b.run_id
+      WHERE b.worktree_id=? AND d.state='claimed' AND (? IS NULL OR d.dispatch_id!=?) LIMIT 1`)
+      .get(request.worktreeId, recoveryDispatchId ?? null, recoveryDispatchId ?? null) as { dispatch_id: string } | undefined;
+    if (activeHolder) throw new ValidationError("worktree is held by another active dispatch", { dispatch_id: activeHolder.dispatch_id });
+
+    const artifacts = this.store.db.prepare(`SELECT a.artifact_id,a.sha256,a.dispatch_id,d.packet_json
+      FROM artifacts a LEFT JOIN dispatches d ON d.dispatch_id=a.dispatch_id
+      WHERE a.run_id=? AND a.kind='result' AND (a.artifact_id=? OR a.sha256=?)`).all(row.run_id, request.expectedSourceArtifact, request.expectedSourceArtifact) as Array<any>;
+    const artifact = artifacts.find((candidate) => {
+      const context = JSON.parse(candidate.packet_json ?? "{}").context ?? {};
+      return context.task_id === request.taskId || candidate.dispatch_id === sourceTask.developer_dispatch_id || candidate.dispatch_id === sourceTask.test_dispatch_id;
+    });
+    if (!artifact) throw new ValidationError("expected source artifact does not match the source task lineage");
+
+    const operationId = `op_${sha256(key).slice(0, 26)}`;
+    const replacedStaging = replacementStaging ? {
+      staging_id: replacementStaging.staging_id as string,
+      dispatch_id: replacementStaging.dispatch_id as string,
+      digest: replacementStaging.content_sha256 as string,
+      before_state: "ready" as const,
+      after_state: "canceled" as const,
+      operation_id: operationId,
+    } : undefined;
+    const evidence: TaskWorktreeRecoveryReceipt = {
+      recovery_id: operationId,
+      worktree_id: request.worktreeId,
+      path: canonical,
+      branch,
+      head,
+      task_id: request.taskId,
+      from_run_id: row.run_id,
+      to_run_id: request.toRunId,
+      source_artifact: { artifact_id: artifact.artifact_id, digest: artifact.sha256 },
+      dirty_paths: dirtyPaths,
+      ...(replacedStaging ? { replaced_staging: replacedStaging } : {}),
+      reused: false,
+    };
+    const operationRequest = {
+      ...request,
+      source_run_id: row.run_id,
+      source_plan_digest: sourceRevision.digest ?? null,
+      target_plan_digest: targetRevision.digest,
+      source_allowed_write_paths: sourceScopes,
+      target_allowed_write_paths: targetScopes,
+      dirty_paths: dirtyPaths,
+      owner_before: row.run_id,
+      owner_after: request.toRunId,
+      source_artifact: evidence.source_artifact,
+      ...(replacedStaging ? { replaced_staging: replacedStaging } : {}),
+    };
+    this.store.db.transaction(() => {
+      this.store.db.prepare("INSERT INTO operations(operation_id,run_id,idempotency_key,kind,state,request_json,evidence_json,created_at,completed_at) VALUES (?,?,?,'git.worktree.recover','completed',?,?,?,?)")
+        .run(operationId, request.toRunId, key, stableJson(operationRequest), stableJson(evidence), new Date().toISOString(), new Date().toISOString());
+      const owner = this.store.db.prepare("UPDATE worktrees SET run_id=?,adopted_from_run_id=? WHERE worktree_id=? AND run_id=? AND state='active'")
+        .run(request.toRunId, row.run_id, request.worktreeId, row.run_id);
+      if (owner.changes !== 1) throw new ValidationError("worktree owner changed during recovery preflight");
+      const task = this.store.db.prepare(`UPDATE run_tasks SET state=CASE state WHEN 'pending' THEN 'prepared' ELSE state END,worktree_id=?,updated_at=?
+        WHERE run_id=? AND task_id=? AND (worktree_id IS NULL OR worktree_id=?)`)
+        .run(request.worktreeId, new Date().toISOString(), request.toRunId, request.taskId, request.worktreeId);
+      if (task.changes !== 1) throw new ValidationError("target task binding changed during recovery preflight");
+      if (replacedStaging) {
+        const staging = this.store.db.prepare(`UPDATE staging_entries SET state='canceled',replaced_by_operation_id=?,updated_at=?
+          WHERE staging_id=? AND state='ready' AND dispatch_id=?`).run(operationId, new Date().toISOString(), replacedStaging.staging_id, replacedStaging.dispatch_id);
+        if (staging.changes !== 1) throw new ValidationError("replacement staging changed during recovery preflight");
+      }
+      this.store.event(row.run_id, "worktree.recovery_released", { ...operationRequest, operation_id: operationId });
+      this.store.event(request.toRunId, "worktree.recovered", { ...operationRequest, operation_id: operationId, receipt: evidence });
+    })();
+    return evidence;
   }
 
   async prepareIntegration(runId: string, dispatchId?: string): Promise<PreparedWorktree> {

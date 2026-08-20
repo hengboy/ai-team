@@ -39,6 +39,14 @@ const createRun = (store: StateStore): string => {
   return store.createRun({ repoId: "repo-1", profile: "coding", mode: "feature", request: "test request" });
 };
 
+test("command contract exposes only an explicit task worktree recovery command", () => {
+  assert.deepEqual(COMMAND_SYNTAX["git recover-task-worktree"], [
+    "ai-team git recover-task-worktree --project <path> --worktree-id <opaque-id> --from-plan-id <plan-id> --from-revision <revision> --to-plan-id <plan-id> --to-revision <revision> --to-run-id <run-id> --task-id <task-id> --expected-head <commit> --expected-source-artifact <artifact-id-or-digest> [--dispatch-id <dispatch-id>] [--replaces-staging-id <staging-id>]",
+  ]);
+  assert.ok((COMMAND_CONTRACT_BASE.commands.agent as readonly string[]).includes("git recover-task-worktree"));
+  assert.equal((COMMAND_CONTRACT_BASE.commands.agent as readonly string[]).filter((command) => command === "git recover-task-worktree").length, 1);
+});
+
 const validResult = (runId = RUN_ID, dispatchId = DISPATCH_ID) => ({
   ...createResultTemplate(runId, dispatchId, "backend-developer"),
   summary: "Implemented and verified",
@@ -173,7 +181,7 @@ test("state migration is recorded once and survives reopening", async () => {
   try {
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }, { name: "017-recovery-staging-lineage" }],
     );
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
@@ -184,7 +192,7 @@ test("state migration is recorded once and survives reopening", async () => {
     store = await StateStore.open(home);
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }, { name: "017-recovery-staging-lineage" }],
     );
   } finally {
     store.close();
@@ -249,7 +257,7 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
     try {
       assert.equal(
         (reader.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count,
-        16,
+        17,
       );
       assert.throws(() => reader.db.prepare("UPDATE runs SET state='failed'").run(), /readonly|read-only/i);
     } finally {

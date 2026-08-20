@@ -59,6 +59,33 @@ export const registerGitCommands = (program: Command, dependencies: GitDependenc
     throw new ValidationError("git adopt requires --commit alone, or --path, --branch, and --base-commit together");
   })));
   gitCommand.command("transfer").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--worktree-id <id>").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).transfer(options.runId, options.worktreeId, options.dispatchId))));
+  gitCommand.command("recover-task-worktree")
+    .requiredOption("--project <path>")
+    .requiredOption("--worktree-id <id>")
+    .requiredOption("--from-plan-id <id>")
+    .requiredOption("--from-revision <revision>")
+    .requiredOption("--to-plan-id <id>")
+    .requiredOption("--to-revision <revision>")
+    .requiredOption("--to-run-id <id>")
+    .requiredOption("--task-id <id>")
+    .requiredOption("--expected-head <sha>")
+    .requiredOption("--expected-source-artifact <id-or-digest>")
+    .option("--dispatch-id <id>")
+    .option("--replaces-staging-id <id>")
+    .action(async (options) => output(await withStore((store) => new GitOrchestrator(store).recoverTaskWorktree({
+      project: options.project,
+      worktreeId: options.worktreeId,
+      fromPlanId: options.fromPlanId,
+      fromRevision: options.fromRevision,
+      toPlanId: options.toPlanId,
+      toRevision: options.toRevision,
+      toRunId: options.toRunId,
+      taskId: options.taskId,
+      expectedHead: options.expectedHead,
+      expectedSourceArtifact: options.expectedSourceArtifact,
+      dispatchId: options.dispatchId,
+      replacesStagingId: options.replacesStagingId,
+    }))));
   gitCommand.command("commit").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--worktree-id <id>").requiredOption("--message <message>").requiredOption("--scope <paths>", "comma-separated repository-relative scopes").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).commit(options.runId, options.worktreeId, options.message, options.scope.split(","), options.dispatchId))));
   gitCommand.command("merge-task").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--task-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).mergeTask(options.runId, options.integrationId, options.taskId, options.dispatchId)) }));
   gitCommand.command("continue-conflict").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--scope <paths>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).continueConflict(options.runId, options.integrationId, options.scope.split(","), options.dispatchId)) }));

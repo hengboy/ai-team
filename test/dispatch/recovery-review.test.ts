@@ -48,6 +48,33 @@ test("dispatch lifecycle support cancels, reissues, and supersedes with audited 
   });
 });
 
+test("a claimed sibling recovery dispatch can validate and submit after its batch makes the run retryable", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const packet = (taskId: string) => ({
+      ...dispatchPacket(),
+      context: { phase: "recover_task_worktree", recovery_batch_id: "recovery_batch_001", task_id: taskId, worktree_id: `worktree_${taskId.toLowerCase()}` },
+    });
+    const first = dispatches.create(runId, "git-operator", packet("TASK-001"));
+    const second = dispatches.create(runId, "git-operator", packet("TASK-002"));
+    dispatches.claim(runId, first, "git-operator");
+    dispatches.claim(runId, second, "git-operator");
+    await dispatches.submitValue(runId, first, "git-operator", {
+      ...createResultTemplate(runId, first, "git-operator"),
+      status: "failed", summary: "TASK-001 recovery needs retry", verification: [], payload: { operations: [] },
+      failure_class: "temporary_tool_failure", side_effect_state: "none",
+    });
+    assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(first) as { state: string }).state, "retryable_failure");
+    assert.equal(store.getRun(runId).state, "retryable_failure");
+    const secondResult = completedResult(runId, second, "git-operator", { operations: [{ command: "recover TASK-002", outcome: "completed" }] });
+    assert.equal(dispatches.validateValue(runId, second, "git-operator", secondResult).status, "completed");
+    assert.equal((await dispatches.submitValue(runId, second, "git-operator", secondResult)).submission.state, "submitted");
+    assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(second) as { state: string }).state, "completed");
+    assert.equal(store.getRun(runId).state, "retryable_failure");
+  });
+});
+
 test("review findings without a concrete location or impact are rejected", async () => {
   await withStore((store) => {
     const runId = createRun(store);

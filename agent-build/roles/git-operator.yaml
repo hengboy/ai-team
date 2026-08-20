@@ -9,6 +9,7 @@ commands:
   - git prepare
   - git adopt
   - git transfer
+  - git recover-task-worktree
   - git commit
   - git merge-task
   - git continue-conflict

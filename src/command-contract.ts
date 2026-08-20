@@ -41,6 +41,7 @@ export const COMMAND_PARAMETER_TYPES = Object.freeze({
   kind: "enum; one of the 10 managed staging JSON kinds",
   commit: "string; exactly 40 lowercase hexadecimal characters",
   "opaque-id": "string; CLI-issued identifier",
+  "artifact-id-or-digest": "string; artifact_ identifier or 64-character lowercase hexadecimal artifact digest",
   branch: "string; Git branch name",
   state: "enum; planning state, or Git reconciliation state completed, not_applied, or conflicted",
   stage: "enum; triage, pre_write, or pre_commit",
@@ -107,6 +108,7 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
     "ai-team git adopt --run-id <run-id> --dispatch-id <dispatch-id> --path <path> --branch <branch> --base-commit <commit> [--commit <commit>]",
   ],
   "git transfer": ["ai-team git transfer --run-id <run-id> --dispatch-id <dispatch-id> --worktree-id <opaque-id>"],
+  "git recover-task-worktree": ["ai-team git recover-task-worktree --project <path> --worktree-id <opaque-id> --from-plan-id <plan-id> --from-revision <revision> --to-plan-id <plan-id> --to-revision <revision> --to-run-id <run-id> --task-id <task-id> --expected-head <commit> --expected-source-artifact <artifact-id-or-digest> [--dispatch-id <dispatch-id>] [--replaces-staging-id <staging-id>]"],
   "git commit": ["ai-team git commit --run-id <run-id> --dispatch-id <dispatch-id> --worktree-id <opaque-id> --message <text> --scope <paths>"],
   "git merge-task": ["ai-team git merge-task --run-id <run-id> --dispatch-id <dispatch-id> --integration-id <opaque-id> --task-id <task-id>"],
   "git continue-conflict": ["ai-team git continue-conflict --run-id <run-id> --dispatch-id <dispatch-id> --integration-id <opaque-id> --scope <paths>"],
@@ -148,7 +150,7 @@ const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>
 });
 
 const PUBLIC_COMMANDS = ["init", "install", "status", "contract", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run handoff-to-planning", "run cancel", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
-const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch packet-schema", "dispatch packet-template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolution-schema", "review resolution-template", "review resolve", "review status"] as const;
+const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch packet-schema", "dispatch packet-template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git recover-task-worktree", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolution-schema", "review resolution-template", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */
 export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.freeze({

@@ -31,6 +31,7 @@ const operationCommand = (kind: string): string => ({
   "git.integration.create": "git prepare",
   "git.worktree.adopt": "git adopt",
   "git.worktree.transfer": "git transfer",
+  "git.worktree.recover": "git recover-task-worktree",
   "git.commit": "git commit",
   "git.merge.task": "git merge-task",
   "git.sync": "git integrate",
@@ -421,6 +422,17 @@ const migrations = [
         CREATE UNIQUE INDEX test_repair_lineage_coding ON test_repair_lineage(coding_dispatch_id);
         CREATE UNIQUE INDEX test_repair_lineage_retest ON test_repair_lineage(retest_dispatch_id) WHERE retest_dispatch_id IS NOT NULL;
       `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
+  {
+    name: "017-recovery-staging-lineage",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      const columns = new Set((db.prepare("PRAGMA table_info(staging_entries)").all() as Array<{ name: string }>).map(({ name }) => name));
+      if (!columns.has("replaced_by_operation_id")) {
+        db.exec("ALTER TABLE staging_entries ADD COLUMN replaced_by_operation_id TEXT REFERENCES operations(operation_id);");
+      }
+      db.exec("CREATE INDEX IF NOT EXISTS staging_entries_replaced_operation ON staging_entries(replaced_by_operation_id) WHERE replaced_by_operation_id IS NOT NULL;");
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },

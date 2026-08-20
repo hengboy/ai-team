@@ -22,6 +22,21 @@ const rowFor = (store: StateStore, worktreeId: string): OwnedWorktree | undefine
   store.db.prepare("SELECT worktree_id,run_id,branch,path,base_commit,state FROM worktrees WHERE worktree_id=?")
     .get(worktreeId) as OwnedWorktree | undefined;
 
+const recoveredTaskBinding = (
+  store: StateStore,
+  runId: string,
+  worktreeId: string,
+  taskId?: string,
+): boolean => Boolean(store.db.prepare(`SELECT 1 FROM operations o
+  JOIN run_tasks t ON t.run_id=o.run_id
+    AND t.task_id=json_extract(o.evidence_json,'$.task_id')
+    AND t.worktree_id=json_extract(o.evidence_json,'$.worktree_id')
+  WHERE o.run_id=? AND o.kind='git.worktree.recover' AND o.state='completed'
+    AND json_extract(o.evidence_json,'$.to_run_id')=?
+    AND json_extract(o.evidence_json,'$.worktree_id')=?
+    AND (? IS NULL OR json_extract(o.evidence_json,'$.task_id')=?) LIMIT 1`)
+  .get(runId, runId, worktreeId, taskId ?? null, taskId ?? null));
+
 export const resolveTaskIdentityWorktree = (store: StateStore, runId: string, taskId: string): OwnedWorktree => {
   const { run } = context(store, runId);
   if (run.mode !== "planned" || !run.plan_id || !run.revision || !/^TASK-\d{3}$/.test(taskId)) {
@@ -32,8 +47,15 @@ export const resolveTaskIdentityWorktree = (store: StateStore, runId: string, ta
     FROM worktrees w JOIN runs r ON r.run_id=w.run_id
     WHERE w.branch=? AND w.state='active' AND r.repo_id=?`)
     .get(branch, run.repo_id) as OwnedWorktree | undefined;
-  if (!row) throw new ValidationError(`task identity ${taskId} has no active worktree record for run ${runId}`);
-  return row;
+  if (row) return row;
+  const recovered = store.db.prepare(`SELECT w.worktree_id,w.run_id,w.branch,w.path,w.base_commit,w.state
+    FROM run_tasks t JOIN worktrees w ON w.worktree_id=t.worktree_id
+    WHERE t.run_id=? AND t.task_id=? AND w.run_id=? AND w.state='active'`)
+    .get(runId, taskId, runId) as OwnedWorktree | undefined;
+  if (!recovered || !recoveredTaskBinding(store, runId, recovered.worktree_id, taskId)) {
+    throw new ValidationError(`task identity ${taskId} has no active worktree record for run ${runId}`);
+  }
+  return recovered;
 };
 
 const ownershipError = (worktreeId: string, runId: string, row: OwnedWorktree | undefined, constraint: string): ValidationError =>
@@ -49,7 +71,9 @@ export const resolveMergeTaskWorktree = (store: StateStore, runId: string, workt
   if (row.run_id !== runId) throw ownershipError(worktreeId, runId, row, "run_id=expected_run_id");
   if (run.mode === "planned" && run.plan_id && run.revision) {
     const prefix = `task/${run.plan_id}/${run.plan_id}-${run.revision}--`;
-    if (!row.branch.startsWith(prefix)) throw ownershipError(worktreeId, runId, row, `branch_starts_with=${prefix}`);
+    if (!row.branch.startsWith(prefix) && !recoveredTaskBinding(store, runId, worktreeId)) {
+      throw ownershipError(worktreeId, runId, row, `branch_starts_with=${prefix}`);
+    }
   }
   return row;
 };
@@ -111,7 +135,7 @@ export const completedMergeOwnershipPartialEffect = (
   });
   if (mergeExists) return undefined;
   const ownershipRows = store.db.prepare(`SELECT operation_id,request_json,evidence_json FROM operations
-    WHERE run_id=? AND state='completed' AND kind IN ('git.worktree.transfer','git.worktree.adopt') ORDER BY created_at`)
+    WHERE run_id=? AND state='completed' AND kind IN ('git.worktree.transfer','git.worktree.adopt','git.worktree.recover') ORDER BY created_at`)
     .all(runId) as Array<{ operation_id: string; request_json: string; evidence_json?: string }>;
   const expectedIds = new Set([integrationWorktreeId, ...taskWorktreeIds]);
   const matched = ownershipRows.filter((operation) => {

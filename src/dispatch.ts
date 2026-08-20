@@ -1203,7 +1203,9 @@ export class DispatchService {
     const validRunState = dispatch.state === "needs_decision"
       ? run.state === "needs_decision"
       : dispatch.state === "completed" ? run.state === "active" || run.state === "completed" : run.state === "active";
-    if (!validRunState) throw new ValidationError("run must be active before validate");
+    if (!validRunState && !this.claimedRecoveryMayFinish(runId, dispatchId, role, dispatch, run.state)) {
+      throw new ValidationError("run must be active before validate");
+    }
     const result = checkResultEnvelope(value);
     if (!result.valid) throw new ValidationError("result envelope is invalid", result.errors);
     if (result.value.run_id !== runId || result.value.dispatch_id !== dispatchId || result.value.role !== role) {
@@ -1211,6 +1213,26 @@ export class DispatchService {
     }
     this.assertVerificationEvidence(role, JSON.parse(dispatch.packet_json) as DispatchPacket, result.value);
     return result.value;
+  }
+
+  private claimedRecoveryMayFinish(
+    runId: string,
+    dispatchId: string,
+    role: Role,
+    dispatch: { state: string; packet_json: string },
+    runState: string,
+  ): boolean {
+    if (role !== "git-operator" || dispatch.state !== "claimed" || runState !== "retryable_failure") return false;
+    const packet = JSON.parse(dispatch.packet_json) as DispatchPacket;
+    const batchId = packet.context.recovery_batch_id;
+    if (packet.context.phase !== "recover_task_worktree" || typeof batchId !== "string" || !batchId) return false;
+    const current = this.store.db.prepare("SELECT claimed_at FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, dispatchId) as { claimed_at?: string } | undefined;
+    if (!current?.claimed_at) return false;
+    return Boolean(this.store.db.prepare(`SELECT 1 FROM dispatches
+      WHERE run_id=? AND dispatch_id!=? AND state='retryable_failure' AND completed_at>=?
+      AND json_extract(packet_json,'$.context.phase')='recover_task_worktree'
+      AND json_extract(packet_json,'$.context.recovery_batch_id')=? LIMIT 1`)
+      .get(runId, dispatchId, current.claimed_at, batchId));
   }
 
   private assertPlannedTaskTestScope(runId: string, dispatchId: string, packet: DispatchPacket): void {
@@ -1360,7 +1382,7 @@ export class DispatchService {
     const result = this.validateValue(runId, dispatchId, role, value);
     if (role === "git-operator" && result.status === "failed" && result.side_effect_state === "none") {
       const phase = ((JSON.parse(row.packet_json) as DispatchPacket).context as { phase?: unknown }).phase;
-      if (phase === "integrate_implementation" || phase === "reconcile_worktree_ownership" || phase === "finalize_integration") {
+      if (phase === "integrate_implementation" || phase === "reconcile_worktree_ownership" || phase === "recover_task_worktree" || phase === "finalize_integration") {
         result.status = "retryable_failure";
       }
     }

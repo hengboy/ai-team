@@ -256,6 +256,7 @@ const LEGACY_RENDERER_NOT_USED: Record<string, string[]> = {
   "review status": ["ai-team review status --run-id <run-id> (--barrier-id <opaque-id> | --revision-sha <commit>)"],
   "git status": ["ai-team git status --run-id <run-id>"],
   "git prepare": ["ai-team git prepare --run-id <run-id> [--task-id <task-id>] [--integration] [--base-commit <commit>] [--depends-on <opaque-id>]"],
+  "git recover-task-worktree": ["ai-team git recover-task-worktree --project <path> --worktree-id <opaque-id> --from-plan-id <plan-id> --from-revision <revision> --to-plan-id <plan-id> --to-revision <revision> --to-run-id <run-id> --task-id <task-id> --expected-head <commit> --expected-source-artifact <artifact-id-or-digest> [--dispatch-id <dispatch-id>] [--replaces-staging-id <staging-id>]"],
   "git commit": ["ai-team git commit --run-id <run-id> --worktree-id <opaque-id> --message <text> --scope <paths>"],
   "git merge-task": ["ai-team git merge-task --run-id <run-id> --integration-id <opaque-id> --task-id <task-id>"],
   "git continue-conflict": ["ai-team git continue-conflict --run-id <run-id> --integration-id <opaque-id> --scope <paths>"],

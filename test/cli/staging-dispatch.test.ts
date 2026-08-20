@@ -11,6 +11,17 @@ import { StateStore } from "../../src/state.js";
 
 import { cli, cliWithInput, json, makeSandbox } from "../helpers/cli.js";
 
+test("CLI advertises the explicit task worktree recovery identity and lineage flags", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const help = await cli(sandbox, ["git", "recover-task-worktree", "--help"]);
+  assert.equal(help.status, 0, help.stderr);
+  for (const option of [
+    "--project <path>", "--worktree-id <id>", "--from-plan-id <id>", "--from-revision <revision>",
+    "--to-plan-id <id>", "--to-revision <revision>", "--to-run-id <id>", "--task-id <id>",
+    "--expected-head <sha>", "--expected-source-artifact <id-or-digest>", "--dispatch-id <id>", "--replaces-staging-id <id>",
+  ]) assert.match(help.stdout, new RegExp(option.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
 
 test("CLI manages cancel, reissue, and supersede for a claimed support dispatch", async (t) => {
   const sandbox = await makeSandbox(t);
