@@ -1579,12 +1579,17 @@ export class DispatchService {
         if (typeof context.explorer_dispatch_id === "string") this.createPlannedCodingDispatch(runId, context.explorer_dispatch_id, result.dispatch_id);
         return;
       }
-      if (run.mode === "planned" && context.phase === "prepare_implementation_worktree") {
+      if (run.mode === "planned" && (context.phase === "prepare_implementation_worktree" || context.phase === "recover_task_worktree")) {
         const taskId = typeof (context as { task_id?: unknown }).task_id === "string" ? (context as { task_id: string }).task_id : undefined;
         if (taskId && this.plannedTaskRows(runId).some((task) => task.task_id === taskId)) {
+          const recoveryWorktreeId = context.phase === "recover_task_worktree" && typeof (context as { worktree_id?: unknown }).worktree_id === "string"
+            ? (context as { worktree_id: string }).worktree_id
+            : undefined;
           const taskKey = taskId.toLowerCase();
-          const worktree = this.store.db.prepare(`SELECT worktree_id FROM worktrees WHERE run_id=? AND state='active' AND (branch LIKE ? OR branch LIKE ?)
-            ORDER BY created_at DESC LIMIT 1`).get(runId, `task/%/${taskKey}`, `task/%--${taskKey}`) as { worktree_id: string } | undefined;
+          const worktree = recoveryWorktreeId
+            ? this.store.db.prepare("SELECT worktree_id FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, recoveryWorktreeId) as { worktree_id: string } | undefined
+            : this.store.db.prepare(`SELECT worktree_id FROM worktrees WHERE run_id=? AND state='active' AND (branch LIKE ? OR branch LIKE ?)
+              ORDER BY created_at DESC LIMIT 1`).get(runId, `task/%/${taskKey}`, `task/%--${taskKey}`) as { worktree_id: string } | undefined;
           if (!worktree) throw new ValidationError("completed planned task prepare is missing its registered worktree");
           this.store.advanceRunTask(runId, taskId, "prepared", { worktree_id: worktree.worktree_id });
         }
@@ -1913,6 +1918,70 @@ export class DispatchService {
     const integration = this.activeIntegrationWorktree(runId);
     if (!integration) throw new ValidationError("planned task prepare requires the active plan worktree");
     const baseCommit = execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const recovery = this.pendingPlannedTaskRecovery(runId, next.task_id);
+    if (recovery) {
+      const existingRecovery = this.store.db.prepare(`SELECT dispatch_id,state FROM dispatches WHERE run_id=? AND role='git-operator' AND state IN ('pending','claimed','completed')
+        AND json_extract(packet_json,'$.context.phase')='recover_task_worktree'
+        AND json_extract(packet_json,'$.context.task_id')=? ORDER BY created_at DESC LIMIT 1`).get(runId, next.task_id) as { dispatch_id: string; state: string } | undefined;
+      if (existingRecovery) return existingRecovery.dispatch_id;
+      const existingPrepare = this.store.db.prepare(`SELECT dispatch_id,state FROM dispatches WHERE run_id=? AND role='git-operator' AND state IN ('pending','claimed','completed')
+        AND json_extract(packet_json,'$.context.phase')='prepare_implementation_worktree'
+        AND json_extract(packet_json,'$.context.task_id')=? ORDER BY created_at DESC LIMIT 1`).get(runId, next.task_id) as { dispatch_id: string; state: string } | undefined;
+      if (existingPrepare?.state === "completed") return existingPrepare.dispatch_id;
+      if (existingPrepare && !this.prepareDispatchHasNoSideEffects(runId, existingPrepare.dispatch_id)) {
+        throw new ValidationError("claimed planned task prepare has recorded side effects and requires reconciliation before task worktree recovery");
+      }
+      const coordinator = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='coding' AND state='completed' ORDER BY completed_at DESC,created_at DESC LIMIT 1")
+        .get(runId) as { dispatch_id: string; packet_json: string } | undefined;
+      if (!coordinator) return undefined;
+      const coordinatorPacket = JSON.parse(coordinator.packet_json) as DispatchPacket;
+      const explorerDispatchId = typeof coordinatorPacket.context.explorer_dispatch_id === "string"
+        ? coordinatorPacket.context.explorer_dispatch_id
+        : (this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='file-explorer' AND state='completed' ORDER BY completed_at DESC LIMIT 1").get(runId) as { dispatch_id?: string } | undefined)?.dispatch_id;
+      if (!explorerDispatchId) throw new ValidationError("planned task recovery requires completed Explorer provenance");
+      const dispatchId = this.insert(runId, "git-operator", validatePacket({
+        objective: `Recover ${next.task_id}'s existing managed worktree into this directly superseding planned revision.`,
+        allowed_read_paths: [],
+        allowed_write_paths: [],
+        acceptance_criteria: [
+          "Execute only the frozen recover-task-worktree operation",
+          "Preserve the frozen source worktree owner, HEAD, source artifact lineage, and dirty paths",
+          "Do not prepare, rebuild, adopt, transfer, or clean a task worktree",
+        ],
+        context: {
+          stage: "git-operator",
+          phase: "recover_task_worktree",
+          operation: "recover-task-worktree",
+          task_id: next.task_id,
+          explorer_dispatch_id: explorerDispatchId,
+          coordinator_dispatch_id: coordinator.dispatch_id,
+          project: recovery.project,
+          worktree_id: recovery.worktree_id,
+          source_run_id: recovery.source_run_id,
+          source_worktree_owner_run_id: recovery.source_run_id,
+          from_plan_id: recovery.plan_id,
+          from_revision: recovery.revision,
+          to_plan_id: recovery.plan_id,
+          to_revision: recovery.target_revision,
+          to_run_id: runId,
+          expected_head: recovery.expected_head,
+          expected_source_artifact: recovery.artifact_id,
+          expected_source_artifact_digest: recovery.artifact_digest,
+        },
+      }, "git-operator"), existingPrepare?.dispatch_id);
+      if (existingPrepare) {
+        this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
+          .run(new Date().toISOString(), existingPrepare.dispatch_id);
+        this.store.event(runId, "dispatch.prepare_superseded_for_task_recovery", {
+          dispatch_id: existingPrepare.dispatch_id,
+          replacement_dispatch_id: dispatchId,
+          task_id: next.task_id,
+          reason: "pending source-owned planned task worktree recovery lineage",
+        });
+      }
+      this.changeStage(runId, "git-operator", dispatchId);
+      return dispatchId;
+    }
     const taskKey = next.task_id.toLowerCase();
     const taskWorktree = this.store.db.prepare(`SELECT worktree_id,base_commit FROM worktrees WHERE run_id=? AND state='active'
       AND (branch LIKE ? OR branch LIKE ?) ORDER BY created_at DESC LIMIT 1`).get(runId, `task/%/${taskKey}`, `task/%--${taskKey}`) as { worktree_id: string; base_commit: string } | undefined;
@@ -1980,6 +2049,59 @@ export class DispatchService {
     });
     this.changeStage(runId, "git-operator", dispatchId);
     return dispatchId;
+  }
+
+  private pendingPlannedTaskRecovery(runId: string, taskId: string): {
+    project: string;
+    plan_id: string;
+    revision: string;
+    target_revision: string;
+    source_run_id: string;
+    worktree_id: string;
+    artifact_id: string;
+    artifact_digest: string;
+    expected_head: string;
+  } | undefined {
+    const run = this.store.getRun(runId) as { repo_id: string; profile: string; mode?: string; plan_id?: string; revision?: string };
+    if (run.profile !== "coding" || run.mode !== "planned" || !run.plan_id || !run.revision) return undefined;
+    const source = this.store.db.prepare(`SELECT source_run.run_id AS source_run_id,source_run.plan_id,source_run.revision,
+        source_task.worktree_id,worktree.path,artifact.artifact_id,artifact.sha256 AS artifact_digest,repository.project_path
+      FROM revisions target_revision
+      JOIN runs source_run ON source_run.repo_id=target_revision.repo_id AND source_run.profile='coding' AND source_run.mode='planned'
+        AND source_run.plan_id=target_revision.plan_id AND source_run.revision=target_revision.supersedes
+      JOIN run_tasks source_task ON source_task.run_id=source_run.run_id AND source_task.task_id=?
+      JOIN worktrees worktree ON worktree.worktree_id=source_task.worktree_id AND worktree.run_id=source_run.run_id AND worktree.state='active'
+      JOIN repositories repository ON repository.repo_id=source_run.repo_id
+      JOIN artifacts artifact ON artifact.run_id=source_run.run_id AND artifact.kind='result'
+        AND artifact.dispatch_id IN (source_task.developer_dispatch_id,source_task.test_dispatch_id)
+      WHERE target_revision.repo_id=? AND target_revision.plan_id=? AND target_revision.revision=?
+      ORDER BY artifact.created_at DESC LIMIT 1`)
+      .get(taskId, run.repo_id, run.plan_id, run.revision) as {
+        source_run_id: string; plan_id: string; revision: string; worktree_id: string; path: string;
+        artifact_id: string; artifact_digest: string; project_path: string;
+      } | undefined;
+    if (!source) return undefined;
+    const expectedHead = execFileSync("git", ["-C", source.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    if (!/^[a-f0-9]{40}$/.test(expectedHead)) throw new ValidationError("planned task recovery source worktree has an invalid HEAD");
+    return {
+      project: source.project_path,
+      plan_id: source.plan_id,
+      revision: source.revision,
+      target_revision: run.revision,
+      source_run_id: source.source_run_id,
+      worktree_id: source.worktree_id,
+      artifact_id: source.artifact_id,
+      artifact_digest: source.artifact_digest,
+      expected_head: expectedHead,
+    };
+  }
+
+  private prepareDispatchHasNoSideEffects(runId: string, dispatchId: string): boolean {
+    const worktreeBinding = this.store.db.prepare("SELECT 1 FROM dispatch_worktree_bindings WHERE run_id=? AND dispatch_id=? LIMIT 1")
+      .get(runId, dispatchId);
+    const staging = this.store.db.prepare("SELECT 1 FROM staging_entries WHERE run_id=? AND dispatch_id=? LIMIT 1")
+      .get(runId, dispatchId);
+    return !worktreeBinding && !staging;
   }
 
   private createPlannedTaskTest(runId: string, developerDispatchId: string): string | undefined {
@@ -2077,9 +2199,9 @@ export class DispatchService {
     if (run.profile !== "coding" || run.mode !== "planned" || run.state !== "active") return undefined;
     const prepare = (prepareDispatchId
       ? this.store.db.prepare(`SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator' AND state='completed'
-          AND json_extract(packet_json,'$.context.phase')='prepare_implementation_worktree'`).get(runId, prepareDispatchId)
+          AND json_extract(packet_json,'$.context.phase') IN ('prepare_implementation_worktree','recover_task_worktree')`).get(runId, prepareDispatchId)
       : this.store.db.prepare(`SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='git-operator' AND state='completed'
-          AND json_extract(packet_json,'$.context.phase')='prepare_implementation_worktree' ORDER BY completed_at DESC,created_at DESC LIMIT 1`).get(runId)) as { dispatch_id: string; packet_json: string } | undefined;
+          AND json_extract(packet_json,'$.context.phase') IN ('prepare_implementation_worktree','recover_task_worktree') ORDER BY completed_at DESC,created_at DESC LIMIT 1`).get(runId)) as { dispatch_id: string; packet_json: string } | undefined;
     if (!prepare) return undefined;
     const preparePacket = JSON.parse(prepare.packet_json) as DispatchPacket;
     const prepareContext = preparePacket.context as Record<string, unknown>;
@@ -2179,7 +2301,7 @@ export class DispatchService {
   }
 
   private assertGitPrepareResult(runId: string, packet: DispatchPacket): void {
-    const context = packet.context as { phase?: unknown; task_id?: unknown; worktree_ids?: unknown };
+    const context = packet.context as { phase?: unknown; task_id?: unknown; worktree_id?: unknown; worktree_ids?: unknown; operation?: unknown };
     if (context.phase === "prepare_worktrees") {
       const worktree = this.activeIntegrationWorktree(runId);
       if (!worktree) throw new ValidationError("prepare_worktrees requires a registered active integration worktree or plan worktree owned by this run");
@@ -2189,6 +2311,20 @@ export class DispatchService {
       const worktree = this.store.db.prepare("SELECT 1 FROM worktrees WHERE run_id=? AND state='active' AND (branch LIKE ? OR branch LIKE ?)")
         .get(runId, `task/%/${taskId}`, `task/%--${taskId}`);
       if (!worktree) throw new ValidationError("prepare_implementation_worktree requires a registered active implementation task worktree owned by this run");
+    }
+    if (context.phase === "recover_task_worktree") {
+      const taskId = typeof context.task_id === "string" ? context.task_id : "";
+      const worktreeId = typeof context.worktree_id === "string" ? context.worktree_id : "";
+      if (!/^TASK-\d{3}$/.test(taskId) || !worktreeId) {
+        throw new ValidationError("recover_task_worktree requires its frozen recovery operation and task worktree identity");
+      }
+      if (context.operation === undefined) return;
+      if (context.operation !== "recover-task-worktree") {
+        throw new ValidationError("recover_task_worktree requires its frozen recovery operation and task worktree identity");
+      }
+      const recovered = this.store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.worktree.recover' AND state='completed'
+        AND json_extract(evidence_json,'$.worktree_id')=? AND json_extract(evidence_json,'$.task_id')=? LIMIT 1`).get(runId, worktreeId, taskId);
+      if (!recovered) throw new ValidationError("recover_task_worktree requires its completed recovery receipt");
     }
     if (context.phase === "reconcile_worktree_ownership") {
       if (!Array.isArray(context.worktree_ids) || !context.worktree_ids.length || context.worktree_ids.some((id) => typeof id !== "string")) {
@@ -3265,7 +3401,16 @@ export class DispatchService {
         const pendingTest = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='test' AND state IN ('pending','claimed') ORDER BY created_at DESC LIMIT 1")
           .get(runId) as { dispatch_id: string } | undefined;
         if (pendingTest && run.stage !== "test") this.changeStage(runId, "test", pendingTest.dispatch_id);
-        const pendingDispatch = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId);
+        const pendingDispatch = this.store.db.prepare(`SELECT dispatch_id,role,packet_json FROM dispatches
+          WHERE run_id=? AND state IN ('pending','claimed') ORDER BY created_at DESC LIMIT 1`).get(runId) as { dispatch_id: string; role: Role; packet_json: string } | undefined;
+        if (pendingDispatch && run.profile === "coding") {
+          const pendingPacket = JSON.parse(pendingDispatch.packet_json) as DispatchPacket;
+          if (pendingDispatch.role === "git-operator" && pendingPacket.context.phase === "prepare_implementation_worktree"
+            && typeof pendingPacket.context.task_id === "string" && this.pendingPlannedTaskRecovery(runId, pendingPacket.context.task_id)) {
+            this.ensureNextPlannedTaskPrepare(runId);
+            return;
+          }
+        }
         if (pendingDispatch) return;
         if (run.profile === "coding" && (this.ensurePlannedTaskContinuation(runId) || this.ensureNextPlannedTaskPrepare(runId))) return;
       }
