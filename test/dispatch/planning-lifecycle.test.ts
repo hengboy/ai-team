@@ -71,6 +71,162 @@ test("an exact File Explorer result creates one planning or coding dispatch and 
   });
 });
 
+test("completed planned task continuations derive one developer for prepared and recovered worktrees", async () => {
+  await withStore(async (store) => {
+    const dispatches = new DispatchService(store);
+    const prepareTask = async (phase: "prepare_implementation_worktree" | "recover_task_worktree") => {
+      const repoId = "repo-review-fixture";
+      store.registerRepository(repoId, join(process.cwd(), "."), process.cwd());
+      const taskId = phase === "prepare_implementation_worktree" ? "TASK-001" : "TASK-002";
+      const runId = store.createRun({
+        repoId,
+        profile: "coding",
+        mode: "planned",
+        planId: `20260820-${phase}`,
+        revision: "001",
+      });
+      store.initializeRunTasks(runId, [{
+        task_id: taskId,
+        source_path: `.ai-team/plans/20260820-${phase}/revisions/001/tasks/${taskId}.md`,
+        source_digest: "a".repeat(64),
+        write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
+      }]);
+      const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"]));
+      store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+        .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+      const coordinatorId = dispatches.create(runId, "coding", {
+        ...dispatchPacket(["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"]),
+        context: { explorer_dispatch_id: explorerId },
+      });
+      dispatches.claim(runId, coordinatorId, "coding");
+      const worktreeId = `worktree_${phase}`;
+      const worktreePath = `/tmp/${runId}-${taskId.toLowerCase()}`;
+      const prepareId = dispatches.create(runId, "git-operator", {
+        ...dispatchPacket([]),
+        context: {
+          phase,
+          ...(phase === "recover_task_worktree" ? {
+            operation: "recover-task-worktree",
+            worktree_id: worktreeId,
+            project: process.cwd(),
+            source_run_id: "run_source_task",
+            from_plan_id: "20260820-source",
+            from_revision: "001",
+            to_plan_id: `20260820-${phase}`,
+            to_revision: "001",
+            to_run_id: runId,
+            expected_head: "a".repeat(40),
+            expected_source_artifact: "artifact_source_task",
+            expected_source_artifact_digest: "b".repeat(64),
+          } : {}),
+          task_id: taskId,
+          explorer_dispatch_id: explorerId,
+          coordinator_dispatch_id: coordinatorId,
+        },
+      }, "coding", coordinatorId);
+      store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+        .run(JSON.stringify(completedResult(runId, coordinatorId, "coding", { actions: [`prepare ${taskId}`] })), new Date().toISOString(), coordinatorId);
+      store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+        .run(worktreeId, runId, `task/20260820/${taskId.toLowerCase()}`, worktreePath, "a".repeat(40), new Date().toISOString());
+      if (phase === "recover_task_worktree") {
+        store.db.prepare("INSERT INTO operations(operation_id,run_id,idempotency_key,kind,state,request_json,evidence_json,created_at,completed_at) VALUES (?,?,?,'git.worktree.recover','completed',?,?,?,?)")
+          .run(`op_${taskId.toLowerCase()}`, runId, `recover:${runId}:${taskId}`, "{}", JSON.stringify({ task_id: taskId, worktree_id: worktreeId }), new Date().toISOString(), new Date().toISOString());
+      }
+      dispatches.claim(runId, prepareId, "git-operator");
+      const prepared = await dispatches.submitValue(runId, prepareId, "git-operator", completedResult(runId, prepareId, "git-operator", {
+        operations: [{ command: `${phase} ${taskId}`, outcome: worktreeId }],
+      }));
+      const continuationId = prepared.continuation.pending_dispatches[0]!.dispatch_id;
+      dispatches.claim(runId, continuationId, "coding");
+      const continued = await dispatches.submitValue(runId, continuationId, "coding", completedResult(runId, continuationId, "coding", {
+        actions: [`dispatch ${taskId} developer`],
+      }));
+      assert.equal(continued.continuation.pending_dispatches.length, 1);
+      const developerId = continued.continuation.pending_dispatches[0]!.dispatch_id;
+      const developer = store.db.prepare("SELECT role,packet_json FROM dispatches WHERE dispatch_id=?").get(developerId) as { role: string; packet_json: string };
+      const context = JSON.parse(developer.packet_json).context;
+      assert.equal(developer.role, "backend-developer");
+      assert.deepEqual({
+        explorer_dispatch_id: context.explorer_dispatch_id,
+        coordinator_dispatch_id: context.coordinator_dispatch_id,
+        prepare_git_dispatch_id: context.prepare_git_dispatch_id,
+        task_id: context.task_id,
+        worktree_id: context.worktree_id,
+        worktree_path: context.worktree_path,
+      }, {
+        explorer_dispatch_id: explorerId,
+        coordinator_dispatch_id: continuationId,
+        prepare_git_dispatch_id: prepareId,
+        task_id: taskId,
+        worktree_id: worktreeId,
+        worktree_path: worktreePath,
+      });
+      assert.deepEqual(JSON.parse(developer.packet_json).allowed_write_paths, ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"]);
+      assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role IN ('frontend-developer','backend-developer')").get(runId) as { count: number }).count, 1);
+    };
+
+    await prepareTask("prepare_implementation_worktree");
+    await prepareTask("recover_task_worktree");
+  });
+});
+
+test("run resume compensates one missing developer dispatch for a completed planned continuation", () => {
+  return withStore((store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), "."), process.cwd());
+    const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "20260820-resume", revision: "001" });
+    const dispatches = new DispatchService(store);
+    store.initializeRunTasks(runId, [{
+      task_id: "TASK-001",
+      source_path: ".ai-team/plans/20260820-resume/revisions/001/tasks/TASK-001.md",
+      source_digest: "a".repeat(64),
+      write_paths: ["src/dispatch.ts"],
+    }]);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["src/dispatch.ts"]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+    const prepareId = dispatches.create(runId, "git-operator", {
+      ...dispatchPacket([]),
+      context: {
+        phase: "recover_task_worktree", operation: "recover-task-worktree", task_id: "TASK-001",
+        explorer_dispatch_id: explorerId, coordinator_dispatch_id: "dispatch_original_coordinator", worktree_id: "worktree_resume",
+        project: process.cwd(), source_run_id: "run_source_task", from_plan_id: "20260820-source", from_revision: "001",
+        to_plan_id: "20260820-resume", to_revision: "001", to_run_id: runId, expected_head: "a".repeat(40),
+        expected_source_artifact: "artifact_source_task", expected_source_artifact_digest: "b".repeat(64),
+      },
+    });
+    const continuationId = dispatches.create(runId, "coding", {
+      ...dispatchPacket(["src/dispatch.ts"]),
+      context: {
+        phase: "continue_implementation",
+        explorer_dispatch_id: explorerId,
+        coordinator_dispatch_id: "dispatch_original_coordinator",
+        prepare_git_dispatch_id: prepareId,
+        task_id: "TASK-001",
+        worktree_id: "worktree_resume",
+        worktree_path: `/tmp/${runId}-task-001`,
+      },
+    });
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(completedResult(runId, prepareId, "git-operator", { operations: [] })), new Date().toISOString(), prepareId);
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(completedResult(runId, continuationId, "coding", { actions: ["dispatch TASK-001 developer"] })), new Date().toISOString(), continuationId);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_resume", runId, "task/20260820/task-001", `/tmp/${runId}-task-001`, "a".repeat(40), new Date().toISOString());
+    store.advanceRunTask(runId, "TASK-001", "prepared", { worktree_id: "worktree_resume" });
+    store.db.prepare("INSERT INTO operations(operation_id,run_id,idempotency_key,kind,state,request_json,evidence_json,created_at,completed_at) VALUES (?,?,?,'git.worktree.recover','completed',?,?,?,?)")
+      .run("op_resume", runId, `recover:${runId}:TASK-001`, "{}", JSON.stringify({ task_id: "TASK-001", worktree_id: "worktree_resume" }), new Date().toISOString(), new Date().toISOString());
+
+    const first = dispatches.resume(runId);
+    const second = dispatches.resume(runId);
+    assert.equal(first.pending_dispatches.length, 1);
+    assert.equal(first.pending_dispatches[0]?.role, "backend-developer");
+    assert.deepEqual(second.pending_dispatches, first.pending_dispatches);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role IN ('frontend-developer','backend-developer')").get(runId) as { count: number }).count, 1);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM run_events WHERE run_id=? AND type='coding.developer_dispatch_created' AND json_extract(payload_json,'$.source')='resume'").get(runId) as { count: number }).count, 1);
+  });
+});
+
 test("public planning schema and runtime validator share the typed decision contract", () => {
   const runId = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV";
   const dispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAV";

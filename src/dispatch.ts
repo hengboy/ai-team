@@ -1736,6 +1736,7 @@ export class DispatchService {
     }
     if (["coding", "frontend-developer", "backend-developer", "git-operator"].includes(role)) {
       if (run.mode === "planned") {
+        if (role === "coding" && this.ensurePlannedTaskDeveloperDispatch(runId, result.dispatch_id, "completion")) return;
         this.reconcilePlannedTaskStates(runId);
         if (this.ensureNextPlannedTaskPrepare(runId)) return;
       }
@@ -2268,6 +2269,81 @@ export class DispatchService {
       worktree_id: worktree.worktree_id,
       prepare_git_dispatch_id: prepare.dispatch_id,
       replacement_for: coordinator.dispatch_id,
+    });
+    this.changeStage(runId, "coding", dispatchId);
+    return dispatchId;
+  }
+
+  private ensurePlannedTaskDeveloperDispatch(
+    runId: string,
+    continuationDispatchId?: string,
+    source: "completion" | "resume" = "resume",
+  ): string | undefined {
+    const run = this.store.getRun(runId) as { profile: string; mode?: string; state: string };
+    if (run.profile !== "coding" || run.mode !== "planned" || run.state !== "active") return undefined;
+    const continuation = (continuationDispatchId
+      ? this.store.db.prepare(`SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='coding' AND state='completed'
+          AND json_extract(packet_json,'$.context.phase')='continue_implementation'`).get(runId, continuationDispatchId)
+      : this.store.db.prepare(`SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='coding' AND state='completed'
+          AND json_extract(packet_json,'$.context.phase')='continue_implementation' ORDER BY completed_at DESC,created_at DESC LIMIT 1`).get(runId)) as { dispatch_id: string; packet_json: string } | undefined;
+    if (!continuation) return undefined;
+    const coordinator = JSON.parse(continuation.packet_json) as DispatchPacket;
+    const context = coordinator.context as Record<string, unknown>;
+    const taskId = typeof context.task_id === "string" ? context.task_id : undefined;
+    const explorerDispatchId = typeof context.explorer_dispatch_id === "string" ? context.explorer_dispatch_id : undefined;
+    const worktreeId = typeof context.worktree_id === "string" ? context.worktree_id : undefined;
+    const worktreePath = typeof context.worktree_path === "string" ? context.worktree_path : undefined;
+    const prepareDispatchId = typeof context.prepare_git_dispatch_id === "string" ? context.prepare_git_dispatch_id : undefined;
+    if (!taskId || !explorerDispatchId || !worktreeId || !worktreePath || !prepareDispatchId) return undefined;
+    const task = this.plannedTaskRows(runId).find((candidate) => candidate.task_id === taskId);
+    if (!task || task.state !== "prepared" || task.developer_dispatch_id) return undefined;
+    const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role IN ('frontend-developer','backend-developer')
+      AND state IN ('pending','claimed','completed') AND json_extract(packet_json,'$.context.coordinator_dispatch_id')=? LIMIT 1`)
+      .get(runId, continuation.dispatch_id) as { dispatch_id: string } | undefined;
+    if (existing) return undefined;
+    const prepare = this.store.db.prepare(`SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator' AND state='completed'
+      AND json_extract(packet_json,'$.context.phase') IN ('prepare_implementation_worktree','recover_task_worktree')`)
+      .get(runId, prepareDispatchId) as { packet_json: string } | undefined;
+    const prepareTaskId = prepare ? (JSON.parse(prepare.packet_json) as DispatchPacket).context.task_id : undefined;
+    if (prepareTaskId !== taskId) throw new ValidationError("planned task developer requires its frozen prepare lineage");
+    const worktree = this.store.db.prepare("SELECT path,branch FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'")
+      .get(runId, worktreeId) as { path: string; branch: string } | undefined;
+    if (!worktree || worktree.path !== worktreePath || !worktree.branch.startsWith("task/")) {
+      throw new ValidationError("planned task developer requires its prepared active task worktree");
+    }
+    const developer = validatePacket({
+      objective: `Implement ${taskId} in its frozen prepared task worktree.`,
+      allowed_read_paths: coordinator.allowed_read_paths,
+      allowed_write_paths: this.frozenTaskWritePaths(runId, taskId),
+      acceptance_criteria: [
+        "Implement only the frozen Task scope",
+        "Preserve the frozen Explorer, coordinator, prepare, and worktree lineage",
+      ],
+      context: {
+        stage: "coding",
+        phase: "implementation",
+        explorer_dispatch_id: explorerDispatchId,
+        coordinator_dispatch_id: continuation.dispatch_id,
+        prepare_git_dispatch_id: prepareDispatchId,
+        task_id: taskId,
+        worktree_id: worktreeId,
+        worktree_path: worktreePath,
+        ...(context.predecessor_repair !== undefined ? { predecessor_repair: context.predecessor_repair } : {}),
+      },
+    }, "backend-developer");
+    this.assertCommandAllowed("coding", "dispatch create");
+    this.assertContinueImplementationDelegation(runId, continuation.dispatch_id, "backend-developer", coordinator, developer);
+    const frozenDeveloper = freezeExecutionContract("backend-developer", this.freezeVerificationContext(runId, "backend-developer", developer));
+    assertExplorerAuthorization(this.store, runId, "backend-developer", frozenDeveloper);
+    const dispatchId = this.insert(runId, "backend-developer", frozenDeveloper);
+    this.store.event(runId, "coding.developer_dispatch_created", {
+      dispatch_id: dispatchId,
+      source,
+      coordinator_dispatch_id: continuation.dispatch_id,
+      prepare_git_dispatch_id: prepareDispatchId,
+      task_id: taskId,
+      worktree_id: worktreeId,
+      explorer_dispatch_id: explorerDispatchId,
     });
     this.changeStage(runId, "coding", dispatchId);
     return dispatchId;
@@ -3412,7 +3488,7 @@ export class DispatchService {
           }
         }
         if (pendingDispatch) return;
-        if (run.profile === "coding" && (this.ensurePlannedTaskContinuation(runId) || this.ensureNextPlannedTaskPrepare(runId))) return;
+        if (run.profile === "coding" && (this.ensurePlannedTaskDeveloperDispatch(runId) || this.ensurePlannedTaskContinuation(runId) || this.ensureNextPlannedTaskPrepare(runId))) return;
       }
       const retryableHasNoSideEffects = retryableResultHasNoSideEffects(retryableDispatch?.result_json);
       if (retryableDispatch && retryableHasNoSideEffects && !mergePartialEffect) {
