@@ -3,9 +3,12 @@ import { chmod, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeF
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import test from "node:test";
+import { DispatchService } from "../../src/dispatch.js";
+import { repositoryIdentity } from "../../src/git.js";
+import { GitOrchestrator } from "../../src/git-orchestrator.js";
 import { StateStore } from "../../src/state.js";
 
-import { cli, json, makeSandbox } from "../helpers/cli.js";
+import { cli, git, json, makeSandbox } from "../helpers/cli.js";
 
 
 test("init creates project metadata, context skeletons, and documented ignore entries", async (t) => {
@@ -28,6 +31,68 @@ test("init creates project metadata, context skeletons, and documented ignore en
   assert.match(project, /repo_id:/);
   assert.match(await readFile(join(sandbox.repo, "MEMORY.md"), "utf8"), /## 项目上下文/);
   assert.match(await readFile(join(sandbox.repo, ".ai-team", "index", "feature-navigation.md"), "utf8"), /# 功能导航/);
+});
+
+test("CLI git prepare preserves omitted task-id for a planned prepare_worktrees dispatch", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const planId = "20260820-prepare-default";
+  const revision = "001";
+  const taskDirectory = join(sandbox.repo, ".ai-team", "plans", planId, "revisions", revision, "tasks");
+  await mkdir(taskDirectory, { recursive: true });
+  await writeFile(join(taskDirectory, "TASK-001.md"), "# TASK-001\n");
+  await writeFile(join(taskDirectory, "TASK-002.md"), "# TASK-002\n");
+  assert.equal((await git(sandbox, ["add", ".ai-team"])).status, 0);
+  assert.equal((await git(sandbox, ["commit", "-m", "Add planned task fixture"])).status, 0);
+  const baseCommit = (await git(sandbox, ["rev-parse", "HEAD"])).stdout.trim();
+
+  const store = await StateStore.open(sandbox.aiTeamHome);
+  let runId: string;
+  let dispatchId: string;
+  let planWorktreeId: string;
+  try {
+    const identity = await repositoryIdentity(sandbox.repo);
+    store.registerRepository(identity.repoId, identity.commonDir, identity.root);
+    runId = store.createRun({
+      repoId: identity.repoId,
+      profile: "coding",
+      mode: "planned",
+      planId,
+      revision,
+      baseCommit,
+      targetBranch: "main",
+    });
+    const plan = await new GitOrchestrator(store).prepareIntegration(runId);
+    planWorktreeId = plan.worktree_id;
+    const dispatches = new DispatchService(store);
+    dispatchId = dispatches.create(runId, "git-operator", {
+      objective: "Verify the plan worktree prepared for this planned run.",
+      allowed_read_paths: [".ai-team/plans"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Plan worktree is prepared"],
+      context: { phase: "prepare_worktrees", base_commit: baseCommit },
+    });
+    dispatches.claim(runId, dispatchId, "git-operator");
+  } finally {
+    store.close();
+  }
+
+  const prepared = json<{ worktree_id: string; branch: string; path: string; base_commit: string; reused: boolean }>(await cli(sandbox, [
+    "git", "prepare", "--run-id", runId!, "--dispatch-id", dispatchId!, "--base-commit", baseCommit,
+  ]));
+  assert.equal(prepared.worktree_id, planWorktreeId!);
+  assert.equal(prepared.branch, `plan/${planId}/${planId}-${revision}`);
+  assert.equal(prepared.path, await realpath(join(sandbox.repo, ".worktrees", "plans", planId, `${planId}-${revision}`)));
+  assert.equal(prepared.base_commit, baseCommit);
+  assert.equal(prepared.reused, true);
+
+  const verifyStore = await StateStore.open(sandbox.aiTeamHome, { readonly: true });
+  try {
+    const implementationWorktrees = verifyStore.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=? AND branch LIKE ?")
+      .get(runId, `%--implementation`) as { count: number };
+    assert.equal(implementationWorktrees.count, 0);
+  } finally {
+    verifyStore.close();
+  }
 });
 
 test("context update accepts File Explorer output and validate reports maintenance state", async (t) => {

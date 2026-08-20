@@ -140,14 +140,20 @@ export class GitOrchestrator {
     return undefined;
   }
 
-  async prepareTask(runId: string, taskId = "implementation", baseCommit?: string, dependsOn?: string, dispatchId?: string): Promise<PreparedWorktree> {
+  async prepareTask(runId: string, taskId?: string, baseCommit?: string, dependsOn?: string, dispatchId?: string): Promise<PreparedWorktree> {
     this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
     if ((["bug", "feature"] as string[]).includes(run.mode)) new ScopeGate(this.store).assertPassed(runId, "pre_write");
-    const { branch, path } = worktreeNames(root, run, runId, taskId);
+    const worktreeTaskId = isPlannedRun(run) ? taskId : taskId ?? "implementation";
+    const { branch, path } = worktreeNames(root, run, runId, worktreeTaskId);
     const integration = isPlannedRun(run) ? this.activeIntegrationWorktree(runId, root, run) : undefined;
     if (isPlannedRun(run) && !integration) throw new ValidationError("planned Task requires an active plan worktree");
-    if (isPlannedRun(run) && integration) {
+    const integrationHead = integration ? await currentHead(integration.path) : undefined;
+    if (integrationHead && baseCommit && baseCommit !== integrationHead) throw new ValidationError("planned Task base must equal the current plan worktree HEAD");
+    if (isPlannedRun(run) && taskId === undefined) {
+      return { worktree_id: integration!.worktree_id, branch: integration!.branch, path: integration!.path, base_commit: integration!.base_commit, reused: true };
+    }
+    if (isPlannedRun(run) && integration && taskId !== undefined) {
       const taskDirectory = join(integration.path, ".ai-team", "plans", run.plan_id, "revisions", run.revision, "tasks");
       let taskIds: string[] = [];
       try {
@@ -159,8 +165,6 @@ export class GitOrchestrator {
       if (taskIds.length <= 1) throw new ValidationError("planned revision with zero or one explicit TASK uses its plan worktree directly");
       if (!taskIds.includes(taskId.toLowerCase())) throw new ValidationError(`unknown explicit planned Task: ${taskId}`);
     }
-    const integrationHead = integration ? await currentHead(integration.path) : undefined;
-    if (integrationHead && baseCommit && baseCommit !== integrationHead) throw new ValidationError("planned Task base must equal the current plan worktree HEAD");
     let base = integrationHead ?? baseCommit ?? run.base_commit;
     if (dependsOn) {
       const dependency = this.worktree(runId, dependsOn);
