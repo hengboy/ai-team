@@ -47,11 +47,25 @@ const initializeRepositoryContext = async (repository: { directory: string; head
 const commitPlanRevision = async (repository: { directory: string; head: string }, planId: string, revision: string, taskIds: string[] = []): Promise<void> => {
   const planRoot = path.join(repository.directory, ".ai-team", "plans", planId);
   const revisionRoot = path.join(planRoot, "revisions", revision);
+  const mappedTaskIds = taskIds.length ? taskIds : ["TASK-001"];
+  const planVerification = {
+    acceptance_criteria: ["AC-001"],
+    acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+    task_mapping: mappedTaskIds.map((task_id) => ({ task_id, acceptance_criteria: ["AC-001"] })),
+    test_commands: ["npm test"],
+  };
   await mkdir(path.join(revisionRoot, "tasks"), { recursive: true });
   await writeFile(path.join(planRoot, "plan.yaml"), `plan_id: ${planId}\nactive_revision: ${revision}\n`);
   await writeFile(path.join(revisionRoot, "spec.md"), `# ${planId} ${revision} spec\n`);
-  await writeFile(path.join(revisionRoot, "plan.md"), `# ${planId} ${revision} plan\n`);
-  for (const taskId of taskIds) await writeFile(path.join(revisionRoot, "tasks", `${taskId}.md`), `# ${taskId}\n\n- Allowed write paths: \`src/${taskId.toLowerCase()}.ts\`\n`);
+  await writeFile(path.join(revisionRoot, "plan.md"), `# ${planId} ${revision} plan\n\n## 方案验收契约\n\n\`\`\`json\n${JSON.stringify(planVerification, null, 2)}\n\`\`\`\n`);
+  for (const taskId of taskIds) {
+    const taskVerification = {
+      ...planVerification,
+      task_mapping: [{ task_id: taskId, acceptance_criteria: ["AC-001"] }],
+      tdd_cycles: [{ acceptance_criterion: "AC-001", test_path: `test/${taskId.toLowerCase()}.test.ts`, red: { command: "npm test", expected_failure: "fails" }, green: { implementation_steps: ["implement"], command: "npm test", expected_result: "passes" }, refactor: { scope: "none", command: "npm test", expected_result: "passes" } }],
+    };
+    await writeFile(path.join(revisionRoot, "tasks", `${taskId}.md`), `# ${taskId}\n\n- Allowed write paths: \`src/${taskId.toLowerCase()}.ts\`\n\n## 任务验收契约\n\n\`\`\`json\n${JSON.stringify(taskVerification, null, 2)}\n\`\`\`\n`);
+  }
   await git(repository.directory, "add", "--", path.relative(repository.directory, planRoot));
   await git(repository.directory, "commit", "-m", `freeze ${planId} ${revision}`);
   repository.head = await git(repository.directory, "rev-parse", "HEAD");
@@ -359,7 +373,9 @@ test("run resume creates one continue_testing replacement with inherited evidenc
     assert.equal(store.getStagingEntry(staging.stagingId).state, "canceled");
 
     dispatches.claim(fixture.runId, replacementId, "coding");
-    assert.throws(() => dispatches.create(fixture.runId, "frontend-developer", packet, "coding", replacementId), /only delegate to Test/);
+    const invalidDeveloperPacket = { ...packet };
+    delete invalidDeveloperPacket.execution_contract;
+    assert.throws(() => dispatches.create(fixture.runId, "frontend-developer", invalidDeveloperPacket, "coding", replacementId), /only delegate to Test/);
     const testContext = {
       ...packet.context,
       stage: "test",
@@ -634,8 +650,19 @@ test("project init requires confirmation before appending to a dirty .gitignore"
 test("revision writing enforces coverage, frontmatter, and immutability", async () => {
   const project = await temporaryDirectory();
   const planId = "20260813-workflow";
-  const specDocument = ["# Spec", "## 背景", "背景", "## 目标", "目标", "## 非目标", "无", "## 用户场景", "场景", "## 功能需求", "REQ-001", "## 验收标准", "AC-001", "## 数据与接口", "无", "## 兼容约束", "macOS", "## 安全约束", "本地", "## 错误与边界", "失败", "## 迁移发布回滚", "回滚", "## 已确认偏好", "中文", "## 默认取舍", "默认", "## 已关闭问题", "无", "## 未决问题", "none"].join("\n");
-  const planDocument = ["# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", "REQ-001", "## 验证", "验证", "## 发布与回滚", "回滚"].join("\n");
+  const specDocument = ["# Spec", "## 背景", "背景", "## 目标", "目标", "## 非目标", "无", "## 用户场景", "场景", "## 功能需求", "### REQ-001：需求", "对应验收 AC-001", "## 验收标准", "### AC-001：验收", "- Given：前置", "- When：操作", "- Then：结果", "- 覆盖需求：REQ-001", "- RED 判定：实施前失败", "- 可观察结果：实施后通过", "- 边界反例：无输入", "- 建议测试层级：unit", "## 数据与接口", "无", "## 兼容约束", "macOS", "## 安全约束", "本地", "## 错误与边界", "失败", "## 迁移发布回滚", "回滚", "## 已确认偏好", "中文", "## 默认取舍", "默认", "## 已关闭问题", "无", "## 未决问题", "none"].join("\n");
+  const planContract = {
+    acceptance_criteria: ["AC-001"],
+    acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+    task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+    test_commands: ["npm test"],
+  };
+  const taskContract = {
+    ...planContract,
+    tdd_cycles: [{ acceptance_criterion: "AC-001", test_path: "test/example.test.ts", red: { command: "npm test", expected_failure: "fails" }, green: { implementation_steps: ["implement"], command: "npm test", expected_result: "passes" }, refactor: { scope: "none", command: "npm test", expected_result: "passes" } }],
+  };
+  const planDocument = ["# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", "REQ-001 AC-001", "## 验证", "验证", "## 方案验收契约", "```json", JSON.stringify(planContract), "```", "## 发布与回滚", "回滚"].join("\n");
+  const taskDocument = ["# Tasks", "REQ-001 AC-001 TASK-001", "## 任务验收契约", "```json", JSON.stringify(taskContract), "```"].join("\n");
   try {
     assert.deepEqual(validateCoverage("REQ-001 AC-001", ["REQ-001 REQ-999"]), {
       requirements: ["AC-001", "REQ-001"],
@@ -656,14 +683,14 @@ test("revision writing enforces coverage, frontmatter, and immutability", async 
       /missing required sections/,
     );
     await assert.rejects(
-      () => writeRevision(project, planId, "001", "main", { spec: specDocument, plan: planDocument }),
+      () => writeRevision(project, planId, "001", "main", { spec: specDocument, plan: planDocument.replace("REQ-001 AC-001", "AC-001") }),
       /coverage is incomplete/,
     );
 
     const written = await writeRevision(project, planId, "001", "main", {
       spec: specDocument,
       plan: planDocument,
-      tasks: "# Tasks\nAC-001",
+      tasks: taskDocument,
     }, "000");
     const spec = await readFile(path.join(written.path, "spec.md"), "utf8");
     assert.match(spec, /^---\nplan_id: 20260813-workflow\nrevision: "001"\ntarget_branch: main\nsupersedes: "000"\n---\n\n# Spec/);
@@ -673,7 +700,7 @@ test("revision writing enforces coverage, frontmatter, and immutability", async 
       () => writeRevision(project, "20260813-workflow-abcd", "002", "main", {
         spec: specDocument,
         plan: planDocument,
-        tasks: "# Tasks\nAC-001",
+        tasks: taskDocument,
       }),
       /invalid plan id/,
     );

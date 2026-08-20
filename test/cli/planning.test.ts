@@ -18,20 +18,32 @@ test("planning revision creation enforces task preview approval and preserves re
 
   const spec = [
     "# Spec", "## 背景", "背景", "## 目标", "目标", "## 非目标", "无", "## 用户场景", "场景",
-    "## 功能需求", "REQ-001", "## 验收标准", "AC-001", "## 数据与接口", "无", "## 兼容约束", "无",
+    "## 功能需求", "### REQ-001：需求", "对应验收 AC-001", "## 验收标准", "### AC-001：验收",
+    "- Given：前置", "- When：操作", "- Then：结果", "- 覆盖需求：REQ-001", "- RED 判定：实施前失败",
+    "- 可观察结果：实施后通过", "- 边界反例：无输入", "- 建议测试层级：unit", "## 数据与接口", "无", "## 兼容约束", "无",
     "## 安全约束", "无", "## 错误与边界", "无", "## 迁移发布回滚", "回滚", "## 已确认偏好", "无",
     "## 默认取舍", "无", "## 已关闭问题", "无", "## 未决问题", "无",
   ].join("\n");
+  const planContract = {
+    acceptance_criteria: ["AC-001"],
+    acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+    task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+    test_commands: ["npm test"],
+  };
+  const taskContract = {
+    ...planContract,
+    tdd_cycles: [{ acceptance_criterion: "AC-001", test_path: "test/example.test.ts", red: { command: "npm test", expected_failure: "fails" }, green: { implementation_steps: ["implement"], command: "npm test", expected_result: "passes" }, refactor: { scope: "none", command: "npm test", expected_result: "passes" } }],
+  };
   const plan = (coverage: string) => [
     "# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", coverage,
-    "## 验证", "验证", "## 发布与回滚", "回滚",
+    "## 验证", "验证", "## 方案验收契约", "```json", JSON.stringify(planContract), "```", "## 发布与回滚", "回滚",
   ].join("\n");
   const simpleDocuments = { spec, plan: plan("REQ-001 AC-001") };
   const taskDocuments = {
     spec,
-    plan: plan("REQ-001"),
-    tasks: "# Tasks\nAC-001\nTASK-001",
-    taskFiles: { "TASK-001": "# TASK-001\nREQ-001\nAC-001" },
+    plan: plan("REQ-001 AC-001"),
+    tasks: ["# Tasks", "REQ-001 AC-001 TASK-001", "## 任务验收契约", "```json", JSON.stringify(taskContract), "```"].join("\n"),
+    taskFiles: { "TASK-001": ["# TASK-001", "REQ-001 AC-001 TASK-001", "## 任务验收契约", "```json", JSON.stringify(taskContract), "```"].join("\n") },
   };
   const approvalChoices = [
     { id: "approve", label: "Approve", impact: "Create task documents" },
@@ -138,11 +150,21 @@ test("planning revision create stdin preserves failed preflight staging for retr
   const documents = {
     spec: [
       "# Spec", "## 背景", "背景", "## 目标", "目标", "## 非目标", "无", "## 用户场景", "场景",
-      "## 功能需求", "REQ-001", "## 验收标准", "AC-001", "## 数据与接口", "无", "## 兼容约束", "无",
+      "## 功能需求", "### REQ-001：需求", "对应验收 AC-001", "## 验收标准", "### AC-001：验收",
+      "- Given：前置", "- When：操作", "- Then：结果", "- 覆盖需求：REQ-001", "- RED 判定：实施前失败",
+      "- 可观察结果：实施后通过", "- 边界反例：无输入", "- 建议测试层级：unit", "## 数据与接口", "无", "## 兼容约束", "无",
       "## 安全约束", "无", "## 错误与边界", "无", "## 迁移发布回滚", "回滚", "## 已确认偏好", "无",
       "## 默认取舍", "无", "## 已关闭问题", "无", "## 未决问题", "无",
     ].join("\n"),
-    plan: ["# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", "REQ-001 AC-001", "## 验证", "验证", "## 发布与回滚", "回滚"].join("\n"),
+    plan: [
+      "# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", "REQ-001 AC-001", "## 验证", "验证",
+      "## 方案验收契约", "```json", JSON.stringify({
+        acceptance_criteria: ["AC-001"],
+        acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+        task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+        test_commands: ["npm test"],
+      }), "```", "## 发布与回滚", "回滚",
+    ].join("\n"),
   };
   const args = [
     "planning", "revision", "create", "--project", sandbox.repo,

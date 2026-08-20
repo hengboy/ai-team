@@ -5,7 +5,7 @@ import { currentBranch, currentHead, git, repositoryIdentity, worktreeStatus } f
 import { frozenTaskWritePathsFromDocument, StateStore } from "./state.js";
 import { DispatchService } from "./dispatch.js";
 import { ValidationError } from "./errors.js";
-import { triageRequest } from "./planning.js";
+import { parsePlanVerification, parseTaskVerification, triageRequest, type PlanVerification, type TaskVerification } from "./planning.js";
 import { AGENT_BUILD } from "./roles.js";
 import { assertReadablePath } from "./security.js";
 import { GitOrchestrator } from "./git-orchestrator.js";
@@ -140,7 +140,8 @@ export class WorkflowService {
   private async planningSnapshot(project: string, planId: string, revision: string, planCommit?: string): Promise<{
     paths: string[];
     digest: string;
-    tasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[] }>;
+    planVerification: PlanVerification;
+    tasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[]; verification: TaskVerification }>;
   }> {
     const root = join(".ai-team", "plans", planId);
     const revisionRoot = join(root, "revisions", revision);
@@ -176,9 +177,17 @@ export class WorkflowService {
         source_path: path,
         source_digest: sha256(content),
         write_paths: frozenTaskWritePathsFromDocument(content, path),
+        verification: parseTaskVerification(content),
       };
     }));
-    return { paths, tasks, digest: sha256(documents.map(({ path, content }) => `${path}\n${content}`).join("\n")) };
+    const planDocument = documents.find(({ path }) => path === join(revisionRoot, "plan.md"));
+    if (!planDocument) throw new ValidationError("planned verification contract could not be read");
+    return {
+      paths,
+      tasks,
+      planVerification: parsePlanVerification(planDocument.content),
+      digest: sha256(documents.map(({ path, content }) => `${path}\n${content}`).join("\n")),
+    };
   }
 
   async codingStart(input: { project: string; mode: "planned" | "bug" | "feature"; planId?: string; revision?: string; request?: string }): Promise<{ run_id: string; dispatch_id: string; role: Role; depends_on: string[] }> {
@@ -189,8 +198,9 @@ export class WorkflowService {
     const head = await currentHead(repo.root);
     let selectedRevision = input.revision;
     let planDigest: string | undefined;
+    let planVerification: PlanVerification | undefined;
     let planPaths: string[] = [];
-    let planTasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[] }> = [];
+    let planTasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[]; verification: TaskVerification }> = [];
     if (input.mode === "planned") {
       if (!input.planId || input.request) throw new ValidationError("planned mode requires plan-id and forbids request input");
       const rows = this.store.db.prepare("SELECT * FROM revisions WHERE repo_id=? AND plan_id=? AND state='ready'").all(repo.repoId, input.planId) as any[];
@@ -206,6 +216,7 @@ export class WorkflowService {
       const snapshot = await this.planningSnapshot(repo.root, input.planId, selectedRevision, selected.plan_commit as string | undefined);
       planPaths = snapshot.paths;
       planTasks = snapshot.tasks;
+      planVerification = snapshot.planVerification;
       planDigest = typeof selected.digest === "string" && selected.digest.trim() ? selected.digest : snapshot.digest;
     } else {
       if (input.planId || input.revision) throw new ValidationError(`${input.mode} mode forbids plan-id and revision`);
@@ -214,7 +225,7 @@ export class WorkflowService {
       if (inferred !== input.mode) throw new ValidationError(`explicit ${input.mode} mode does not match inferred ${inferred}; planning required`);
     }
     this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
-    const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}), clientPlatform: clientPlatform(), ...(planDigest ? { planDigest } : {}) });
+    const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}), clientPlatform: clientPlatform(), ...(planDigest ? { planDigest } : {}), ...(planVerification ? { planVerification } : {}) });
     const commandId = this.store.startCommand(runId, "coding start");
     if (input.mode === "planned") {
       this.store.initializeRunTasks(runId, planTasks);

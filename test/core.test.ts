@@ -10,7 +10,7 @@ import { ROLES } from "../src/constants.js";
 import { COMMAND_CONTRACT_BASE, COMMAND_PARAMETER_TYPES, COMMAND_SYNTAX, commandContractFor } from "../src/command-contract.js";
 import { DispatchService, dispatchPacketSchema, dispatchPacketTemplate, type DispatchPacket } from "../src/dispatch.js";
 import { IncompatibleError, ValidationError } from "../src/errors.js";
-import { assertCoverage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, triage, validateCoverage } from "../src/planning.js";
+import { assertCoverage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, parsePlanVerification, parseTaskVerification, preflightRevision, triage, validateCoverage, verificationDigest } from "../src/planning.js";
 import { StateStore } from "../src/state.js";
 import { legacyStagingFilePath, pathMatchesScope, stagingFilePath } from "../src/security.js";
 import { makePlanId, sha256 } from "../src/utils.js";
@@ -173,7 +173,7 @@ test("state migration is recorded once and survives reopening", async () => {
   try {
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }],
     );
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
@@ -184,12 +184,37 @@ test("state migration is recorded once and survives reopening", async () => {
     store = await StateStore.open(home);
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }],
     );
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("new runs and tasks freeze canonical TDD verification while legacy rows remain nullable", async () => {
+  await withStore(async (store) => {
+    store.registerRepository("repo-tdd", "/tmp/repo-tdd/.git", "/tmp/repo-tdd");
+    const plan = {
+      acceptance_criteria: ["AC-001"],
+      acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+      task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+      test_commands: ["npm test"],
+    };
+    const task = {
+      ...plan,
+      tdd_cycles: [{ acceptance_criterion: "AC-001", test_path: "test/example.test.ts", red: { command: "npm test", expected_failure: "fails" }, green: { implementation_steps: ["implement"], command: "npm test", expected_result: "passes" }, refactor: { scope: "none", command: "npm test", expected_result: "passes" } }],
+    };
+    const runId = store.createRun({ repoId: "repo-tdd", profile: "coding", mode: "planned", planId: "plan", revision: "001", planVerification: plan });
+    store.initializeRunTasks(runId, [{ task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "a".repeat(64), write_paths: ["src/example.ts"], verification: task }]);
+    const run = store.getRun(runId) as { plan_verification_json: string };
+    assert.deepEqual(JSON.parse(run.plan_verification_json), plan);
+    const frozenTask = store.runTasks(runId)[0]!;
+    assert.deepEqual(JSON.parse(frozenTask.verification_json!), task);
+
+    const legacyRunId = store.createRun({ repoId: "repo-tdd", profile: "coding", mode: "planned", planId: "legacy", revision: "001" });
+    assert.equal((store.getRun(legacyRunId) as { plan_verification_json?: string }).plan_verification_json, null);
+  });
 });
 
 test("readonly state opens alongside a writer without locks, backups, or migrations", async () => {
@@ -201,7 +226,7 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
     try {
       assert.equal(
         (reader.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count,
-        14,
+        16,
       );
       assert.throws(() => reader.db.prepare("UPDATE runs SET state='failed'").run(), /readonly|read-only/i);
     } finally {
@@ -974,6 +999,89 @@ test("planning coverage reports sorted missing and unknown identifiers", () => {
       assert.deepEqual(error.details, validateCoverage(spec, documents)) === undefined,
   );
   assert.doesNotThrow(() => assertCoverage(spec, ["REQ-001 REQ-002 AC-001"]));
+});
+
+const tddSpecDocument = [
+  "# Spec", "## 背景", "背景", "## 目标", "目标", "## 非目标", "无", "## 用户场景", "场景",
+  "## 功能需求", "### REQ-001：需求", "- 对应验收：AC-001",
+  "## 验收标准", "### AC-001：验收", "- Given：前置", "- When：操作", "- Then：结果",
+  "- 覆盖需求：REQ-001", "- RED 判定：实现前命令失败", "- 可观察结果：退出码非零",
+  "- 边界反例：缺少输入", "- 建议测试层级：unit",
+  "## 数据与接口", "无", "## 兼容约束", "无", "## 安全约束", "无", "## 错误与边界", "无",
+  "## 迁移发布回滚", "无", "## 已确认偏好", "无", "## 默认取舍", "无", "## 已关闭问题", "无", "## 未决问题", "无",
+].join("\n");
+
+const planVerification = {
+  acceptance_criteria: ["AC-001"],
+  acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+  task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+  test_commands: ["npm test"],
+};
+
+const taskVerification = {
+  ...planVerification,
+  tdd_cycles: [{
+    acceptance_criterion: "AC-001",
+    test_path: "test/example.test.ts",
+    red: { command: "npm test", expected_failure: "assertion fails before implementation" },
+    green: { implementation_steps: ["Implement the required behavior"], command: "npm test", expected_result: "passes" },
+    refactor: { scope: "No behavior change", command: "npm test", expected_result: "passes" },
+  }],
+};
+
+const contractSection = (heading: string, value: unknown): string => `## ${heading}\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
+const tddPlanDocument = [
+  "# Plan", "## 方案摘要", "摘要", "## 实施步骤", "STEP-001 REQ-001 AC-001 TASK-001", "## 需求覆盖", "REQ-001 AC-001 TASK-001",
+  "## 验证", "npm test", contractSection("方案验收契约", planVerification), "## 发布与回滚", "无",
+].join("\n");
+const tddTaskDocument = [
+  "# Task", "TASK-001 REQ-001 AC-001", contractSection("任务验收契约", taskVerification),
+].join("\n");
+
+test("planning verification contracts parse strictly and produce canonical digests", () => {
+  assert.deepEqual(parsePlanVerification(tddPlanDocument), planVerification);
+  assert.deepEqual(parseTaskVerification(tddTaskDocument), taskVerification);
+  assert.equal(verificationDigest({ b: 2, a: 1 }), verificationDigest({ a: 1, b: 2 }));
+
+  assert.throws(() => parsePlanVerification(`${tddPlanDocument}\n${contractSection("方案验收契约", planVerification)}`), /exactly one/);
+  assert.throws(() => parsePlanVerification(tddPlanDocument.replace('"test_commands"', '"unknown"')), /unknown field/);
+  assert.throws(() => parsePlanVerification(contractSection("方案验收契约", { ...planVerification, acceptance_criteria: ["AC-invalid"] })), /invalid acceptance criterion id/);
+  assert.throws(() => parseTaskVerification(tddTaskDocument.replace('"red":', '"missing_red":')), /unknown field|red/);
+  assert.throws(() => parseTaskVerification(tddTaskDocument.replace('"green":', '"missing_green":')), /unknown field|green/);
+  assert.throws(() => parseTaskVerification(tddTaskDocument.replace('"refactor":', '"missing_refactor":')), /unknown field|refactor/);
+});
+
+test("planning preflight rejects incomplete TDD and inconsistent AC/task mappings", async () => {
+  const project = await temporaryHome();
+  try {
+    const legacyPlan = ["# Plan", "## 方案摘要", "摘要", "## 实施步骤", "REQ-001", "## 需求覆盖", "REQ-001 AC-001", "## 验证", "npm test", "## 方案验收契约", "missing", "## 发布与回滚", "无"].join("\n");
+    await assert.rejects(() => preflightRevision(project, "20260820-tdd", "001", { spec: tddSpecDocument, plan: legacyPlan }), /JSON contract/);
+    await assert.rejects(() => preflightRevision(project, "20260820-tdd", "001", {
+      spec: tddSpecDocument,
+      plan: tddPlanDocument,
+      taskFiles: { "TASK-001": tddTaskDocument.replaceAll("AC-001", "AC-002") },
+    }), /unknown|mapping|coverage/i);
+    await assert.doesNotReject(() => preflightRevision(project, "20260820-tdd", "001", {
+      spec: tddSpecDocument,
+      plan: tddPlanDocument,
+      taskFiles: { "TASK-001": tddTaskDocument },
+    }));
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+test("planning preflight accepts single-character non-empty TDD field values", async () => {
+  const project = await temporaryHome();
+  try {
+    await assert.doesNotReject(() => preflightRevision(project, "20260820-tdd-short", "001", {
+      spec: tddSpecDocument.replace("- 边界反例：缺少输入", "- 边界反例：无"),
+      plan: tddPlanDocument,
+      taskFiles: { "TASK-001": tddTaskDocument },
+    }));
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
 });
 
 test("planning states allow only declared forward transitions", () => {
