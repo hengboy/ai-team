@@ -904,6 +904,87 @@ export class DispatchService {
     return this.replaceDispatch(runId, dispatchId, role, actorRole, reason, "superseded", validatePacket(packet, role));
   }
 
+  recoverClaimedTaskScope(input: {
+    runId: string;
+    dispatchId: string;
+    authorityCommit: string;
+    expectedHead: string;
+    addedWritePaths: string[];
+  }): ReplacementResult<"superseded"> & { authority_commit: string; allowed_write_paths: string[]; dirty_paths: string[] } {
+    const run = this.store.getRun(input.runId) as { profile: string; mode?: string; state: string; repo_id: string };
+    if (run.profile !== "coding" || run.mode !== "planned" || run.state !== "active") throw new ValidationError("claimed task scope recovery requires an active planned Coding run");
+    this.assertCommandAllowed("coding", "dispatch supersede");
+    if (!/^[a-f0-9]{40}$/.test(input.authorityCommit) || !/^[a-f0-9]{40}$/.test(input.expectedHead)) throw new ValidationError("scope recovery requires full authority and expected HEAD commit SHAs");
+    const row = this.get(input.runId, input.dispatchId, "backend-developer") as { state: string; packet_json: string; result_json?: string };
+    const sourcePacket = JSON.parse(row.packet_json) as DispatchPacket;
+    const taskId = typeof sourcePacket.context.task_id === "string" ? sourcePacket.context.task_id : undefined;
+    const worktreeId = typeof sourcePacket.context.worktree_id === "string" ? sourcePacket.context.worktree_id : undefined;
+    const worktreePath = typeof sourcePacket.context.worktree_path === "string" ? sourcePacket.context.worktree_path : undefined;
+    if (!taskId || !worktreeId || !worktreePath) throw new ValidationError("claimed developer dispatch lacks frozen task worktree identity");
+    const normalizedAddedPaths = assertExplicitTaskWritePaths(input.addedWritePaths, `scope recovery ${taskId}`);
+    const existing = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
+      .get(input.runId, input.dispatchId) as { dispatch_id: string; packet_json: string } | undefined;
+    if (existing) {
+      const packet = JSON.parse(existing.packet_json) as DispatchPacket;
+      const recovery = packet.context.scope_recovery as { authority_commit?: string; dirty_paths?: string[] } | undefined;
+      if (recovery?.authority_commit !== input.authorityCommit || !normalizedAddedPaths.every((path) => packet.allowed_write_paths.includes(path))) {
+        throw new ValidationError("claimed developer dispatch already has a different scope recovery replacement");
+      }
+      return { action: "superseded", dispatch_id: existing.dispatch_id, replacement_for: input.dispatchId, reused: true, authority_commit: input.authorityCommit, allowed_write_paths: packet.allowed_write_paths, dirty_paths: recovery.dirty_paths ?? [] };
+    }
+    const task = this.plannedTaskRows(input.runId).find((candidate) => candidate.task_id === taskId);
+    if (!task || task.state === "integrated" || task.developer_dispatch_id !== input.dispatchId) throw new ValidationError("claimed developer dispatch is not the active unintegrated task owner");
+    const originalPaths = this.frozenTaskWritePaths(input.runId, taskId);
+    const allowedWritePaths = [...new Set([...originalPaths, ...normalizedAddedPaths])].sort();
+    if (row.state !== "claimed" || row.result_json) throw new ValidationError("scope recovery requires a claimed developer dispatch with no result");
+    const sideEffects = this.store.db.prepare(`SELECT
+      (SELECT COUNT(*) FROM artifacts WHERE run_id=? AND dispatch_id=?) AS artifacts,
+      (SELECT COUNT(*) FROM staging_entries WHERE run_id=? AND dispatch_id=?) AS staging`).get(input.runId, input.dispatchId, input.runId, input.dispatchId) as { artifacts: number; staging: number };
+    if (sideEffects.artifacts || sideEffects.staging) throw new ValidationError("scope recovery requires a developer dispatch with no side effects", sideEffects);
+    const worktree = this.store.db.prepare("SELECT path,state FROM worktrees WHERE run_id=? AND worktree_id=?")
+      .get(input.runId, worktreeId) as { path: string; state: string } | undefined;
+    if (!worktree || worktree.state !== "active" || worktree.path !== worktreePath) throw new ValidationError("scope recovery worktree does not match its frozen task identity");
+    const head = execFileSync("git", ["-C", worktree.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    if (head !== input.expectedHead) throw new ValidationError("scope recovery worktree HEAD does not match --expected-head", { expected: input.expectedHead, actual: head });
+    const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
+    if (!repository) throw new ValidationError("scope recovery repository is missing");
+    const authority = execFileSync("git", ["-C", repository.project_path, "rev-parse", `${input.authorityCommit}^{commit}`], { encoding: "utf8" }).trim();
+    if (authority !== input.authorityCommit) throw new ValidationError("scope recovery authority commit does not resolve exactly");
+    try { execFileSync("git", ["-C", repository.project_path, "merge-base", "--is-ancestor", authority, "HEAD"], { stdio: "ignore" }); }
+    catch { throw new ValidationError("scope recovery authority commit is not reachable from the current main checkout"); }
+    const authorityPaths = execFileSync("git", ["-C", repository.project_path, "diff-tree", "--no-commit-id", "--name-only", "-r", authority], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+    const unsupported = normalizedAddedPaths.filter((path) => !authorityPaths.includes(path));
+    if (unsupported.length) throw new ValidationError("scope recovery authority commit does not contain every added write path", { authority_commit: authority, unsupported_paths: unsupported });
+    const dirtyPaths = dirtyWorktreePaths(worktree.path);
+    const outOfScope = dirtyPaths.filter((path) => !pathMatchesScope(path, allowedWritePaths));
+    if (outOfScope.length) throw new ValidationError("scope recovery would not preserve dirty paths within the replacement scope", { dirty_paths: outOfScope });
+    const packet = validatePacket({
+      ...sourcePacket,
+      allowed_write_paths: allowedWritePaths,
+      context: {
+        ...sourcePacket.context,
+        scope_recovery: {
+          authority_commit: authority,
+          expected_head: input.expectedHead,
+          original_allowed_write_paths: originalPaths,
+          added_write_paths: normalizedAddedPaths,
+          dirty_paths: dirtyPaths,
+        },
+      },
+    }, "backend-developer");
+    let replacementId = "";
+    this.store.db.transaction(() => {
+      this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=? AND state='claimed'").run(new Date().toISOString(), input.dispatchId);
+      replacementId = this.insert(input.runId, "backend-developer", packet, input.dispatchId);
+      const updated = this.store.db.prepare(`UPDATE run_tasks SET write_paths_json=?,developer_dispatch_id=?,updated_at=?
+        WHERE run_id=? AND task_id=? AND developer_dispatch_id=? AND state!='integrated'`).run(stableJson(allowedWritePaths), replacementId, new Date().toISOString(), input.runId, taskId, input.dispatchId);
+      if (updated.changes !== 1) throw new ValidationError("task ownership changed during claimed scope recovery");
+      this.store.event(input.runId, "dispatch.superseded", { dispatchId: input.dispatchId, replacement_dispatch_id: replacementId, role: "backend-developer", actor_role: "coding", reason: "frozen task scope expanded by explicit authority commit" });
+      this.store.event(input.runId, "task.scope_recovered", { task_id: taskId, worktree_id: worktreeId, authority_commit: authority, expected_head: input.expectedHead, original_allowed_write_paths: originalPaths, allowed_write_paths: allowedWritePaths, dirty_paths: dirtyPaths, superseded_dispatch_id: input.dispatchId, replacement_dispatch_id: replacementId });
+    })();
+    return { action: "superseded", dispatch_id: replacementId, replacement_for: input.dispatchId, reused: false, authority_commit: authority, allowed_write_paths: allowedWritePaths, dirty_paths: dirtyPaths };
+  }
+
   reconcile(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): ReplacementResult<"reconciled"> & { resumed_finalization?: boolean } {
     const commandId = this.store.startCommand(runId, "dispatch reconcile", { dispatchId, correlationId: dispatchId });
     try {

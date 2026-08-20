@@ -22,6 +22,15 @@ test("CLI advertises the explicit task worktree recovery identity and lineage fl
   ]) assert.match(help.stdout, new RegExp(option.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
+test("CLI advertises the supported claimed task scope recovery authority flags", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const help = await cli(sandbox, ["dispatch", "recover-claimed-task-scope", "--help"]);
+  assert.equal(help.status, 0, help.stderr);
+  for (const option of ["--authority-commit <sha>", "--expected-head <sha>", "--add-write-path <path...>"]) {
+    assert.ok(help.stdout.includes(option));
+  }
+});
+
 
 test("CLI manages cancel, reissue, and supersede for a claimed support dispatch", async (t) => {
   const sandbox = await makeSandbox(t);

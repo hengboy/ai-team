@@ -1208,6 +1208,125 @@ test("recoverTaskWorktree atomically carries a dirty managed Task into its direc
   }
 });
 
+test("claimed planned developer scope recovery supersedes without touching its dirty task worktree", async () => {
+  const fixture = await createFixture();
+  try {
+    const identity = await repositoryIdentity(fixture.root);
+    const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    const runId = fixture.store.createRun({
+      repoId: identity.repoId,
+      profile: "coding",
+      mode: "planned",
+      planId: "20260820-scope-recovery",
+      revision: "001",
+      baseCommit,
+      targetBranch: "main",
+      request: "recover frozen claimed developer scope",
+    });
+    fixture.store.initializeRunTasks(runId, [{
+      task_id: "TASK-001",
+      source_path: "tasks/TASK-001.md",
+      source_digest: "a".repeat(64),
+      write_paths: ["README.md"],
+    }, {
+      task_id: "TASK-002",
+      source_path: "tasks/TASK-002.md",
+      source_digest: "b".repeat(64),
+      write_paths: ["README.md"],
+    }]);
+    const taskPath = join(fixture.root, ".worktrees", "tasks", "20260820-scope-recovery", "20260820-scope-recovery-001--task-001");
+    const taskBranch = "task/20260820-scope-recovery/20260820-scope-recovery-001--task-001";
+    await mkdir(dirname(taskPath), { recursive: true });
+    await rawGit(fixture.root, ["worktree", "add", "-b", taskBranch, taskPath, baseCommit]);
+    const prepared = { worktree_id: "worktree_scope_recovery", path: taskPath };
+    fixture.store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run(prepared.worktree_id, runId, taskBranch, taskPath, baseCommit, new Date().toISOString());
+    fixture.store.db.prepare("UPDATE run_tasks SET state='prepared',worktree_id=? WHERE run_id=? AND task_id='TASK-001'")
+      .run(prepared.worktree_id, runId);
+    const dispatches = new DispatchService(fixture.store);
+    const explorerId = "dispatch_scope_recovery_explorer";
+    fixture.store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,result_json,completed_at,created_at)
+      VALUES (?,?,'file-explorer','completed','{}','fixture','{}','{}',?,?,?)`)
+      .run(explorerId, runId, JSON.stringify({ payload: { allowed_read_paths: ["README.md"] } }), new Date().toISOString(), new Date().toISOString());
+    const sourceId = dispatches.create(runId, "backend-developer", {
+      objective: "Implement TASK-001", allowed_read_paths: ["README.md"], allowed_write_paths: ["README.md"], acceptance_criteria: ["Preserve task identity"],
+      context: {
+        phase: "implementation",
+        task_id: "TASK-001",
+        worktree_id: prepared.worktree_id,
+        worktree_path: prepared.path,
+        explorer_dispatch_id: explorerId,
+        coordinator_dispatch_id: "dispatch_coordinator",
+        prepare_git_dispatch_id: "dispatch_prepare",
+      },
+    });
+    dispatches.claim(runId, sourceId, "backend-developer");
+    fixture.store.db.prepare("UPDATE run_tasks SET developer_dispatch_id=? WHERE run_id=? AND task_id='TASK-001'").run(sourceId, runId);
+
+    await writeFile(join(prepared.path, "README.md"), "staged\n");
+    await rawGit(prepared.path, ["add", "README.md"]);
+    await writeFile(join(prepared.path, "README.md"), "staged\nunstaged\n");
+    await writeFile(join(prepared.path, "dirty.txt"), "untracked\n");
+    fixture.store.db.prepare("UPDATE run_tasks SET write_paths_json=? WHERE run_id=? AND task_id='TASK-001'")
+      .run(JSON.stringify(["README.md", "dirty.txt"]), runId);
+    const before = {
+      head: await rawGit(prepared.path, ["rev-parse", "HEAD"]),
+      staged: await rawGit(prepared.path, ["diff", "--cached", "--binary"]),
+      unstaged: await rawGit(prepared.path, ["diff", "--binary"]),
+      untracked: await readFile(join(prepared.path, "dirty.txt"), "utf8"),
+    };
+
+    await mkdir(join(fixture.root, "src", "commands"), { recursive: true });
+    await writeFile(join(fixture.root, "src", "contracts.ts"), "export {};\n");
+    await writeFile(join(fixture.root, "src", "commands", "planning-run.ts"), "export {};\n");
+    await rawGit(fixture.root, ["add", "src"]);
+    await rawGit(fixture.root, ["commit", "-m", "Add scope recovery authority"]);
+    const authorityCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+
+    const recovered = dispatches.recoverClaimedTaskScope({
+      runId,
+      dispatchId: sourceId,
+      authorityCommit,
+      expectedHead: baseCommit,
+      addedWritePaths: ["src/contracts.ts", "src/commands/planning-run.ts"],
+    });
+    assert.equal(recovered.action, "superseded");
+    assert.deepEqual(recovered.allowed_write_paths, ["README.md", "dirty.txt", "src/commands/planning-run.ts", "src/contracts.ts"]);
+    assert.deepEqual(recovered.dirty_paths, ["README.md", "dirty.txt"]);
+    assert.deepEqual(fixture.store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(sourceId), { state: "failed" });
+    assert.deepEqual(fixture.store.db.prepare("SELECT state,replacement_for FROM dispatches WHERE dispatch_id=?").get(recovered.dispatch_id), { state: "pending", replacement_for: sourceId });
+    const replacement = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(recovered.dispatch_id) as { packet_json: string };
+    const packet = JSON.parse(replacement.packet_json) as { allowed_write_paths: string[]; context: Record<string, unknown> };
+    assert.deepEqual(packet.allowed_write_paths, recovered.allowed_write_paths);
+    assert.deepEqual(packet.context.scope_recovery, {
+      authority_commit: authorityCommit,
+      expected_head: baseCommit,
+      original_allowed_write_paths: ["README.md", "dirty.txt"],
+      added_write_paths: ["src/commands/planning-run.ts", "src/contracts.ts"],
+      dirty_paths: ["README.md", "dirty.txt"],
+    });
+    assert.equal(packet.context.explorer_dispatch_id, explorerId);
+    assert.equal(packet.context.coordinator_dispatch_id, "dispatch_coordinator");
+    assert.equal(packet.context.prepare_git_dispatch_id, "dispatch_prepare");
+    assert.deepEqual(fixture.store.db.prepare("SELECT developer_dispatch_id,write_paths_json FROM run_tasks WHERE run_id=? AND task_id='TASK-001'").get(runId), {
+      developer_dispatch_id: recovered.dispatch_id,
+      write_paths_json: JSON.stringify(recovered.allowed_write_paths),
+    });
+    assert.deepEqual({
+      head: await rawGit(prepared.path, ["rev-parse", "HEAD"]),
+      staged: await rawGit(prepared.path, ["diff", "--cached", "--binary"]),
+      unstaged: await rawGit(prepared.path, ["diff", "--binary"]),
+      untracked: await readFile(join(prepared.path, "dirty.txt"), "utf8"),
+    }, before);
+    assert.deepEqual(dispatches.recoverClaimedTaskScope({
+      runId, dispatchId: sourceId, authorityCommit, expectedHead: baseCommit,
+      addedWritePaths: ["src/contracts.ts", "src/commands/planning-run.ts"],
+    }), { ...recovered, reused: true });
+  } finally {
+    await fixture.dispose();
+  }
+});
+
 test("commit accepts changed files in scope and rejects files outside it", async () => {
   const fixture = await createFixture();
   try {

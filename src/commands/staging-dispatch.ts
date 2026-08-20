@@ -132,6 +132,14 @@ export const registerDispatchCommands = (program: Command, dependencies: Dispatc
         } catch (error) { input.validationFailed(error); }
       }));
     });
+  dispatchCommand("recover-claimed-task-scope").requiredOption("--authority-commit <sha>").requiredOption("--expected-head <sha>").requiredOption("--add-write-path <path...>")
+    .action(async (options) => output(await withStore((store) => new DispatchService(store).recoverClaimedTaskScope({
+      runId: options.runId,
+      dispatchId: options.dispatchId,
+      authorityCommit: options.authorityCommit,
+      expectedHead: options.expectedHead,
+      addedWritePaths: options.addWritePath,
+    }))));
   dispatchCommand("prompt").action(async (options) => output(await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role), { readonly: true }), { legacyRaw: true }));
   dispatchCommand("schema").action(async (options) => output(await withStore((store) => new DispatchService(store).schema(options.runId, options.dispatchId, options.role), { readonly: true })));
   dispatchCommand("template").action(async (options) => output(await withStore((store) => new DispatchService(store).template(options.runId, options.dispatchId, options.role), { readonly: true })));

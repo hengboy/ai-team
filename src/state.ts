@@ -1008,6 +1008,8 @@ export class StateStore {
   }
 
   planningClarifications(runId: string): Array<Record<string, unknown>> {
+    const table = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='planning_clarifications'").get();
+    if (!table) return [];
     return (this.db.prepare(`SELECT c.clarification_id,c.source,c.impact_json,c.requirement_ids_json,c.acceptance_criteria_json,c.decision_id,
       d.status,d.choice FROM planning_clarifications c JOIN decisions d ON d.decision_id=c.decision_id
       WHERE c.run_id=? ORDER BY c.created_at,c.clarification_id`).all(runId) as Array<{
