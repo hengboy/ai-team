@@ -26,7 +26,7 @@ import {
   validatePacket as validateDispatchPacket,
 } from "./dispatch/packet.js";
 import { buildContinueTestingPacket, buildReviewPacket as assembleReviewPacket, buildTestPacket } from "./dispatch/implementation.js";
-import { assertPlanningTransition, planningContinuationPacket, planningSubmissionIntent } from "./dispatch/planning.js";
+import { assertPlanningSubmissionTransition, planningContinuationPacket, planningSubmissionIntent } from "./dispatch/planning.js";
 import { isManagedPlannedRecovery, livenessRecoveryIntent, managedCleanupPacket, reconciliationIntent, reissuePacket, retryableResultHasNoSideEffects } from "./dispatch/recovery.js";
 import { executionEnforcement, freezeExecutionContract, type ExecutionContract, type ExecutionRequest } from "./execution-contract.js";
 import { recoveryProjection, type NextAction, type TimelineEntry } from "./run-recovery.js";
@@ -549,6 +549,9 @@ export class DispatchService {
     const frozenPacket = JSON.parse(packetJson) as DispatchPacket;
     const prompt = redact(promptFor(runId, dispatchId, role, frozenPacket));
     const template = createResultTemplate(runId, dispatchId, role);
+    if (role === "planning" && typeof frozenPacket.context.target_stage === "string") {
+      template.payload = { ...template.payload, stage: frozenPacket.context.target_stage };
+    }
     if (role === "review-spec" || role === "review-standards") {
       const barrierId = (frozenPacket.context as { barrier_id?: unknown }).barrier_id;
       if (typeof barrierId === "string") template.payload = { barrier_id: barrierId, finding_ids: [] };
@@ -1199,10 +1202,10 @@ export class DispatchService {
     if (!["claimed", "completed", "needs_decision"].includes(dispatch.state)) {
       throw new ValidationError("dispatch must be claimed before validate");
     }
-    const run = this.store.getRun(runId) as { state: string };
+    const run = this.store.getRun(runId) as { state: string; stage: string };
     const validRunState = dispatch.state === "needs_decision"
       ? run.state === "needs_decision"
-      : dispatch.state === "completed" ? run.state === "active" || run.state === "completed" : run.state === "active";
+      : dispatch.state === "completed" ? run.state === "active" || run.state === "completed" || role === "planning" && run.state === "needs_decision" : run.state === "active";
     if (!validRunState && !this.claimedRecoveryMayFinish(runId, dispatchId, role, dispatch, run.state)) {
       throw new ValidationError("run must be active before validate");
     }
@@ -1210,6 +1213,15 @@ export class DispatchService {
     if (!result.valid) throw new ValidationError("result envelope is invalid", result.errors);
     if (result.value.run_id !== runId || result.value.dispatch_id !== dispatchId || result.value.role !== role) {
       throw new ValidationError("result envelope identity does not match dispatch");
+    }
+    if (role === "planning" && dispatch.state === "claimed" && (result.value.status === "completed" || result.value.status === "needs_decision")) {
+      const payload = result.value.payload as {
+        stage: string;
+        pending_questions: string[];
+        decision: { question: string; choices: Array<{ id: string; label: string; impact: string }>; recommendation: string } | null;
+      };
+      const packet = JSON.parse(dispatch.packet_json) as DispatchPacket;
+      assertPlanningSubmissionTransition(run.stage, payload.stage, packet.context, payload.decision, payload.pending_questions);
     }
     this.assertVerificationEvidence(role, JSON.parse(dispatch.packet_json) as DispatchPacket, result.value);
     return result.value;
@@ -2552,7 +2564,8 @@ export class DispatchService {
       no_change?: { decision_id: string; conclusion: string; repository_evidence: Array<{ command: string; outcome: string }> };
     };
     const run = this.store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string; stage: string };
-    assertPlanningTransition(run.stage, payload.stage);
+    const packet = JSON.parse(this.get(runId, result.dispatch_id, "planning").packet_json) as DispatchPacket;
+    assertPlanningSubmissionTransition(run.stage, payload.stage, packet.context, payload.decision, payload.pending_questions);
     if (payload.stage === "no_change") {
       if (!payload.no_change) throw new ValidationError("planning no_change requires repository evidence and a decision receipt");
       const decision = this.store.db.prepare("SELECT status,choice,receipt_json FROM decisions WHERE run_id=? AND decision_id=?")

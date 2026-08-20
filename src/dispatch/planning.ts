@@ -10,6 +10,24 @@ export const assertPlanningTransition = (current: string, next: string): void =>
   if (!TRANSITIONS[current]?.includes(next)) throw new ValidationError(`invalid planning stage transition: ${current} -> ${next}`);
 };
 
+export const assertPlanningSubmissionTransition = (
+  current: string,
+  next: string,
+  context: Record<string, unknown>,
+  decision: PlanningDecision | null,
+  pendingQuestions: string[],
+): void => {
+  assertPlanningTransition(current, next);
+  if (context.phase !== "task_split") return;
+  const choiceIds = decision?.choices.map(({ id }) => id).sort() ?? [];
+  if (current !== "spec_ready" || context.target_stage !== "plan_ready" || next !== "plan_ready") {
+    throw new ValidationError("task_split continuation must advance spec_ready to plan_ready");
+  }
+  if (pendingQuestions.length || choiceIds.length !== 2 || choiceIds[0] !== "no_split" || choiceIds[1] !== "split") {
+    throw new ValidationError("task_split continuation requires split and no_split decision choices without pending_questions");
+  }
+};
+
 export const planningDecisionKind = (stage: string, choiceIds: string[]): { finalConfirmation: boolean; taskSplit: boolean } => ({
   finalConfirmation: stage === "requirements" && choiceIds.length === 2 && choiceIds[0] === "confirm" && choiceIds[1] === "revise",
   taskSplit: stage === "plan_ready" && choiceIds.length === 2 && choiceIds[0] === "no_split" && choiceIds[1] === "split",
@@ -57,9 +75,15 @@ export const planningSubmissionIntent = (
 };
 
 export const planningContinuationPacket = (stage: string) => ({
-  objective: "Continue the planning workflow from the current stage, asking at most one highest-priority question.",
+  objective: stage === "spec_ready"
+    ? "Advance the completed specification to plan_ready and request the task split decision."
+    : "Continue the planning workflow from the current stage, asking at most one highest-priority question.",
   allowed_read_paths: ["package.json"],
   allowed_write_paths: [".ai-team/plans/**"],
-  acceptance_criteria: ["Return the next planning stage", "Return at most one pending question"],
-  context: { stage },
+  acceptance_criteria: stage === "spec_ready"
+    ? ["Return stage plan_ready", "Return one split or no_split task_split decision"]
+    : ["Return the next planning stage", "Return at most one pending question"],
+  context: stage === "spec_ready"
+    ? { stage, phase: "task_split", target_stage: "plan_ready" }
+    : { stage },
 });

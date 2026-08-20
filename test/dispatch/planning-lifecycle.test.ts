@@ -6,6 +6,7 @@ import { Ajv } from "ajv";
 
 import { checkResultEnvelope, resultSchemaForRole } from "../../src/contracts.js";
 import { DispatchService } from "../../src/dispatch.js";
+import { planningContinuationPacket } from "../../src/dispatch/planning.js";
 import { completedResult, createRun, dispatchPacket, projectContext, withStore } from "../helpers/dispatch.js";
 
 const fileExplorerResult = (runId: string, dispatchId: string) => completedResult(runId, dispatchId, "file-explorer", {
@@ -442,6 +443,95 @@ test("planning stages without questions continue automatically exactly once", as
       (store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='planning'").get(runId) as { count: number }).count,
       2,
     );
+  });
+});
+
+test("spec_ready task split continuation advances once and rejects a stage self-loop during validate", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store, "planning");
+    store.db.prepare("UPDATE runs SET stage='spec_ready' WHERE run_id=?").run(runId);
+    const dispatches = new DispatchService(store);
+    const dispatchId = dispatches.continuePlanning(runId);
+    const packet = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatchId) as { packet_json: string }).packet_json);
+    assert.deepEqual(packet.context.phase, "task_split");
+    assert.deepEqual(packet.context.target_stage, "plan_ready");
+    assert.equal((dispatches.template(runId, dispatchId, "planning").payload as { stage: string }).stage, "plan_ready");
+    dispatches.claim(runId, dispatchId, "planning");
+
+    const retryableFailure = {
+      ...completedResult(runId, dispatchId, "planning", {}),
+      status: "retryable_failure" as const,
+      verification: [],
+      failure_class: "temporary_tool_failure",
+      side_effect_state: "none" as const,
+    };
+    assert.doesNotThrow(() => dispatches.validateValue(runId, dispatchId, "planning", retryableFailure));
+    assert.deepEqual(store.db.prepare("SELECT state,stage FROM runs WHERE run_id=?").get(runId), { state: "active", stage: "spec_ready" });
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=?").get(runId) as { count: number }).count, 0);
+
+    const invalid = completedResult(runId, dispatchId, "planning", {
+      actions: ["repeat the current stage"], stage: "spec_ready", pending_questions: [], decision: null,
+    });
+    assert.throws(() => dispatches.validateValue(runId, dispatchId, "planning", invalid), /invalid planning stage transition: spec_ready -> spec_ready/);
+    assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(dispatchId) as { state: string }).state, "claimed");
+
+    const decision = {
+      question: "Split the implementation into tasks?",
+      choices: [
+        { id: "split", label: "Split", impact: "Preview task documents" },
+        { id: "no_split", label: "Do not split", impact: "Create the revision without tasks" },
+      ],
+      recommendation: "split",
+    };
+    const result = completedResult(runId, dispatchId, "planning", {
+      actions: ["request task split"], stage: "plan_ready", pending_questions: [], decision,
+    });
+    assert.doesNotThrow(() => dispatches.validateValue(runId, dispatchId, "planning", result));
+    const first = await dispatches.submitValue(runId, dispatchId, "planning", result);
+    assert.equal(first.reused, false);
+    assert.deepEqual(store.db.prepare("SELECT state,stage FROM runs WHERE run_id=?").get(runId), { state: "needs_decision", stage: "plan_ready" });
+    assert.deepEqual(store.db.prepare("SELECT decision_type FROM decisions WHERE run_id=?").get(runId), { decision_type: "task_split" });
+    const repeated = await dispatches.submitValue(runId, dispatchId, "planning", result);
+    assert.equal(repeated.reused, true);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='task_split'").get(runId) as { count: number }).count, 1);
+  });
+});
+
+test("fresh Planning and long-lived continuations share the spec_ready task split contract", async () => {
+  await withStore(async (store) => {
+    const dispatches = new DispatchService(store);
+    const createSpecReadyRun = (): string => {
+      const runId = createRun(store, "planning");
+      store.db.prepare("UPDATE runs SET stage='spec_ready' WHERE run_id=?").run(runId);
+      return runId;
+    };
+    const freshRun = createSpecReadyRun();
+    const freshId = dispatches.create(freshRun, "planning", planningContinuationPacket("spec_ready"), "planning");
+    const longLivedRun = createSpecReadyRun();
+    const longLivedId = dispatches.continuePlanning(longLivedRun);
+    const packet = (runId: string, dispatchId: string) => JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, dispatchId) as { packet_json: string }).packet_json);
+    assert.deepEqual(packet(freshRun, freshId).context, packet(longLivedRun, longLivedId).context);
+    assert.equal((dispatches.template(freshRun, freshId, "planning").payload as { stage: string }).stage, "plan_ready");
+    assert.equal((dispatches.template(longLivedRun, longLivedId, "planning").payload as { stage: string }).stage, "plan_ready");
+
+    for (const [runId, dispatchId] of [[freshRun, freshId], [longLivedRun, longLivedId]] as const) {
+      dispatches.claim(runId, dispatchId, "planning");
+      const decision = {
+        question: "Split the implementation into tasks?",
+        choices: [
+          { id: "split", label: "Split", impact: "Preview task documents" },
+          { id: "no_split", label: "Do not split", impact: "Create the revision without tasks" },
+        ],
+        recommendation: "split",
+      };
+      const result = completedResult(runId, dispatchId, "planning", {
+        actions: ["request task split"], stage: "plan_ready", pending_questions: [], decision,
+      });
+      assert.doesNotThrow(() => dispatches.validateValue(runId, dispatchId, "planning", result));
+      await dispatches.submitValue(runId, dispatchId, "planning", result);
+      assert.deepEqual(store.db.prepare("SELECT state,stage FROM runs WHERE run_id=?").get(runId), { state: "needs_decision", stage: "plan_ready" });
+      assert.deepEqual(store.db.prepare("SELECT decision_type FROM decisions WHERE run_id=?").get(runId), { decision_type: "task_split" });
+    }
   });
 });
 
