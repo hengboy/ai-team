@@ -14,6 +14,7 @@
 
 1. 检查平台锁定、分支、`HEAD`、`contract/role/template/document digest`、计划状态和实施基线；任一门禁失败即暂停并请求 `decision`。
 2. 让 **File Explorer** 返回精确入口、调用链、影响范围、路径授权来源和测试命令。
+   开始任何实施前，必须先根据冻结计划创建可执行的 todo 列表并按顺序逐条推进；每完成一项必须立即更新 todo 的完成状态，禁止到实施结束后批量回填。冻结 revision 包含多个显式 TASK 时，每个 task 在开始实施时都必须分别创建只覆盖该 task 的 todo 列表，并在该 task 的实施过程中持续维护。
 3. `planned` run 启动时已有当前 run 持有的 `<planId>-<revision>` plan worktree，先让 **Git Operator** 验证其注册；冻结 revision 只有 0/1 个显式 `TASK-*.md` 时开发、测试、提交和最终合并都复用 plan worktree，只有多个显式 TASK 才使用 `<planId>-<revision>--<taskId>` 并从 plan worktree 当前 `HEAD` 派生。direct run 保持 run-scoped `integration` worktree，并在通过 `pre_write` 范围门禁后使用幂等的 implementation prepare dispatch 创建 task worktree。只有对应 phase 的 run-owned active worktree 已注册后，才让 **开发角色** 在隔离 `worktree` 内实现；**Coding** 只调度、协调和收集结果，禁止直接写产品代码。
    planned run 不适用 direct `pre_write` scope gate；其写入授权来自冻结 TASK、已完成 Explorer 授权和 `prepare_implementation_worktree`。多 TASK prepare 完成后必须领取系统派生的 `continue_implementation` Coding continuation；该 continuation 冻结 `explorer_dispatch_id`、`task_id`、`worktree_id`、`worktree_path` 和 prepare lineage，且只能向继承相同身份的开发角色派发。
    planned task 在提交前使用 `scope check --stage pre_commit --worktree-id <worktree-id>` 将冻结的 developer 写入路径绑定到对应 run-owned worktree。若 Coding coordinator 已完成且 developer 与 `pre_commit` 已结束、但 task worktree 尚未提交，`run resume` 只生成一个继承 Explorer 授权的 `continue_commit` replacement；必须 claim 该 replacement 后才能创建 Git Operator commit dispatch，禁止复用 completed coordinator 绕过权限。

@@ -303,6 +303,24 @@ test("planning and coding distinguish owned JSON from delegated submit responsib
   assert.match(coding, /submission\.state=submitted.*不得创建新 staging 或重复 submit/s);
 });
 
+test("generated coding and developer agents require live todo tracking", () => {
+  const files = renderAgents(balancedEnvironment());
+
+  for (const platform of PLATFORMS) {
+    const extension = platform === "codex" ? "toml" : "md";
+    const coding = files.get(`${platform}/agents/coding.${extension}`) ?? "";
+    assert.match(coding, /开始任何实施前.*创建.*todo 列表/s);
+    assert.match(coding, /多个显式 TASK.*每个 task.*分别创建.*todo 列表/s);
+    assert.match(coding, /每完成一项.*立即更新.*完成状态/s);
+
+    for (const role of ["backend-developer", "frontend-developer"]) {
+      const developer = files.get(`${platform}/agents/${role}.${extension}`) ?? "";
+      assert.match(developer, /开始实施当前 task 前.*创建.*todo 列表/s);
+      assert.match(developer, /逐条实现.*每完成一项.*立即更新.*完成状态/s);
+    }
+  }
+});
+
 test("planning remains coordinator while delegating claimed File Explorer dispatches", () => {
   const files = renderAgents(balancedEnvironment());
 
