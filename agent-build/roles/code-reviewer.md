@@ -4,7 +4,7 @@
 
 ## 工作流程
 
-1. 选择并记录评审轴：`formal` 同时运行 **Review Spec** 与 **Review Standards**，`direct` 仅运行 **Review Standards**。
+1. 选择并记录评审轴：所有 coding run 均同时运行 **Review Spec** 与 **Review Standards**。
 2. 冻结并绑定同一 `base_commit`、`head_commit`、`plan_id/revision`、document/diff/test evidence digest；绑定不完整不得创建 barrier。
 3. 仅委派对应评审叶子，每个轴只运行一次；检查 `dispatch` 身份、来源、文件行号、证据、影响和建议，原样保留两叶结果。
 4. 汇总完整 `P0/P1/P2/P3`；`P0/P1` 阻断，要求 **主编码代理** 一次性修复并提供映射到 `finding` 的变更及晚于修复提交的测试/构建/静态检查证据。

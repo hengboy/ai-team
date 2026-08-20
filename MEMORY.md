@@ -75,7 +75,7 @@
 - `skills/switch-ai-team-env` 负责预检并切换 AI Team 全局环境配置的可复用 Codex 工作流。
 - `src/dispatch.ts` 将已完成的评审叶子汇总到所属 barrier，并幂等创建唯一的 review resolution 或最终 Git Operator continuation。
 - `src/review.ts` 提供 barrier 幂等创建，以及按 barrier ID 或 run revision 查询状态。
-- `src/workflow.ts` 负责显式 direct mode 分诊一致性，并将 frozen coding run 原子关联到 planning run，保留原 task worktree 所有权。
+- `src/workflow.ts` 负责显式 direct mode 分诊一致性、为 direct run 冻结封闭 TDD 验收合同，并将 frozen coding run 原子关联到 planning run，保留原 task worktree 所有权。
 - `src/dispatch.ts` 负责区分 requirement 编号问题、requirements_final 与 task_split，冻结 File Explorer 结果证据，并管理无 stale Planning dispatch 的 continuation。
 - `src/dispatch.ts` 负责 delegated role 自提交回执、renderer 版本冻结，以及 `verify_existing` 驱动的受审计 `no_change` 规划终态。
 - src/state.ts persists dispatch-worktree binding migrations
@@ -95,7 +95,7 @@
 
 ### 模块边界
 - `src/git-orchestrator.ts` 与 `src/git.ts` 负责 planned revision-scoped plan/task worktree、direct run-scoped integration/task 编排、精确 plan ownership 接受、已有直接子提交 TASK adoption、planned pre_commit worktree scope 与 no-ff merge，并将相关身份写入操作证据。
-- `src/review.ts` 仅评审已通过独立测试的 planned plan HEAD 或 direct integration HEAD，并验证 code-reviewer packet 的 revision、文档、diff、testedCommit 与 evidence digest 绑定。
+- `src/review.ts` 仅对已通过独立测试的 planned plan HEAD 或 direct integration HEAD 执行一次双轴评审，并验证 code-reviewer packet 的 revision、文档、diff、testedCommit 与 evidence digest 绑定。
 - `src/context.ts` 仅以 `.ai-team/index/feature-navigation.md` 为权威导航路径，并负责 schema/renderer 版本记录及旧格式迁移。
 - `src/environment.ts` 与 `agent-build/roles` 负责受管角色生成、能力定义及只读环境查询。
 - `src/cli.ts` 为受管 JSON 命令提供 file、`--staging-id` 与 `--input-stdin` 输入；新 dispatch prompt 固定走显式 staging，planning commit 会关闭遗留 Planning dispatch。
@@ -111,5 +111,5 @@
 - `run show.events` 与 `run resume.last_event` 排除 `command.%` 以保持旧 domain event 语义；timeline 中 authoritative row 明确标记为当前投影。
 - role YAML execution policy 是 default/ceiling 的事实源；legacy dispatch packet 与 digest 不回写，manifest 不匹配的 replacement 必须启动新 run。
 - Planning templates define testable ACs; src/planning.ts validates them before src/workflow.ts freezes the contracts
-- src/dispatch.ts and src/dispatch/implementation.ts coordinate task/final/review-repair retest lineage while Test remains read-only
+- src/dispatch.ts and src/dispatch/implementation.ts coordinate task/final/review-repair retest lineage while Test remains read-only; a successful review-repair Test never opens another review barrier
 <!-- ai-team:project-context:end -->

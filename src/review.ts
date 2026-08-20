@@ -104,16 +104,15 @@ const validateFindings = (result: ReviewResult): void => {
 export class ReviewService {
   constructor(readonly store: StateStore) {}
 
-  create(runId: string, revisionSha: string, formal: boolean): ReviewCreateResult {
+  create(runId: string, revisionSha: string, _formal: boolean): ReviewCreateResult {
     const run = this.store.getRun(runId) as { mode: string; repo_id: string; plan_id?: string; revision?: string };
-    const requiredFormal = run.mode === "planned";
-    if (formal !== requiredFormal) throw new ValidationError(`${run.mode} runs require ${requiredFormal ? "formal" : "direct"} review axes`);
+    const requiredFormal = true;
     if (!/^[a-f0-9]{40}$/.test(revisionSha)) throw new ValidationError("review revision must be a 40-character commit SHA");
     const existing = this.store.db.prepare("SELECT barrier_id,formal,axes_json,spec_dispatch_id,standards_dispatch_id FROM review_barriers WHERE run_id=? AND revision_sha=?")
       .get(runId, revisionSha) as { barrier_id: string; formal: number; axes_json?: string; spec_dispatch_id?: string; standards_dispatch_id?: string } | undefined;
     if (existing) {
-      if (Boolean(existing.formal) !== formal) throw new ValidationError("existing review barrier has different axes");
-      const existingAxes = existing.axes_json ? JSON.parse(existing.axes_json) as string[] : formal ? ["spec", "standards"] : ["standards"];
+      if (Boolean(existing.formal) !== requiredFormal) throw new ValidationError("existing review barrier has different axes");
+      const existingAxes = existing.axes_json ? JSON.parse(existing.axes_json) as string[] : ["spec", "standards"];
       if (!existing.standards_dispatch_id) throw new ValidationError("existing review barrier is missing its standards dispatch");
       return { barrier_id: existing.barrier_id, axes: existingAxes, spec_dispatch_id: existing.spec_dispatch_id ?? null, standards_dispatch_id: existing.standards_dispatch_id, reused: true };
     }
@@ -162,7 +161,7 @@ export class ReviewService {
     const committedDiff = context.committed_diff;
     const testEvidence = context.test_evidence;
     const barrierId = `review_${sha256(`${runId}:${baseCommit}:${revisionSha}:${run.plan_id ?? ""}:${run.revision ?? ""}:${documentDigest}:${diffDigest}:${testEvidenceDigest}:${revisionDigest}:${evidenceDigest}`).slice(0, 24)}`;
-    const axes = formal ? ["spec", "standards"] as const : ["standards"] as const;
+    const axes = ["spec", "standards"] as const;
     let reused = false;
     const create = this.store.db.transaction(() => {
       const columns = (this.store.db.prepare("PRAGMA table_info(review_barriers)").all() as Array<{ name: string }>).map((item) => item.name);
@@ -171,10 +170,10 @@ export class ReviewService {
       let inserted;
       if (["base_commit", "head_commit", "document_digest", "diff_digest", "test_evidence_digest", "revision_digest", "evidence_digest"].every((column) => columns.includes(column))) {
         inserted = this.store.db.prepare(`INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,base_commit,head_commit,plan_id,revision,document_digest,diff_digest,test_evidence_digest,revision_digest,evidence_digest,axes_json,created_at)
-          VALUES (?,?,?,?, 'pending',?,?,?,?,?,?,?,?,?,?,?)`).run(barrierId, runId, revisionSha, formal ? 1 : 0, binding.base_commit, binding.head_commit, binding.plan_id, binding.revision, binding.document_digest, binding.diff_digest, binding.test_evidence_digest, binding.revision_digest, binding.evidence_digest, stableJson(axes), now);
+          VALUES (?,?,?,?, 'pending',?,?,?,?,?,?,?,?,?,?,?)`).run(barrierId, runId, revisionSha, requiredFormal ? 1 : 0, binding.base_commit, binding.head_commit, binding.plan_id, binding.revision, binding.document_digest, binding.diff_digest, binding.test_evidence_digest, binding.revision_digest, binding.evidence_digest, stableJson(axes), now);
       } else {
         inserted = this.store.db.prepare("INSERT OR IGNORE INTO review_barriers(barrier_id,run_id,revision_sha,formal,state,created_at) VALUES (?,?,?,?, 'pending', ?)")
-          .run(barrierId, runId, revisionSha, formal ? 1 : 0, now);
+          .run(barrierId, runId, revisionSha, requiredFormal ? 1 : 0, now);
       }
       if (!inserted.changes) { reused = true; return; }
       for (const axis of axes) {

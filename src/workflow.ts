@@ -18,6 +18,21 @@ const clientPlatform = (): string => {
   return value;
 };
 
+const directVerification = (request: string): PlanVerification => {
+  const acceptanceCriterion = `AC-001: ${request.trim()}`;
+  return {
+    acceptance_criteria: [acceptanceCriterion],
+    acceptance_steps: [{
+      id: "VERIFY-001",
+      acceptance_criteria: [acceptanceCriterion],
+      command: "Independent Test verification",
+      expected_result: "passes",
+    }],
+    task_mapping: [{ task_id: "DIRECT-001", acceptance_criteria: [acceptanceCriterion] }],
+    test_commands: [],
+  };
+};
+
 export class WorkflowService {
   readonly dispatches: DispatchService;
   constructor(readonly store: StateStore) { this.dispatches = new DispatchService(store); }
@@ -223,6 +238,7 @@ export class WorkflowService {
       if (!input.request?.trim()) throw new ValidationError(`${input.mode} mode requires request input`);
       const inferred = triageRequest(input.request);
       if (inferred !== input.mode) throw new ValidationError(`explicit ${input.mode} mode does not match inferred ${inferred}; planning required`);
+      planVerification = directVerification(input.request);
     }
     this.store.registerRepository(repo.repoId, repo.commonDir, repo.root);
     const runId = this.store.createRun({ repoId: repo.repoId, profile: "coding", mode: input.mode, ...(input.planId ? { planId: input.planId } : {}), ...(selectedRevision ? { revision: selectedRevision } : {}), baseCommit: head, targetBranch: branch, ...(input.request ? { request: input.request } : {}), clientPlatform: clientPlatform(), ...(planDigest ? { planDigest } : {}), ...(planVerification ? { planVerification } : {}) });

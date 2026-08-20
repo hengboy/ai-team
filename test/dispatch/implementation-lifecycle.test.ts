@@ -21,7 +21,7 @@ const fileExplorerResult = (runId: string, dispatchId: string) => completedResul
   project_context: projectContext(),
 });
 
-test("new planned packets freeze TDD contracts and require Developer/Test AC evidence", async () => {
+test("planned and direct packets freeze TDD contracts and require Developer/Test AC evidence", async () => {
   await withStore(async (store) => {
     const repoId = "repo-review-fixture";
     store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
@@ -78,6 +78,32 @@ test("new planned packets freeze TDD contracts and require Developer/Test AC evi
       ...missingChecks,
       payload: { ...missingChecks.payload, verification_digest: verificationDigest(plan), acceptance_checks: [{ acceptance_criterion: "AC-001", command: "npm test", outcome: "passed" }] },
     }));
+
+    const directRunId = store.createRun({ repoId, profile: "coding", mode: "feature", planVerification: plan });
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_direct_tdd", directRunId, "task/direct/tdd", `/tmp/${directRunId}-tdd`, REVIEW_HEAD, new Date().toISOString());
+    const directExplorerId = dispatches.create(directRunId, "file-explorer", dispatchPacket(["."]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(fileExplorerResult(directRunId, directExplorerId)), new Date().toISOString(), directExplorerId);
+    const directDeveloperId = dispatches.create(directRunId, "backend-developer", {
+      ...dispatchPacket(["src/dispatch.ts"]),
+      allowed_write_paths: ["src/dispatch.ts"],
+      context: { explorer_dispatch_id: directExplorerId, worktree_id: "worktree_direct_tdd" },
+    }, "coding");
+    const directDeveloperPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(directDeveloperId) as { packet_json: string }).packet_json);
+    assert.deepEqual(directDeveloperPacket.context.verification_contract, plan);
+    dispatches.claim(directRunId, directDeveloperId, "backend-developer");
+    const directMissingEvidence = completedResult(directRunId, directDeveloperId, "backend-developer", {
+      modified_paths: ["src/dispatch.ts"], self_tests: [{ command: "npm test", outcome: "passed" }],
+    });
+    assert.throws(() => dispatches.validateValue(directRunId, directDeveloperId, "backend-developer", directMissingEvidence), /TDD evidence/);
+
+    const directTestId = dispatches.create(directRunId, "test", dispatchPacket(["src/dispatch.ts"]));
+    dispatches.claim(directRunId, directTestId, "test");
+    const directMissingChecks = completedResult(directRunId, directTestId, "test", {
+      checks: [{ command: "npm test", outcome: "passed" }], verification_digest: verificationDigest(plan),
+    });
+    assert.throws(() => dispatches.validateValue(directRunId, directTestId, "test", directMissingChecks), /acceptance checks/);
   });
 });
 

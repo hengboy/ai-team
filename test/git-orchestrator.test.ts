@@ -28,6 +28,12 @@ const completeStandardsReview = (store: StateStore, runId: string, summary = "pa
     .run(JSON.stringify({ ...createResultTemplate(runId, row.dispatch_id, "review-standards"), summary, verification: [{ command: "review", outcome: "completed" }], payload: { finding_ids: [] } }), new Date().toISOString(), row.dispatch_id);
 };
 
+const completeSpecReview = (store: StateStore, runId: string): void => {
+  const row = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='review-spec' ORDER BY created_at DESC LIMIT 1").get(runId) as { dispatch_id: string };
+  store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+    .run(JSON.stringify({ ...createResultTemplate(runId, row.dispatch_id, "review-spec"), summary: "passed", verification: [{ command: "review", outcome: "completed" }], payload: { finding_ids: [] } }), new Date().toISOString(), row.dispatch_id);
+};
+
 const completeFrozenTest = (store: StateStore, runId: string, commit: string, completedAt = new Date().toISOString()): void => {
   const dispatches = new DispatchService(store);
   const testDispatch = dispatches.create(runId, "test", {
@@ -1174,6 +1180,8 @@ test("integration uses no-ff merges and cleanup removes owned worktrees", async 
     const packet = JSON.parse(reviewPacket.packet_json);
     assert.match(packet.context.committed_diff, /feature\.ts/);
     assert.equal(packet.context.test_evidence.status, "completed");
+    completeSpecReview(fixture.store, runId);
+    reviews.submit(runId, barrier.barrier_id, { axis: "spec", summary: "passed", findings: [] });
     completeStandardsReview(fixture.store, runId);
     reviews.submit(runId, barrier.barrier_id, { axis: "standards", summary: "passed", findings: [] });
     fixture.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=? WHERE run_id=? AND role='code-reviewer'")
@@ -1252,6 +1260,8 @@ test("review rejects a task commit and binds the tested integration commit", asy
     const barrier = reviews.create(runId, integrated, false);
     const packet = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role='review-standards'").get(runId) as { packet_json: string }).packet_json);
     assert.equal(packet.context.review_strategy, "integration_head");
+    completeSpecReview(fixture.store, runId);
+    reviews.submit(runId, barrier.barrier_id, { axis: "spec", summary: "passed", findings: [] });
     completeStandardsReview(fixture.store, runId);
     reviews.submit(runId, barrier.barrier_id, { axis: "standards", summary: "passed", findings: [] });
     assert.doesNotThrow(() => reviews.assertGate(runId, integrated));
@@ -1281,6 +1291,8 @@ test("resolved review persists the repair commit and Test artifact as the effect
       ...createResultTemplate(runId, leaf.dispatch_id, "review-standards"), summary: "blocked", findings: [finding],
       verification: [{ command: "review", outcome: "completed" }], payload: { finding_ids: [finding.finding_id] },
     }), new Date().toISOString(), leaf.dispatch_id);
+    completeSpecReview(fixture.store, runId);
+    reviews.submit(runId, barrier.barrier_id, { axis: "spec", summary: "passed", findings: [] });
     assert.equal(reviews.submit(runId, barrier.barrier_id, { axis: "standards", summary: "blocked", findings: [finding] }).state, "blocked");
 
     await writeFile(join(integration.path, "reviewed.txt"), "repaired\n");
@@ -1340,6 +1352,8 @@ test("target drift sync runs once and requires a newer final test before integra
     completeFrozenTest(fixture.store, runId, reviewedCommit, "2026-08-14T00:00:00.000Z");
     const reviews = new ReviewService(fixture.store);
     const barrier = reviews.create(runId, reviewedCommit, false);
+    completeSpecReview(fixture.store, runId);
+    reviews.submit(runId, barrier.barrier_id, { axis: "spec", summary: "passed", findings: [] });
     completeStandardsReview(fixture.store, runId);
     reviews.submit(runId, barrier.barrier_id, { axis: "standards", summary: "passed", findings: [] });
 

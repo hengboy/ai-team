@@ -207,30 +207,28 @@ const submitReview = (reviews: ReviewService, store: StateStore, runId: string, 
   return reviews.submit(runId, barrierId, review);
 };
 
-test("direct and formal reviews require the correct axes and run once per frozen revision", async () => {
+test("all coding reviews require both axes and run once per frozen revision", async () => {
   const { store, home } = await openStore();
   try {
     const reviews = new ReviewService(store);
     const directRun = createRun(store);
     await completeTest(store, directRun);
-    assert.throws(() => reviews.create(directRun, REVIEW_HEAD, true), /require direct review axes/);
-    assert.throws(() => reviews.create(directRun, "0".repeat(40), false), /commit does not exist/);
+    assert.throws(() => reviews.create(directRun, "0".repeat(40), true), /commit does not exist/);
     const direct = reviews.create(directRun, REVIEW_HEAD, false);
-    assert.deepEqual(direct.axes, ["standards"]);
-    assert.equal(direct.spec_dispatch_id, null);
+    assert.deepEqual(direct.axes, ["spec", "standards"]);
+    assert.match(direct.spec_dispatch_id!, /^dispatch_/);
     assert.match(direct.standards_dispatch_id, /^dispatch_/);
     assert.deepEqual(
       (store.db.prepare("SELECT role FROM dispatches WHERE run_id=? AND role LIKE 'review-%' ORDER BY role").all(directRun) as Array<{ role: string }>).map(({ role }) => role),
-      ["review-standards"],
+      ["review-spec", "review-standards"],
     );
-    assert.throws(() => reviews.submit(directRun, direct.barrier_id, result("spec")), /not required/);
+    assert.equal(submitReview(reviews, store, directRun, direct.barrier_id, result("spec")).state, "pending");
     assert.equal(submitReview(reviews, store, directRun, direct.barrier_id, result("standards")).state, "passed");
     assert.equal(reviews.submit(directRun, direct.barrier_id, result("standards")).state, "passed");
-    assert.deepEqual(reviews.create(directRun, REVIEW_HEAD, false), { ...direct, reused: true });
+    assert.deepEqual(reviews.create(directRun, REVIEW_HEAD, true), { ...direct, reused: true });
 
     const formalRun = createRun(store, "planned");
     await completeTest(store, formalRun);
-    assert.throws(() => reviews.create(formalRun, REVIEW_HEAD, false), /require formal review axes/);
     const formal = reviews.create(formalRun, REVIEW_HEAD, true);
     assert.deepEqual(formal.axes, ["spec", "standards"]);
     assert.match(formal.spec_dispatch_id!, /^dispatch_/);
@@ -249,6 +247,44 @@ test("direct and formal reviews require the correct axes and run once per frozen
   }
 });
 
+test("direct review-repair Test completion does not create a second review coordinator", async () => {
+  const { store, home } = await openStore();
+  try {
+    const runId = createRun(store);
+    await completeTest(store, runId);
+    const originalReview = store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND role='code-reviewer'").get(runId) as { dispatch_id: string; packet_json: string };
+    const originalPacket = JSON.parse(originalReview.packet_json);
+    originalPacket.context.revision_sha = REVIEW_BASE;
+    store.db.prepare("UPDATE dispatches SET packet_json=? WHERE dispatch_id=?").run(JSON.stringify(originalPacket), originalReview.dispatch_id);
+
+    const dispatches = new WorkflowService(store).dispatches;
+    const repairTestId = dispatches.create(runId, "test", {
+      objective: "verify review repair",
+      allowed_read_paths: ["package.json"],
+      allowed_write_paths: [],
+      acceptance_criteria: ["repair passes"],
+      context: {
+        phase: "review_repair_test",
+        barrier_id: "review_aaaaaaaaaaaaaaaaaaaaaaaa",
+        implementation_commit: REVIEW_HEAD,
+        implementation_committed: true,
+        changed_paths: ["package.json"],
+      },
+    });
+    dispatches.claim(runId, repairTestId, "test");
+    await dispatches.submitValue(runId, repairTestId, "test", {
+      ...createResultTemplate(runId, repairTestId, "test"),
+      summary: "repair verified",
+      verification: [{ command: "npm test", outcome: "passed" }],
+      payload: { checks: [{ command: "npm test", outcome: "passed" }], testedCommit: REVIEW_HEAD },
+    });
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='code-reviewer'").get(runId) as { count: number }).count, 1);
+  } finally {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("review submit owns leaf result registration and publishes the finding schema", async () => {
   const { store, home } = await openStore();
   try {
@@ -259,7 +295,9 @@ test("review submit owns leaf result registration and publishes the finding sche
     const runId = createRun(store);
     await completeTest(store, runId);
     const reviews = new ReviewService(store);
-    const created = reviews.create(runId, REVIEW_HEAD, false);
+    const created = reviews.create(runId, REVIEW_HEAD, true);
+    new WorkflowService(store).dispatches.claim(runId, created.spec_dispatch_id!, "review-spec");
+    await reviews.submitValue(runId, created.barrier_id, result("spec"));
     new WorkflowService(store).dispatches.claim(runId, created.standards_dispatch_id, "review-standards");
     const submitted = await reviews.submitValue(runId, created.barrier_id, result("standards"));
     assert.equal(submitted.dispatch_id, created.standards_dispatch_id);
@@ -481,13 +519,14 @@ test("blocked review resolution maps every P0 and P1 finding exactly", async () 
   try {
     const reviews = new ReviewService(store);
     const runId = createRun(store);
-    completeTest(store, runId);
-    const barrier = reviews.create(runId, REVIEW_HEAD, false);
+    await completeTest(store, runId);
+    const barrier = reviews.create(runId, REVIEW_HEAD, true);
     const findings: ReviewResult["findings"] = [
       { finding_id: "FIND-SEC-001", severity: "P0", title: "P0", source: "spec", source_file: "spec.md", source_line: 1, evidence: "e0", impact: "security", recommendation: "fix" },
       { finding_id: "FIND-CODE-002", severity: "P1", title: "P1", source: "code", source_file: "src/a.ts", source_line: 2, evidence: "e1", impact: "bug", recommendation: "fix" },
       { finding_id: "FIND-TEST-003", severity: "P2", title: "P2", source: "test", source_file: "test/a.ts", source_line: 3, evidence: "e2", impact: "coverage", recommendation: "test" },
     ];
+    assert.equal(submitReview(reviews, store, runId, barrier.barrier_id, result("spec")).state, "pending");
     assert.equal(submitReview(reviews, store, runId, barrier.barrier_id, result("standards", findings)).state, "blocked");
     new WorkflowService(store).dispatches.reconcileReview(runId, barrier.barrier_id);
     assert.equal(
@@ -547,15 +586,16 @@ test("review gate requires both a completed test dispatch and a passed review", 
   try {
     const reviews = new ReviewService(store);
     const runId = createRun(store);
-    assert.throws(() => reviews.create(runId, REVIEW_HEAD, false), /requires a completed independent test/);
-    completeTest(store, runId);
-    const barrier = reviews.create(runId, REVIEW_HEAD, false);
+    assert.throws(() => reviews.create(runId, REVIEW_HEAD, true), /requires a completed independent test/);
+    await completeTest(store, runId);
+    const barrier = reviews.create(runId, REVIEW_HEAD, true);
     assert.throws(() => reviews.submit(runId, barrier.barrier_id, result("standards")), /leaf dispatch has not completed/);
+    submitReview(reviews, store, runId, barrier.barrier_id, result("spec"));
     submitReview(reviews, store, runId, barrier.barrier_id, result("standards"));
     assert.doesNotThrow(() => reviews.assertGate(runId));
 
     const unreviewedRun = createRun(store);
-    completeTest(store, unreviewedRun);
+    await completeTest(store, unreviewedRun);
     assert.throws(() => reviews.assertGate(unreviewedRun), /review gate has not passed/);
   } finally {
     store.close();
@@ -850,6 +890,9 @@ test("bug and feature coding modes require a request and capture their Git basel
       assert.equal(run.target_branch, "main");
       assert.equal(run.base_commit, repository.head);
       assert.equal((store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=?").get(runId) as { count: number }).count, 0);
+      const contract = JSON.parse(run.plan_verification_json as string);
+      assert.deepEqual(contract.acceptance_criteria, [`AC-001: ${request}`]);
+      assert.deepEqual(contract.acceptance_steps[0].acceptance_criteria, contract.acceptance_criteria);
     }
     await assert.rejects(
       () => workflow.codingStart({ project: repository.directory, mode: "bug", request: featureRequest }),

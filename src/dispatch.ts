@@ -1601,7 +1601,7 @@ export class DispatchService {
         return;
       }
     }
-    if (run.mode === "planned" && (role === "frontend-developer" || role === "backend-developer")) {
+    if (role === "frontend-developer" || role === "backend-developer") {
       const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string };
       const packet = JSON.parse(packetRow.packet_json) as DispatchPacket;
       if (packet.context.phase === "test_repair" && typeof packet.context.source_test_dispatch_id === "string" && typeof packet.context.worktree_id === "string") {
@@ -1652,7 +1652,7 @@ export class DispatchService {
         return;
       }
     }
-    if (run.mode === "planned" && role === "test") {
+    if (role === "test") {
       const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string };
       const packet = JSON.parse(packetRow.packet_json) as DispatchPacket;
       if (packet.context.phase === "review_repair_test") {

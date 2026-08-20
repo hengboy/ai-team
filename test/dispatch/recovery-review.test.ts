@@ -93,6 +93,10 @@ test("review findings without a concrete location or impact are rejected", async
     const leaf = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='review-standards'").get(runId) as { dispatch_id: string };
     store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
       .run(JSON.stringify({ ...completedResult(runId, leaf.dispatch_id, "review-standards", { finding_ids: [validFinding.finding_id] }), summary: "reviewed", findings: [validFinding] }), new Date().toISOString(), leaf.dispatch_id);
+    const specLeaf = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='review-spec'").get(runId) as { dispatch_id: string };
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify({ ...completedResult(runId, specLeaf.dispatch_id, "review-spec", { finding_ids: [] }), summary: "passed", findings: [] }), new Date().toISOString(), specLeaf.dispatch_id);
+    reviews.submit(runId, barrier.barrier_id, { axis: "spec", summary: "passed", findings: [] });
     assert.equal(reviews.submit(runId, barrier.barrier_id, {
       axis: "standards",
       summary: "reviewed",
