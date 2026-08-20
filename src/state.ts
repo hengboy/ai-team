@@ -437,6 +437,29 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "018-planning-clarifications",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      db.exec(`
+        CREATE TABLE planning_clarifications (
+          clarification_id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          decision_id TEXT NOT NULL UNIQUE REFERENCES decisions(decision_id) ON DELETE CASCADE,
+          source TEXT NOT NULL,
+          impact_json TEXT NOT NULL,
+          requirement_ids_json TEXT NOT NULL,
+          acceptance_criteria_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','resolved')),
+          answer TEXT,
+          created_at TEXT NOT NULL,
+          resolved_at TEXT
+        );
+        CREATE UNIQUE INDEX one_pending_planning_clarification ON planning_clarifications(run_id) WHERE status='pending';
+        CREATE INDEX planning_clarifications_run_status ON planning_clarifications(run_id,status,created_at);
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
@@ -921,20 +944,113 @@ export class StateStore {
     return { command_id: row.command_id, command: payload.command ?? "operation reconcile" };
   }
 
-  createDecision(runId: string, question: string, choices: Array<{ id: string; label: string; impact: string }>, recommendation?: string, type = "workflow", dispatchId?: string): string {
+  createDecision(
+    runId: string,
+    question: string,
+    choices: Array<{ id: string; label: string; impact: string }>,
+    recommendation?: string,
+    type = "workflow",
+    dispatchId?: string,
+    mappings?: { requirementIds: string[]; acceptanceCriteria: string[] },
+  ): string {
     const existing = this.db.prepare("SELECT decision_id FROM decisions WHERE run_id=? AND status='pending'").get(runId);
     if (existing) throw new ValidationError(`run already has a pending decision: ${(existing as any).decision_id}`);
     if (dispatchId) {
       const dispatch = this.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, dispatchId);
       if (!dispatch) throw new ValidationError("decision dispatch binding does not match run");
     }
-    const checked = checkDecisionInput({ question, choices, recommendation, type });
+    const checked = checkDecisionInput({
+      question,
+      choices,
+      recommendation,
+      type,
+      ...(mappings ? { requirement_ids: mappings.requirementIds, acceptance_criteria: mappings.acceptanceCriteria } : {}),
+    });
     if (!checked.valid) throw new ValidationError("decision input is invalid", checked.errors);
     const decisionId = `decision_${makeId("dispatch").slice(9)}`;
     const receipt = { type: checked.value.type ?? "workflow", question, choices, recommendation: recommendation ?? null, dispatch_id: dispatchId ?? null };
     this.db.prepare("INSERT INTO decisions(decision_id,run_id,dispatch_id,question,choices_json,recommendation,decision_type,receipt_json,status,created_at) VALUES (?,?,?,?,?,?,?,?, 'pending',?)")
       .run(decisionId, runId, dispatchId ?? null, question, stableJson(choices), recommendation, checked.value.type ?? "workflow", stableJson(receipt), new Date().toISOString());
     return decisionId;
+  }
+
+  createPlanningClarification(input: {
+    runId: string;
+    decisionId: string;
+    source: string;
+    impact: unknown;
+    requirementIds: string[];
+    acceptanceCriteria: string[];
+  }): string {
+    const decision = this.db.prepare("SELECT decision_type,status FROM decisions WHERE run_id=? AND decision_id=?")
+      .get(input.runId, input.decisionId) as { decision_type: string; status: string } | undefined;
+    if (!decision || decision.decision_type !== "requirement" || decision.status !== "pending") {
+      throw new ValidationError("planning clarification requires a pending requirement decision");
+    }
+    const validMappings = (values: string[], pattern: RegExp, field: string): string[] => {
+      const normalized = [...new Set(values)].sort();
+      if (!normalized.length || normalized.some((value) => !pattern.test(value))) {
+        throw new ValidationError(`planning clarification requires non-empty valid ${field}`);
+      }
+      return normalized;
+    };
+    const requirementIds = validMappings(input.requirementIds, /^REQ-[0-9]{3}$/, "requirement IDs");
+    const acceptanceCriteria = validMappings(input.acceptanceCriteria, /^AC-[0-9]{3}$/, "acceptance criteria");
+    const clarificationId = `clarification_${makeId("dispatch").slice(9)}`;
+    this.db.prepare(`INSERT INTO planning_clarifications(
+      clarification_id,run_id,decision_id,source,impact_json,requirement_ids_json,acceptance_criteria_json,status,created_at
+    ) VALUES (?,?,?,?,?,?,?,'pending',?)`).run(
+      clarificationId, input.runId, input.decisionId, input.source, stableJson(input.impact),
+      stableJson(requirementIds), stableJson(acceptanceCriteria), new Date().toISOString(),
+    );
+    this.event(input.runId, "planning.clarification_opened", { clarification_id: clarificationId, decision_id: input.decisionId, source: input.source });
+    return clarificationId;
+  }
+
+  planningClarifications(runId: string): Array<Record<string, unknown>> {
+    return (this.db.prepare(`SELECT c.clarification_id,c.source,c.impact_json,c.requirement_ids_json,c.acceptance_criteria_json,c.decision_id,
+      d.status,d.choice FROM planning_clarifications c JOIN decisions d ON d.decision_id=c.decision_id
+      WHERE c.run_id=? ORDER BY c.created_at,c.clarification_id`).all(runId) as Array<{
+      clarification_id: string; source: string; impact_json: string; requirement_ids_json: string; acceptance_criteria_json: string;
+      decision_id: string; status: string; choice?: string;
+    }>).map(({ impact_json, requirement_ids_json, acceptance_criteria_json, status, choice, ...clarification }) => ({
+      ...clarification,
+      impact: JSON.parse(impact_json),
+      requirement_ids: JSON.parse(requirement_ids_json),
+      acceptance_criteria: JSON.parse(acceptance_criteria_json),
+      status,
+      answer: choice ?? null,
+    }));
+  }
+
+  assertPlanningClarificationsResolved(runId: string): void {
+    const clarifications = this.db.prepare(`SELECT c.clarification_id,c.requirement_ids_json,c.acceptance_criteria_json,c.status,c.answer,
+      d.status AS decision_status,d.choice FROM planning_clarifications c JOIN decisions d ON d.decision_id=c.decision_id
+      WHERE c.run_id=? ORDER BY c.created_at,c.clarification_id`).all(runId) as Array<{
+      clarification_id: string; requirement_ids_json: string; acceptance_criteria_json: string; status: string; answer?: string;
+      decision_status: string; choice?: string;
+    }>;
+    for (const clarification of clarifications) {
+      let requirementIds: unknown;
+      let acceptanceCriteria: unknown;
+      try {
+        requirementIds = JSON.parse(clarification.requirement_ids_json);
+        acceptanceCriteria = JSON.parse(clarification.acceptance_criteria_json);
+      } catch {
+        throw new ValidationError(`planning clarification is structurally incomplete: ${clarification.clarification_id}`);
+      }
+      const valid = (values: unknown, pattern: RegExp): values is string[] => Array.isArray(values)
+        && values.length > 0
+        && values.every((value) => typeof value === "string" && pattern.test(value));
+      if (!valid(requirementIds, /^REQ-[0-9]{3}$/) || !valid(acceptanceCriteria, /^AC-[0-9]{3}$/)
+        || clarification.status !== clarification.decision_status
+        || clarification.answer !== (clarification.choice ?? null)) {
+        throw new ValidationError(`planning clarification is structurally incomplete: ${clarification.clarification_id}`);
+      }
+      if (clarification.decision_status !== "resolved") {
+        throw new ValidationError(`planning has a pending clarification: ${clarification.clarification_id}`);
+      }
+    }
   }
 
   decide(runId: string, decisionId: string, choice: string, note?: string): void {
@@ -946,7 +1062,10 @@ export class StateStore {
     const receipt = { ...JSON.parse(row.receipt_json ?? "{}"), decision_id: decisionId, choice, note: note ?? null, resolved_at: resolvedAt };
     this.db.prepare("UPDATE decisions SET status='resolved',choice=?,note=?,receipt_json=?,resolved_at=? WHERE decision_id=?")
       .run(choice, note ?? null, stableJson(receipt), resolvedAt, decisionId);
+    const clarification = this.db.prepare(`UPDATE planning_clarifications SET status='resolved',answer=?,resolved_at=?
+      WHERE run_id=? AND decision_id=? AND status='pending'`).run(choice, resolvedAt, runId, decisionId);
     this.event(runId, "decision.resolved", { decisionId, choice });
+    if (clarification.changes) this.event(runId, "planning.clarification_resolved", { decision_id: decisionId, answer: choice });
   }
 
   assertTaskPreviewApproved(runId: string): void {

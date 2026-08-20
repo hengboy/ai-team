@@ -27,7 +27,7 @@ import {
   validatePacket as validateDispatchPacket,
 } from "./dispatch/packet.js";
 import { buildContinueTestingPacket, buildReviewPacket as assembleReviewPacket, buildTestPacket } from "./dispatch/implementation.js";
-import { assertPlanningSubmissionTransition, planningContinuationPacket, planningSubmissionIntent } from "./dispatch/planning.js";
+import { assertPlanningSubmissionTransition, planningContinuationPacket, planningSubmissionIntent, requirementClarificationMappings } from "./dispatch/planning.js";
 import { isManagedPlannedRecovery, livenessRecoveryIntent, managedCleanupPacket, reconciliationIntent, reissuePacket, retryableResultHasNoSideEffects } from "./dispatch/recovery.js";
 import { executionEnforcement, freezeExecutionContract, type ExecutionContract, type ExecutionRequest } from "./execution-contract.js";
 import { recoveryProjection, type NextAction, type TimelineEntry } from "./run-recovery.js";
@@ -526,6 +526,7 @@ export class DispatchService {
   createPlanningCommit(runId: string, packet: DispatchPacket): string {
     const run = this.store.getRun(runId) as { profile: string; repo_id: string; plan_id?: string; revision?: string };
     if (run.profile !== "planning" || !run.plan_id || !run.revision) throw new ValidationError("planning commit requires a bound planning revision");
+    this.store.assertPlanningClarificationsResolved(runId);
     const revision = this.store.db.prepare("SELECT state FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
       .get(run.repo_id, run.plan_id, run.revision) as { state: string } | undefined;
     if (revision?.state !== "plan_ready") throw new ValidationError("planning commit dispatch requires a plan_ready revision");
@@ -1517,6 +1518,7 @@ export class DispatchService {
 
   runShowProjection(runId: string): {
     continuation: DispatchContinuation;
+    planning_clarifications: Array<Record<string, unknown>>;
     pending_dependencies: Array<{ dispatch_id: string; depends_on: string[] }>;
     suggested_commands: string[];
   } {
@@ -1532,6 +1534,7 @@ export class DispatchService {
     if (!suggestedCommands.length && run.state === "active") suggestedCommands.push(`ai-team run resume ${runId}`);
     return {
       continuation,
+      planning_clarifications: this.store.planningClarifications(runId),
       pending_dependencies: continuation.pending_dispatches.map(({ dispatch_id, depends_on }) => ({ dispatch_id, depends_on })),
       suggested_commands: suggestedCommands,
     };
@@ -2776,7 +2779,7 @@ export class DispatchService {
     const payload = result.payload as {
       stage: string;
       pending_questions: string[];
-      decision: { question: string; choices: Array<{ id: string; label: string; impact: string }>; recommendation: string } | null;
+      decision: { question: string; choices: Array<{ id: string; label: string; impact: string }>; recommendation: string; requirement_ids?: string[]; acceptance_criteria?: string[] } | null;
       no_change?: { decision_id: string; conclusion: string; repository_evidence: Array<{ command: string; outcome: string }> };
     };
     const run = this.store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string; stage: string };
@@ -2822,7 +2825,17 @@ export class DispatchService {
     this.store.event(runId, "planning.stage_changed", { stage: payload.stage });
     if (needsDecision) {
       if (!payload.decision) throw new ValidationError("planning pending question requires one matching decision");
-      this.store.createDecision(runId, intent.question!, payload.decision.choices, payload.decision.recommendation, intent.decisionType!, result.dispatch_id);
+      const mappings = intent.decisionType === "requirement" ? requirementClarificationMappings(payload.decision) : undefined;
+      const decisionId = this.store.createDecision(runId, intent.question!, payload.decision.choices, payload.decision.recommendation, intent.decisionType!, result.dispatch_id, mappings);
+      if (intent.decisionType === "requirement") {
+        this.store.createPlanningClarification({
+          runId,
+          decisionId,
+          source: "planning_dispatch",
+          impact: payload.decision.choices,
+          ...mappings!,
+        });
+      }
     } else if (payload.stage !== "ready") {
       this.continuePlanning(runId);
     }
@@ -2831,6 +2844,7 @@ export class DispatchService {
   continuePlanning(runId: string): string {
     const run = this.store.getRun(runId) as { profile: string; stage: string };
     if (run.profile !== "planning") throw new ValidationError("only planning runs can continue planning");
+    this.store.assertPlanningClarificationsResolved(runId);
     const pending = this.store.db.prepare("SELECT 1 FROM decisions WHERE run_id=? AND status='pending'").get(runId);
     if (pending) throw new ValidationError("planning cannot continue with a pending decision");
     const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='planning' AND state IN ('pending','claimed') ORDER BY created_at DESC LIMIT 1")

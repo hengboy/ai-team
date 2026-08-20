@@ -256,6 +256,49 @@ test("independent task split decisions have one legal plan_ready continuation", 
   ]);
 });
 
+test("CLI requirement decisions require mappings and create a clarification ledger", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const store = await StateStore.open(sandbox.aiTeamHome);
+  const repoId = "repo-cli-clarification";
+  store.registerRepository(repoId, join(sandbox.repo, ".git"), sandbox.repo);
+  const runId = store.createRun({ repoId, profile: "planning", mode: "planned", request: "Clarify requirements" });
+  store.db.prepare("UPDATE runs SET stage='requirements' WHERE run_id=?").run(runId);
+  const service = new DispatchService(store);
+  const dispatchId = service.create(runId, "planning", {
+    objective: "Clarify one requirement", allowed_read_paths: ["README.md"], allowed_write_paths: [], acceptance_criteria: ["Record the decision"], context: {},
+  }, "planning");
+  service.claim(runId, dispatchId, "planning");
+  store.close();
+
+  const base = {
+    question: "Which runtime is supported?",
+    choices: [
+      { id: "current", label: "Current", impact: "No compatibility work" },
+      { id: "legacy", label: "Legacy", impact: "Add compatibility work" },
+    ],
+    recommendation: "current",
+    type: "requirement",
+  };
+  const created = json<{ decision_id: string }>(await cliWithInput(sandbox, [
+    "decision", "create", "--run-id", runId, "--dispatch-id", dispatchId, "--input-stdin",
+  ], JSON.stringify({ ...base, requirement_ids: ["REQ-001"], acceptance_criteria: ["AC-001"] })));
+  const shown = json<{ planning_clarifications: Array<Record<string, unknown>> }>(await cli(sandbox, ["run", "show", runId]));
+  assert.deepEqual(shown.planning_clarifications, [{
+    clarification_id: shown.planning_clarifications[0]!.clarification_id,
+    decision_id: created.decision_id,
+    source: "cli_decision_create",
+    impact: base.choices,
+    requirement_ids: ["REQ-001"],
+    acceptance_criteria: ["AC-001"],
+    status: "pending",
+    answer: null,
+  }]);
+
+  json(await cli(sandbox, ["run", "decide", "--run-id", runId, "--decision-id", created.decision_id, "--choice", "current"]));
+  const resolved = json<{ planning_clarifications: Array<{ status: string; answer: string }> }>(await cli(sandbox, ["run", "show", runId]));
+  assert.deepEqual(resolved.planning_clarifications.map(({ status, answer }) => ({ status, answer })), [{ status: "resolved", answer: "current" }]);
+});
+
 test("planning dispatch can be claimed, inspected, submitted, resumed, and decided", async (t) => {
   const sandbox = await makeSandbox(t);
   const requestFile = join(sandbox.root, "request.md");
@@ -401,9 +444,11 @@ test("planning no_change submit consumes one staging entry and leaves a terminal
     choices: [
       { id: "verify_existing", label: "Verify existing", impact: "Finish without changes" },
       { id: "plan_changes", label: "Plan changes", impact: "Continue planning" },
-    ],
-    recommendation: "verify_existing",
-  };
+  ],
+  recommendation: "verify_existing",
+  requirement_ids: ["REQ-001"],
+  acceptance_criteria: ["AC-001"],
+};
   await dispatches.submitValue(runId, questionDispatch, "planning", {
     ...createResultTemplate(runId, questionDispatch, "planning"),
     summary: "HEAD behavior was presented for confirmation.",

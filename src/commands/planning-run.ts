@@ -3,6 +3,7 @@ import { validateCommand } from "../command-contract.js";
 import { checkDecisionInput, DECISION_INPUT_SCHEMA, DECISION_INPUT_TEMPLATE } from "../contracts.js";
 import type { Role } from "../constants.js";
 import { DispatchService, type DispatchPacket } from "../dispatch.js";
+import { planningDecisionKind, requirementClarificationMappings } from "../dispatch/planning.js";
 import { ValidationError } from "../errors.js";
 import { recoveryProjection } from "../run-recovery.js";
 import { commitPlanningRevision, repositoryIdentity } from "../git.js";
@@ -135,6 +136,7 @@ const preflightPlanningRevision = async (
     if (run.plan_id && (run.plan_id !== input.planId || run.revision !== input.revision)) {
       throw new ValidationError("planning run is already bound to a different revision");
     }
+    store.assertPlanningClarificationsResolved(input.runId);
     assertRevisionCreateRunStage(input.documents, run.stage);
     if (hasTaskDocuments(input.documents)) store.assertTaskPreviewApproved(input.runId);
     if (run.state !== "active") throw new ValidationError("planning revision requires an active planning run");
@@ -243,6 +245,7 @@ export const registerPlanningCommands = (program: Command, dependencies: Plannin
       const run = store.getRun(options.runId) as { repo_id: string; profile: string; stage: string; state: string };
       if (run.repo_id !== repo.repoId || run.profile !== "planning") throw new ValidationError("planning commit dispatch does not belong to this revision repository");
       if (run.state !== "active") throw new ValidationError("planning run must be active before revision commit");
+      store.assertPlanningClarificationsResolved(options.runId);
       const row = store.db.prepare("SELECT * FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?").get(repo.repoId, options.planId, options.revision) as { state: string; digest?: string; plan_commit?: string } | undefined;
       if (!row || !["plan_ready", "tasks_preview", "ready"].includes(row.state) || !row.digest) throw new ValidationError("planning revision is not ready to commit");
       const revisionDigest = row.digest;
@@ -377,6 +380,14 @@ export const registerDecisionResearchCommands = (program: Command, dependencies:
         const checked = checkDecisionInput(input.value);
         if (!checked.valid) throw new ValidationError("decision input is invalid", checked.errors);
         const value = checked.value;
+        const requirementClarification = run.profile === "planning" && value.type === "requirement";
+        if (requirementClarification) {
+          const current = store.getRun(options.runId) as { stage: string; state: string };
+          const choiceIds = value.choices.map(({ id }) => id).sort();
+          if (current.stage !== "requirements" || current.state !== "active" || planningDecisionKind(current.stage, choiceIds).finalConfirmation) {
+            throw new ValidationError("requirement decision requires an active requirements-stage planning run");
+          }
+        }
         let taskSplit = false;
         if (run.profile === "planning" && value.type === "task_split") {
           const current = store.getRun(options.runId) as { stage: string; state: string };
@@ -387,7 +398,17 @@ export const registerDecisionResearchCommands = (program: Command, dependencies:
           if (!dispatch || dispatch.role !== "planning" || !["claimed", "completed"].includes(dispatch.state)) throw new ValidationError("task_split decision requires a claimed or completed planning dispatch");
           taskSplit = true;
         }
-        const result = { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation, value.type ?? "workflow", options.dispatchId) };
+        const mappings = requirementClarification ? requirementClarificationMappings(value) : undefined;
+        const result = { decision_id: store.createDecision(options.runId, value.question, value.choices, value.recommendation, value.type ?? "workflow", options.dispatchId, mappings) };
+        if (requirementClarification) {
+          store.createPlanningClarification({
+            runId: options.runId,
+            decisionId: result.decision_id,
+            source: "cli_decision_create",
+            impact: value.choices,
+            ...mappings!,
+          });
+        }
         if (taskSplit) {
           store.db.prepare("UPDATE dispatches SET state='needs_decision',completed_at=NULL WHERE dispatch_id=?").run(options.dispatchId);
           store.db.prepare("UPDATE runs SET state='needs_decision',updated_at=? WHERE run_id=?").run(new Date().toISOString(), options.runId);

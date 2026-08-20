@@ -55,6 +55,8 @@ export interface TypedDecisionInput {
   choices: Array<{ id: string; label: string; impact: string }>;
   recommendation?: string;
   type?: string;
+  requirement_ids?: string[];
+  acceptance_criteria?: string[];
 }
 
 const DECISION_CHOICE_SCHEMA = {
@@ -77,6 +79,8 @@ const DECISION_INPUT_SHAPE = {
     choices: { type: "array", minItems: 2, uniqueItems: true, items: DECISION_CHOICE_SCHEMA },
     recommendation: { type: "string", minLength: 1 },
     type: { type: "string", minLength: 1 },
+    requirement_ids: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", pattern: "^REQ-[0-9]{3}$" } },
+    acceptance_criteria: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", pattern: "^AC-[0-9]{3}$" } },
   },
 } as const;
 export const DECISION_INPUT_SCHEMA = {
@@ -282,6 +286,12 @@ export const checkDecisionInput = (value: unknown): { valid: true; value: TypedD
   if (!validateDecisionInput(value)) return { valid: false, errors: formatSchemaErrors(validateDecisionInput.errors) };
   const ids = value.choices.map((choice) => choice.id);
   if (new Set(ids).size !== ids.length) return { valid: false, errors: [validationDetail("/choices", "uniqueItems", "choice ids must be unique")] };
+  if (value.type === "requirement") {
+    const errors: ValidationDetail[] = [];
+    if (!value.requirement_ids?.length) errors.push(validationDetail("/requirement_ids", "minItems", "requirement decisions require at least one requirement ID"));
+    if (!value.acceptance_criteria?.length) errors.push(validationDetail("/acceptance_criteria", "minItems", "requirement decisions require at least one acceptance criterion"));
+    if (errors.length) return { valid: false, errors };
+  }
   return { valid: true, value };
 };
 

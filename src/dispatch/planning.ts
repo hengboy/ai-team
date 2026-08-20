@@ -37,7 +37,29 @@ export interface PlanningDecision {
   question: string;
   choices: Array<{ id: string; label: string; impact: string }>;
   recommendation: string;
+  requirement_ids?: string[];
+  acceptance_criteria?: string[];
 }
+
+export const requirementClarificationMappings = (decision: {
+  requirement_ids?: string[];
+  acceptance_criteria?: string[];
+}): {
+  requirementIds: string[];
+  acceptanceCriteria: string[];
+} => {
+  const normalize = (values: string[] | undefined, pattern: RegExp, field: string): string[] => {
+    const normalized = [...new Set(values ?? [])].sort();
+    if (!normalized.length || normalized.some((value) => !pattern.test(value))) {
+      throw new ValidationError(`requirement clarification requires non-empty valid ${field}`);
+    }
+    return normalized;
+  };
+  return {
+    requirementIds: normalize(decision.requirement_ids, /^REQ-[0-9]{3}$/, "requirement_ids"),
+    acceptanceCriteria: normalize(decision.acceptance_criteria, /^AC-[0-9]{3}$/, "acceptance_criteria"),
+  };
+};
 
 export interface PlanningSubmissionIntent {
   needsDecision: boolean;

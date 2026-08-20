@@ -320,6 +320,8 @@ test("planning results advance one stage and create at most one matching decisio
           { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
         ],
         recommendation: "current",
+        requirement_ids: ["REQ-001"],
+        acceptance_criteria: ["AC-001"],
       },
     })));
     await dispatches.submit(runId, planningId, "planning", resultPath);
@@ -342,6 +344,8 @@ test("planning results advance one stage and create at most one matching decisio
           { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
         ],
         recommendation: "current",
+        requirement_ids: ["REQ-002"],
+        acceptance_criteria: ["AC-002"],
       },
     }));
     assert.equal((store.db.prepare("SELECT question FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { question: string }).question, `问题 2、${secondQuestion}`);
@@ -411,6 +415,7 @@ test("requirements final confirmation is typed without a functional question num
       store.db.prepare("SELECT question,decision_type FROM decisions WHERE run_id=?").get(runId),
       { question: decision.question, decision_type: "requirements_final" },
     );
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM planning_clarifications WHERE run_id=?").get(runId) as { count: number }).count, 0);
     assert.doesNotMatch((store.db.prepare("SELECT question FROM decisions WHERE run_id=?").get(runId) as { question: string }).question, /^问题 \d+、/);
   });
 });
@@ -437,6 +442,8 @@ test("planning question results normalize completed and needs_decision into one 
               { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
             ],
             recommendation: "current",
+            requirement_ids: ["REQ-001"],
+            acceptance_criteria: ["AC-001"],
           },
         }),
         status,
@@ -447,6 +454,8 @@ test("planning question results normalize completed and needs_decision into one 
             { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
           ],
           recommendation: "current",
+          requirement_ids: ["REQ-001"],
+          acceptance_criteria: ["AC-001"],
         }] : [],
       }));
 
@@ -493,6 +502,8 @@ test("resolving a planning decision restores the run and creates exactly one con
           { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
         ],
         recommendation: "current",
+        requirement_ids: ["REQ-001"],
+        acceptance_criteria: ["AC-001"],
       },
     })));
     await dispatches.submit(runId, planningId, "planning", resultPath);
@@ -521,9 +532,11 @@ test("verify_existing completes a planning run as audited no_change without impl
       choices: [
         { id: "verify_existing", label: "Verify existing", impact: "Record evidence and finish without changes" },
         { id: "plan_changes", label: "Plan changes", impact: "Continue the normal planning workflow" },
-      ],
-      recommendation: "verify_existing",
-    };
+    ],
+    recommendation: "verify_existing",
+    requirement_ids: ["REQ-001"],
+    acceptance_criteria: ["AC-001"],
+  };
     await dispatches.submitValue(runId, questionDispatch, "planning", completedResult(runId, questionDispatch, "planning", {
       actions: ["present verified HEAD implementation"],
       stage: "requirements",
@@ -846,5 +859,50 @@ test("run resume repairs a stale planning retryable failure without crossing blo
       assert.equal((blockedResult.run as { state: string }).state, "retryable_failure", name);
       assert.equal(blockedResult.pending_dispatches.length, 0, name);
     }
+  });
+});
+
+test("requirement clarifications require explicit mappings and block planning continuation", async () => {
+  await withStore(async (store) => {
+    const runId = createRun(store, "planning");
+    store.db.prepare("UPDATE runs SET stage='planning' WHERE run_id=?").run(runId);
+    const dispatches = new DispatchService(store);
+    const dispatchId = dispatches.create(runId, "planning", dispatchPacket(), "planning");
+    dispatches.claim(runId, dispatchId, "planning");
+    const question = "Which supported runtime is required?";
+    const result = completedResult(runId, dispatchId, "planning", {
+      actions: ["clarify runtime"],
+      stage: "requirements",
+      pending_questions: [question],
+      decision: {
+        question,
+        choices: [
+          { id: "current", label: "Current", impact: "No compatibility work" },
+          { id: "legacy", label: "Legacy", impact: "Add compatibility work" },
+        ],
+        recommendation: "current",
+      },
+    });
+    await assert.rejects(dispatches.submitValue(runId, dispatchId, "planning", result), /requirement_ids/);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=?").get(runId) as { count: number }).count, 0);
+
+    result.payload.decision = {
+      ...result.payload.decision as Record<string, unknown>,
+      requirement_ids: ["REQ-001"],
+      acceptance_criteria: ["AC-001"],
+    };
+    await dispatches.submitValue(runId, dispatchId, "planning", result);
+    const clarification = dispatches.runShowProjection(runId).planning_clarifications[0] as { clarification_id: string; status: string; answer: unknown };
+    assert.equal(clarification.status, "pending");
+    assert.equal(clarification.answer, null);
+    assert.throws(() => dispatches.continuePlanning(runId), new RegExp(clarification.clarification_id));
+
+    const decisionId = (store.db.prepare("SELECT decision_id FROM decisions WHERE run_id=?").get(runId) as { decision_id: string }).decision_id;
+    dispatches.resolvePlanningDecision(runId, decisionId, "current");
+    assert.deepEqual(dispatches.runShowProjection(runId).planning_clarifications[0], {
+      ...clarification,
+      status: "resolved",
+      answer: "current",
+    });
   });
 });

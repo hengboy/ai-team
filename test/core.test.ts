@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Ajv2020 } from "ajv/dist/2020.js";
-import { checkResultEnvelope, createResultTemplate } from "../src/contracts.js";
+import { checkDecisionInput, checkResultEnvelope, createResultTemplate } from "../src/contracts.js";
 import { ROLES } from "../src/constants.js";
 import { COMMAND_CONTRACT_BASE, COMMAND_PARAMETER_TYPES, COMMAND_SYNTAX, commandContractFor } from "../src/command-contract.js";
 import { DispatchService, dispatchPacketSchema, dispatchPacketTemplate, type DispatchPacket } from "../src/dispatch.js";
@@ -181,7 +181,7 @@ test("state migration is recorded once and survives reopening", async () => {
   try {
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }, { name: "017-recovery-staging-lineage" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }, { name: "017-recovery-staging-lineage" }, { name: "018-planning-clarifications" }],
     );
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
@@ -192,7 +192,7 @@ test("state migration is recorded once and survives reopening", async () => {
     store = await StateStore.open(home);
     assert.deepEqual(
       store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }, { name: "017-recovery-staging-lineage" }],
+      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }, { name: "017-recovery-staging-lineage" }, { name: "018-planning-clarifications" }],
     );
   } finally {
     store.close();
@@ -257,7 +257,7 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
     try {
       assert.equal(
         (reader.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count,
-        17,
+        18,
       );
       assert.throws(() => reader.db.prepare("UPDATE runs SET state='failed'").run(), /readonly|read-only/i);
     } finally {
@@ -662,6 +662,50 @@ test("decisions allow one pending question, validate choices, and record resolut
     };
     assert.equal(event.type, "decision.resolved");
     assert.equal(event.payload_json, `{"choice":"keep","decisionId":"${decisionId}"}`);
+  });
+});
+
+test("requirement clarification mappings are explicit and project the authoritative decision", async () => {
+  await withStore((store) => {
+    const runId = createRun(store);
+    const choices = [
+      { id: "keep", label: "Keep", impact: "No migration" },
+      { id: "move", label: "Move", impact: "Migrate branch" },
+    ];
+    const invalid = checkDecisionInput({ question: "Which requirement?", choices, type: "requirement" });
+    assert.equal(invalid.valid, false);
+    if (!invalid.valid) assert.deepEqual(invalid.errors.map(({ pointer }) => pointer), ["/requirement_ids", "/acceptance_criteria"]);
+
+    const mappings = { requirementIds: ["REQ-001"], acceptanceCriteria: ["AC-001"] };
+    const decisionId = store.createDecision(runId, "Which requirement?", choices, "keep", "requirement", undefined, mappings);
+    const clarificationId = store.createPlanningClarification({ runId, decisionId, source: "test", impact: choices, ...mappings });
+    assert.throws(() => store.assertPlanningClarificationsResolved(runId), new RegExp(clarificationId));
+    store.db.prepare("UPDATE planning_clarifications SET requirement_ids_json='[]' WHERE clarification_id=?").run(clarificationId);
+    assert.throws(() => store.assertPlanningClarificationsResolved(runId), new RegExp(`structurally incomplete: ${clarificationId}`));
+    store.db.prepare("UPDATE planning_clarifications SET requirement_ids_json=? WHERE clarification_id=?").run(JSON.stringify(mappings.requirementIds), clarificationId);
+    assert.deepEqual(store.planningClarifications(runId), [{
+      clarification_id: clarificationId,
+      decision_id: decisionId,
+      source: "test",
+      impact: choices,
+      requirement_ids: ["REQ-001"],
+      acceptance_criteria: ["AC-001"],
+      status: "pending",
+      answer: null,
+    }]);
+
+    store.decide(runId, decisionId, "keep");
+    assert.doesNotThrow(() => store.assertPlanningClarificationsResolved(runId));
+    assert.deepEqual(store.planningClarifications(runId)[0], {
+      clarification_id: clarificationId,
+      decision_id: decisionId,
+      source: "test",
+      impact: choices,
+      requirement_ids: ["REQ-001"],
+      acceptance_criteria: ["AC-001"],
+      status: "resolved",
+      answer: "keep",
+    });
   });
 });
 
