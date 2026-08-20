@@ -9,7 +9,7 @@ import test from "node:test";
 import { ValidationError } from "../src/errors.js";
 import { createResultTemplate } from "../src/contracts.js";
 import { repositoryIdentity } from "../src/git.js";
-import { assertCoverage, validateCoverage, writeRevision } from "../src/planning.js";
+import { assertCoverage, preflightRevision, validateCoverage, writeRevision } from "../src/planning.js";
 import { initializeProject, planProjectInit } from "../src/project.js";
 import { validateResearchConclusions, type ResearchConclusion } from "../src/research.js";
 import { REVIEW_RESOLUTION_SCHEMA, REVIEW_RESOLUTION_TEMPLATE, REVIEW_RESULT_SCHEMA, ReviewService, checkReviewResolutions, type ReviewResult } from "../src/review.js";
@@ -687,10 +687,87 @@ test("project init requires confirmation before appending to a dirty .gitignore"
   }
 });
 
+test("revision preflight accepts legacy and canonical TDD acceptance field labels", async () => {
+  const project = await temporaryDirectory();
+  const legacyAcceptance = [
+    "### AC-001：澄清 ledger 完整持久化",
+    "",
+    "- Given：Planning 产生、解决、修改或取代疑点。",
+    "- When：写入 ledger 并查询 compact projection。",
+    "- Then：唯一 ID、来源、影响、状态、答案、decision 和 REQ/AC 映射均与权威状态一致。",
+    "- RED：先在 `test/dispatch/planning-lifecycle.test.ts` 增加能在旧实现失败的行为测试。",
+    "- 可观察结果：唯一 ID、来源、影响、状态、答案、decision 和 REQ/AC 映射均与权威状态一致。",
+    "- 边界反例：requirements_final、task_split、task_preview 不占功能问题编号。",
+    "- 测试层级：单元、合同/生命周期集成与相关 CLI smoke。",
+    "- 验证命令或证据：`npm test -- test/dispatch/planning-lifecycle.test.ts test/cli/planning.test.ts`。",
+  ].join("\n");
+  const spec = (acceptance: string) => [
+    "# Spec", "## 背景", "背景", "## 目标", "目标", "## 非目标", "无", "## 用户场景", "场景",
+    "## 功能需求", "### REQ-001：需求", "描述", "## 验收标准", acceptance,
+    "## 数据与接口", "无", "## 兼容约束", "无", "## 安全约束", "无", "## 错误与边界", "无",
+    "## 迁移发布回滚", "无", "## 已确认偏好", "无", "## 默认取舍", "无", "## 已关闭问题", "无", "## 未决问题", "无",
+  ].join("\n");
+  const planContract = {
+    acceptance_criteria: ["AC-001"],
+    acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+    task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+    test_commands: ["npm test"],
+  };
+  const plan = [
+    "# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", "REQ-001 AC-001",
+    "## 验证", "验证", "## 方案验收契约", "```json", JSON.stringify(planContract), "```", "## 发布与回滚", "回滚",
+  ].join("\n");
+  const canonicalAcceptance = legacyAcceptance
+    .replace("- RED：", "- RED 判定：")
+    .replace("- 测试层级：", "- 建议测试层级：")
+    .replace("- 验证命令或证据：", "- 验证命令或证据路径：");
+
+  try {
+    await assert.doesNotReject(() => preflightRevision(project, "20260820-legacy-ac", "002", { spec: spec(legacyAcceptance), plan }, "001"));
+    await assert.doesNotReject(() => preflightRevision(project, "20260820-canonical-ac", "001", { spec: spec(canonicalAcceptance), plan }));
+    await assert.rejects(
+      () => preflightRevision(project, "20260820-missing-coverage", "001", { spec: spec(legacyAcceptance), plan: plan.replace("REQ-001 AC-001", "AC-001") }),
+      /planning coverage is incomplete/,
+    );
+
+    const requiredLines: Array<[string, string]> = [
+      ["Given", "- Given：Planning 产生、解决、修改或取代疑点。"],
+      ["When", "- When：写入 ledger 并查询 compact projection。"],
+      ["Then", "- Then：唯一 ID、来源、影响、状态、答案、decision 和 REQ/AC 映射均与权威状态一致。"],
+      ["RED", "- RED：先在 `test/dispatch/planning-lifecycle.test.ts` 增加能在旧实现失败的行为测试。"],
+      ["可观察结果", "- 可观察结果：唯一 ID、来源、影响、状态、答案、decision 和 REQ/AC 映射均与权威状态一致。"],
+      ["边界反例", "- 边界反例：requirements_final、task_split、task_preview 不占功能问题编号。"],
+      ["测试层级", "- 测试层级：单元、合同/生命周期集成与相关 CLI smoke。"],
+      ["验证命令", "- 验证命令或证据：`npm test -- test/dispatch/planning-lifecycle.test.ts test/cli/planning.test.ts`。"],
+    ];
+    for (const [field, line] of requiredLines) {
+      const omitted = legacyAcceptance.split("\n").filter((candidate) => candidate !== line).join("\n");
+      for (const acceptance of [omitted, legacyAcceptance.replace(line, `${line.slice(0, line.indexOf("：") + 1)}   `)]) {
+        await assert.rejects(
+          () => preflightRevision(project, "20260820-invalid-ac", "001", { spec: spec(acceptance), plan }),
+          (error: unknown) => error instanceof ValidationError
+            && (error.details as { missing: string[] }).missing.includes(field),
+          `${field} must be present and non-empty`,
+        );
+      }
+    }
+    await assert.rejects(
+      () => preflightRevision(project, "20260820-keyword-collision", "001", {
+        spec: spec(`${legacyAcceptance.split("\n").filter((line) => !line.startsWith("- 验证命令或证据：")).join("\n")}\n正文提到验证命令或证据但不是字段。`),
+        plan,
+      }),
+      (error: unknown) => error instanceof ValidationError
+        && (error.details as { missing: string[] }).missing.includes("验证命令"),
+    );
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
 test("revision writing enforces coverage, frontmatter, and immutability", async () => {
   const project = await temporaryDirectory();
   const planId = "20260813-workflow";
-  const specDocument = ["# Spec", "## 背景", "背景", "## 目标", "目标", "## 非目标", "无", "## 用户场景", "场景", "## 功能需求", "### REQ-001：需求", "对应验收 AC-001", "## 验收标准", "### AC-001：验收", "- Given：前置", "- When：操作", "- Then：结果", "- 覆盖需求：REQ-001", "- RED 判定：实施前失败", "- 可观察结果：实施后通过", "- 边界反例：无输入", "- 建议测试层级：unit", "## 数据与接口", "无", "## 兼容约束", "macOS", "## 安全约束", "本地", "## 错误与边界", "失败", "## 迁移发布回滚", "回滚", "## 已确认偏好", "中文", "## 默认取舍", "默认", "## 已关闭问题", "无", "## 未决问题", "none"].join("\n");
+  const specDocument = ["# Spec", "## 背景", "背景", "## 目标", "目标", "## 非目标", "无", "## 用户场景", "场景", "## 功能需求", "### REQ-001：需求", "对应验收 AC-001", "## 验收标准", "### AC-001：验收", "- Given：前置", "- When：操作", "- Then：结果", "- 覆盖需求：REQ-001", "- RED 判定：实施前失败", "- 可观察结果：实施后通过", "- 边界反例：无输入", "- 建议测试层级：unit", "- 验证命令或证据路径：npm test", "## 数据与接口", "无", "## 兼容约束", "macOS", "## 安全约束", "本地", "## 错误与边界", "失败", "## 迁移发布回滚", "回滚", "## 已确认偏好", "中文", "## 默认取舍", "默认", "## 已关闭问题", "无", "## 未决问题", "none"].join("\n");
   const planContract = {
     acceptance_criteria: ["AC-001"],
     acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],

@@ -313,17 +313,24 @@ const assertSpecTddContract = (spec: string): string[] => {
   if (new Set(requirements).size !== requirements.length) throw new ValidationError("spec.md requirement ids must be unique");
   if (new Set(criteria.map((match) => match[1]!)).size !== criteria.length) throw new ValidationError("spec.md acceptance criterion ids must be unique");
   for (const id of requirements) if (!REQUIREMENT_ID_RE.test(id)) throw new ValidationError(`invalid requirement id: ${id}`);
-  const requiredFields = ["Given", "When", "Then", "覆盖需求", "RED 判定", "可观察结果", "边界反例", "建议测试层级"];
+  const requiredFields = [
+    { name: "Given", labels: ["Given"] },
+    { name: "When", labels: ["When"] },
+    { name: "Then", labels: ["Then"] },
+    { name: "RED", labels: ["RED 判定", "RED"] },
+    { name: "可观察结果", labels: ["可观察结果"] },
+    { name: "边界反例", labels: ["边界反例"] },
+    { name: "测试层级", labels: ["建议测试层级", "测试层级"] },
+    { name: "验证命令", labels: ["验证命令或证据路径", "验证命令或证据"] },
+  ];
   for (const [index, match] of criteria.entries()) {
     const start = match.index! + match[0].length;
     const end = criteria[index + 1]?.index ?? spec.indexOf("\n## ", start);
     const section = spec.slice(start, end >= 0 ? end : undefined);
-    const missing = requiredFields.filter((field) => !new RegExp(`^- ${field}：\\s*\\S.*$`, "m").test(section));
+    const missing = requiredFields
+      .filter(({ labels }) => !labels.some((label) => new RegExp(`^- ${label}：[ \\t]*\\S.*$`, "m").test(section)))
+      .map(({ name }) => name);
     if (missing.length) throw new ValidationError(`spec.md ${match[1]} is missing TDD acceptance fields`, { missing });
-    const coveredRequirements = [...section.matchAll(/\bREQ-\d{3}\b/g)].map((item) => item[0]);
-    if (!coveredRequirements.length || coveredRequirements.some((id) => !requirements.includes(id))) {
-      throw new ValidationError(`spec.md ${match[1]} has invalid requirement mapping`);
-    }
   }
   return criteria.map((match) => match[1]!);
 };
