@@ -7,8 +7,9 @@
 1. 仅读取 **File Explorer** `dispatch` 授权的入口、调用链、组件、样式、测试和项目规范；授权来源缺失或路径不匹配时停止。
 2. 在 `.worktrees/` 隔离工作树中实现，只修改 `allowed_write_paths`；发现需要额外路径时停止并请求扩大范围。
 3. 保持现有设计系统、键盘/屏幕阅读器可访问性、响应式断点、加载/错误/空状态和交互行为；不做无关重构。
-4. 添加或更新覆盖行为、可访问性和桌面/移动响应式的测试，记录命令、结果和未覆盖风险。
-5. 当入口、职责或模块边界变化时，将 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md` 加入写入范围，使用 `ai-team context update` 写入 File Explorer 结构化结果并运行 `ai-team context validate`。
+4. 严格执行 packet 中每个 AC 的冻结 TDD cycle：先运行 RED 命令并记录预期失败，再做最小 GREEN 实现，最后只在冻结范围内 REFACTOR 并复验。结果必须返回合同 digest 和逐 AC 的测试路径、RED/GREEN/REFACTOR 命令与观察结果。
+5. 添加或更新覆盖行为、可访问性和桌面/移动响应式的测试，记录命令、结果和未覆盖风险。
+6. 仅当 packet 的 `context_owner` 是 `frontend-developer` 且入口、职责或模块边界变化时，将 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md` 加入写入范围，使用 `ai-team context update` 写入 File Explorer 结构化结果并运行 `ai-team context validate`。
 
 ## 验证
 
@@ -19,4 +20,4 @@
 
 ## 交接
 
-只提交符合 `result schema` 的结果，包含 `modified paths`、`self tests`、风险和下一步 `handoff`。
+只提交符合 `result schema` 的结果，包含 `modified paths`、`self tests`、`verification_digest`、`tdd_evidence`、风险和下一步 `handoff`。

@@ -3,13 +3,190 @@ import { join } from "node:path";
 import YAML from "yaml";
 import { PLAN_STATES } from "./constants.js";
 import { ValidationError } from "./errors.js";
-import { sha256 } from "./utils.js";
+import { sha256, stableJson } from "./utils.js";
 import { canonicalizeInside } from "./security.js";
 
 const ID_RE = /\b(?:REQ|AC)-\d{3}\b/g;
 
 export const SPEC_SECTIONS = ["背景", "目标", "非目标", "用户场景", "功能需求", "验收标准", "数据与接口", "兼容约束", "安全约束", "错误与边界", "迁移发布回滚", "已确认偏好", "默认取舍", "已关闭问题", "未决问题"] as const;
-export const PLAN_SECTIONS = ["方案摘要", "实施步骤", "需求覆盖", "验证", "发布与回滚"] as const;
+export const PLAN_SECTIONS = ["方案摘要", "实施步骤", "需求覆盖", "验证", "方案验收契约", "发布与回滚"] as const;
+
+const ACCEPTANCE_ID_RE = /^AC-\d{3}$/;
+const REQUIREMENT_ID_RE = /^REQ-\d{3}$/;
+const TASK_ID_RE = /^TASK-\d{3}$/;
+const VERIFICATION_ID_RE = /^VERIFY-\d{3}$/;
+
+export interface AcceptanceStep {
+  id: string;
+  acceptance_criteria: string[];
+  command: string;
+  expected_result: string;
+}
+
+export interface TaskMapping {
+  task_id: string;
+  acceptance_criteria: string[];
+}
+
+export interface PlanVerification {
+  acceptance_criteria: string[];
+  acceptance_steps: AcceptanceStep[];
+  task_mapping: TaskMapping[];
+  test_commands: string[];
+}
+
+export interface TddCycle {
+  acceptance_criterion: string;
+  test_path: string;
+  red: { command: string; expected_failure: string };
+  green: { implementation_steps: string[]; command: string; expected_result: string };
+  refactor: { scope: string; command: string; expected_result: string };
+}
+
+export interface TaskVerification extends PlanVerification {
+  tdd_cycles: TddCycle[];
+}
+
+const contractObject = (value: unknown, path: string): Record<string, unknown> => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new ValidationError(`${path} must be an object`);
+  return value as Record<string, unknown>;
+};
+
+const exactFields = (value: Record<string, unknown>, fields: readonly string[], path: string): void => {
+  const allowed = new Set(fields);
+  const unknown = Object.keys(value).filter((field) => !allowed.has(field));
+  if (unknown.length) throw new ValidationError(`${path} has unknown field`, { unknown });
+  const missing = fields.filter((field) => !(field in value));
+  if (missing.length) throw new ValidationError(`${path} is missing required fields`, { missing });
+};
+
+const nonEmptyString = (value: unknown, path: string): string => {
+  if (typeof value !== "string" || !value.trim()) throw new ValidationError(`${path} must be a non-empty string`);
+  return value;
+};
+
+const stringList = (value: unknown, path: string, pattern?: RegExp, idName?: string): string[] => {
+  if (!Array.isArray(value) || value.length === 0) throw new ValidationError(`${path} must be a non-empty array`);
+  const result = value.map((item, index) => nonEmptyString(item, `${path}/${index}`));
+  if (new Set(result).size !== result.length) throw new ValidationError(`${path} must not contain duplicates`);
+  if (pattern) {
+    const invalid = result.filter((item) => !pattern.test(item));
+    if (invalid.length) throw new ValidationError(`${path} contains invalid ${idName ?? "id"}`, { invalid });
+  }
+  return result;
+};
+
+const parseContractBlock = (markdown: string, heading: string): unknown => {
+  const headings = [...markdown.matchAll(new RegExp(`^## ${heading}$`, "gm"))];
+  if (headings.length !== 1) throw new ValidationError(`${heading} must contain exactly one JSON contract block`);
+  const start = headings[0]!.index! + headings[0]![0].length;
+  const remainder = markdown.slice(start);
+  const nextHeading = remainder.search(/^##\s+/m);
+  const section = (nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder).trim();
+  const match = section.match(/^```json\s*\n([\s\S]*?)\n```$/);
+  if (!match) throw new ValidationError(`${heading} must contain exactly one fenced JSON contract`);
+  try {
+    return JSON.parse(match[1]!);
+  } catch (error) {
+    throw new ValidationError(`${heading} contains invalid JSON`, { cause: error instanceof Error ? error.message : String(error) });
+  }
+};
+
+const parseAcceptanceStep = (value: unknown, path: string): AcceptanceStep => {
+  const item = contractObject(value, path);
+  exactFields(item, ["id", "acceptance_criteria", "command", "expected_result"], path);
+  const id = nonEmptyString(item.id, `${path}/id`);
+  if (!VERIFICATION_ID_RE.test(id)) throw new ValidationError(`${path}/id contains invalid verification id`);
+  return {
+    id,
+    acceptance_criteria: stringList(item.acceptance_criteria, `${path}/acceptance_criteria`, ACCEPTANCE_ID_RE, "acceptance criterion id"),
+    command: nonEmptyString(item.command, `${path}/command`),
+    expected_result: nonEmptyString(item.expected_result, `${path}/expected_result`),
+  };
+};
+
+const parseTaskMapping = (value: unknown, path: string): TaskMapping => {
+  const item = contractObject(value, path);
+  exactFields(item, ["task_id", "acceptance_criteria"], path);
+  const taskId = nonEmptyString(item.task_id, `${path}/task_id`);
+  if (!TASK_ID_RE.test(taskId)) throw new ValidationError(`${path}/task_id contains invalid task id`);
+  return {
+    task_id: taskId,
+    acceptance_criteria: stringList(item.acceptance_criteria, `${path}/acceptance_criteria`, ACCEPTANCE_ID_RE, "acceptance criterion id"),
+  };
+};
+
+const assertMappedExactly = (criteria: string[], groups: string[][], path: string): void => {
+  const expected = [...criteria].sort();
+  const actual = [...new Set(groups.flat())].sort();
+  const missing = expected.filter((id) => !actual.includes(id));
+  const unknown = actual.filter((id) => !expected.includes(id));
+  if (missing.length || unknown.length) throw new ValidationError(`${path} acceptance criteria mapping is incomplete`, { missing, unknown });
+};
+
+const parsePlanVerificationValue = (value: unknown, task = false): PlanVerification => {
+  const contract = contractObject(value, task ? "task verification" : "plan verification");
+  exactFields(contract, task
+    ? ["acceptance_criteria", "acceptance_steps", "task_mapping", "test_commands", "tdd_cycles"]
+    : ["acceptance_criteria", "acceptance_steps", "task_mapping", "test_commands"], task ? "task verification" : "plan verification");
+  const criteria = stringList(contract.acceptance_criteria, "/acceptance_criteria", ACCEPTANCE_ID_RE, "acceptance criterion id");
+  if (!Array.isArray(contract.acceptance_steps) || contract.acceptance_steps.length === 0) throw new ValidationError("/acceptance_steps must be a non-empty array");
+  if (!Array.isArray(contract.task_mapping) || contract.task_mapping.length === 0) throw new ValidationError("/task_mapping must be a non-empty array");
+  const acceptanceSteps = contract.acceptance_steps.map((item, index) => parseAcceptanceStep(item, `/acceptance_steps/${index}`));
+  const taskMapping = contract.task_mapping.map((item, index) => parseTaskMapping(item, `/task_mapping/${index}`));
+  if (new Set(acceptanceSteps.map(({ id }) => id)).size !== acceptanceSteps.length) throw new ValidationError("acceptance step ids must be unique");
+  if (new Set(taskMapping.map(({ task_id }) => task_id)).size !== taskMapping.length) throw new ValidationError("task mapping ids must be unique");
+  assertMappedExactly(criteria, acceptanceSteps.map(({ acceptance_criteria }) => acceptance_criteria), "/acceptance_steps");
+  assertMappedExactly(criteria, taskMapping.map(({ acceptance_criteria }) => acceptance_criteria), "/task_mapping");
+  return {
+    acceptance_criteria: criteria,
+    acceptance_steps: acceptanceSteps,
+    task_mapping: taskMapping,
+    test_commands: stringList(contract.test_commands, "/test_commands"),
+  };
+};
+
+export const parsePlanVerification = (markdown: string): PlanVerification =>
+  parsePlanVerificationValue(parseContractBlock(markdown, "方案验收契约"));
+
+export const parseTaskVerification = (markdown: string): TaskVerification => {
+  const value = contractObject(parseContractBlock(markdown, "任务验收契约"), "task verification");
+  const verification = parsePlanVerificationValue(value, true);
+  if (!Array.isArray(value.tdd_cycles) || value.tdd_cycles.length === 0) throw new ValidationError("/tdd_cycles must be a non-empty array");
+  const tddCycles = value.tdd_cycles.map((entry, index): TddCycle => {
+    const path = `/tdd_cycles/${index}`;
+    const cycle = contractObject(entry, path);
+    exactFields(cycle, ["acceptance_criterion", "test_path", "red", "green", "refactor"], path);
+    const acceptanceCriterion = nonEmptyString(cycle.acceptance_criterion, `${path}/acceptance_criterion`);
+    if (!ACCEPTANCE_ID_RE.test(acceptanceCriterion)) throw new ValidationError(`${path}/acceptance_criterion contains invalid acceptance criterion id`);
+    const red = contractObject(cycle.red, `${path}/red`);
+    const green = contractObject(cycle.green, `${path}/green`);
+    const refactor = contractObject(cycle.refactor, `${path}/refactor`);
+    exactFields(red, ["command", "expected_failure"], `${path}/red`);
+    exactFields(green, ["implementation_steps", "command", "expected_result"], `${path}/green`);
+    exactFields(refactor, ["scope", "command", "expected_result"], `${path}/refactor`);
+    return {
+      acceptance_criterion: acceptanceCriterion,
+      test_path: nonEmptyString(cycle.test_path, `${path}/test_path`),
+      red: { command: nonEmptyString(red.command, `${path}/red/command`), expected_failure: nonEmptyString(red.expected_failure, `${path}/red/expected_failure`) },
+      green: {
+        implementation_steps: stringList(green.implementation_steps, `${path}/green/implementation_steps`),
+        command: nonEmptyString(green.command, `${path}/green/command`),
+        expected_result: nonEmptyString(green.expected_result, `${path}/green/expected_result`),
+      },
+      refactor: {
+        scope: nonEmptyString(refactor.scope, `${path}/refactor/scope`),
+        command: nonEmptyString(refactor.command, `${path}/refactor/command`),
+        expected_result: nonEmptyString(refactor.expected_result, `${path}/refactor/expected_result`),
+      },
+    };
+  });
+  assertMappedExactly(verification.acceptance_criteria, tddCycles.map(({ acceptance_criterion }) => [acceptance_criterion]), "/tdd_cycles");
+  return { ...verification, tdd_cycles: tddCycles };
+};
+
+export const verificationDigest = (verification: PlanVerification | TaskVerification | unknown): string =>
+  sha256(stableJson(verification));
 
 const assertSections = (document: string, sections: readonly string[], name: string): void => {
   const headings = new Set([...document.matchAll(/^##\s+(.+)$/gm)].map((match) => match[1]!.trim()));
@@ -120,6 +297,71 @@ export const assertRevisionCreateRunStage = (docs: RevisionDocuments, runStage: 
   assertRevisionRunStage("draft", runStage);
 };
 
+const exactIdSet = (expected: string[], actual: string[], message: string): void => {
+  const expectedIds = [...new Set(expected)].sort();
+  const actualIds = [...new Set(actual)].sort();
+  const missing = expectedIds.filter((id) => !actualIds.includes(id));
+  const unknown = actualIds.filter((id) => !expectedIds.includes(id));
+  if (missing.length || unknown.length) throw new ValidationError(message, { missing, unknown });
+};
+
+const assertSpecTddContract = (spec: string): string[] => {
+  const requirements = [...spec.matchAll(/^###\s+(REQ-\d{3})：/gm)].map((match) => match[1]!);
+  const criteria = [...spec.matchAll(/^###\s+(AC-\d{3})：/gm)];
+  if (!requirements.length) throw new ValidationError("spec.md must define at least one requirement");
+  if (!criteria.length) throw new ValidationError("spec.md must define at least one acceptance criterion");
+  if (new Set(requirements).size !== requirements.length) throw new ValidationError("spec.md requirement ids must be unique");
+  if (new Set(criteria.map((match) => match[1]!)).size !== criteria.length) throw new ValidationError("spec.md acceptance criterion ids must be unique");
+  for (const id of requirements) if (!REQUIREMENT_ID_RE.test(id)) throw new ValidationError(`invalid requirement id: ${id}`);
+  const requiredFields = ["Given", "When", "Then", "覆盖需求", "RED 判定", "可观察结果", "边界反例", "建议测试层级"];
+  for (const [index, match] of criteria.entries()) {
+    const start = match.index! + match[0].length;
+    const end = criteria[index + 1]?.index ?? spec.indexOf("\n## ", start);
+    const section = spec.slice(start, end >= 0 ? end : undefined);
+    const missing = requiredFields.filter((field) => !new RegExp(`^- ${field}：\\s*\\S.*$`, "m").test(section));
+    if (missing.length) throw new ValidationError(`spec.md ${match[1]} is missing TDD acceptance fields`, { missing });
+    const coveredRequirements = [...section.matchAll(/\bREQ-\d{3}\b/g)].map((item) => item[0]);
+    if (!coveredRequirements.length || coveredRequirements.some((id) => !requirements.includes(id))) {
+      throw new ValidationError(`spec.md ${match[1]} has invalid requirement mapping`);
+    }
+  }
+  return criteria.map((match) => match[1]!);
+};
+
+const assertVerificationMappings = (docs: RevisionDocuments, specCriteria: string[], planVerification: PlanVerification): void => {
+  exactIdSet(specCriteria, planVerification.acceptance_criteria, "plan verification acceptance criteria do not match spec.md");
+  const taskDocuments = [
+    ...(docs.tasks === undefined ? [] : [{ name: "tasks", document: docs.tasks }]),
+    ...Object.entries(docs.taskFiles ?? {}).map(([name, document]) => ({ name, document })),
+  ];
+  if (!taskDocuments.length) return;
+  const taskMappings = new Map<string, string[]>();
+  const hasIndividualTasks = Object.keys(docs.taskFiles ?? {}).length > 0;
+  for (const { name, document } of taskDocuments) {
+    const verification = parseTaskVerification(document);
+    exactIdSet(verification.acceptance_criteria, verification.tdd_cycles.map(({ acceptance_criterion }) => acceptance_criterion), `${name} TDD cycles do not match its acceptance criteria`);
+    if (name === "tasks") {
+      exactIdSet(planVerification.acceptance_criteria, verification.acceptance_criteria, "tasks verification acceptance criteria do not match plan verification");
+      exactIdSet(planVerification.task_mapping.map(({ task_id }) => task_id), verification.task_mapping.map(({ task_id }) => task_id), "tasks verification task mappings do not match plan verification");
+      for (const mapping of planVerification.task_mapping) {
+        exactIdSet(mapping.acceptance_criteria, verification.task_mapping.find(({ task_id }) => task_id === mapping.task_id)?.acceptance_criteria ?? [], `tasks verification AC mappings are inconsistent for ${mapping.task_id}`);
+      }
+      if (hasIndividualTasks) continue;
+    }
+    if (name !== "tasks" && (verification.task_mapping.length !== 1 || verification.task_mapping[0]!.task_id !== name)) {
+      throw new ValidationError(`${name} task verification must map only its own task id`);
+    }
+    for (const mapping of verification.task_mapping) {
+      if (taskMappings.has(mapping.task_id)) throw new ValidationError(`duplicate task verification mapping: ${mapping.task_id}`);
+      taskMappings.set(mapping.task_id, mapping.acceptance_criteria);
+    }
+  }
+  exactIdSet(planVerification.task_mapping.map(({ task_id }) => task_id), [...taskMappings.keys()], "plan and task verification task mappings are inconsistent");
+  for (const mapping of planVerification.task_mapping) {
+    exactIdSet(mapping.acceptance_criteria, taskMappings.get(mapping.task_id) ?? [], `plan and task verification AC mappings are inconsistent for ${mapping.task_id}`);
+  }
+};
+
 export const preflightRevision = async (project: string, planId: string, revision: string, docs: RevisionDocuments, supersedes?: string): Promise<{ path: string; digest: string }> => {
   if (!/^(?!.*-[a-f0-9]{4}$)\d{8}-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(planId)) throw new ValidationError("invalid plan id");
   if (!/^\d{3}$/.test(revision)) throw new ValidationError("invalid revision");
@@ -130,6 +372,9 @@ export const preflightRevision = async (project: string, planId: string, revisio
   try { await stat(revisionPath); throw new ValidationError("planning revisions are immutable; create a new revision"); } catch (error) { if (error instanceof ValidationError) throw error; }
   assertSections(docs.spec, SPEC_SECTIONS, "spec.md");
   assertSections(docs.plan, PLAN_SECTIONS, "plan.md");
+  const specCriteria = assertSpecTddContract(docs.spec);
+  const planVerification = parsePlanVerification(docs.plan);
+  assertVerificationMappings(docs, specCriteria, planVerification);
   assertCoverage(docs.spec, [docs.plan, docs.tasks ?? "", ...Object.values(docs.taskFiles ?? {})]);
   for (const taskId of Object.keys(docs.taskFiles ?? {})) {
     if (!/^TASK-\d{3}$/.test(taskId)) throw new ValidationError(`invalid task id: ${taskId}`);

@@ -8,6 +8,7 @@
 4. 每个任务只能写入“允许写入路径”，不得扩大范围或顺手修改无关文件。
 5. 依赖关系、并行批次和各任务的前置任务、写入范围必须一致。
 6. revision 冻结后不得修改任务文档；完成状态以 AI Team 运行状态和审计证据为准。
+7. “任务验收契约”只能包含一个 fenced JSON 块；每个 AC 都必须包含可执行的 RED、GREEN、REFACTOR cycle。
 -->
 
 ## 任务清单
@@ -50,6 +51,49 @@ TASK-001
 | 1 | 无 | TASK-001 | `src/example/**` | 输入已确认且写入范围无重叠 |
 
 - 同一批次只允许放置无依赖且写入范围不重叠的任务；任一条件不满足时必须拆到后续批次。
+
+## 任务验收契约
+
+```json
+{
+  "acceptance_criteria": ["AC-001"],
+  "acceptance_steps": [
+    {
+      "id": "VERIFY-001",
+      "acceptance_criteria": ["AC-001"],
+      "command": "<任务验收命令>",
+      "expected_result": "<可观察的通过结果>"
+    }
+  ],
+  "task_mapping": [
+    {
+      "task_id": "TASK-001",
+      "acceptance_criteria": ["AC-001"]
+    }
+  ],
+  "test_commands": ["<任务完整测试命令>"],
+  "tdd_cycles": [
+    {
+      "acceptance_criterion": "AC-001",
+      "test_path": "<冻结的测试路径>",
+      "red": {
+        "command": "<实施前命令>",
+        "expected_failure": "<预期失败断言或退出状态>"
+      },
+      "green": {
+        "implementation_steps": ["<最小实现步骤>"],
+        "command": "<实施后命令>",
+        "expected_result": "<预期通过结果>"
+      },
+      "refactor": {
+        "scope": "<允许的整理范围；无则明确写无>",
+        "command": "<重构后命令>",
+        "expected_result": "<行为保持通过的结果>"
+      }
+    }
+  ]
+}
+```
 
 ## 风险与阻塞
 

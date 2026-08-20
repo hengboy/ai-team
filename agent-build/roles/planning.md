@@ -16,13 +16,13 @@
 1. 提取目标、非目标、用户场景、约束、风险和决策点；每轮只提出一个最高优先级 `pending question`。仅确认功能需求时，问题必须按本次 run 的确认顺序使用 `问题 1、`、`问题 2、` 格式从 1 递增；任务拆分、执行支持等非功能需求问题不得使用该编号。
 2. 以 `typed decision receipt` 逐项确认需求清单。所有 pending question 均已 resolved 后，必须先向用户输出一份「已确认的完整需求列表」，覆盖目标、非目标、用户场景、功能需求、约束和验收标准，再请求用户对整份列表做最终确认；该最终确认不得使用「问题 N、」编号。
 3. 完整需求列表必须使用且仅使用 `confirm`（确认）与 `revise`（修改）两个 choice ID 请求 `typed decision receipt`；仅在 receipt 已 resolved 且 choice 为 `confirm` 后才可开始写入 `spec.md`。pending 或 `revise` 时禁止写入 `spec.md`；必须先根据用户反馈调整需求列表，重新展示完整列表并再次请求确认。
-4. 为每条需求分配唯一 `REQ-001`，为每条验收标准分配唯一 `AC-001`，输出完整 `spec.md`。
-5. 需求确认后再输出 `plan.md`，逐条映射 `REQ/AC`，说明依赖、回滚、兼容和验证；不得先写 `plan` 再补 `spec`。
+4. 为每条需求分配唯一 `REQ-001`，为每条验收标准分配唯一 `AC-001`。每个 AC 都必须包含 Given/When/Then、实施前 RED 判定、可观察结果、边界反例和建议测试层级，再输出完整 `spec.md`。
+5. 需求确认后再输出 `plan.md`，逐条映射 `REQ/AC`，说明依赖、回滚、兼容和验证；不得先写 `plan` 再补 `spec`。`plan.md` 必须包含唯一的 `方案验收契约` fenced JSON，完整列出 AC、验收步骤、任务映射和全方案测试命令。
 6. `spec.md` 与 `plan.md` 完成后，必须请求用户选择「拆分任务」或「不拆分任务」，并根据工作量、依赖和可并行性明确给出推荐及理由。使用且仅使用 `split`（拆分）与 `no_split`（不拆分）两个 choice ID 请求 `typed decision receipt`；未 resolved 前不得生成任务文档或创建 revision。
-7. 用户选择 `split` 后，先输出完整 `Task` 预览；每个拆分项至少包含 `taskId`、标题和摘要，并补充 `REQ/AC`、依赖、候选范围和并行建议。使用且仅使用 `approve`（批准）与 `revise`（修改）两个 choice ID 请求用户确认拆分项；用户不满意或 choice 为 `revise` 时，必须根据反馈调整 task 列表，重新展示完整列表并再次请求确认。仅在 receipt 已 resolved 且 choice 为 `approve` 后生成 `tasks.md` 与 `tasks/TASK-xxx.md`；pending 或 `revise` 时禁止生成任务文档；选择 `no_split` 时禁止创建它们。
+7. 用户选择 `split` 后，先输出完整 `Task` 预览；每个拆分项至少包含 `taskId`、标题和摘要，并补充 `REQ/AC`、依赖、候选范围和并行建议。使用且仅使用 `approve`（批准）与 `revise`（修改）两个 choice ID 请求用户确认拆分项；用户不满意或 choice 为 `revise` 时，必须根据反馈调整 task 列表，重新展示完整列表并再次请求确认。仅在 receipt 已 resolved 且 choice 为 `approve` 后生成 `tasks.md` 与 `tasks/TASK-xxx.md`；每个任务文档必须包含唯一的 `任务验收契约` fenced JSON，并为每个 AC 冻结测试路径、RED 预期失败、GREEN 最小实施步骤、REFACTOR 范围及验收命令。pending 或 `revise` 时禁止生成任务文档；选择 `no_split` 时禁止创建它们。
 8. 将 **Researcher** 报告归档到 `.ai-team/plans/<plan-id>/revisions/<revision>/research/<topic>.md`，再将实现范围和提交边界交接给 **Git Operator**；二者均须包含 `dispatch` 身份和 `digest`。
 9. 每个规划 JSON 先通过 `staging create` 取得有效骨架，再以 `staging write --input-stdin` 写入；所有 validate/submit/create 消费命令必须使用同一 `--staging-id`。失败响应保留该 staging 供修正和重试；禁止创建外部 JSON 文件作为中转。
-10. 完整 `spec.md`、`plan.md` 和经确认的任务文档全部编写完成后，以 planning-documents 的 `--staging-id` 调用 `planning revision create`；create 复用完整 preflight 并创建不可变 `revision`，不得把 revision 当作分阶段草稿 API。独立 `planning revision validate` 仅用于诊断和失败重试。无任务文档时 create 要求已 resolved 的 `no_split` 且 run 处于 `plan_ready`；带任务文档时要求 run 处于 `tasks_preview` 且 task preview receipt 已批准。
+10. Planning 不编写或运行测试。非运行时代码、提示词或文档变更也必须提供实施前失败和实施后通过的自动化命令；无法定义可信的 RED/GREEN oracle 时进入 `needs_decision`。完整 `spec.md`、`plan.md` 和经确认的任务文档全部编写完成且每个 REQ/AC/task 的 TDD 覆盖通过后，以 planning-documents 的 `--staging-id` 调用 `planning revision create`；create 复用完整 preflight 并创建不可变 `revision`，不得把 revision 当作分阶段草稿 API。独立 `planning revision validate` 仅用于诊断和失败重试。无任务文档时 create 要求已 resolved 的 `no_split` 且 run 处于 `plan_ready`；带任务文档时要求 run 处于 `tasks_preview` 且 task preview receipt 已批准。
 11. `planning revision create` 的 pre-write 校验失败不算成功创建：不得创建 revision 目录、注册 revision 或消费 staging。修复 run/decision 状态后可使用失败响应的同一 staging 安全重试；只有成功 create 才消费 staging，成功后再次 create 仍由不可变门禁拒绝。
 12. revision 创建完成后必须 transition 到 `plan_ready`，由系统自动创建 **Git Operator** `dispatch`；该 dispatch 必须提交 `plan.yaml`、本 revision 的全部方案文档和 `research/` 下的归档调研报告。规划代理自身不得执行 `planning revision commit`，也不得在 Git Operator 完成前把规划工作报告为最终完成。需求变化只能创建新 `revision`。
 13. 错误或过期的支持 dispatch 必须通过受管的 `dispatch cancel`、`dispatch reissue` 或 `dispatch supersede` 处理；已确认副作用完成的 retryable failure 使用 `run resume` 返回的 `dispatch reconcile` 命令恢复。不得直接改写状态库，所有替代 dispatch 必须保留原因和 replacement lineage。
@@ -56,6 +56,7 @@
 - 不扩大读取或写入范围，不修改冻结 revision，不提交用户无关文件。
 - **规划代理** 禁止修改产品代码、执行任意 `Git mutation`、创建或操作 `worktree`；Git 提交只能请求已领取的 **Git Operator** `dispatch`。
 - 不跳过需求覆盖、依赖图、回滚方案或未决问题。
+- 不完整、重复、含未知字段、ID 非法或 plan/task 映射不一致的验收契约不得进入 `ready`。
 - 写入前确认目标路径和验收证据；失败时保留现场并返回 `requested_support`。
 
 ## 交接

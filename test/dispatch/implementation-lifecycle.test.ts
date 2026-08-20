@@ -9,6 +9,7 @@ import { DispatchService } from "../../src/dispatch.js";
 import { ScopeGate } from "../../src/gates.js";
 import { GitOrchestrator } from "../../src/git-orchestrator.js";
 import { ReviewService } from "../../src/review.js";
+import { verificationDigest } from "../../src/planning.js";
 import { sha256 } from "../../src/utils.js";
 import { completedResult, createRun, dispatchPacket, projectContext, temporaryDirectory, withStore } from "../helpers/dispatch.js";
 import { REVIEW_COMMON_DIR, REVIEW_HEAD } from "../helpers/git.js";
@@ -18,6 +19,145 @@ const fileExplorerResult = (runId: string, dispatchId: string) => completedResul
   entry_points: ["src/dispatch.ts"],
   test_commands: ["npm test"],
   project_context: projectContext(),
+});
+
+test("new planned packets freeze TDD contracts and require Developer/Test AC evidence", async () => {
+  await withStore(async (store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
+    const plan = {
+      acceptance_criteria: ["AC-001"],
+      acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+      task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+      test_commands: ["npm test"],
+    };
+    const task = {
+      ...plan,
+      tdd_cycles: [{ acceptance_criterion: "AC-001", test_path: "test/example.test.ts", red: { command: "npm test", expected_failure: "fails" }, green: { implementation_steps: ["implement"], command: "npm test", expected_result: "passes" }, refactor: { scope: "none", command: "npm test", expected_result: "passes" } }],
+    };
+    const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "tdd-plan", revision: "001", planVerification: plan });
+    store.initializeRunTasks(runId, [{ task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "a".repeat(64), write_paths: ["src/dispatch.ts"], verification: task }]);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_tdd", runId, "plan/tdd-plan/tdd-plan-001", process.cwd(), REVIEW_HEAD, new Date().toISOString());
+    const dispatches = new DispatchService(store);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+
+    const developerId = dispatches.create(runId, "backend-developer", {
+      ...dispatchPacket(["src/dispatch.ts"]),
+      allowed_write_paths: ["src/dispatch.ts"],
+      context: { explorer_dispatch_id: explorerId, worktree_id: "worktree_tdd", task_id: "TASK-001" },
+    }, "coding");
+    const developerPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(developerId) as { packet_json: string }).packet_json);
+    assert.deepEqual(developerPacket.context.task_verification, task);
+    assert.equal(developerPacket.context.task_verification_digest, verificationDigest(task));
+    assert.equal(developerPacket.context.context_owner, "backend-developer");
+    assert.deepEqual(developerPacket.context.context_maintenance.paths, ["MEMORY.md", ".ai-team/index/feature-navigation.md"]);
+    dispatches.claim(runId, developerId, "backend-developer");
+    const missingDeveloperEvidence = completedResult(runId, developerId, "backend-developer", { modified_paths: ["src/dispatch.ts"], self_tests: [{ command: "npm test", outcome: "passed" }] });
+    assert.throws(() => dispatches.validateValue(runId, developerId, "backend-developer", missingDeveloperEvidence), /TDD evidence/);
+    assert.doesNotThrow(() => dispatches.validateValue(runId, developerId, "backend-developer", {
+      ...missingDeveloperEvidence,
+      payload: {
+        ...missingDeveloperEvidence.payload,
+        verification_digest: verificationDigest(task),
+        tdd_evidence: [{ acceptance_criterion: "AC-001", test_path: "test/example.test.ts", red: { command: "npm test", outcome: "failed as expected" }, green: { command: "npm test", outcome: "passed" }, refactor: { command: "npm test", outcome: "passed" } }],
+      },
+    }));
+
+    assert.throws(() => dispatches.create(runId, "test", { ...dispatchPacket(["src/dispatch.ts"]), allowed_write_paths: ["src/dispatch.ts"] }), /write paths/);
+    const testId = dispatches.create(runId, "test", dispatchPacket(["src/dispatch.ts"]));
+    const testPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(testId) as { packet_json: string }).packet_json);
+    assert.deepEqual(testPacket.context.plan_verification, plan);
+    assert.equal(testPacket.context.plan_verification_digest, verificationDigest(plan));
+    dispatches.claim(runId, testId, "test");
+    const missingChecks = completedResult(runId, testId, "test", { checks: [{ command: "npm test", outcome: "passed" }], verification_digest: verificationDigest(plan) });
+    assert.throws(() => dispatches.validateValue(runId, testId, "test", missingChecks), /acceptance checks/);
+    assert.doesNotThrow(() => dispatches.validateValue(runId, testId, "test", {
+      ...missingChecks,
+      payload: { ...missingChecks.payload, verification_digest: verificationDigest(plan), acceptance_checks: [{ acceptance_criterion: "AC-001", command: "npm test", outcome: "passed" }] },
+    }));
+  });
+});
+
+test("failed task, final, and review-repair Tests return through Coding to the original Developer", async () => {
+  await withStore(async (store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
+    const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "repair-loop", revision: "001" });
+    store.initializeRunTasks(runId, [{ task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "a".repeat(64), write_paths: ["src/dispatch.ts"] }]);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_repair_loop", runId, "plan/repair-loop/repair-loop-001", process.cwd(), REVIEW_HEAD, new Date().toISOString());
+    store.advanceRunTask(runId, "TASK-001", "prepared", { worktree_id: "worktree_repair_loop" });
+    const dispatches = new DispatchService(store);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+    const originalDeveloper = dispatches.create(runId, "backend-developer", {
+      ...dispatchPacket(["src/dispatch.ts"]), allowed_write_paths: ["src/dispatch.ts"],
+      context: { explorer_dispatch_id: explorerId, worktree_id: "worktree_repair_loop", task_id: "TASK-001" },
+    }, "coding");
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(completedResult(runId, originalDeveloper, "backend-developer", { modified_paths: ["src/dispatch.ts"], self_tests: [{ command: "npm test", outcome: "passed" }] })), new Date().toISOString(), originalDeveloper);
+    store.advanceRunTask(runId, "TASK-001", "implemented", { developer_dispatch_id: originalDeveloper, worktree_id: "worktree_repair_loop" });
+
+    const scopes = [
+      { scope: "task", phase: "task_test", extra: { task_id: "TASK-001" } },
+      { scope: "final", phase: undefined, extra: {} },
+      { scope: "review_repair", phase: "review_repair_test", extra: { barrier_id: "review_aaaaaaaaaaaaaaaaaaaaaaaa" } },
+    ] as const;
+    const created: Array<{ source: string; coding: string; scope: string }> = [];
+    for (const item of scopes) {
+      const source = dispatches.create(runId, "test", {
+        ...dispatchPacket(["src/dispatch.ts"]),
+        context: {
+          stage: "test", ...(item.phase ? { phase: item.phase } : {}), ...item.extra,
+          explorer_dispatch_id: explorerId, worktree_id: "worktree_repair_loop", worktree_path: process.cwd(),
+          implementation_dispatch_id: originalDeveloper, implementation_commit: REVIEW_HEAD,
+          test_commands: ["npm test"],
+        },
+      });
+      dispatches.claim(runId, source, "test");
+      const failed = completedResult(runId, source, "test", { checks: [{ command: "npm test", outcome: "failed" }] });
+      await dispatches.submitValue(runId, source, "test", { ...failed, status: "failed", failure_class: "test_failure", side_effect_state: "none" });
+      const lineage = store.db.prepare("SELECT * FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(source) as { test_scope: string; attempt: number; developer_role: string; worktree_id: string; coding_dispatch_id: string };
+      assert.deepEqual({ scope: lineage.test_scope, attempt: lineage.attempt, role: lineage.developer_role, worktree: lineage.worktree_id }, {
+        scope: item.scope, attempt: 1, role: "backend-developer", worktree: "worktree_repair_loop",
+      });
+      const codingPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(lineage.coding_dispatch_id) as { packet_json: string }).packet_json);
+      assert.equal(codingPacket.context.phase, "test_repair");
+      assert.equal(codingPacket.context.source_test_dispatch_id, source);
+      created.push({ source, coding: lineage.coding_dispatch_id, scope: item.scope });
+    }
+
+    const taskRepair = created[0]!;
+    dispatches.claim(runId, taskRepair.coding, "coding");
+    const repairDeveloper = dispatches.create(runId, "backend-developer", {
+      ...dispatchPacket(["src/dispatch.ts"]), allowed_write_paths: ["src/dispatch.ts"],
+      context: {
+        phase: "test_repair", test_scope: "task", source_test_dispatch_id: taskRepair.source,
+        explorer_dispatch_id: explorerId, worktree_id: "worktree_repair_loop", worktree_path: process.cwd(), task_id: "TASK-001",
+        coordinator_dispatch_id: taskRepair.coding,
+      },
+    }, "coding", taskRepair.coding);
+    assert.equal((store.db.prepare("SELECT replacement_for FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { replacement_for: string }).replacement_for, originalDeveloper);
+    await dispatches.submitValue(runId, taskRepair.coding, "coding", completedResult(runId, taskRepair.coding, "coding", { actions: ["repair"] }));
+    dispatches.claim(runId, repairDeveloper, "backend-developer");
+    await dispatches.submitValue(runId, repairDeveloper, "backend-developer", completedResult(runId, repairDeveloper, "backend-developer", {
+      modified_paths: ["src/dispatch.ts"], self_tests: [{ command: "npm test", outcome: "passed" }],
+    }));
+    const lineage = store.db.prepare("SELECT repair_developer_dispatch_id,retest_dispatch_id FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(taskRepair.source) as { repair_developer_dispatch_id: string; retest_dispatch_id: string };
+    assert.equal(lineage.repair_developer_dispatch_id, repairDeveloper);
+    assert.match(lineage.retest_dispatch_id, /^dispatch_/);
+    assert.equal((store.db.prepare("SELECT replacement_for FROM dispatches WHERE dispatch_id=?").get(lineage.retest_dispatch_id) as { replacement_for: string }).replacement_for, taskRepair.source);
+    assert.equal(store.runTasks(runId)[0]!.state, "implemented");
+    dispatches.claim(runId, lineage.retest_dispatch_id, "test");
+    const failedRetest = completedResult(runId, lineage.retest_dispatch_id, "test", { checks: [{ command: "npm test", outcome: "failed again" }] });
+    await dispatches.submitValue(runId, lineage.retest_dispatch_id, "test", { ...failedRetest, status: "failed", failure_class: "test_failure", side_effect_state: "none" });
+    const secondAttempt = store.db.prepare("SELECT attempt,developer_role,worktree_id FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(lineage.retest_dispatch_id) as { attempt: number; developer_role: string; worktree_id: string };
+    assert.deepEqual(secondAttempt, { attempt: 2, developer_role: "backend-developer", worktree_id: "worktree_repair_loop" });
+  });
 });
 
 test("direct Git prepare phases require registered run-owned worktrees and defer the task until pre_write", async () => {
@@ -523,9 +663,15 @@ test("planned multi-Task resume handles a premature final Test and prepares the 
         context: { stage: "test", implementation_commit: currentPlanHead, implementation_artifacts: [{ dispatch_id: developerId }] },
       });
       dispatches.claim(runId, prematureTest, "test");
-      await dispatches.submitValue(runId, prematureTest, "test", completedResult(runId, prematureTest, "test", {
+      const prematureFailure = completedResult(runId, prematureTest, "test", {
         checks: [{ command: "npm run lint", outcome: "failed" }],
-      }));
+      });
+      await dispatches.submitValue(runId, prematureTest, "test", {
+        ...prematureFailure,
+        status: "failed",
+        failure_class: "test_failure",
+        side_effect_state: "none",
+      });
       const prematureArtifact = store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=?").get(runId, prematureTest) as { artifact_id: string; sha256: string };
       store.db.prepare("UPDATE runs SET stage='test' WHERE run_id=?").run(runId);
 

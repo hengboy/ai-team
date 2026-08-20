@@ -192,6 +192,7 @@ export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   if (!(value.acceptance_criteria as string[]).length) throw new ValidationError("dispatch packet requires acceptance criteria", ["/acceptance_criteria"]);
   const reads = role === "file-explorer" ? [...new Set([...EXPLORER_CONTEXT_PATHS, ...(value.allowed_read_paths as string[])])] : value.allowed_read_paths as string[];
   const writes = value.allowed_write_paths as string[];
+  if (role === "test" && writes.length) throw new ValidationError("Test dispatch packets must have empty write paths", ["/allowed_write_paths"]);
   for (const path of [...reads, ...writes]) if (path !== "." && path !== "**") assertRelativePosixPath(path);
   for (const path of reads) if (path !== "." && path !== "**") assertReadablePath(path);
   for (const path of writes) assertWritablePath(path);

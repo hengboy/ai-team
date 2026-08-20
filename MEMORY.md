@@ -42,6 +42,10 @@
 - recovery timeline
 - next action
 - human renderer
+- TDD verification contract
+- acceptance check
+- test repair lineage
+- context owner
 
 ### 仓库约束
 - 要求 Node.js >=22.13.0，并必须通过 npm 验证脚本。
@@ -51,6 +55,8 @@
 - 发布验收必须安装真实 npm tarball，且该网络门禁与日常 `verify` 分离。
 - 代理生成的 JSON 必须使用受管 staging CLI；staging 元数据和审计事件不得保存原始 JSON；文件名使用 run 内不可复用序号标识创建顺序和产出阶段。
 - Git Operator merge authorization must use frozen dispatch-worktree bindings
+- planned revision 进入 ready 前必须具备完整且可映射的 TDD 验收合同
+- Test dispatch 始终保持空写入范围并逐条报告 acceptance checks
 
 ### 职责
 - `src/cli.ts` 保留规范输出、全局错误处理和注册组合；`src/commands/` 按项目、规划运行、staging/dispatch、Git/review 与环境职责注册命令。
@@ -81,6 +87,11 @@
 - `src/resource-registry.ts` 管理 invocation-scoped AbortSignal、store、finalizer 与已注册子进程；`StateStore.closeAsync()` 等待数据库锁释放。
 - `src/human-renderer.ts` 负责受支持命令的生产级 human 输出和无单行嵌套 JSON 的递归 fallback。
 - `src/environment.ts` 在不探测客户端的前提下组合 resolved environment、effective config、provenance 与 digests。
+- src/planning.ts parses and validates TDD verification contracts and canonical digests
+- src/workflow.ts freezes planned run and task verification contracts
+- src/state.ts persists verification contracts and test repair lineage
+- src/dispatch.ts enforces Developer/Test evidence, context ownership, and repair loops
+- src/contracts.ts defines Developer TDD evidence and Test acceptance-check schemas
 
 ### 模块边界
 - `src/git-orchestrator.ts` 与 `src/git.ts` 负责 planned revision-scoped plan/task worktree、direct run-scoped integration/task 编排、精确 plan ownership 接受、已有直接子提交 TASK adoption、planned pre_commit worktree scope 与 no-ff merge，并将相关身份写入操作证据。
@@ -99,4 +110,6 @@
 - `run_events` 的 command lifecycle 仅用于审计和恢复投影；runs、dispatches、decisions、operations 仍是权威状态，副作用幂等仅由 `operations.idempotency_key` 决定。
 - `run show.events` 与 `run resume.last_event` 排除 `command.%` 以保持旧 domain event 语义；timeline 中 authoritative row 明确标记为当前投影。
 - role YAML execution policy 是 default/ceiling 的事实源；legacy dispatch packet 与 digest 不回写，manifest 不匹配的 replacement 必须启动新 run。
+- Planning templates define testable ACs; src/planning.ts validates them before src/workflow.ts freezes the contracts
+- src/dispatch.ts and src/dispatch/implementation.ts coordinate task/final/review-repair retest lineage while Test remains read-only
 <!-- ai-team:project-context:end -->

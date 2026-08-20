@@ -9,10 +9,14 @@
 | Run Recovery Projection | timeline, next action, resume | `src/run-recovery.ts`<br>`src/dispatch.ts`<br>`src/commands/planning-run.ts` | 只读恢复投影 |
 | Resolved Environment | effective config, provenance | `src/environment.ts`<br>`src/commands/environment.ts` | 环境解析与只读配置 |
 | Human Output | human renderer, error output | `src/human-renderer.ts`<br>`src/cli.ts` | CLI 展示层 |
+| Planning TDD Contract | TDD, acceptance contract, verification digest | `src/planning.ts`<br>`agent-build/templates/spec.md`<br>`agent-build/templates/plan.md`<br>`agent-build/templates/task.md`<br>`src/workflow.ts` | Planning artifacts, strict validation, and frozen verification contracts |
+| Verification Evidence and Repair Loop | acceptance check, TDD evidence, test repair lineage, context owner | `src/contracts.ts`<br>`src/dispatch.ts`<br>`src/state.ts`<br>`src/dispatch/implementation.ts` | Developer/Test evidence gates and task/final/review-repair retest orchestration |
 
 <!-- ai-team:feature-navigation-entry {"entry_paths":["src/execution-contract.ts","src/dispatch/packet.ts","agent-build/schemas/role-v1.json"],"feature":"Execution Contract","keywords":["dispatch","execution","ceiling"],"module_boundary":"角色策略与冻结 packet"} -->
 <!-- ai-team:feature-navigation-entry {"entry_paths":["src/state.ts","src/resource-registry.ts","src/cli.ts"],"feature":"Command Lifecycle","keywords":["command event","migration","shutdown"],"module_boundary":"SQLite 生命周期与 invocation 资源"} -->
 <!-- ai-team:feature-navigation-entry {"entry_paths":["src/run-recovery.ts","src/dispatch.ts","src/commands/planning-run.ts"],"feature":"Run Recovery Projection","keywords":["timeline","next action","resume"],"module_boundary":"只读恢复投影"} -->
 <!-- ai-team:feature-navigation-entry {"entry_paths":["src/environment.ts","src/commands/environment.ts"],"feature":"Resolved Environment","keywords":["effective config","provenance"],"module_boundary":"环境解析与只读配置"} -->
 <!-- ai-team:feature-navigation-entry {"entry_paths":["src/human-renderer.ts","src/cli.ts"],"feature":"Human Output","keywords":["human renderer","error output"],"module_boundary":"CLI 展示层"} -->
+<!-- ai-team:feature-navigation-entry {"entry_paths":["src/planning.ts","agent-build/templates/spec.md","agent-build/templates/plan.md","agent-build/templates/task.md","src/workflow.ts"],"feature":"Planning TDD Contract","keywords":["TDD","acceptance contract","verification digest"],"module_boundary":"Planning artifacts, strict validation, and frozen verification contracts"} -->
+<!-- ai-team:feature-navigation-entry {"entry_paths":["src/contracts.ts","src/dispatch.ts","src/state.ts","src/dispatch/implementation.ts"],"feature":"Verification Evidence and Repair Loop","keywords":["acceptance check","TDD evidence","test repair lineage","context owner"],"module_boundary":"Developer/Test evidence gates and task/final/review-repair retest orchestration"} -->
 <!-- ai-team:feature-navigation:end -->

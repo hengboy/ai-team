@@ -85,18 +85,29 @@ test("planning templates match the workflow structure contract", async () => {
   assert.match(spec, /^### 场景 1：<场景标题>$/m);
   assert.match(spec, /^### REQ-001：<需求标题>$/m);
   assert.match(spec, /^### AC-001：<验收标题>$/m);
+  assert.match(spec, /^- RED 判定：$/m);
+  assert.match(spec, /^- 可观察结果：$/m);
+  assert.match(spec, /^- 边界反例：$/m);
+  assert.match(spec, /^- 建议测试层级：$/m);
   assert.doesNotMatch(goalSection, /^\s*- \[[ xX]\]/m);
   assert.match(spec, /写入 revision 后即冻结，不得修改/);
 
   assert.match(plan, /^# 实施计划$/m);
   assert.deepEqual(sectionHeadings(plan), [...PLAN_SECTIONS]);
   assert.match(plan, /^### STEP-001：<步骤标题>$/m);
+  assert.equal((plan.match(/^## 方案验收契约$/gm) ?? []).length, 1);
+  assert.match(plan, /"acceptance_criteria"/);
+  assert.match(plan, /"acceptance_steps"/);
+  assert.match(plan, /"task_mapping"/);
+  assert.match(plan, /"test_commands"/);
 
   assert.match(task, /^# 任务拆分$/m);
-  assert.deepEqual(sectionHeadings(task), ["任务清单", "依赖关系", "并行批次", "风险与阻塞"]);
+  assert.deepEqual(sectionHeadings(task), ["任务清单", "依赖关系", "并行批次", "任务验收契约", "风险与阻塞"]);
   assert.match(task, /^### TASK-001：<任务标题>$/m);
   assert.doesNotMatch(task, /^### \[[ xX]\] TASK-/m);
   assert.match(task, /^- 允许写入路径：$/m);
   assert.match(task, /revision 冻结后不得修改任务文档/);
   assert.match(task, /完成状态以 AI Team 运行状态和审计证据为准/);
+  assert.equal((task.match(/^## 任务验收契约$/gm) ?? []).length, 1);
+  assert.match(task, /"tdd_cycles"/);
 });

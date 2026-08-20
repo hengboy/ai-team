@@ -8,7 +8,7 @@ import { IncompatibleError, ValidationError, validationCause } from "./errors.js
 import { ROLE_MANIFEST, ROLE_MANIFEST_DIGEST } from "./roles.js";
 import { assertReadablePath, pathMatchesScope } from "./security.js";
 import { assertExplicitTaskWritePaths, StateStore } from "./state.js";
-import { assertRevisionRunStage } from "./planning.js";
+import { assertRevisionRunStage, verificationDigest, type PlanVerification, type TaskVerification } from "./planning.js";
 import { makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
 import type { ReviewFinding, ReviewResult } from "./review.js";
 import { plannedWorktreeSnapshot, ScopeGate } from "./gates.js";
@@ -215,6 +215,167 @@ const assertExplorerAuthorization = (store: StateStore, runId: string, role: Rol
 export class DispatchService {
   constructor(readonly store: StateStore) {}
 
+  private freezeVerificationContext(runId: string, role: Role, packet: DispatchPacket): DispatchPacket {
+    if (role !== "frontend-developer" && role !== "backend-developer" && role !== "test") return packet;
+    const run = this.store.getRun(runId) as { plan_verification_json?: string };
+    if (!run.plan_verification_json) return packet;
+    const planVerification = JSON.parse(run.plan_verification_json) as PlanVerification;
+    const taskId = typeof packet.context.task_id === "string" ? packet.context.task_id : undefined;
+    const taskRow = taskId ? this.store.db.prepare("SELECT verification_json FROM run_tasks WHERE run_id=? AND task_id=?")
+      .get(runId, taskId) as { verification_json?: string } | undefined : undefined;
+    if (taskId && !taskRow?.verification_json) throw new ValidationError(`frozen task verification is missing: ${taskId}`);
+    const taskVerification = taskRow?.verification_json ? JSON.parse(taskRow.verification_json) as TaskVerification : undefined;
+    const effectiveVerification = taskVerification ?? planVerification;
+    const context = { ...packet.context } as Record<string, unknown>;
+    const frozen: Record<string, unknown> = {
+      plan_verification: planVerification,
+      plan_verification_digest: verificationDigest(planVerification),
+      ...(taskVerification ? {
+        task_verification: taskVerification,
+        task_verification_digest: verificationDigest(taskVerification),
+      } : {}),
+      verification_contract: effectiveVerification,
+      verification_digest: verificationDigest(effectiveVerification),
+    };
+    if (role === "frontend-developer" || role === "backend-developer") {
+      const existingOwners = (this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND role IN ('frontend-developer','backend-developer')").all(runId) as Array<{ packet_json: string }>)
+        .map(({ packet_json }) => (JSON.parse(packet_json) as DispatchPacket).context.context_owner)
+        .filter((owner): owner is string => typeof owner === "string");
+      const contextOwner = existingOwners[0] ?? role;
+      const explorerId = typeof context.explorer_dispatch_id === "string" ? context.explorer_dispatch_id : undefined;
+      const explorer = explorerId ? this.store.db.prepare("SELECT result_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='file-explorer' AND state='completed'")
+        .get(runId, explorerId) as { result_json?: string } | undefined : undefined;
+      const maintenance = explorer?.result_json
+        ? ((JSON.parse(explorer.result_json) as ResultEnvelope).payload.project_context as { maintenance?: { status?: string; paths?: string[] } } | undefined)?.maintenance
+        : undefined;
+      frozen.context_owner = contextOwner;
+      frozen.context_maintenance = {
+        owner: contextOwner,
+        status: maintenance?.status ?? "verify and update when module responsibilities or entry points change",
+        paths: maintenance?.paths ?? ["MEMORY.md", ".ai-team/index/feature-navigation.md"],
+      };
+    }
+    for (const [key, value] of Object.entries(frozen)) {
+      if (context[key] !== undefined && stableJson(context[key]) !== stableJson(value)) {
+        throw new ValidationError(`dispatch packet ${key} does not match frozen verification context`, [`/context/${key}`]);
+      }
+      context[key] = value;
+    }
+    return { ...packet, context };
+  }
+
+  private assertVerificationEvidence(role: Role, packet: DispatchPacket, result: ResultEnvelope): void {
+    if (result.status !== "completed") return;
+    const context = packet.context as { verification_contract?: PlanVerification | TaskVerification; verification_digest?: string };
+    if (!context.verification_contract || !context.verification_digest) return;
+    const payload = result.payload as Record<string, unknown>;
+    if (payload.verification_digest !== context.verification_digest) throw new ValidationError(`${role} TDD evidence digest does not match the frozen contract`);
+    const criteria = context.verification_contract.acceptance_criteria;
+    if (role === "frontend-developer" || role === "backend-developer") {
+      const evidence = payload.tdd_evidence as Array<{ acceptance_criterion: string; test_path: string }> | undefined;
+      if (!Array.isArray(evidence)) throw new ValidationError(`${role} completed result requires TDD evidence`);
+      const evidenceIds = evidence.map(({ acceptance_criterion }) => acceptance_criterion);
+      const missing = criteria.filter((id) => !evidenceIds.includes(id));
+      const unknown = evidenceIds.filter((id) => !criteria.includes(id));
+      if (missing.length || unknown.length || new Set(evidenceIds).size !== evidenceIds.length) {
+        throw new ValidationError(`${role} TDD evidence does not cover the frozen acceptance criteria`, { missing, unknown });
+      }
+      if ("tdd_cycles" in context.verification_contract) {
+        const invalidPaths = evidence.filter((item) => context.verification_contract && "tdd_cycles" in context.verification_contract
+          && context.verification_contract.tdd_cycles.find(({ acceptance_criterion }) => acceptance_criterion === item.acceptance_criterion)?.test_path !== item.test_path);
+        if (invalidPaths.length) throw new ValidationError(`${role} TDD evidence test paths do not match the frozen task contract`);
+      }
+    }
+    if (role === "test") {
+      const checks = payload.acceptance_checks as Array<{ acceptance_criterion: string }> | undefined;
+      if (!Array.isArray(checks)) throw new ValidationError("Test completed result requires acceptance checks");
+      const checkIds = checks.map(({ acceptance_criterion }) => acceptance_criterion);
+      const missing = criteria.filter((id) => !checkIds.includes(id));
+      const unknown = checkIds.filter((id) => !criteria.includes(id));
+      if (missing.length || unknown.length || new Set(checkIds).size !== checkIds.length) {
+        throw new ValidationError("Test acceptance checks do not cover the frozen acceptance criteria", { missing, unknown });
+      }
+    }
+  }
+
+  private createTestRepair(runId: string, sourceTestDispatchId: string, packet: DispatchPacket, result: ResultEnvelope): string | undefined {
+    const phase = typeof packet.context.phase === "string" ? packet.context.phase : undefined;
+    const testScope = phase === "task_test" ? "task" : phase === "review_repair_test" ? "review_repair" : "final";
+    const taskId = typeof packet.context.task_id === "string" ? packet.context.task_id : undefined;
+    const barrierId = typeof packet.context.barrier_id === "string" ? packet.context.barrier_id : undefined;
+    const worktreeId = typeof packet.context.worktree_id === "string" ? packet.context.worktree_id : undefined;
+    const implementationDispatchId = typeof packet.context.implementation_dispatch_id === "string" ? packet.context.implementation_dispatch_id : undefined;
+    const developer = implementationDispatchId
+      ? this.store.db.prepare("SELECT dispatch_id,role,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role IN ('frontend-developer','backend-developer')")
+        .get(runId, implementationDispatchId) as { dispatch_id: string; role: Role; packet_json: string } | undefined
+      : worktreeId ? this.store.db.prepare(`SELECT dispatch_id,role,packet_json FROM dispatches WHERE run_id=? AND role IN ('frontend-developer','backend-developer')
+          AND json_extract(packet_json,'$.context.worktree_id')=? ORDER BY completed_at DESC,created_at DESC LIMIT 1`)
+        .get(runId, worktreeId) as { dispatch_id: string; role: Role; packet_json: string } | undefined : undefined;
+    if (!developer || !worktreeId) return undefined;
+    const developerPacket = JSON.parse(developer.packet_json) as DispatchPacket;
+    const attemptRow = this.store.db.prepare(`SELECT COALESCE(MAX(attempt),0) AS attempt FROM test_repair_lineage
+      WHERE run_id=? AND test_scope=? AND COALESCE(task_id,'')=COALESCE(?,'') AND COALESCE(barrier_id,'')=COALESCE(?,'')`)
+      .get(runId, testScope, taskId ?? null, barrierId ?? null) as { attempt: number };
+    const failedChecks = Array.isArray((result.payload as { checks?: unknown }).checks)
+      ? (result.payload as { checks: unknown[] }).checks : [];
+    const codingId = this.insert(runId, "coding", validatePacket({
+      objective: `Coordinate ${testScope} Test repair attempt ${attemptRow.attempt + 1} with the original ${developer.role}.`,
+      allowed_read_paths: developerPacket.allowed_read_paths,
+      allowed_write_paths: [],
+      acceptance_criteria: ["Delegate exactly once to the original Developer role and worktree", "Preserve the failed Test scope and evidence"],
+      context: {
+        stage: "coding", phase: "test_repair", test_scope: testScope, attempt: attemptRow.attempt + 1,
+        source_test_dispatch_id: sourceTestDispatchId, original_developer_dispatch_id: developer.dispatch_id,
+        developer_role: developer.role, worktree_id: worktreeId,
+        ...(typeof packet.context.worktree_path === "string" ? { worktree_path: packet.context.worktree_path } : {}),
+        ...(typeof packet.context.explorer_dispatch_id === "string" ? { explorer_dispatch_id: packet.context.explorer_dispatch_id } : {}),
+        ...(taskId ? { task_id: taskId } : {}), ...(barrierId ? { barrier_id: barrierId } : {}),
+        failed_checks: failedChecks,
+      },
+    }, "coding"), sourceTestDispatchId);
+    this.store.db.prepare(`INSERT INTO test_repair_lineage(source_test_dispatch_id,run_id,test_scope,attempt,task_id,barrier_id,
+      original_developer_dispatch_id,developer_role,worktree_id,coding_dispatch_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(sourceTestDispatchId, runId, testScope, attemptRow.attempt + 1, taskId ?? null, barrierId ?? null,
+        developer.dispatch_id, developer.role, worktreeId, codingId, new Date().toISOString());
+    this.store.db.prepare("UPDATE runs SET state='active',stage='coding',updated_at=? WHERE run_id=?")
+      .run(new Date().toISOString(), runId);
+    this.store.event(runId, "test.repair_created", { source_test_dispatch_id: sourceTestDispatchId, coding_dispatch_id: codingId, test_scope: testScope, attempt: attemptRow.attempt + 1, task_id: taskId ?? null, barrier_id: barrierId ?? null, developer_role: developer.role, worktree_id: worktreeId });
+    return codingId;
+  }
+
+  private createRepairRetest(runId: string, sourceTestDispatchId: string, developerDispatchId: string, commit?: string, changedPaths?: string[]): string {
+    const lineage = this.store.db.prepare("SELECT * FROM test_repair_lineage WHERE run_id=? AND source_test_dispatch_id=?")
+      .get(runId, sourceTestDispatchId) as { test_scope: string; attempt: number; worktree_id: string; task_id?: string; barrier_id?: string } | undefined;
+    const source = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='test'")
+      .get(runId, sourceTestDispatchId) as { packet_json: string } | undefined;
+    const artifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result' ORDER BY created_at DESC LIMIT 1")
+      .get(runId, developerDispatchId) as { artifact_id: string; sha256: string } | undefined;
+    if (!lineage || !source || !artifact) throw new ValidationError("repair retest cannot freeze its lineage and Developer artifact");
+    const original = JSON.parse(source.packet_json) as DispatchPacket;
+    const context = {
+      ...original.context,
+      stage: "test",
+      repair_attempt: lineage.attempt,
+      repaired_from_test_dispatch_id: sourceTestDispatchId,
+      implementation_dispatch_id: developerDispatchId,
+      implementation_artifact: { artifact_id: artifact.artifact_id, digest: artifact.sha256 },
+      ...(commit ? { implementation_commit: commit, implementation_committed: true } : { implementation_committed: false }),
+      ...(changedPaths ? { changed_paths: changedPaths } : {}),
+    };
+    const retestId = this.insert(runId, "test", validatePacket({
+      objective: `Re-run the frozen ${lineage.test_scope} Test after repair attempt ${lineage.attempt}.`,
+      allowed_read_paths: original.allowed_read_paths,
+      allowed_write_paths: [],
+      acceptance_criteria: original.acceptance_criteria,
+      context,
+    }, "test"), sourceTestDispatchId);
+    this.store.db.prepare("UPDATE test_repair_lineage SET retest_dispatch_id=? WHERE source_test_dispatch_id=?")
+      .run(retestId, sourceTestDispatchId);
+    this.changeStage(runId, "test", retestId);
+    this.store.event(runId, "test.retest_created", { source_test_dispatch_id: sourceTestDispatchId, retest_dispatch_id: retestId, developer_dispatch_id: developerDispatchId, attempt: lineage.attempt });
+    return retestId;
+  }
+
   create(runId: string, role: Role, packet: DispatchPacket, actorRole?: Role, actorDispatchId?: string): string {
     const run = this.store.getRun(runId) as { profile: Role; state: string };
     if (run.state !== "active") throw new ValidationError(`run must be active before dispatch creation: ${run.state}`);
@@ -246,6 +407,21 @@ export class DispatchService {
     if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "continue_implementation") {
       this.assertContinueImplementationDelegation(runId, actorDispatchId!, role, actorPacket, validated);
     }
+    let replacementFor: string | undefined;
+    if (actorPacket && actorPacket.context.phase === "test_repair") {
+      if (role !== "frontend-developer" && role !== "backend-developer") throw new ValidationError("test repair Coding dispatch can only delegate to its original Developer role");
+      const lineage = this.store.db.prepare("SELECT * FROM test_repair_lineage WHERE run_id=? AND coding_dispatch_id=?")
+        .get(runId, actorDispatchId) as { source_test_dispatch_id: string; original_developer_dispatch_id: string; developer_role: string; worktree_id: string; task_id?: string; barrier_id?: string } | undefined;
+      if (!lineage || role !== lineage.developer_role || validated.context.worktree_id !== lineage.worktree_id
+        || validated.context.source_test_dispatch_id !== lineage.source_test_dispatch_id
+        || validated.context.coordinator_dispatch_id !== actorDispatchId
+        || (lineage.task_id && validated.context.task_id !== lineage.task_id)
+        || (lineage.barrier_id && validated.context.barrier_id !== lineage.barrier_id)) {
+        throw new ValidationError("test repair Developer packet must preserve the original role, worktree, and Test scope");
+      }
+      validated.context.phase = "test_repair";
+      replacementFor = lineage.original_developer_dispatch_id;
+    }
     if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "review_resolution"
       && (role === "frontend-developer" || role === "backend-developer")) {
       const barrierId = (actorPacket.context as { barrier_id?: unknown }).barrier_id;
@@ -258,7 +434,7 @@ export class DispatchService {
       }
       validated.context.phase = "review_repair";
     }
-    validated = freezeExecutionContract(role, validated);
+    validated = freezeExecutionContract(role, this.freezeVerificationContext(runId, role, validated));
     if (role === "file-explorer") {
       const repository = this.store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get((this.store.getRun(runId) as { repo_id: string }).repo_id) as { project_path: string } | undefined;
       const missing = repository ? EXPLORER_CONTEXT_PATHS.filter((path) => !existsSync(join(repository.project_path, path))) : [...EXPLORER_CONTEXT_PATHS];
@@ -278,7 +454,10 @@ export class DispatchService {
       const plannedPlanWorktree = (this.store.getRun(runId) as { mode?: string }).mode === "planned" && worktree?.branch.startsWith("plan/");
       if (!worktree?.branch.startsWith("task/") && !plannedPlanWorktree) throw new ValidationError(`${role} dispatch requires a prepared active implementation worktree`, ["/context/worktree_id"]);
     }
-    const dispatchId = this.insert(runId, role, validated);
+    const dispatchId = this.insert(runId, role, validated, replacementFor);
+    if (replacementFor && actorPacket?.context.phase === "test_repair") {
+      this.store.db.prepare("UPDATE test_repair_lineage SET repair_developer_dispatch_id=? WHERE coding_dispatch_id=?").run(dispatchId, actorDispatchId);
+    }
     if (actorPacket && (actorPacket.context as { phase?: unknown }).phase === "continue_testing") this.changeStage(runId, "test", dispatchId);
     return dispatchId;
   }
@@ -340,6 +519,7 @@ export class DispatchService {
   }
 
   private insert(runId: string, role: Role, packet: DispatchPacket, replacementFor?: string): string {
+    packet = this.freezeVerificationContext(runId, role, packet);
     packet = packet.execution_contract ? packet : freezeExecutionContract(role, packet);
     const dispatchId = makeId("dispatch");
     const packetJson = redact(stableJson(packet));
@@ -992,7 +1172,7 @@ export class DispatchService {
   }
 
   validateValue(runId: string, dispatchId: string, role: Role, value: unknown): ResultEnvelope {
-    const dispatch = this.get(runId, dispatchId, role) as { state: string };
+    const dispatch = this.get(runId, dispatchId, role) as { state: string; packet_json: string };
     if (!["claimed", "completed", "needs_decision"].includes(dispatch.state)) {
       throw new ValidationError("dispatch must be claimed before validate");
     }
@@ -1006,6 +1186,7 @@ export class DispatchService {
     if (result.value.run_id !== runId || result.value.dispatch_id !== dispatchId || result.value.role !== role) {
       throw new ValidationError("result envelope identity does not match dispatch");
     }
+    this.assertVerificationEvidence(role, JSON.parse(dispatch.packet_json) as DispatchPacket, result.value);
     return result.value;
   }
 
@@ -1239,7 +1420,11 @@ export class DispatchService {
           if (!checked.valid) throw new ValidationError("needs_decision result requires one typed decision", checked.errors);
           this.store.createDecision(runId, checked.value.question, checked.value.choices, checked.value.recommendation, checked.value.type ?? "workflow", dispatchId);
         }
-        this.store.db.prepare("UPDATE runs SET state=?,updated_at=? WHERE run_id=?")
+        const repairableTest = role === "test" && (result.status === "failed" || result.status === "retryable_failure") && result.decisions_needed.length === 0;
+        const repairDispatchId = repairableTest
+          ? this.createTestRepair(runId, dispatchId, JSON.parse(row.packet_json) as DispatchPacket, result)
+          : undefined;
+        if (!repairDispatchId) this.store.db.prepare("UPDATE runs SET state=?,updated_at=? WHERE run_id=?")
           .run(result.status === "needs_decision" || result.status === "retryable_failure" && result.decisions_needed.length === 1 ? "needs_decision" : result.status === "retryable_failure" ? "retryable_failure" : "failed", new Date().toISOString(), runId);
       }
     });
@@ -1379,11 +1564,27 @@ export class DispatchService {
           acceptance_criteria: ["Run every frozen test command", "Bind the Test artifact to the repair commit"],
           context: {
             stage: "test", phase: "review_repair_test", barrier_id: barrierId, worktree_id: worktreeId,
+            implementation_dispatch_id: developerId,
             implementation_commit: evidence.commit, implementation_committed: true, changed_paths: evidence.paths ?? [],
             test_commands: frozen.commands, test_command_provenance: frozen.provenance,
           },
         }, "test"), result.dispatch_id);
         this.changeStage(runId, "test", testId);
+        return;
+      }
+      if (context.phase === "test_repair_commit") {
+        const sourceTestDispatchId = typeof (context as { source_test_dispatch_id?: unknown }).source_test_dispatch_id === "string"
+          ? (context as { source_test_dispatch_id: string }).source_test_dispatch_id : undefined;
+        const worktreeId = typeof (context as { worktree_id?: unknown }).worktree_id === "string"
+          ? (context as { worktree_id: string }).worktree_id : undefined;
+        const developerId = typeof (context as { developer_dispatch_id?: unknown }).developer_dispatch_id === "string"
+          ? (context as { developer_dispatch_id: string }).developer_dispatch_id : undefined;
+        if (!sourceTestDispatchId || !worktreeId || !developerId) throw new ValidationError("Test repair commit is missing its lineage identity");
+        const operation = this.store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.commit' AND state='completed' AND json_extract(evidence_json,'$.worktree_id')=? ORDER BY completed_at DESC LIMIT 1")
+          .get(runId, worktreeId) as { evidence_json?: string } | undefined;
+        const evidence = JSON.parse(operation?.evidence_json ?? "{}") as { commit?: string; paths?: string[] };
+        if (!evidence.commit) throw new ValidationError("completed Test repair Git Operator result has no bound commit operation");
+        this.createRepairRetest(runId, sourceTestDispatchId, developerId, evidence.commit, evidence.paths ?? []);
         return;
       }
       if (context.phase === "cancel_cleanup") {
@@ -1403,6 +1604,31 @@ export class DispatchService {
     if (run.mode === "planned" && (role === "frontend-developer" || role === "backend-developer")) {
       const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string };
       const packet = JSON.parse(packetRow.packet_json) as DispatchPacket;
+      if (packet.context.phase === "test_repair" && typeof packet.context.source_test_dispatch_id === "string" && typeof packet.context.worktree_id === "string") {
+        const lineage = this.store.db.prepare("SELECT test_scope FROM test_repair_lineage WHERE run_id=? AND source_test_dispatch_id=? AND repair_developer_dispatch_id=?")
+          .get(runId, packet.context.source_test_dispatch_id, result.dispatch_id) as { test_scope: string } | undefined;
+        if (!lineage) throw new ValidationError("completed Test repair Developer is not bound to its lineage");
+        if (lineage.test_scope === "task") {
+          this.createRepairRetest(runId, packet.context.source_test_dispatch_id, result.dispatch_id);
+          return;
+        }
+        const modifiedPaths = Array.isArray((result.payload as { modified_paths?: unknown }).modified_paths)
+          ? (result.payload as { modified_paths: string[] }).modified_paths : [];
+        const commitId = this.insert(runId, "git-operator", validatePacket({
+          objective: `Commit ${lineage.test_scope} Test repair before independent retest.`,
+          allowed_read_paths: [], allowed_write_paths: [],
+          acceptance_criteria: ["Commit only the repair Developer paths", "Preserve the Test repair lineage"],
+          context: {
+            stage: "git-operator", phase: "test_repair_commit", test_scope: lineage.test_scope,
+            source_test_dispatch_id: packet.context.source_test_dispatch_id,
+            worktree_id: packet.context.worktree_id, developer_dispatch_id: result.dispatch_id, changed_paths: modifiedPaths,
+          },
+        }, "git-operator"), result.dispatch_id);
+        this.store.db.prepare("UPDATE test_repair_lineage SET repair_commit_dispatch_id=? WHERE source_test_dispatch_id=?")
+          .run(commitId, packet.context.source_test_dispatch_id);
+        this.changeStage(runId, "git-operator", commitId);
+        return;
+      }
       if (packet.context.phase === "review_repair" && typeof packet.context.barrier_id === "string" && typeof packet.context.worktree_id === "string") {
         const modifiedPaths = Array.isArray((result.payload as { modified_paths?: unknown }).modified_paths)
           ? (result.payload as { modified_paths: string[] }).modified_paths : [];

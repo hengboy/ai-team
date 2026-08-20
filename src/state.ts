@@ -17,6 +17,7 @@ import {
 import { ensureManagedDirectory } from "./security.js";
 import { migrateStagingFiles, StagingStore, type StagingBinding, type StagingCleanupSelector, type StagingEntry } from "./staging.js";
 import { registerInvocationFinalizer } from "./resource-registry.js";
+import type { PlanVerification, TaskVerification } from "./planning.js";
 
 export type { StagingBinding, StagingCleanupSelector, StagingEntry } from "./staging.js";
 
@@ -384,6 +385,45 @@ const migrations = [
     },
     down: async () => { throw new Error("forward-only migrations"); },
   },
+  {
+    name: "015-tdd-verification-contracts",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      const addColumn = (table: string, name: string): void => {
+        const columns = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(({ name: column }) => column));
+        if (!columns.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} TEXT;`);
+      };
+      addColumn("runs", "plan_verification_json");
+      addColumn("run_tasks", "verification_json");
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
+  {
+    name: "016-test-repair-lineage",
+    up: async ({ context: db }: { context: Database.Database }) => {
+      db.exec(`
+        CREATE TABLE test_repair_lineage (
+          source_test_dispatch_id TEXT PRIMARY KEY REFERENCES dispatches(dispatch_id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          test_scope TEXT NOT NULL CHECK(test_scope IN ('task','final','review_repair')),
+          attempt INTEGER NOT NULL,
+          task_id TEXT,
+          barrier_id TEXT,
+          original_developer_dispatch_id TEXT NOT NULL REFERENCES dispatches(dispatch_id),
+          developer_role TEXT NOT NULL CHECK(developer_role IN ('frontend-developer','backend-developer')),
+          worktree_id TEXT NOT NULL REFERENCES worktrees(worktree_id),
+          coding_dispatch_id TEXT NOT NULL REFERENCES dispatches(dispatch_id),
+          repair_developer_dispatch_id TEXT REFERENCES dispatches(dispatch_id),
+          repair_commit_dispatch_id TEXT REFERENCES dispatches(dispatch_id),
+          retest_dispatch_id TEXT REFERENCES dispatches(dispatch_id),
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX test_repair_lineage_scope ON test_repair_lineage(run_id,test_scope,task_id,barrier_id,attempt);
+        CREATE UNIQUE INDEX test_repair_lineage_coding ON test_repair_lineage(coding_dispatch_id);
+        CREATE UNIQUE INDEX test_repair_lineage_retest ON test_repair_lineage(retest_dispatch_id) WHERE retest_dispatch_id IS NOT NULL;
+      `);
+    },
+    down: async () => { throw new Error("forward-only migrations"); },
+  },
 ];
 
 export class StateStore {
@@ -558,18 +598,20 @@ export class StateStore {
     templateDigest?: string;
     implementationBaseCommit?: string;
     planDigest?: string;
+    planVerification?: PlanVerification;
     sourceRunId?: string;
   }): string {
     const runId = makeId("run");
     const now = new Date().toISOString();
     const implementationBaseCommit = input.implementationBaseCommit ?? input.baseCommit ?? null;
     this.db.prepare(`INSERT INTO runs(run_id, repo_id, profile, mode, state, stage, plan_id, revision, base_commit, target_branch, request,
-      client_platform, environment, contract_digest, role_manifest_digest, template_digest, implementation_base_commit, plan_digest, source_run_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'active', 'file-explorer', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      client_platform, environment, contract_digest, role_manifest_digest, template_digest, implementation_base_commit, plan_digest, plan_verification_json, source_run_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'active', 'file-explorer', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       runId, input.repoId, input.profile, input.mode, input.planId ?? null, input.revision ?? null, input.baseCommit ?? null,
       input.targetBranch ?? null, input.request ?? null, input.clientPlatform ?? "codex", input.environment ?? "balanced",
       input.contractDigest ?? CONTRACT_DIGEST, input.roleManifestDigest ?? ROLE_MANIFEST_DIGEST,
-      input.templateDigest ?? AGENT_BUILD.digest, implementationBaseCommit, input.planDigest ?? null, input.sourceRunId ?? null, now, now,
+      input.templateDigest ?? AGENT_BUILD.digest, implementationBaseCommit, input.planDigest ?? null,
+      input.planVerification ? stableJson(input.planVerification) : null, input.sourceRunId ?? null, now, now,
     );
     this.event(runId, "run.created", input);
     return runId;
@@ -591,30 +633,35 @@ export class StateStore {
     return run;
   }
 
-  initializeRunTasks(runId: string, tasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[] }>): void {
+  initializeRunTasks(runId: string, tasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[]; verification?: TaskVerification }>): void {
     this.getRun(runId);
     if (new Set(tasks.map(({ task_id }) => task_id)).size !== tasks.length
       || tasks.some(({ task_id, source_path, source_digest, write_paths }) => !/^TASK-\d{3}$/.test(task_id) || !source_path
         || !/^[a-f0-9]{64}$/.test(source_digest) || !write_paths.length || write_paths.some((path) => !path))) {
       throw new ValidationError("frozen run task metadata is invalid");
     }
-    const existing = this.db.prepare("SELECT task_id,ordinal,source_path,source_digest,write_paths_json FROM run_tasks WHERE run_id=? ORDER BY ordinal")
-      .all(runId) as Array<{ task_id: string; ordinal: number; source_path: string; source_digest: string; write_paths_json?: string }>;
+    const existing = this.db.prepare("SELECT task_id,ordinal,source_path,source_digest,write_paths_json,verification_json FROM run_tasks WHERE run_id=? ORDER BY ordinal")
+      .all(runId) as Array<{ task_id: string; ordinal: number; source_path: string; source_digest: string; write_paths_json?: string; verification_json?: string }>;
     const expected = tasks.map((task, ordinal) => ({
       ...task,
       write_paths: assertExplicitTaskWritePaths(task.write_paths, task.source_path),
+      verification: task.verification ?? null,
       ordinal,
     }));
     if (existing.length) {
-      const comparable = existing.map(({ write_paths_json, ...task }) => ({ ...task, write_paths: JSON.parse(write_paths_json ?? "[]") }));
+      const comparable = existing.map(({ write_paths_json, verification_json, ...task }) => ({
+        ...task,
+        write_paths: JSON.parse(write_paths_json ?? "[]"),
+        verification: verification_json ? JSON.parse(verification_json) : null,
+      }));
       if (stableJson(comparable) !== stableJson(expected)) throw new ValidationError("run task manifest is already frozen with different metadata");
       return;
     }
-    const insert = this.db.prepare(`INSERT INTO run_tasks(run_id,task_id,ordinal,source_path,source_digest,write_paths_json,state,updated_at)
-      VALUES (?,?,?,?,?,?,'pending',?)`);
+    const insert = this.db.prepare(`INSERT INTO run_tasks(run_id,task_id,ordinal,source_path,source_digest,write_paths_json,verification_json,state,updated_at)
+      VALUES (?,?,?,?,?,?,?,'pending',?)`);
     this.db.transaction(() => {
       const now = new Date().toISOString();
-      for (const task of expected) insert.run(runId, task.task_id, task.ordinal, task.source_path, task.source_digest, stableJson(task.write_paths), now);
+      for (const task of expected) insert.run(runId, task.task_id, task.ordinal, task.source_path, task.source_digest, stableJson(task.write_paths), task.verification ? stableJson(task.verification) : null, now);
       if (expected.length) this.event(runId, "run.tasks_frozen", { tasks: expected });
     })();
   }
@@ -625,6 +672,7 @@ export class StateStore {
     source_path: string;
     source_digest: string;
     write_paths_json?: string;
+    verification_json?: string;
     state: "pending" | "prepared" | "implemented" | "tested" | "committed" | "integrated";
     worktree_id?: string;
     developer_dispatch_id?: string;

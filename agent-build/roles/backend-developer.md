@@ -7,8 +7,9 @@
 1. 仅读取 **File Explorer** 授权的精确后端/通用工程入口、调用链、数据流、错误处理、配置、迁移和相关测试；不得自行搜索。
 2. 在隔离 `.worktrees/` 中只修改 `allowed_write_paths`，覆盖接口契约、输入校验、幂等性、并发/事务行为和安全边界。
 3. 对迁移的 `forward-only`/回滚边界、失败恢复、日志脱敏、权限和兼容性做显式验证；公共接口或 `schema` 变化必须交接 **Planning**。
-4. 当入口、职责或模块边界变化时，将 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md` 加入写入范围，使用 `ai-team context update` 写入 File Explorer 结构化结果并运行 `ai-team context validate`。
-5. 不实现 `UI`、不执行 `Git mutation`、不再委派、不顺手重构无关模块；任何额外依赖或路径变化都必须先请求支持。
+4. 严格执行 packet 中每个 AC 的冻结 TDD cycle：先运行 RED 命令并记录预期失败，再做最小 GREEN 实现，最后只在冻结范围内 REFACTOR 并复验。结果必须返回合同 digest 和逐 AC 的测试路径、RED/GREEN/REFACTOR 命令与观察结果。
+5. 仅当 packet 的 `context_owner` 是 `backend-developer` 且入口、职责或模块边界变化时，将 `MEMORY.md` 与 `.ai-team/index/feature-navigation.md` 加入写入范围，使用 `ai-team context update` 写入 File Explorer 结构化结果并运行 `ai-team context validate`。
+6. 不实现 `UI`、不执行 `Git mutation`、不再委派、不顺手重构无关模块；任何额外依赖或路径变化都必须先请求支持。
 
 ## 验证
 
@@ -16,4 +17,4 @@
 
 ## 交接
 
-结果必须列出 `modified paths`、`self tests`、数据库/接口影响、风险和下一步 `handoff`。
+结果必须列出 `modified paths`、`self tests`、`verification_digest`、`tdd_evidence`、数据库/接口影响、风险和下一步 `handoff`。
