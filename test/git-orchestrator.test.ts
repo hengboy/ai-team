@@ -1261,7 +1261,6 @@ test("claimed planned developer scope recovery supersedes without touching its d
       },
     });
     dispatches.claim(runId, sourceId, "backend-developer");
-    fixture.store.db.prepare("UPDATE run_tasks SET developer_dispatch_id=? WHERE run_id=? AND task_id='TASK-001'").run(sourceId, runId);
 
     await writeFile(join(prepared.path, "README.md"), "staged\n");
     await rawGit(prepared.path, ["add", "README.md"]);

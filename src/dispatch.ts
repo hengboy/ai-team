@@ -933,7 +933,9 @@ export class DispatchService {
       return { action: "superseded", dispatch_id: existing.dispatch_id, replacement_for: input.dispatchId, reused: true, authority_commit: input.authorityCommit, allowed_write_paths: packet.allowed_write_paths, dirty_paths: recovery.dirty_paths ?? [] };
     }
     const task = this.plannedTaskRows(input.runId).find((candidate) => candidate.task_id === taskId);
-    if (!task || task.state === "integrated" || task.developer_dispatch_id !== input.dispatchId) throw new ValidationError("claimed developer dispatch is not the active unintegrated task owner");
+    if (!task || task.state === "integrated" || task.developer_dispatch_id && task.developer_dispatch_id !== input.dispatchId) {
+      throw new ValidationError("claimed developer dispatch is not the active unintegrated task owner");
+    }
     const originalPaths = this.frozenTaskWritePaths(input.runId, taskId);
     const allowedWritePaths = [...new Set([...originalPaths, ...normalizedAddedPaths])].sort();
     if (row.state !== "claimed" || row.result_json) throw new ValidationError("scope recovery requires a claimed developer dispatch with no result");
@@ -977,7 +979,7 @@ export class DispatchService {
       this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=? AND state='claimed'").run(new Date().toISOString(), input.dispatchId);
       replacementId = this.insert(input.runId, "backend-developer", packet, input.dispatchId);
       const updated = this.store.db.prepare(`UPDATE run_tasks SET write_paths_json=?,developer_dispatch_id=?,updated_at=?
-        WHERE run_id=? AND task_id=? AND developer_dispatch_id=? AND state!='integrated'`).run(stableJson(allowedWritePaths), replacementId, new Date().toISOString(), input.runId, taskId, input.dispatchId);
+        WHERE run_id=? AND task_id=? AND (developer_dispatch_id=? OR developer_dispatch_id IS NULL) AND state!='integrated'`).run(stableJson(allowedWritePaths), replacementId, new Date().toISOString(), input.runId, taskId, input.dispatchId);
       if (updated.changes !== 1) throw new ValidationError("task ownership changed during claimed scope recovery");
       this.store.event(input.runId, "dispatch.superseded", { dispatchId: input.dispatchId, replacement_dispatch_id: replacementId, role: "backend-developer", actor_role: "coding", reason: "frozen task scope expanded by explicit authority commit" });
       this.store.event(input.runId, "task.scope_recovered", { task_id: taskId, worktree_id: worktreeId, authority_commit: authority, expected_head: input.expectedHead, original_allowed_write_paths: originalPaths, allowed_write_paths: allowedWritePaths, dirty_paths: dirtyPaths, superseded_dispatch_id: input.dispatchId, replacement_dispatch_id: replacementId });
