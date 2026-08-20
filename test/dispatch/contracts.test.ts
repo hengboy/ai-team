@@ -152,6 +152,66 @@ test("completed results enforce the payload schema selected for every role", () 
   assert.equal(checkResultEnvelope({ ...needsDecision, payload: {} }).valid, false);
 });
 
+test("planning needs_decision distinguishes task preview confirmation from functional clarification", () => {
+  const runId = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const dispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const taskPreviewQuestion = "Approve the task preview?";
+  const taskPreviewDecision = {
+    question: taskPreviewQuestion,
+    choices: [
+      { id: "approve", label: "Approve", impact: "Accept the proposed tasks" },
+      { id: "revise", label: "Revise", impact: "Request changes to the proposed tasks" },
+    ],
+    recommendation: "approve",
+  };
+  const taskPreview = {
+    ...completedResult(runId, dispatchId, "planning", {
+      actions: ["preview tasks"],
+      stage: "tasks_preview",
+      pending_questions: [],
+      decision: taskPreviewDecision,
+    }),
+    status: "needs_decision" as const,
+    verification: [],
+    decisions_needed: [taskPreviewDecision],
+  };
+  assert.equal(checkResultEnvelope(taskPreview).valid, true);
+
+  const functionalQuestion = "Which compatibility target?";
+  const functionalDecision = {
+    question: functionalQuestion,
+    choices: [
+      { id: "current", label: "Current", impact: "No migration" },
+      { id: "legacy", label: "Legacy", impact: "Adds compatibility work" },
+    ],
+    recommendation: "current",
+  };
+  const functionalClarification = {
+    ...completedResult(runId, dispatchId, "planning", {
+      actions: ["clarify compatibility"],
+      stage: "requirements",
+      pending_questions: [],
+      decision: functionalDecision,
+    }),
+    status: "needs_decision" as const,
+    verification: [],
+    decisions_needed: [functionalDecision],
+  };
+  const functionalWithoutQuestion = checkResultEnvelope(functionalClarification);
+  assert.equal(functionalWithoutQuestion.valid, false);
+  if (!functionalWithoutQuestion.valid) {
+    assert.equal(functionalWithoutQuestion.errors[0]?.path, "/payload/pending_questions");
+    assert.equal(functionalWithoutQuestion.errors[0]?.constraint, "minItems");
+  }
+  assert.equal(checkResultEnvelope({
+    ...functionalClarification,
+    payload: {
+      ...functionalClarification.payload,
+      pending_questions: [functionalQuestion],
+    },
+  }).valid, true);
+});
+
 test("project context and context command contracts reject unsafe paths and identities", () => {
   const valid = {
     project_shape: "CLI",

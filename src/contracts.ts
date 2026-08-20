@@ -331,7 +331,7 @@ export const checkResultEnvelope = (value: unknown): { valid: true; value: Resul
   if (requiresPayload && envelope.role === "planning") {
     const payload = envelope.payload as { pending_questions: string[]; decision: { question: string; choices: Array<{ id: string }> } | null };
     const choiceIds = payload.decision?.choices.map(({ id }) => id).sort() ?? [];
-    const nonFunctionalDecision = choiceIds.join(",") === "confirm,revise" || choiceIds.join(",") === "no_split,split";
+    const nonFunctionalDecision = choiceIds.join(",") === "approve,revise" || choiceIds.join(",") === "confirm,revise" || choiceIds.join(",") === "no_split,split";
     if (envelope.status === "needs_decision" && !payload.decision) {
       return { valid: false, errors: [validationDetail("/payload/decision", "required", "needs_decision requires one typed decision")] };
     }
