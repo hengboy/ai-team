@@ -26,6 +26,7 @@ test("only File Explorer may receive broad read paths including ./**", async () 
         path,
       );
     }
+    assert.doesNotThrow(() => dispatches.create(runId, "coding", dispatchPacket([])));
     assert.doesNotThrow(() => dispatches.create(runId, "coding", dispatchPacket(["src/dispatch.ts"])));
     assert.doesNotThrow(() => dispatches.create(runId, "file-explorer", dispatchPacket(["./**"])));
   });

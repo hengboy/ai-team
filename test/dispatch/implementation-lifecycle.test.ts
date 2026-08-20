@@ -320,18 +320,26 @@ test("planned Coding dispatch waits for Git Operator and exposes dispatch depend
     const dispatches = new DispatchService(store);
     const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
     dispatches.claim(runId, explorerId, "file-explorer");
-    const explorerSubmission = await dispatches.submitValue(runId, explorerId, "file-explorer", fileExplorerResult(runId, explorerId));
+    const explorerResult = fileExplorerResult(runId, explorerId);
+    const explorerSubmission = await dispatches.submitValue(runId, explorerId, "file-explorer", {
+      ...explorerResult,
+      payload: { ...explorerResult.payload, allowed_read_paths: ["."] },
+    });
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='coding'").get(runId) as { count: number }).count, 0);
     assert.equal(explorerSubmission.continuation.pending_dispatches[0]?.role, "git-operator");
     assert.deepEqual(explorerSubmission.continuation.pending_dispatches[0]?.depends_on, [explorerId]);
 
     const gitDispatch = explorerSubmission.continuation.pending_dispatches[0]!;
+    const gitPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(gitDispatch.dispatch_id) as { packet_json: string }).packet_json);
+    assert.deepEqual(gitPacket.allowed_read_paths, []);
     dispatches.claim(runId, gitDispatch.dispatch_id, "git-operator");
     const gitSubmission = await dispatches.submitValue(runId, gitDispatch.dispatch_id, "git-operator", completedResult(runId, gitDispatch.dispatch_id, "git-operator", {
       operations: [{ command: "verify registered plan worktree", outcome: "verified" }],
     }));
     assert.equal(gitSubmission.continuation.pending_dispatches[0]?.role, "coding");
     assert.deepEqual(new Set(gitSubmission.continuation.pending_dispatches[0]?.depends_on), new Set([explorerId, gitDispatch.dispatch_id]));
+    const codingPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(gitSubmission.continuation.pending_dispatches[0]!.dispatch_id) as { packet_json: string }).packet_json);
+    assert.deepEqual(codingPacket.allowed_read_paths, []);
   });
 });
 
@@ -342,8 +350,9 @@ test("planned task prepare completion creates one identity-bound Coding continua
     const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "20260817-continuation", revision: "001" });
     const dispatches = new DispatchService(store);
     const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    const explorerResult = fileExplorerResult(runId, explorerId);
     store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
-      .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+      .run(JSON.stringify({ ...explorerResult, payload: { ...explorerResult.payload, allowed_read_paths: ["."] } }), new Date().toISOString(), explorerId);
     const coordinatorId = dispatches.create(runId, "coding", {
       ...dispatchPacket(["src/dispatch.ts", "test/dispatch/implementation-lifecycle.test.ts"]),
       context: { explorer_dispatch_id: explorerId },
@@ -368,6 +377,8 @@ test("planned task prepare completion creates one identity-bound Coding continua
 
     assert.equal(submitted.continuation.pending_dispatches.length, 1);
     const continuationId = submitted.continuation.pending_dispatches[0]!.dispatch_id;
+    const continuationPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(continuationId) as { packet_json: string }).packet_json);
+    assert.deepEqual(continuationPacket.allowed_read_paths, []);
     const continuation = store.db.prepare("SELECT replacement_for,packet_json FROM dispatches WHERE dispatch_id=?").get(continuationId) as { replacement_for: string; packet_json: string };
     const context = JSON.parse(continuation.packet_json).context;
     assert.equal(continuation.replacement_for, coordinatorId);

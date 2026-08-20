@@ -18,6 +18,7 @@ import {
   dispatchPacketSchema as packetSchema,
   dispatchPacketTemplate as packetTemplate,
   EXPLORER_CONTEXT_PATHS as PACKET_EXPLORER_CONTEXT_PATHS,
+  isBroadReadPath,
   mergeBindingsFromPacket as packetMergeBindings,
   promptFor as renderPrompt,
   promptForV2 as renderPromptV2,
@@ -2045,6 +2046,8 @@ export class DispatchService {
       : undefined;
     if (!explorer?.result_json) throw new ValidationError("planned Coding dispatch requires its completed Explorer dependency");
     const result = JSON.parse(explorer.result_json) as ResultEnvelope;
+    const allowedReadPaths = ((result.payload.allowed_read_paths as string[] | undefined) ?? [])
+      .filter((path) => !isBroadReadPath(path));
     const worktree = this.activeIntegrationWorktree(runId);
     if (!worktree) throw new ValidationError("planned Coding dispatch requires the verified plan worktree");
     const tasks = this.plannedTaskRows(runId);
@@ -2053,7 +2056,7 @@ export class DispatchService {
     }
     const dispatchId = this.create(runId, "coding", {
       objective: "Create an implementation plan from the exact File Explorer scope and dispatch the implementation roles.",
-      allowed_read_paths: (result.payload.allowed_read_paths as string[] | undefined) ?? [],
+      allowed_read_paths: allowedReadPaths,
       allowed_write_paths: [],
       acceptance_criteria: ["Use the verified run-owned plan worktree", "Create Task worktrees only for a frozen plan with multiple explicit TASK files"],
       context: {
@@ -2111,9 +2114,10 @@ export class DispatchService {
     const explorerResult = JSON.parse(explorer.result_json) as ResultEnvelope;
     const authorizedPaths = explorerResult.payload.allowed_read_paths;
     if (!Array.isArray(authorizedPaths) || authorizedPaths.some((path) => typeof path !== "string")) throw new ValidationError("planned task continuation requires valid Explorer paths");
+    const allowedReadPaths = authorizedPaths.filter((path) => !isBroadReadPath(path));
     const packet = validatePacket({
       objective: `Continue ${taskId} by dispatching one developer role in its prepared task worktree${prepareContext.predecessor_repair ? ", including the recorded predecessor repair" : ""}.`,
-      allowed_read_paths: authorizedPaths,
+      allowed_read_paths: allowedReadPaths,
       allowed_write_paths: [],
       acceptance_criteria: [
         "Dispatch a developer with the frozen task worktree identity",

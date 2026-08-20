@@ -21,6 +21,7 @@ export interface MergeWorktreeBindings {
 
 export const RENDERER_VERSION = "dispatch-renderer-v5";
 export const EXPLORER_CONTEXT_PATHS = ["MEMORY.md", ".ai-team/index/feature-navigation.md"] as const;
+export const isBroadReadPath = (path: string): boolean => path === "**" || path === "." || path.endsWith("/**");
 
 export const mergeBindingsFromPacket = (role: Role, packet: DispatchPacket): MergeWorktreeBindings | undefined => {
   if (role !== "git-operator" || !["integrate_implementation", "reconcile_worktree_ownership"].includes(String(packet.context.phase))) return undefined;
@@ -196,7 +197,7 @@ export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   for (const path of [...reads, ...writes]) if (path !== "." && path !== "**") assertRelativePosixPath(path);
   for (const path of reads) if (path !== "." && path !== "**") assertReadablePath(path);
   for (const path of writes) assertWritablePath(path);
-  const broad = reads.filter((path) => path === "**" || path === "." || path.endsWith("/**"));
+  const broad = reads.filter(isBroadReadPath);
   if (role !== "file-explorer" && broad.length) throw new ValidationError(`${role} requires exact allowed_read_paths`);
   return { ...value, allowed_read_paths: reads } as unknown as DispatchPacket;
 };
