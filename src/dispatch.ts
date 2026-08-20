@@ -343,6 +343,29 @@ export class DispatchService {
     return codingId;
   }
 
+  private resumeFailedTestRepair(runId: string): boolean {
+    const failed = this.store.db.prepare(`SELECT dispatch_id,packet_json,result_json FROM dispatches
+      WHERE run_id=? AND role='test' AND state='failed' ORDER BY completed_at DESC,created_at DESC LIMIT 1`)
+      .get(runId) as { dispatch_id: string; packet_json: string; result_json?: string } | undefined;
+    if (!failed?.result_json) return false;
+    const existing = this.store.db.prepare("SELECT 1 FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(failed.dispatch_id);
+    if (existing) return false;
+    let result: ResultEnvelope;
+    try { result = JSON.parse(failed.result_json) as ResultEnvelope; }
+    catch { return false; }
+    if (!["failed", "retryable_failure"].includes(result.status) || result.side_effect_state !== "none" || result.decisions_needed.length) return false;
+    const packet = JSON.parse(failed.packet_json) as DispatchPacket;
+    this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=? AND state='failed'")
+      .run(new Date().toISOString(), runId);
+    const repairDispatchId = this.createTestRepair(runId, failed.dispatch_id, packet, result);
+    if (!repairDispatchId) {
+      this.store.db.prepare("UPDATE runs SET state='failed',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+      return false;
+    }
+    this.store.event(runId, "test.repair_resumed", { source_test_dispatch_id: failed.dispatch_id, coding_dispatch_id: repairDispatchId });
+    return true;
+  }
+
   private createRepairRetest(runId: string, sourceTestDispatchId: string, developerDispatchId: string, commit?: string, changedPaths?: string[]): string {
     const lineage = this.store.db.prepare("SELECT * FROM test_repair_lineage WHERE run_id=? AND source_test_dispatch_id=?")
       .get(runId, sourceTestDispatchId) as { test_scope: string; attempt: number; worktree_id: string; task_id?: string; barrier_id?: string } | undefined;
@@ -3177,6 +3200,9 @@ export class DispatchService {
         }
       }
       if (run.state === "frozen") return;
+      if (run.profile === "coding" && run.state === "failed" && !pendingDecision && this.resumeFailedTestRepair(runId)) {
+        run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
+      }
       if (run.profile === "coding") {
         this.reconcileReview(runId);
         this.reconcilePlannedTaskStates(runId);

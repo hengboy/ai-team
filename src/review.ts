@@ -105,6 +105,7 @@ export class ReviewService {
   constructor(readonly store: StateStore) {}
 
   create(runId: string, revisionSha: string, _formal: boolean): ReviewCreateResult {
+    void _formal;
     const run = this.store.getRun(runId) as { mode: string; repo_id: string; plan_id?: string; revision?: string };
     const requiredFormal = true;
     if (!/^[a-f0-9]{40}$/.test(revisionSha)) throw new ValidationError("review revision must be a 40-character commit SHA");

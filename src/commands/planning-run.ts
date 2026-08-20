@@ -314,13 +314,17 @@ export const registerPlanningCommands = (program: Command, dependencies: Plannin
           operation_id: operation.operationId,
         });
       }
+      const handoff = store.getRun(options.runId) as { source_run_id?: string };
+      const handoffContract = handoff.source_run_id
+        ? await new WorkflowService(store).planningSnapshot(repo.root, options.planId, options.revision, commit)
+        : undefined;
       store.db.transaction(() => {
         store.db.prepare("UPDATE revisions SET state='ready',plan_commit=? WHERE repo_id=? AND plan_id=? AND revision=?").run(commit, repo.repoId, options.planId, options.revision);
         const closedPlanning = store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND role='planning' AND state IN ('pending','claimed','needs_decision')").run(new Date().toISOString(), options.runId).changes;
         store.db.prepare("UPDATE runs SET stage='ready',updated_at=? WHERE run_id=?").run(new Date().toISOString(), options.runId);
         store.event(options.runId, "planning.revision_committed", { planId: options.planId, revision: options.revision, commit });
         if (closedPlanning) store.event(options.runId, "planning.stale_dispatches_closed", { count: closedPlanning, reason: "revision_committed" });
-        new WorkflowService(store).completePlanningHandoff(options.runId, options.planId, options.revision, revisionDigest, commit);
+        new WorkflowService(store).completePlanningHandoff(options.runId, options.planId, options.revision, revisionDigest, commit, handoffContract);
         store.finishOperation(operation.operationId, { state: "ready", plan_commit: commit });
       })();
       return { state: "ready", plan_commit: commit, operation_id: operation.operationId, reused: false };

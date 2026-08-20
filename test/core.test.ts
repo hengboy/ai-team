@@ -217,6 +217,29 @@ test("new runs and tasks freeze canonical TDD verification while legacy rows rem
   });
 });
 
+test("failed planned runs can replace only unintegrated task contracts", async () => {
+  await withStore(async (store) => {
+    store.registerRepository("repo-contract-repair", "/tmp/repo-contract-repair/.git", "/tmp/repo-contract-repair");
+    const runId = store.createRun({ repoId: "repo-contract-repair", profile: "coding", mode: "planned", planId: "plan", revision: "001" });
+    const original = [
+      { task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "a".repeat(64), write_paths: ["src/dispatch.ts"] },
+      { task_id: "TASK-002", source_path: "tasks/TASK-002.md", source_digest: "b".repeat(64), write_paths: ["src/agent-build.ts"] },
+    ];
+    store.initializeRunTasks(runId, original);
+    store.advanceRunTask(runId, "TASK-001", "integrated", { recovered: true });
+    store.db.prepare("UPDATE runs SET state='failed' WHERE run_id=?").run(runId);
+    store.replaceRunTaskManifest(runId, [
+      original[0]!,
+      { task_id: "TASK-002", source_path: "tasks/TASK-002.md", source_digest: "c".repeat(64), write_paths: ["src/agent-build.ts", "agent-build/schemas/environment-v1.json"] },
+    ]);
+    assert.deepEqual(JSON.parse(store.runTasks(runId)[1]!.write_paths_json!), ["agent-build/schemas/environment-v1.json", "src/agent-build.ts"]);
+    assert.throws(() => store.replaceRunTaskManifest(runId, [
+      { task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "d".repeat(64), write_paths: ["src/dispatch.ts", "test/core.test.ts"] },
+      { task_id: "TASK-002", source_path: "tasks/TASK-002.md", source_digest: "c".repeat(64), write_paths: ["src/agent-build.ts", "agent-build/schemas/environment-v1.json"] },
+    ]), /cannot alter integrated task/);
+  });
+});
+
 test("readonly state opens alongside a writer without locks, backups, or migrations", async () => {
   const home = await temporaryHome();
   const writer = await StateStore.open(home);

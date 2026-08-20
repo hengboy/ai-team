@@ -186,6 +186,61 @@ test("failed task, final, and review-repair Tests return through Coding to the o
   });
 });
 
+test("resume recreates a failed Test repair as an active Coding continuation", async () => {
+  await withStore(async (store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
+    const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "resume-repair", revision: "001" });
+    store.initializeRunTasks(runId, [{ task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "a".repeat(64), write_paths: ["src/dispatch.ts"] }]);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_resume_repair", runId, "plan/resume-repair/resume-repair-001", process.cwd(), REVIEW_HEAD, new Date().toISOString());
+    const dispatches = new DispatchService(store);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+    const originalDeveloper = dispatches.create(runId, "backend-developer", {
+      ...dispatchPacket(["src/dispatch.ts"]), allowed_write_paths: ["src/dispatch.ts"],
+      context: { explorer_dispatch_id: explorerId, task_id: "TASK-001", worktree_id: "worktree_resume_repair" },
+    }, "coding");
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(completedResult(runId, originalDeveloper, "backend-developer", { modified_paths: ["src/dispatch.ts"] })), new Date().toISOString(), originalDeveloper);
+    const failedTest = dispatches.create(runId, "test", {
+      ...dispatchPacket(["src/dispatch.ts"]),
+      context: {
+        stage: "test", phase: "task_test", task_id: "TASK-001", explorer_dispatch_id: explorerId,
+        worktree_id: "worktree_resume_repair", worktree_path: process.cwd(), implementation_dispatch_id: originalDeveloper,
+      },
+    });
+    const failedResult = {
+      ...completedResult(runId, failedTest, "test", { checks: [{ command: "npm test", outcome: "failed" }] }),
+      status: "failed" as const,
+      failure_class: "test_failure" as const,
+      side_effect_state: "none" as const,
+    };
+    store.db.prepare("UPDATE dispatches SET state='failed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(failedResult), new Date().toISOString(), failedTest);
+    store.db.prepare("UPDATE runs SET state='failed',stage='test' WHERE run_id=?").run(runId);
+
+    const resumed = dispatches.resume(runId);
+    assert.equal((resumed.run as { state: string }).state, "active");
+    const continuation = resumed.pending_dispatches.find(({ role }) => role === "coding")!;
+    assert.ok(continuation);
+    dispatches.claim(runId, continuation.dispatch_id, "coding");
+    const repairDeveloper = dispatches.create(runId, "backend-developer", {
+      ...dispatchPacket(["src/dispatch.ts"]), allowed_write_paths: ["src/dispatch.ts"],
+      context: {
+        phase: "test_repair", test_scope: "task", source_test_dispatch_id: failedTest, explorer_dispatch_id: explorerId,
+        task_id: "TASK-001", worktree_id: "worktree_resume_repair", worktree_path: process.cwd(), coordinator_dispatch_id: continuation.dispatch_id,
+      },
+    }, "coding", continuation.dispatch_id);
+    assert.equal((store.db.prepare("SELECT replacement_for FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { replacement_for: string }).replacement_for, originalDeveloper);
+    dispatches.claim(runId, repairDeveloper, "backend-developer");
+    assert.doesNotThrow(() => dispatches.validateValue(runId, repairDeveloper, "backend-developer", completedResult(runId, repairDeveloper, "backend-developer", {
+      modified_paths: ["src/dispatch.ts"], self_tests: [{ command: "npm test", outcome: "passed" }],
+    })));
+  });
+});
+
 test("direct Git prepare phases require registered run-owned worktrees and defer the task until pre_write", async () => {
   await withStore(async (store) => {
     const runId = createRun(store);

@@ -666,6 +666,47 @@ export class StateStore {
     })();
   }
 
+  replaceRunTaskManifest(
+    runId: string,
+    tasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[]; verification?: TaskVerification }>,
+  ): void {
+    const run = this.getRun(runId) as { profile: string; mode: string; state: string };
+    if (run.profile !== "coding" || run.mode !== "planned" || !["frozen", "failed"].includes(run.state)) {
+      throw new ValidationError("task manifest replacement requires a frozen or failed planned coding run");
+    }
+    const existing = this.runTasks(runId);
+    const expected = tasks.map((task, ordinal) => ({
+      ...task,
+      ordinal,
+      write_paths: assertExplicitTaskWritePaths(task.write_paths, task.source_path),
+      verification: task.verification ?? null,
+    }));
+    if (existing.length !== expected.length || existing.some((task, index) => task.task_id !== expected[index]?.task_id || task.ordinal !== index)) {
+      throw new ValidationError("replacement task manifest must preserve frozen task identity and order");
+    }
+    for (const task of existing) {
+      if (task.state !== "integrated") continue;
+      const replacement = expected[task.ordinal]!;
+      const unchanged = task.source_path === replacement.source_path
+        && task.source_digest === replacement.source_digest
+        && stableJson(JSON.parse(task.write_paths_json ?? "[]")) === stableJson(replacement.write_paths)
+        && stableJson(task.verification_json ? JSON.parse(task.verification_json) : null) === stableJson(replacement.verification);
+      if (!unchanged) throw new ValidationError(`replacement task manifest cannot alter integrated task: ${task.task_id}`);
+    }
+    this.db.transaction(() => {
+      const update = this.db.prepare(`UPDATE run_tasks SET source_path=?,source_digest=?,write_paths_json=?,verification_json=?,updated_at=?
+        WHERE run_id=? AND task_id=? AND state!='integrated'`);
+      const now = new Date().toISOString();
+      for (const task of expected) {
+        update.run(task.source_path, task.source_digest, stableJson(task.write_paths), task.verification ? stableJson(task.verification) : null, now, runId, task.task_id);
+      }
+      this.event(runId, "run.task_manifest_replaced", {
+        tasks: expected,
+        preserved_integrated_task_ids: existing.filter((task) => task.state === "integrated").map((task) => task.task_id),
+      });
+    })();
+  }
+
   runTasks(runId: string): Array<{
     task_id: string;
     ordinal: number;

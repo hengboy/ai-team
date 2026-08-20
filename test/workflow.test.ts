@@ -1012,6 +1012,35 @@ test("frozen coding runs hand off to one linked planning run without transferrin
   }
 });
 
+test("failed coding runs can hand off to Planning and resume only after the handoff revision", async () => {
+  const repository = await createRepository();
+  await initializeRepositoryContext(repository);
+  const { store, home } = await openStore();
+  try {
+    const workflow = new WorkflowService(store);
+    const started = await workflow.codingStart({
+      project: repository.directory,
+      mode: "bug",
+      request: "actual: test failed\nexpected: planning reconciliation\nevidence: failed run",
+    });
+    const now = new Date().toISOString();
+    store.db.prepare("UPDATE runs SET state='failed',stage='test' WHERE run_id=?").run(started.run_id);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_failed_handoff", started.run_id, "task/direct/failed-handoff/implementation", path.join(repository.directory, ".worktrees", "failed-handoff"), repository.head, now);
+
+    const handoff = workflow.handoffToPlanning(started.run_id, "Reconcile the failed scope through Planning.");
+    assert.equal(store.getRun(handoff.run_id).source_run_id, started.run_id);
+    assert.equal(workflow.completePlanningHandoff(handoff.run_id, "20260816-failed-handoff", "002", "digest", "b".repeat(40)), started.run_id);
+    assert.deepEqual(store.db.prepare("SELECT state,stage,revision FROM runs WHERE run_id=?").get(started.run_id), {
+      state: "active", stage: "coding", revision: "002",
+    });
+  } finally {
+    store.close();
+    await rm(home, { recursive: true, force: true });
+    await rm(repository.directory, { recursive: true, force: true });
+  }
+});
+
 test("automatic coding triage prioritizes one ready revision and otherwise classifies evidence", async () => {
   const repository = await createRepository();
   await initializeRepositoryContext(repository);
