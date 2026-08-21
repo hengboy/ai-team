@@ -1878,28 +1878,7 @@ export class DispatchService {
         const repairDispatchId = repairableTest
           ? this.createTestRepair(runId, dispatchId, JSON.parse(row.packet_json) as DispatchPacket, result)
           : undefined;
-        const packet = JSON.parse(row.packet_json) as DispatchPacket;
-        const blockedTestRepair = (role === "frontend-developer" || role === "backend-developer")
-          && packet.context.phase === "test_repair"
-          && result.status === "failed"
-          && result.failure_class === "allowed_path_blocked"
-          && result.side_effect_state === "completed";
-        if (blockedTestRepair) {
-          const decisionId = this.store.createDecision(
-            runId,
-            "Frozen Test repair is blocked by a path outside the Developer packet scope.",
-            [
-              { id: "retry", label: "Retry recovery", impact: "Preserve the frozen scope and retry through the supported recovery path." },
-              { id: "abort", label: "Abort run", impact: "Stop this run while preserving its recorded repair evidence." },
-            ],
-            "retry",
-            "active_run_recovery",
-            dispatchId,
-          );
-          this.store.db.prepare("UPDATE runs SET state='needs_decision',stage='coding',updated_at=? WHERE run_id=?")
-            .run(new Date().toISOString(), runId);
-          this.store.event(runId, "test.repair_scope_blocked", { dispatch_id: dispatchId, decision_id: decisionId, failure_class: result.failure_class });
-        } else if (!repairDispatchId) this.store.db.prepare("UPDATE runs SET state=?,updated_at=? WHERE run_id=?")
+        if (!this.createBlockedTestRepairRecovery(runId, dispatchId) && !repairDispatchId) this.store.db.prepare("UPDATE runs SET state=?,updated_at=? WHERE run_id=?")
           .run(result.status === "needs_decision" || result.status === "retryable_failure" && result.decisions_needed.length === 1 ? "needs_decision" : result.status === "retryable_failure" ? "retryable_failure" : "failed", new Date().toISOString(), runId);
       }
     });
@@ -3822,6 +3801,64 @@ export class DispatchService {
     this.store.event(runId, "run.recovery_decision_created", { dispatch_id: dispatchId, stage: run.stage });
   }
 
+  private createBlockedTestRepairRecovery(runId: string, dispatchId?: string): boolean {
+    const pendingDecision = this.store.db.prepare("SELECT 1 FROM decisions WHERE run_id=? AND status='pending'").get(runId);
+    if (pendingDecision) return false;
+    const query = dispatchId
+      ? `SELECT d.dispatch_id,d.packet_json,d.result_json FROM dispatches d
+          WHERE d.run_id=? AND d.dispatch_id=? AND d.state='failed'
+            AND d.role IN ('frontend-developer','backend-developer')
+            AND json_extract(d.packet_json,'$.context.phase')='test_repair'
+            AND json_extract(d.result_json,'$.status')='failed'
+            AND json_extract(d.result_json,'$.failure_class')='allowed_path_blocked'
+            AND json_extract(d.result_json,'$.side_effect_state')='completed'
+            AND EXISTS (SELECT 1 FROM artifacts a WHERE a.run_id=d.run_id AND a.dispatch_id=d.dispatch_id AND a.kind='result')`
+      : `SELECT d.dispatch_id,d.packet_json,d.result_json FROM dispatches d
+          WHERE d.run_id=? AND d.state='failed'
+            AND d.role IN ('frontend-developer','backend-developer')
+            AND json_extract(d.packet_json,'$.context.phase')='test_repair'
+            AND json_extract(d.result_json,'$.status')='failed'
+            AND json_extract(d.result_json,'$.failure_class')='allowed_path_blocked'
+            AND json_extract(d.result_json,'$.side_effect_state')='completed'
+            AND EXISTS (SELECT 1 FROM artifacts a WHERE a.run_id=d.run_id AND a.dispatch_id=d.dispatch_id AND a.kind='result')
+          ORDER BY COALESCE(d.completed_at,d.created_at) DESC,d.created_at DESC LIMIT 1`;
+    const blocked = (dispatchId
+      ? this.store.db.prepare(query).get(runId, dispatchId)
+      : this.store.db.prepare(query).get(runId)) as { dispatch_id: string; packet_json: string; result_json?: string } | undefined;
+    if (!blocked?.result_json) return false;
+    let packet: DispatchPacket;
+    let result: ResultEnvelope;
+    try {
+      packet = JSON.parse(blocked.packet_json) as DispatchPacket;
+      result = JSON.parse(blocked.result_json) as ResultEnvelope;
+    } catch {
+      return false;
+    }
+    if (packet.context.phase !== "test_repair"
+      || result.status !== "failed"
+      || result.failure_class !== "allowed_path_blocked"
+      || result.side_effect_state !== "completed") return false;
+    const decisionId = this.store.createDecision(
+      runId,
+      "Frozen Test repair is blocked by a path outside the Developer packet scope.",
+      [
+        { id: "retry", label: "Retry recovery", impact: "Preserve the frozen scope and retry through the supported recovery path." },
+        { id: "abort", label: "Abort run", impact: "Stop this run while preserving its recorded repair evidence." },
+      ],
+      "retry",
+      "active_run_recovery",
+      blocked.dispatch_id,
+    );
+    this.store.db.prepare("UPDATE runs SET state='needs_decision',stage='coding',updated_at=? WHERE run_id=?")
+      .run(new Date().toISOString(), runId);
+    this.store.event(runId, "test.repair_scope_blocked", {
+      dispatch_id: blocked.dispatch_id,
+      decision_id: decisionId,
+      failure_class: result.failure_class,
+    });
+    return true;
+  }
+
   resume(runId: string): RunResumeResult {
     this.store.db.transaction(() => {
       let run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
@@ -3993,6 +4030,7 @@ export class DispatchService {
         }
       }
       if (run.state === "frozen") return;
+      if (run.profile === "coding" && run.state === "failed" && !pendingDecision && this.createBlockedTestRepairRecovery(runId)) return;
       if (run.profile === "coding" && run.state === "failed" && !pendingDecision && this.resumeFailedTestRepair(runId)) {
         run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
       }

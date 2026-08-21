@@ -367,14 +367,30 @@ test("blocked frozen Test repair preserves evidence and creates an explicit reco
 
     assert.equal(submission.staging.state, "consumed");
     assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { state: string }).state, "failed");
-    assert.ok(store.db.prepare("SELECT 1 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'").get(runId, repairDeveloper));
+    const artifact = store.db.prepare("SELECT artifact_id FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'").get(runId, repairDeveloper) as { artifact_id: string };
+    assert.ok(artifact);
     const decision = store.db.prepare("SELECT decision_id,decision_type,dispatch_id FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; decision_type: string; dispatch_id: string };
     assert.deepEqual({ decision_type: decision.decision_type, dispatch_id: decision.dispatch_id }, { decision_type: "active_run_recovery", dispatch_id: repairDeveloper });
     const continuation = dispatches.continuation(runId);
     assert.equal(continuation.run_state, "needs_decision");
     assert.equal(continuation.pending_decision?.decision_type, "active_run_recovery");
     assert.equal(continuation.pending_dispatches.length, 0);
-    const successor = dispatches.resolveDecision(runId, decision.decision_id, "retry");
+
+    // Simulate the historical terminal failure written before the submit-time recovery decision existed.
+    store.db.prepare("DELETE FROM decisions WHERE decision_id=?").run(decision.decision_id);
+    store.db.prepare("UPDATE runs SET state='failed',stage='coding' WHERE run_id=?").run(runId);
+    const resumed = dispatches.resume(runId);
+    const resumedDecision = resumed.pending_decision as { decision_id: string; decision_type: string; dispatch_id: string };
+    assert.equal(resumed.run.state, "needs_decision");
+    assert.deepEqual({ decision_type: resumedDecision.decision_type, dispatch_id: resumedDecision.dispatch_id }, { decision_type: "active_run_recovery", dispatch_id: repairDeveloper });
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { count: number }).count, 1);
+    assert.equal((store.db.prepare("SELECT artifact_id FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'").get(runId, repairDeveloper) as { artifact_id: string }).artifact_id, artifact.artifact_id);
+    assert.equal((store.db.prepare("SELECT state FROM staging_entries WHERE staging_id=?").get(staging.stagingId) as { state: string }).state, "consumed");
+
+    const resumedAgain = dispatches.resume(runId);
+    assert.equal((resumedAgain.pending_decision as { decision_id: string }).decision_id, resumedDecision.decision_id);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { count: number }).count, 1);
+    const successor = dispatches.resolveDecision(runId, resumedDecision.decision_id, "retry");
     assert.ok(store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND dispatch_id=? AND state IN ('pending','claimed')").get(runId, successor));
     assert.equal((store.getRun(runId) as { state: string }).state, "active");
   });
