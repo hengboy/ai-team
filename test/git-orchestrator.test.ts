@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { applyAuthorityCommitPreservingDirtyWork, git, repositoryIdentity } from "../src/git.js";
+import { applyAuthorityCommitPreservingDirtyWork, AuthorityApplyConflictError, git, repositoryIdentity } from "../src/git.js";
 import { GitOrchestrator } from "../src/git-orchestrator.js";
 import { DispatchService } from "../src/dispatch.js";
 import { ReviewService } from "../src/review.js";
@@ -1579,6 +1579,84 @@ test("authority content conflict creates a frozen continuation and records its r
     assert.equal(await rawGit(task.path, ["ls-files", "-u"]), "");
     assert.equal(await readFile(join(task.path, "authority.txt"), "utf8"), "authority-only\n");
     assert.deepEqual((await rawGit(task.path, ["status", "--porcelain=v1"])).split("\n").map((line) => line.slice(3)).sort(), ["README.md", "authority.txt", "dirty.txt"]);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("legacy pending authority apply reconciles strict conflict evidence into a claimable continuation", async () => {
+  const fixture = await createFixture();
+  try {
+    const identity = await repositoryIdentity(fixture.root);
+    const taskRoot = join(fixture.root, ".ai-team", "plans", "20260821-legacy-authority", "revisions", "001", "tasks");
+    await mkdir(taskRoot, { recursive: true });
+    await writeFile(join(taskRoot, "TASK-001.md"), "# TASK-001\n");
+    await writeFile(join(taskRoot, "TASK-002.md"), "# TASK-002\n");
+    await rawGit(fixture.root, ["add", ".ai-team"]);
+    await rawGit(fixture.root, ["commit", "-m", "Freeze legacy authority tasks"]);
+    const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    const runId = fixture.store.createRun({
+      repoId: identity.repoId, profile: "coding", mode: "planned", planId: "20260821-legacy-authority", revision: "001",
+      baseCommit, targetBranch: "main", request: "reconcile legacy authority conflict",
+    });
+    fixture.store.initializeRunTasks(runId, [
+      { task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "a".repeat(64), write_paths: ["README.md"] },
+      { task_id: "TASK-002", source_path: "tasks/TASK-002.md", source_digest: "b".repeat(64), write_paths: ["README.md"] },
+    ]);
+    await fixture.orchestrator.prepareIntegration(runId);
+    const task = await fixture.orchestrator.prepareTask(runId, "TASK-001");
+    await writeFile(join(fixture.root, "README.md"), "authority\n");
+    await rawGit(fixture.root, ["add", "README.md"]);
+    await rawGit(fixture.root, ["commit", "-m", "Authority change"]);
+    const authorityCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    await rawGit(fixture.root, ["reset", "--hard", baseCommit]);
+    await writeFile(join(task.path, "README.md"), "task work\n");
+    await rawGit(task.path, ["add", "README.md"]);
+
+    const dispatches = new DispatchService(fixture.store);
+    const authorityDispatchId = dispatches.create(runId, "git-operator", {
+      objective: "Apply authority", allowed_read_paths: [], allowed_write_paths: ["README.md"], acceptance_criteria: ["Apply authority"],
+      context: {
+        stage: "git-operator", phase: "apply_task_authority", operation: "apply-task-authority", task_id: "TASK-001",
+        worktree_id: task.worktree_id, worktree_path: task.path, authority_commit: authorityCommit, expected_head: baseCommit,
+        superseded_developer_dispatch_id: "dispatch_source", scope_recovery: {
+          authority_commit: authorityCommit, expected_head: baseCommit, original_allowed_write_paths: ["README.md"], added_write_paths: [],
+          allowed_write_paths: ["README.md"], dirty_paths: ["README.md"],
+        },
+      },
+    });
+    dispatches.claim(runId, authorityDispatchId, "git-operator");
+    const pending = fixture.store.beginOperation("git.task_authority.apply", `legacy-authority:${runId}`, {
+      runId, dispatchId: authorityDispatchId, worktreeId: task.worktree_id, authorityCommit, expectedHead: baseCommit, dirty_paths: ["README.md"],
+    }, runId);
+    let conflict: AuthorityApplyConflictError | undefined;
+    try { await applyAuthorityCommitPreservingDirtyWork(task.path, authorityCommit, "legacy authority"); }
+    catch (error) { if (error instanceof AuthorityApplyConflictError) conflict = error; else throw error; }
+    assert.ok(conflict);
+    const evidence = {
+      worktree_id: task.worktree_id, authority_commit: authorityCommit, expected_head: baseCommit, dirty_paths: ["README.md"],
+      authority_paths: ["README.md"], conflict_paths: ["README.md"], stash_commit: conflict.stashCommit,
+    };
+    await assert.rejects(
+      fixture.orchestrator.reconcileTaskAuthorityConflict(runId, pending.operationId, { ...evidence, authority_paths: ["other.md"] }, authorityDispatchId),
+      /authority conflict paths must be shared dirty authority paths/,
+    );
+    assert.equal((fixture.store.db.prepare("SELECT evidence_json FROM operations WHERE operation_id=?").get(pending.operationId) as { evidence_json: string | null }).evidence_json, null);
+    fixture.store.db.prepare("UPDATE runs SET state='failed',stage='git-operator' WHERE run_id=?").run(runId);
+    const legacyResume = dispatches.resume(runId);
+    assert.equal(legacyResume.recovery?.next_command, `ai-team git reconcile --run-id ${runId} --dispatch-id ${authorityDispatchId} --operation-id ${pending.operationId} --state conflicted --input-stdin`);
+    assert.deepEqual(legacyResume.recovery?.evidence_template, {
+      worktree_id: "<worktree-id>", authority_commit: "<40-character-commit-sha>", expected_head: "<40-character-commit-sha>",
+      dirty_paths: ["<repository-relative-dirty-path>"], authority_paths: ["<repository-relative-authority-path>"],
+      conflict_paths: ["<repository-relative-conflict-path>"], stash_commit: "<40-character-commit-sha>",
+    });
+    const reconciled = await fixture.orchestrator.reconcileTaskAuthorityConflict(runId, pending.operationId, evidence, authorityDispatchId);
+    const continuation = fixture.store.db.prepare("SELECT dispatch_id,state,packet_json FROM dispatches WHERE run_id=? AND replacement_for=?").get(runId, authorityDispatchId) as { dispatch_id: string; state: string; packet_json: string };
+    assert.equal(continuation.state, "pending");
+    assert.deepEqual(JSON.parse((fixture.store.db.prepare("SELECT evidence_json FROM operations WHERE operation_id=?").get(pending.operationId) as { evidence_json: string }).evidence_json), { state: "conflicted", ...evidence });
+    assert.equal(reconciled[0]?.state, "conflicted");
+    dispatches.claim(runId, continuation.dispatch_id, "git-operator");
+    assert.equal(dispatches.resume(runId).recovery?.next_command, `ai-team git continue-authority-conflict --run-id ${runId} --dispatch-id ${continuation.dispatch_id}`);
   } finally {
     await fixture.dispose();
   }

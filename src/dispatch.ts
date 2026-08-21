@@ -3923,6 +3923,8 @@ export class DispatchService {
         const evidence = JSON.parse(operation.evidence_json ?? "{}") as {
           state?: string; conflict_paths?: string[]; integration_worktree_id?: string;
           integration_head_before?: string; target_head?: string;
+          worktree_id?: string; authority_commit?: string; expected_head?: string; dirty_paths?: string[];
+          authority_paths?: string[]; stash_commit?: string;
         };
         const integrationWorktreeId = request.integration_worktree_id ?? evidence.integration_worktree_id;
         if (operation.kind === "git.sync" && evidence.state === "conflicted" && integrationWorktreeId) {
@@ -3937,6 +3939,21 @@ export class DispatchService {
             evidence_template: {
               integration_worktree_id: "<worktree-id>", conflict_paths: ["<repository-relative-conflict-path>"],
               integration_head_before: "<40-character-commit-sha>", target_head: "<40-character-commit-sha>",
+            },
+          };
+        } else if (operation.kind === "git.task_authority.apply" && evidence.state === "conflicted") {
+          recovery = {
+            state: "action_required", dispatch_id: claimed.dispatch_id, side_effect_state: "unknown",
+            next_command: `ai-team git continue-authority-conflict --run-id ${runId} --dispatch-id ${claimed.dispatch_id}`,
+          };
+        } else if (operation.kind === "git.task_authority.apply") {
+          recovery = {
+            state: "action_required", dispatch_id: claimed.dispatch_id, side_effect_state: "unknown",
+            next_command: `ai-team git reconcile --run-id ${runId} --dispatch-id ${claimed.dispatch_id} --operation-id ${operation.operation_id} --state conflicted --input-stdin`,
+            evidence_template: {
+              worktree_id: "<worktree-id>", authority_commit: "<40-character-commit-sha>", expected_head: "<40-character-commit-sha>",
+              dirty_paths: ["<repository-relative-dirty-path>"], authority_paths: ["<repository-relative-authority-path>"],
+              conflict_paths: ["<repository-relative-conflict-path>"], stash_commit: "<40-character-commit-sha>",
             },
           };
         } else {

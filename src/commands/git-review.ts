@@ -99,7 +99,7 @@ export const registerGitCommands = (program: Command, dependencies: GitDependenc
   gitCommand.command("continue-conflict").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--scope <paths>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).continueConflict(options.runId, options.integrationId, options.scope.split(","), options.dispatchId)) }));
   gitCommand.command("continue-authority-conflict").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).continueTaskAuthorityConflict(options.runId, options.dispatchId))));
   gitCommand.command("integrate").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).integrateTarget(options.runId, options.integrationId, options.dispatchId)) }));
-  jsonOptions(gitCommand.command("reconcile").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--operation-id <id>").addOption(new Option("--state <state>", "completed, not_applied, or conflicted; conflicted evidence requires integration_worktree_id, conflict_paths, integration_head_before, and target_head").choices(["completed", "not_applied", "conflicted"])), "--evidence-file").action(async (options) => {
+  jsonOptions(gitCommand.command("reconcile").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").option("--operation-id <id>").addOption(new Option("--state <state>", "completed, not_applied, or conflicted; conflicted evidence follows the pending operation kind").choices(["completed", "not_applied", "conflicted"])), "--evidence-file").action(async (options) => {
     const retention = await retentionHours();
     output(await withStore(async (store) => {
     const hasJsonInput = Boolean(options.evidenceFile || options.stagingId || options.inputStdin);
@@ -118,7 +118,10 @@ export const registerGitCommands = (program: Command, dependencies: GitDependenc
         return withStagingResult(result, await input.consume());
       }
       if (options.state === "conflicted") {
-        const result = await new GitOrchestrator(store).reconcileSyncConflict(options.runId, options.operationId, evidence, options.dispatchId);
+        const orchestrator = new GitOrchestrator(store);
+        const result = operation.kind === "git.task_authority.apply"
+          ? await orchestrator.reconcileTaskAuthorityConflict(options.runId, options.operationId, evidence, options.dispatchId)
+          : await orchestrator.reconcileSyncConflict(options.runId, options.operationId, evidence, options.dispatchId);
         return withStagingResult(result, await input.consume());
       }
       store.db.transaction(() => {

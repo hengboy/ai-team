@@ -134,13 +134,13 @@ export class GitOrchestrator {
   /** Every mutating operation can be tied to the claimed git-operator dispatch.
    * The optional argument preserves the programmatic API used by older
    * integrations; CLI callers should always provide it. */
-  private assertGitOperator(runId: string, dispatchId?: string, operation?: "apply-task-authority" | "continue-task-authority-conflict"): void {
+  private assertGitOperator(runId: string, dispatchId?: string, operation?: "apply-task-authority" | "reconcile-task-authority-conflict" | "continue-task-authority-conflict"): void {
     if (!dispatchId) return;
     new DispatchService(this.store).assertClaimed(runId, dispatchId, "git-operator");
     const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
       .get(runId, dispatchId) as { packet_json: string } | undefined;
     const context = row ? (JSON.parse(row.packet_json) as { context?: Record<string, unknown> }).context : undefined;
-    if (context?.phase === "apply_task_authority" && operation !== "apply-task-authority"
+    if (context?.phase === "apply_task_authority" && operation !== "apply-task-authority" && operation !== "reconcile-task-authority-conflict"
       || context?.phase === "continue_task_authority_conflict" && operation !== "continue-task-authority-conflict") {
       throw new ValidationError("task authority dispatch only authorizes apply-task-authority");
     }
@@ -1098,6 +1098,87 @@ export class GitOrchestrator {
     return this.reconcile(runId);
   }
 
+  async reconcileTaskAuthorityConflict(runId: string, operationId: string, evidence: unknown, dispatchId?: string): Promise<Array<{ operation_id: string; state: string; fact: string; next_command?: string }>> {
+    this.assertGitOperator(runId, dispatchId, "reconcile-task-authority-conflict");
+    const value = evidence && typeof evidence === "object" && !Array.isArray(evidence) ? evidence as Record<string, unknown> : {};
+    const requiredKeys = ["worktree_id", "authority_commit", "expected_head", "dirty_paths", "authority_paths", "conflict_paths", "stash_commit"];
+    const issues: Array<{ pointer: string; constraint: string; message: string }> = [];
+    if (Object.keys(value).some((key) => !requiredKeys.includes(key))) issues.push({ pointer: "/", constraint: "authority conflict evidence fields only", message: "unexpected authority conflict evidence field" });
+    for (const key of ["worktree_id", "authority_commit", "expected_head", "stash_commit"] as const) {
+      if (typeof value[key] !== "string" || !value[key]) issues.push({ pointer: `/${key}`, constraint: "non-empty string", message: `${key} is required` });
+    }
+    for (const key of ["dirty_paths", "authority_paths", "conflict_paths"] as const) {
+      if (!Array.isArray(value[key]) || !value[key].length || value[key].some((path) => typeof path !== "string" || !path)) {
+        issues.push({ pointer: `/${key}`, constraint: "non-empty string array", message: `${key} is required` });
+      }
+    }
+    for (const key of ["authority_commit", "expected_head", "stash_commit"] as const) {
+      if (typeof value[key] === "string" && !/^[a-f0-9]{40}$/.test(value[key])) issues.push({ pointer: `/${key}`, constraint: "40-character commit SHA", message: `${key} must be a commit SHA` });
+    }
+    if (issues.length) throw new ValidationError("conflicted git.task_authority.apply reconciliation evidence is invalid", issues);
+
+    const normalized: Omit<AuthorityApplyConflictEvidence, "state"> = {
+      worktree_id: value.worktree_id as string,
+      authority_commit: value.authority_commit as string,
+      expected_head: value.expected_head as string,
+      dirty_paths: [...new Set(value.dirty_paths as string[])].sort(),
+      authority_paths: [...new Set(value.authority_paths as string[])].sort(),
+      conflict_paths: [...new Set(value.conflict_paths as string[])].sort(),
+      stash_commit: value.stash_commit as string,
+    };
+    for (const path of [...normalized.dirty_paths, ...normalized.authority_paths, ...normalized.conflict_paths]) assertWritablePath(path);
+    if (normalized.conflict_paths.some((path) => !normalized.dirty_paths.includes(path) || !normalized.authority_paths.includes(path))) {
+      throw new ValidationError("authority conflict paths must be shared dirty authority paths");
+    }
+    const operation = this.store.db.prepare("SELECT run_id,kind,state,request_json FROM operations WHERE operation_id=?").get(operationId) as { run_id: string; kind: string; state: string; request_json: string } | undefined;
+    if (!operation || operation.run_id !== runId) throw new ValidationError("git reconciliation operation does not belong to run");
+    if (operation.kind !== "git.task_authority.apply" || operation.state !== "pending") throw new ValidationError("conflicted reconciliation requires a pending git.task_authority.apply operation");
+    const request = JSON.parse(operation.request_json) as TaskAuthorityApplyRequest & { dirty_paths?: unknown };
+    const recordedDirtyPaths = Array.isArray(request.dirty_paths) && request.dirty_paths.every((path) => typeof path === "string") ? [...request.dirty_paths].sort() : [];
+    if (!request.dispatchId || request.worktreeId !== normalized.worktree_id || request.authorityCommit !== normalized.authority_commit || request.expectedHead !== normalized.expected_head
+      || stableJson(recordedDirtyPaths) !== stableJson(normalized.dirty_paths)) {
+      throw new ValidationError("authority conflict evidence does not match the authority apply request");
+    }
+    if (dispatchId !== request.dispatchId) throw new ValidationError("authority conflict reconciliation requires the original claimed authority dispatch");
+    const dispatch = this.store.db.prepare("SELECT state,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+      .get(runId, request.dispatchId) as { state: string; packet_json: string } | undefined;
+    const packet = dispatch ? JSON.parse(dispatch.packet_json) as { allowed_write_paths: string[]; context: Record<string, unknown> } : undefined;
+    const context = packet?.context;
+    const scopeRecovery = context?.scope_recovery as Record<string, unknown> | undefined;
+    const packetDirtyPaths = Array.isArray(scopeRecovery?.dirty_paths) && scopeRecovery.dirty_paths.every((path) => typeof path === "string") ? [...scopeRecovery.dirty_paths as string[]].sort() : [];
+    const scopePaths = Array.isArray(scopeRecovery?.allowed_write_paths) && scopeRecovery.allowed_write_paths.every((path) => typeof path === "string") ? scopeRecovery.allowed_write_paths as string[] : [];
+    if (!dispatch || dispatch.state !== "claimed" || !packet || context?.phase !== "apply_task_authority" || context.operation !== "apply-task-authority"
+      || context.worktree_id !== normalized.worktree_id || context.authority_commit !== normalized.authority_commit || context.expected_head !== normalized.expected_head
+      || stableJson(packetDirtyPaths) !== stableJson(normalized.dirty_paths) || !scopePaths.length
+      || [...normalized.dirty_paths, ...normalized.authority_paths, ...normalized.conflict_paths].some((path) => !pathMatchesScope(path, packet.allowed_write_paths) || !pathMatchesScope(path, scopePaths))) {
+      throw new ValidationError("authority conflict evidence does not match the claimed frozen authority packet");
+    }
+    const worktree = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, normalized.worktree_id) as { path: string } | undefined;
+    if (!worktree) throw new ValidationError("authority conflict reconciliation worktree is not active for the run");
+    if (await currentHead(worktree.path) !== normalized.expected_head) throw new ValidationError("authority conflict reconciliation worktree HEAD does not match expected_head");
+    const mergeHead = await git(worktree.path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).then(() => true, () => false);
+    const unmerged = (await git(worktree.path, ["diff", "--name-only", "--diff-filter=U"])).stdout.split("\n").filter(Boolean);
+    if (mergeHead || unmerged.length) throw new ValidationError("authority conflict reconciliation worktree must have no active merge or unmerged paths");
+    const actualDirtyPaths = (await git(worktree.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3)).sort();
+    if (stableJson(actualDirtyPaths) !== stableJson(normalized.dirty_paths)) throw new ValidationError("authority conflict reconciliation dirty paths do not match the worktree", { expected: normalized.dirty_paths, actual: actualDirtyPaths });
+    const actualAuthorityPaths = (await git(worktree.path, ["diff", "--name-only", normalized.expected_head, normalized.authority_commit])).stdout.split("\n").filter(Boolean).sort();
+    if (stableJson(actualAuthorityPaths) !== stableJson(normalized.authority_paths)) throw new ValidationError("authority conflict reconciliation authority paths do not match the authority commit");
+    await git(worktree.path, ["cat-file", "-e", `${normalized.stash_commit}^{commit}`]).catch(() => { throw new ValidationError("authority conflict reconciliation stash_commit is not available"); });
+
+    this.store.db.transaction(() => {
+      this.store.recordPendingOperationEvidence(operationId, { state: "conflicted", ...normalized });
+      const run = this.store.getRun(runId) as { state: string };
+      if (run.state === "failed" || run.state === "retryable_failure") this.store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
+      this.store.event(runId, "worktree.task_authority_conflict_reconciled", { dispatch_id: dispatchId, operation_id: operationId, ...normalized });
+    })();
+    new DispatchService(this.store).createAuthorityConflictContinuation({
+      runId, authorityDispatchId: request.dispatchId, operationId, worktreeId: normalized.worktree_id, authorityCommit: normalized.authority_commit,
+      expectedHead: normalized.expected_head, dirtyPaths: normalized.dirty_paths, authorityPaths: normalized.authority_paths,
+      conflictPaths: normalized.conflict_paths, stashCommit: normalized.stash_commit,
+    });
+    return this.reconcile(runId);
+  }
+
   async cleanup(runId: string, dispatchId?: string): Promise<string[]> {
     this.assertGitOperator(runId, dispatchId);
     const { root, run } = this.repositoryForRun(runId);
@@ -1155,6 +1236,18 @@ export class GitOrchestrator {
           result.push({ operation_id: operation.operation_id, state: "not_applied", fact: "target synchronization did not change the integration worktree", ...(dispatch ? { next_command: `ai-team git reconcile --run-id ${runId} --dispatch-id ${dispatch.dispatch_id} --operation-id ${operation.operation_id} --state not_applied --evidence-file <json>` } : {}) });
         } else {
           result.push({ operation_id: operation.operation_id, state: "unknown", fact: "target synchronization state requires explicit evidence" });
+        }
+      } else if (operation.kind === "git.task_authority.apply") {
+        const evidence = JSON.parse(operation.evidence_json ?? "{}") as Partial<AuthorityApplyConflictEvidence>;
+        const continuation = typeof request.dispatchId === "string"
+          ? this.store.db.prepare("SELECT dispatch_id,state FROM dispatches WHERE run_id=? AND replacement_for=? AND role='git-operator' ORDER BY created_at LIMIT 1").get(runId, request.dispatchId) as { dispatch_id: string; state: string } | undefined
+          : undefined;
+        if (evidence.state === "conflicted" && continuation?.state === "claimed") {
+          result.push({ operation_id: operation.operation_id, state: "conflicted", fact: "authority application has a claimed conflict continuation", next_command: `ai-team git continue-authority-conflict --run-id ${runId} --dispatch-id ${continuation.dispatch_id}` });
+        } else if (evidence.state === "conflicted" && continuation) {
+          result.push({ operation_id: operation.operation_id, state: "conflicted", fact: "authority application conflict continuation is ready to claim" });
+        } else {
+          result.push({ operation_id: operation.operation_id, state: "unknown", fact: "authority application state requires explicit conflict evidence" });
         }
       } else if (operation.kind.includes("worktree") || operation.kind.includes("integration.create")) {
         const listed = (await git(root, ["worktree", "list", "--porcelain"])).stdout;
