@@ -65,7 +65,7 @@ export const applyAuthorityCommitPreservingDirtyWork = async (cwd: string, autho
   } catch (error) {
     try {
       await run(["reset", "--hard", "HEAD"]);
-      if (untrackedPaths.length) await run(["clean", "-fd", "--", ...untrackedPaths]);
+      if (untrackedPaths.length) await run(["clean", "-f", "--", ...untrackedPaths]);
       await run(["stash", "apply", "--index", stashCommit]);
     } catch (cleanupError) {
       throw new GitGateError(`task authority apply failed and cleanup could not restore dirty work; dirty-work stash retained at ${stashCommit}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
