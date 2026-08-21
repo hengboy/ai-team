@@ -400,7 +400,28 @@ test("blocked frozen Test repair preserves evidence and creates an explicit reco
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=?").get(runId) as { count: number }).count, dispatchCount);
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND json_extract(packet_json,'$.context.recovery.completed_verification') IS NOT NULL").get(runId) as { count: number }).count, recoveryPacketCount);
     assert.equal(dispatches.continuation(runId).pending_dispatches.length, 0);
-    assert.equal(dispatches.resolveDecision(runId, resumedDecision.decision_id, "new_plan_required"), repairDeveloper);
+
+    // A coordinator claimed before the terminal-decision fix can submit afterward.
+    store.db.prepare("DELETE FROM decisions WHERE decision_id=?").run(resumedDecision.decision_id);
+    store.db.prepare("UPDATE dispatches SET state='completed' WHERE dispatch_id=?").run(repairDeveloper);
+    store.db.prepare("UPDATE runs SET state='active',stage='coding' WHERE run_id=?").run(runId);
+    const historicalCoordinatorPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(repairCoordinator) as { packet_json: string }).packet_json);
+    delete historicalCoordinatorPacket.execution_contract;
+    const historicalCoordinator = dispatches.create(runId, "coding", historicalCoordinatorPacket);
+    dispatches.claim(runId, historicalCoordinator, "coding");
+    await dispatches.submitValue(runId, historicalCoordinator, "coding", completedResult(runId, historicalCoordinator, "coding", { actions: ["repair"] }));
+
+    const historicalDecision = store.db.prepare("SELECT decision_id,dispatch_id,choices_json,recommendation FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; dispatch_id: string; choices_json: string; recommendation: string };
+    assert.equal(historicalDecision.dispatch_id, repairDeveloper);
+    assert.deepEqual((JSON.parse(historicalDecision.choices_json) as Array<{ id: string }>).map(({ id }) => id), ["abort", "new_plan_required"]);
+    assert.equal(historicalDecision.recommendation, "new_plan_required");
+    const afterHistoricalSubmit = dispatches.continuation(runId);
+    assert.equal(afterHistoricalSubmit.run_state, "needs_decision");
+    assert.equal(afterHistoricalSubmit.pending_dispatches.length, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=?").get(runId) as { count: number }).count, dispatchCount + 1);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='backend-developer' AND state IN ('pending','claimed')").get(runId) as { count: number }).count, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND json_extract(packet_json,'$.context.recovery.completed_verification') IS NOT NULL").get(runId) as { count: number }).count, recoveryPacketCount);
+    assert.equal(dispatches.resolveDecision(runId, historicalDecision.decision_id, "new_plan_required"), repairDeveloper);
     assert.equal((store.getRun(runId) as { state: string }).state, "canceled");
   });
 });

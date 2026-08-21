@@ -1951,6 +1951,7 @@ export class DispatchService {
       const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string } | undefined;
       const packet = packetRow ? JSON.parse(packetRow.packet_json) as DispatchPacket : undefined;
       if (packet?.context.phase === "test_repair") {
+        if (this.createBlockedTestRepairRecovery(runId)) return;
         this.ensureTestRepairDeveloperDispatch(runId, result.dispatch_id);
         return;
       }
@@ -3826,7 +3827,7 @@ export class DispatchService {
     if (pendingDecision) return false;
     const query = dispatchId
       ? `SELECT d.dispatch_id,d.packet_json,d.result_json FROM dispatches d
-          WHERE d.run_id=? AND d.dispatch_id=? AND d.state='failed'
+          WHERE d.run_id=? AND d.dispatch_id=?
             AND d.role IN ('frontend-developer','backend-developer')
             AND json_extract(d.packet_json,'$.context.phase')='test_repair'
             AND json_extract(d.result_json,'$.status')='failed'
@@ -3834,7 +3835,7 @@ export class DispatchService {
             AND json_extract(d.result_json,'$.side_effect_state')='completed'
             AND EXISTS (SELECT 1 FROM artifacts a WHERE a.run_id=d.run_id AND a.dispatch_id=d.dispatch_id AND a.kind='result')`
       : `SELECT d.dispatch_id,d.packet_json,d.result_json FROM dispatches d
-          WHERE d.run_id=? AND d.state='failed'
+          WHERE d.run_id=?
             AND d.role IN ('frontend-developer','backend-developer')
             AND json_extract(d.packet_json,'$.context.phase')='test_repair'
             AND json_extract(d.result_json,'$.status')='failed'
