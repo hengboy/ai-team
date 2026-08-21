@@ -3447,8 +3447,7 @@ export class DispatchService {
         WHERE run_id=? AND dispatch_id=? AND role IN ('frontend-developer','backend-developer')
           AND json_extract(packet_json,'$.context.phase')='test_repair'
           AND json_extract(result_json,'$.status')='failed'
-          AND json_extract(result_json,'$.failure_class')='allowed_path_blocked'
-          AND json_extract(result_json,'$.side_effect_state')='completed'`)
+          AND json_extract(result_json,'$.failure_class')='allowed_path_blocked'`)
         .get(runId, existingDecision.dispatch_id);
       if (scopeBlockedTestRepair && choice !== "abort" && choice !== "new_plan_required") {
         throw new ValidationError("frozen Test repair requires a new plan or authorization; retry is unavailable");
@@ -3832,7 +3831,6 @@ export class DispatchService {
             AND json_extract(d.packet_json,'$.context.phase')='test_repair'
             AND json_extract(d.result_json,'$.status')='failed'
             AND json_extract(d.result_json,'$.failure_class')='allowed_path_blocked'
-            AND json_extract(d.result_json,'$.side_effect_state')='completed'
             AND EXISTS (SELECT 1 FROM artifacts a WHERE a.run_id=d.run_id AND a.dispatch_id=d.dispatch_id AND a.kind='result')`
       : `SELECT d.dispatch_id,d.packet_json,d.result_json FROM dispatches d
           WHERE d.run_id=?
@@ -3840,7 +3838,6 @@ export class DispatchService {
             AND json_extract(d.packet_json,'$.context.phase')='test_repair'
             AND json_extract(d.result_json,'$.status')='failed'
             AND json_extract(d.result_json,'$.failure_class')='allowed_path_blocked'
-            AND json_extract(d.result_json,'$.side_effect_state')='completed'
             AND EXISTS (SELECT 1 FROM artifacts a WHERE a.run_id=d.run_id AND a.dispatch_id=d.dispatch_id AND a.kind='result')
           ORDER BY COALESCE(d.completed_at,d.created_at) DESC,d.created_at DESC LIMIT 1`;
     const blocked = (dispatchId
@@ -3857,8 +3854,7 @@ export class DispatchService {
     }
     if (packet.context.phase !== "test_repair"
       || result.status !== "failed"
-      || result.failure_class !== "allowed_path_blocked"
-      || result.side_effect_state !== "completed") return false;
+      || result.failure_class !== "allowed_path_blocked") return false;
     const decisionId = this.store.createDecision(
       runId,
       "Frozen Test repair is blocked by a path outside the Developer packet scope.",

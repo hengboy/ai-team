@@ -358,7 +358,7 @@ test("blocked frozen Test repair preserves evidence and creates an explicit reco
       ...completedResult(runId, repairDeveloper, "backend-developer", { modified_paths: ["src/dispatch.ts"], blocked_path: "src/review.ts" }),
       status: "failed" as const,
       failure_class: "allowed_path_blocked" as const,
-      side_effect_state: "completed" as const,
+      side_effect_state: "none" as const,
     };
     const ready = await store.writeStagingEntry(staging.stagingId, JSON.stringify(failedRepair), {
       runId, dispatchId: repairDeveloper, role: "backend-developer", kind: "dispatch-result",
