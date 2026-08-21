@@ -369,8 +369,10 @@ test("blocked frozen Test repair preserves evidence and creates an explicit reco
     assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { state: string }).state, "failed");
     const artifact = store.db.prepare("SELECT artifact_id FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'").get(runId, repairDeveloper) as { artifact_id: string };
     assert.ok(artifact);
-    const decision = store.db.prepare("SELECT decision_id,decision_type,dispatch_id FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; decision_type: string; dispatch_id: string };
+    const decision = store.db.prepare("SELECT decision_id,decision_type,dispatch_id,choices_json,recommendation FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; decision_type: string; dispatch_id: string; choices_json: string; recommendation: string };
     assert.deepEqual({ decision_type: decision.decision_type, dispatch_id: decision.dispatch_id }, { decision_type: "active_run_recovery", dispatch_id: repairDeveloper });
+    assert.deepEqual((JSON.parse(decision.choices_json) as Array<{ id: string }>).map(({ id }) => id), ["abort", "new_plan_required"]);
+    assert.equal(decision.recommendation, "new_plan_required");
     const continuation = dispatches.continuation(runId);
     assert.equal(continuation.run_state, "needs_decision");
     assert.equal(continuation.pending_decision?.decision_type, "active_run_recovery");
@@ -390,27 +392,16 @@ test("blocked frozen Test repair preserves evidence and creates an explicit reco
     const resumedAgain = dispatches.resume(runId);
     assert.equal((resumedAgain.pending_decision as { decision_id: string }).decision_id, resumedDecision.decision_id);
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { count: number }).count, 1);
-    const successor = dispatches.resolveDecision(runId, resumedDecision.decision_id, "retry");
-    assert.ok(store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND dispatch_id=? AND state IN ('pending','claimed')").get(runId, successor));
-    assert.equal((store.getRun(runId) as { state: string }).state, "active");
-    assert.equal(dispatches.resolveDecision(runId, resumedDecision.decision_id, "retry"), successor);
-
-    dispatches.claim(runId, successor, "coding");
-    await dispatches.submitValue(runId, successor, "coding", completedResult(runId, successor, "coding", { actions: ["repair"] }));
-
-    const replacementRepair = (store.db.prepare("SELECT repair_developer_dispatch_id FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(failedTest) as { repair_developer_dispatch_id: string }).repair_developer_dispatch_id;
-    assert.notEqual(replacementRepair, repairDeveloper);
-    assert.equal((JSON.parse((store.db.prepare("SELECT result_json FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { result_json: string }).result_json) as { status: string }).status, "failed");
-    const afterRetry = dispatches.continuation(runId);
-    assert.equal(afterRetry.run_state, "active");
-    assert.equal(afterRetry.pending_decision, null);
-    assert.deepEqual(afterRetry.pending_dispatches.map(({ dispatch_id, role }) => ({ dispatch_id, role })), [{ dispatch_id: replacementRepair, role: "backend-developer" }]);
-
-    const resumedAfterRetry = dispatches.resume(runId);
-    const resumedAgainAfterRetry = dispatches.resume(runId);
-    assert.deepEqual(resumedAfterRetry.pending_dispatches.map(({ dispatch_id, role }) => ({ dispatch_id, role })), [{ dispatch_id: replacementRepair, role: "backend-developer" }]);
-    assert.deepEqual(resumedAgainAfterRetry.pending_dispatches.map(({ dispatch_id, role }) => ({ dispatch_id, role })), [{ dispatch_id: replacementRepair, role: "backend-developer" }]);
-    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='backend-developer' AND state IN ('pending','claimed')").get(runId) as { count: number }).count, 1);
+    const dispatchCount = (store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=?").get(runId) as { count: number }).count;
+    const recoveryPacketCount = (store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND json_extract(packet_json,'$.context.recovery.completed_verification') IS NOT NULL").get(runId) as { count: number }).count;
+    assert.throws(() => dispatches.resolveDecision(runId, resumedDecision.decision_id, "retry"), /requires a new plan or authorization/);
+    const afterRejectedRetry = dispatches.resume(runId);
+    assert.equal((afterRejectedRetry.pending_decision as { decision_id: string }).decision_id, resumedDecision.decision_id);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=?").get(runId) as { count: number }).count, dispatchCount);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND json_extract(packet_json,'$.context.recovery.completed_verification') IS NOT NULL").get(runId) as { count: number }).count, recoveryPacketCount);
+    assert.equal(dispatches.continuation(runId).pending_dispatches.length, 0);
+    assert.equal(dispatches.resolveDecision(runId, resumedDecision.decision_id, "new_plan_required"), repairDeveloper);
+    assert.equal((store.getRun(runId) as { state: string }).state, "canceled");
   });
 });
 

@@ -3442,7 +3442,17 @@ export class DispatchService {
     }
     if (existingDecision?.decision_type === "active_run_recovery") {
       if (!existingDecision.dispatch_id) throw new ValidationError("active run recovery decision is not bound to its recovery dispatch");
-      if (choice === "abort") {
+      const scopeBlockedTestRepair = this.store.db.prepare(`SELECT 1 FROM dispatches
+        WHERE run_id=? AND dispatch_id=? AND role IN ('frontend-developer','backend-developer')
+          AND json_extract(packet_json,'$.context.phase')='test_repair'
+          AND json_extract(result_json,'$.status')='failed'
+          AND json_extract(result_json,'$.failure_class')='allowed_path_blocked'
+          AND json_extract(result_json,'$.side_effect_state')='completed'`)
+        .get(runId, existingDecision.dispatch_id);
+      if (scopeBlockedTestRepair && choice !== "abort" && choice !== "new_plan_required") {
+        throw new ValidationError("frozen Test repair requires a new plan or authorization; retry is unavailable");
+      }
+      if (choice === "abort" || scopeBlockedTestRepair && choice === "new_plan_required") {
         this.store.db.transaction(() => {
           this.store.decide(runId, decisionId, choice, note);
           this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
@@ -3852,10 +3862,10 @@ export class DispatchService {
       runId,
       "Frozen Test repair is blocked by a path outside the Developer packet scope.",
       [
-        { id: "retry", label: "Retry recovery", impact: "Preserve the frozen scope and retry through the supported recovery path." },
-        { id: "abort", label: "Abort run", impact: "Stop this run while preserving its recorded repair evidence." },
+        { id: "abort", label: "Abort run", impact: "Stop this run while preserving repair evidence; a new plan or authorization is required to change the blocked path." },
+        { id: "new_plan_required", label: "New plan required", impact: "Record that frozen scope cannot repair the blocked path and stop this run without creating a replacement." },
       ],
-      "retry",
+      "new_plan_required",
       "active_run_recovery",
       blocked.dispatch_id,
     );
