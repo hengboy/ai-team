@@ -10,7 +10,7 @@ export const roleOption = (): Option => new Option("--role <role>").choices([...
 export const jsonOptions = (command: Command, fileFlag: string): Command => command.option(`${fileFlag} <file>`).option("--staging-id <id>").option("--input-stdin");
 
 interface StagingDependencies {
-  output(value: unknown, options?: { legacyRaw?: boolean }): void;
+  output(value: unknown): void;
   withStore<T>(action: (store: StateStore) => Promise<T> | T, options?: { readonly?: boolean }): Promise<T>;
   readStdinJson(): Promise<Buffer>;
   retentionHours(): Promise<number>;
@@ -132,23 +132,7 @@ export const registerDispatchCommands = (program: Command, dependencies: Dispatc
         } catch (error) { input.validationFailed(error); }
       }));
     });
-  dispatchCommand("recover-claimed-task-scope").requiredOption("--authority-commit <sha>").requiredOption("--expected-head <sha>").requiredOption("--add-write-path <path...>")
-    .action(async (options) => output(await withStore((store) => new DispatchService(store).recoverClaimedTaskScope({
-      runId: options.runId,
-      dispatchId: options.dispatchId,
-      authorityCommit: options.authorityCommit,
-      expectedHead: options.expectedHead,
-      addedWritePaths: options.addWritePath,
-    }))));
-  dispatch.command("repair-claimed-task-scope-replacement").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>")
-    .action(async (options) => {
-      validateCommand("dispatch.repair-claimed-task-scope-replacement", { runId: options.runId, dispatchId: options.dispatchId });
-      output(await withStore((store) => new DispatchService(store).repairClaimedTaskScopeReplacement({
-        runId: options.runId,
-        dispatchId: options.dispatchId,
-      })));
-    });
-  dispatchCommand("prompt").action(async (options) => output(await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role), { readonly: true }), { legacyRaw: true }));
+  dispatchCommand("prompt").action(async (options) => output(await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role), { readonly: true })));
   dispatchCommand("schema").action(async (options) => output(await withStore((store) => new DispatchService(store).schema(options.runId, options.dispatchId, options.role), { readonly: true })));
   dispatchCommand("template").action(async (options) => output(await withStore((store) => new DispatchService(store).template(options.runId, options.dispatchId, options.role), { readonly: true })));
   dispatchCommand("packet-schema").action(async (options) => output(await withStore((store) => new DispatchService(store).packetSchema(options.runId, options.dispatchId, options.role), { readonly: true })));

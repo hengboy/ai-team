@@ -1,7 +1,6 @@
 import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import semver from "semver";
 import lockfile from "proper-lockfile";
 import YAML from "yaml";
 import { COMMAND_CONTRACT, CONTRACT_DIGEST } from "./contracts.js";
@@ -20,7 +19,7 @@ export type Platform = "codex" | "claude" | "opencode";
 export const PLATFORMS: Platform[] = ["codex", "claude", "opencode"];
 const REASONING = ["low", "medium", "high", "xhigh"] as const;
 const EFFORT = ["low", "medium", "high"] as const;
-const VARIANTS = ["low", "medium", "high"] as const;
+const VARIANTS = ["low", "medium", "high", "xhigh"] as const;
 
 export interface ModelConfig {
   model: string;
@@ -207,83 +206,6 @@ const explainEnvironment = (environment: EnvironmentFile, file: string, role: Ro
 
 export interface AgentRenderInput { role: Role; model: ModelConfig; environment: string; }
 /* command syntax and parameter types are sourced from command-contract.ts */
-/*
-  path: "string; canonical local filesystem path",
-  file: "string; readable file path",
-  json: "string; readable JSON file path",
-  name: "string; lowercase environment name matching ^[a-z][a-z0-9-]*$",
-  role: "enum; one of the 12 manifest role IDs",
-  mode: "enum; planned, bug, or feature",
-  "platform-list": "comma-separated enum; codex, claude, or opencode",
-  "plan-id": "string; eight decimal digits followed by a lowercase slug that does not end with four hexadecimal digits",
-  revision: "string; exactly three decimal digits",
-  "task-id": "string; TASK- followed by three decimal digits",
-  "run-id": "string; run_ followed by a 26-character Crockford ULID",
-  "dispatch-id": "string; dispatch_ followed by a 26-character Crockford ULID",
-  commit: "string; exactly 40 lowercase hexadecimal characters",
-  "opaque-id": "string; CLI-issued identifier",
-  branch: "string; Git branch name",
-  state: "enum; planning state draft|requirements_confirmed|spec_ready|plan_ready|tasks_preview|ready|implemented|superseded|abandoned, or reconciliation state completed|not_applied|unknown",
-  stage: "enum; triage, pre_write, or pre_commit",
-  paths: "comma-separated repository-relative POSIX paths",
-  boolean: "boolean; presence of the flag means true",
-  text: "non-empty string",
-});
-
-const LEGACY_RENDERER_NOT_USED: Record<string, string[]> = {
-  "planning start": ["ai-team planning start --project <path> (--request-file <file> | --request-stdin)"],
-  "planning revision create": ["ai-team planning revision create --project <path> --plan-id <plan-id> --revision <revision> --target-branch <branch> --documents-file <file> [--supersedes <revision>] [--run-id <run-id>]"],
-  "planning revision transition": ["ai-team planning revision transition --project <path> --plan-id <plan-id> --revision <revision> --to <state> [--plan-commit <commit>]"],
-  "coding start": [
-    "ai-team coding start --project <path> --mode planned --plan-id <plan-id> [--revision <revision>]",
-    "ai-team coding start --project <path> --mode bug (--request-file <file> | --request-stdin)",
-    "ai-team coding start --project <path> --mode feature (--request-file <file> | --request-stdin)",
-  ],
-  "dispatch create": ["ai-team dispatch create --run-id <run-id> --role <role> --actor-role <role> --packet-file <json>"],
-  "dispatch claim": ["ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
-  "dispatch prompt": ["ai-team dispatch prompt --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
-  "dispatch schema": ["ai-team dispatch schema --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
-  "dispatch validate": ["ai-team dispatch validate --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --result-file <json>"],
-  "dispatch submit": ["ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --result-file <json>"],
-  "decision create": ["ai-team decision create --run-id <run-id> --file <json>"],
-  "run show": ["ai-team run show <run-id>"],
-  "run resume": ["ai-team run resume <run-id>"],
-  "run decide": ["ai-team run decide --run-id <run-id> --decision-id <opaque-id> --choice <text> [--note-file <file>]"],
-  "scope check": ["ai-team scope check --run-id <run-id> --stage <stage> --paths <paths>"],
-  "review create": ["ai-team review create --run-id <run-id> --revision-sha <commit> [--formal]"],
-  "review submit": ["ai-team review submit --run-id <run-id> --barrier-id <opaque-id> --result-file <json>"],
-  "review resolve": ["ai-team review resolve --run-id <run-id> --barrier-id <opaque-id> --resolution-file <json>"],
-  "review status": ["ai-team review status --run-id <run-id> (--barrier-id <opaque-id> | --revision-sha <commit>)"],
-  "git status": ["ai-team git status --run-id <run-id>"],
-  "git prepare": ["ai-team git prepare --run-id <run-id> [--task-id <task-id>] [--integration] [--base-commit <commit>] [--depends-on <opaque-id>]"],
-  "git recover-task-worktree": ["ai-team git recover-task-worktree --project <path> --worktree-id <opaque-id> --from-plan-id <plan-id> --from-revision <revision> --to-plan-id <plan-id> --to-revision <revision> --to-run-id <run-id> --task-id <task-id> --expected-head <commit> --expected-source-artifact <artifact-id-or-digest> [--dispatch-id <dispatch-id>] [--replaces-staging-id <staging-id>]"],
-  "git commit": ["ai-team git commit --run-id <run-id> --worktree-id <opaque-id> --message <text> --scope <paths>"],
-  "git merge-task": ["ai-team git merge-task --run-id <run-id> --integration-id <opaque-id> --task-id <task-id>"],
-  "git continue-conflict": ["ai-team git continue-conflict --run-id <run-id> --integration-id <opaque-id> --scope <paths>"],
-  "git continue-authority-conflict": ["ai-team git continue-authority-conflict --run-id <run-id> --dispatch-id <dispatch-id>"],
-  "git integrate": ["ai-team git integrate --run-id <run-id> --integration-id <opaque-id>"],
-  "git reconcile": ["ai-team git reconcile --run-id <run-id> [--operation-id <opaque-id> --state <state> --evidence-file <json>]"],
-  "git cleanup": ["ai-team git cleanup --run-id <run-id>"],
-  "install": ["ai-team install [--platform <platform-list>] [--dry-run]"],
-  "env list": ["ai-team env list"],
-  "env show": ["ai-team env show <name> [--resolved]"],
-  "env validate": ["ai-team env validate <name>"],
-  "env edit": ["ai-team env edit <name>"],
-  "env generate": ["ai-team env generate [--platform <platform-list>] [--dry-run]"],
-  "env switch": ["ai-team env switch <name> [--dry-run]"],
-  "env status": ["ai-team env status"],
-  "env doctor": ["ai-team env doctor [--probe]"],
-  "backup restore": ["ai-team backup restore <path> [--dry-run]"],
-  "uninstall": ["ai-team uninstall [--dry-run]"],
-};
-
-const legacyRendererNotUsed = (commands: string[]): { allowed_commands: string[]; syntax: string[]; parameter_types: Record<string, string> } => ({
-  allowed_commands: commands,
-  syntax: [...new Set(commands.flatMap((command) => {
-    return LEGACY_RENDERER_NOT_USED[command] ?? [];
-  }))],
-  parameter_types: {},
-}); */
 const renderedParameterType = (name: string): string => {
   if (name === "path") return "本地路径";
   if (["file", "request-file", "note-file"].includes(name)) return "可读文件";
@@ -418,10 +340,33 @@ export class EnvironmentService {
 
   private async config(): Promise<EnvironmentConfig> {
     await this.bootstrap();
-    const value = YAML.parse(await readFile(join(this.paths.root, "config.yaml"), "utf8")) as Partial<EnvironmentConfig>;
-    value.staging ??= { retention_hours: STAGING_DEFAULT_RETENTION_HOURS };
-    if (!validateEnvironmentConfig(value)) throw new ValidationError("environment config schema is invalid", validateEnvironmentConfig.errors);
-    const normalized = value as EnvironmentConfig;
+    const value = YAML.parse(await readFile(join(this.paths.root, "config.yaml"), "utf8")) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new IncompatibleError("environment config schema is incompatible", {
+      reason_code: "environment_configuration_invalid",
+      next_action: "reset",
+    });
+    const config = value as Partial<EnvironmentConfig>;
+    if (!config.staging) throw new IncompatibleError("environment config is missing staging configuration", {
+      reason_code: "staging_configuration_missing",
+      next_action: "reset",
+    });
+    if (!validateEnvironmentConfig(config)) throw new IncompatibleError("environment config schema is incompatible", {
+      reason_code: "environment_configuration_invalid",
+      next_action: "reset",
+      issues: validateEnvironmentConfig.errors,
+    });
+    const normalized = config as EnvironmentConfig;
+    for (const platform of PLATFORMS) {
+      const configured = normalized.client_versions[platform];
+      const current = CLIENT_VERSIONS[platform];
+      if (configured.command !== current.command || configured.minimum !== current.minimum || configured.verified !== current.verified) {
+        throw new IncompatibleError("environment config has unsupported client version metadata", {
+          reason_code: "client_version_metadata_mismatch",
+          next_action: "reset",
+          platform,
+        });
+      }
+    }
     return { state_schema_epoch: normalized.state_schema_epoch, active_environment: normalized.active_environment, enabled_platforms: [...new Set(normalized.enabled_platforms)], client_versions: normalized.client_versions, staging: { retention_hours: normalized.staging.retention_hours } };
   }
 
@@ -522,11 +467,14 @@ export class EnvironmentService {
       if (!config.enabled_platforms.includes(platform)) return { platform, status: "disabled" };
       const value = config.client_versions[platform]; const version = value.detected_version;
       if (!version) return { platform, status: "missing" };
-      if (semver.lt(version, value.minimum)) return { platform, status: "blocked", version };
-      return { platform, status: semver.gt(version, value.verified) ? "warning-unverified" : "supported", version };
+      return { platform, status: version === CLIENT_VERSIONS[platform].verified ? "supported" : "incompatible", version };
     });
-    const blocked = selected.filter((item) => item.status === "blocked" || item.status === "missing" || item.status === "unknown-version");
-    if (blocked.length) throw new IncompatibleError("client version gate blocked generation", blocked);
+    const blocked = selected.filter((item) => item.status === "incompatible" || item.status === "missing");
+    if (blocked.length) throw new IncompatibleError("client version gate blocked generation", {
+      reason_code: "client_version_not_verified",
+      next_action: "reset",
+      clients: blocked,
+    });
     return selected;
   }
 
@@ -694,10 +642,7 @@ export class EnvironmentService {
     const canonicalSource = await realpath(absolute);
     const sourceRel = relative(canonicalBackupRoot, canonicalSource);
     if (sourceRel === ".." || sourceRel.startsWith(`..${sep}`)) throw new ValidationError("restore source escapes backups through symlink");
-    const indexed = await this.findBackupDestination(absolute);
-    const backupRelative = absolute.slice(resolve(this.paths.backups).length + 1).split("/");
-    const legacyRelative = backupRelative.length > 2 ? backupRelative.slice(1).join("/") : undefined;
-    const destination = indexed ?? (legacyRelative ? join(this.userHome, legacyRelative) : join(this.userHome, basename(absolute)));
+    const destination = await this.findBackupDestination(absolute);
     assertWritablePath(destination);
     const destinationParent = dirname(destination);
     let existingParent = destinationParent;
@@ -713,11 +658,30 @@ export class EnvironmentService {
     return { source: absolute, destination };
   }
 
-  private async findBackupDestination(source: string): Promise<string | undefined> {
+  private async findBackupDestination(source: string): Promise<string> {
+    let manifest: unknown;
     try {
-      const manifest = JSON.parse(await readFile(join(this.paths.root, "backup-index.json"), "utf8")) as Record<string, string>;
-      return manifest[source];
-    } catch { return undefined; }
+      manifest = JSON.parse(await readFile(join(this.paths.root, "backup-index.json"), "utf8"));
+    } catch {
+      throw new IncompatibleError("backup index is required for restore", {
+        reason_code: "backup_index_missing_or_invalid",
+        next_action: "reset",
+      });
+    }
+    if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+      throw new IncompatibleError("backup index is invalid", {
+        reason_code: "backup_index_missing_or_invalid",
+        next_action: "reset",
+      });
+    }
+    const destination = (manifest as Record<string, unknown>)[source];
+    if (typeof destination !== "string" || !destination) {
+      throw new IncompatibleError("backup source has no indexed restore destination", {
+        reason_code: "backup_mapping_missing",
+        next_action: "reset",
+      });
+    }
+    return destination;
   }
 
   async doctor(probe = false): Promise<Array<{ platform: Platform; status: string; version?: string }>> {
@@ -729,8 +693,7 @@ export class EnvironmentService {
         const { stdout } = await execFileForInvocation(CLIENT_VERSIONS[platform].command, ["--version"]);
         const version = stdout.match(/\d+\.\d+\.\d+/)?.[0];
         if (!version) return { platform, status: "unknown-version" };
-        if (semver.lt(version, CLIENT_VERSIONS[platform].minimum)) return { platform, status: "blocked", version };
-        return { platform, status: semver.gt(version, CLIENT_VERSIONS[platform].verified) ? "warning-unverified" : "supported", version };
+        return { platform, status: version === CLIENT_VERSIONS[platform].verified ? "supported" : "incompatible", version };
       } catch { return { platform, status: "missing" }; }
     }));
     if (probe) {

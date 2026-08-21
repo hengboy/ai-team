@@ -204,7 +204,7 @@ test("environment validation rejects unknown override roles and unsafe names", a
   await assert.rejects(service.load("../balanced"), /invalid environment name/);
 });
 
-test("staging retention defaults for new and legacy configs and rejects invalid values", async (t) => {
+test("staging retention is required in the environment config", async (t) => {
   const { aiTeamHome, userHome } = await makeHomes(t);
   const service = new EnvironmentService(aiTeamHome, userHome);
   await service.bootstrap();
@@ -215,11 +215,18 @@ test("staging retention defaults for new and legacy configs and rejects invalid 
 
   delete current.staging;
   await writeFile(configPath, YAML.stringify(current));
-  assert.equal(await service.stagingRetentionHours(), 168);
+  await assert.rejects(service.stagingRetentionHours(), (error: unknown) => {
+    assert.equal((error as { code?: number }).code, 4);
+    assert.deepEqual((error as { details?: unknown }).details, {
+      reason_code: "staging_configuration_missing",
+      next_action: "reset",
+    });
+    return true;
+  });
 
   current.staging = { retention_hours: 0 };
   await writeFile(configPath, YAML.stringify(current));
-  await assert.rejects(service.stagingRetentionHours(), /config schema is invalid/);
+  await assert.rejects(service.stagingRetentionHours(), /config schema is incompatible/);
 });
 
 test("renderAgents renders all twelve roles for all three platforms", () => {
@@ -280,6 +287,19 @@ test("renderAgents renders all twelve roles for all three platforms", () => {
   assert.match(environmentOperator, /<name>`=小写环境名/);
   assert.match(environmentOperator, /<from>`=小写环境名/);
   assert.match(environmentOperator, /<to>`=小写环境名/);
+});
+
+test("renderAgents preserves xhigh OpenCode variants in frontmatter", () => {
+  const environment = balancedEnvironment();
+  environment.overrides = {
+    planning: {
+      opencode: { model: "openai/gpt-5.6-sol", variant: "xhigh", options: {} },
+    },
+  };
+
+  const planning = renderAgents(environment).get("opencode/agents/planning.md") ?? "";
+
+  assert.match(planning, /^variant: xhigh$/m);
 });
 
 test("planning and coding distinguish owned JSON from delegated submit responsibility", () => {
@@ -431,9 +451,36 @@ test("restore refuses to overwrite an existing destination", async (t) => {
   await mkdir(join(destination, ".."), { recursive: true });
   await writeFile(source, "backup\n");
   await writeFile(destination, "current\n");
+  await mkdir(service.paths.root, { recursive: true });
+  await writeFile(join(service.paths.root, "backup-index.json"), JSON.stringify({ [source]: destination }));
 
   await assert.rejects(service.restore(source), /restore destination exists/);
   assert.equal(await readFile(destination, "utf8"), "current\n");
+});
+
+test("restore rejects missing or unmapped backup indexes instead of deriving a destination", async (t) => {
+  const { aiTeamHome, userHome } = await makeHomes(t);
+  const service = new EnvironmentService(aiTeamHome, userHome);
+  const source = join(service.paths.backups, "latest", "backup.toml");
+  await mkdir(join(source, ".."), { recursive: true });
+  await writeFile(source, "backup\n");
+
+  await assert.rejects(service.restore(source), (error: unknown) => {
+    assert.deepEqual((error as { details?: unknown }).details, {
+      reason_code: "backup_index_missing_or_invalid",
+      next_action: "reset",
+    });
+    return true;
+  });
+  await mkdir(service.paths.root, { recursive: true });
+  await writeFile(join(service.paths.root, "backup-index.json"), "{}");
+  await assert.rejects(service.restore(source), (error: unknown) => {
+    assert.deepEqual((error as { details?: unknown }).details, {
+      reason_code: "backup_mapping_missing",
+      next_action: "reset",
+    });
+    return true;
+  });
 });
 
 test("uninstall removes only managed blocks and preserves user instructions", async (t) => {

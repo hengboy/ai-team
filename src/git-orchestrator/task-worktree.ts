@@ -1,14 +1,14 @@
 import { mkdir, readdir, realpath, stat } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { dirname, join, relative } from "node:path";
-import { ValidationError } from "../errors.js";
-import { applyAuthorityCommitPreservingDirtyWork, applyAuthorityPaths, attachWorktree, AuthorityApplyConflictError, createWorktree, currentBranch, currentHead, git, worktreeStatus } from "../git.js";
+import { IncompatibleError, ValidationError } from "../errors.js";
+import { attachWorktree, createWorktree, currentBranch, currentHead, git, worktreeStatus } from "../git.js";
 import { assertWritablePath, canonicalizeInside, pathMatchesScope } from "../security.js";
 import { sha256, stableJson, toPosix } from "../utils.js";
 import { taskSourceDigest } from "../planning.js";
 import { resolveMergeTaskWorktree, resolveTransferredWorktree } from "../worktree-ownership.js";
 import * as common from "./runtime.js";
-export async function prepareTask(store: common.StateStore, ops: common.GitOperations, runId: string, taskId?: string, baseCommit?: string, dependsOn?: string, dispatchId?: string): Promise<common.PreparedWorktree> {
+export async function prepareTask(store: common.StateStore, ops: common.GitOperations, runId: string, taskId: string | undefined, baseCommit: string | undefined, dependsOn: string | undefined, dispatchId: string): Promise<common.PreparedWorktree> {
     ops.assertGitOperator!(store, ops, runId, dispatchId);
     const { root, run } = ops.repositoryForRun!(store, ops, runId);
     if ((["bug", "feature"] as string[]).includes(run.mode)) common.assertDirectScopePassed(store, runId, "pre_write");
@@ -152,7 +152,7 @@ export async function prepareTask(store: common.StateStore, ops: common.GitOpera
     return { worktree_id: worktreeId, branch, path, base_commit: base, reused: false };
   }
 
-export async function adopt(store: common.StateStore, ops: common.GitOperations, runId: string, path: string, branch: string, baseCommit: string, commit?: string, dispatchId?: string): Promise<common.PreparedWorktree> {
+export async function adopt(store: common.StateStore, ops: common.GitOperations, runId: string, path: string, branch: string, baseCommit: string, commit: string | undefined, dispatchId: string): Promise<common.PreparedWorktree> {
     ops.assertGitOperator!(store, ops, runId, dispatchId);
     const { root, run } = ops.repositoryForRun!(store, ops, runId);
     const canonical = await realpath(path);
@@ -182,15 +182,13 @@ export async function adopt(store: common.StateStore, ops: common.GitOperations,
     } else if (run.base_commit && run.base_commit !== baseCommit) {
       throw new ValidationError("adopted base commit does not match run base commit");
     }
-    if (dispatchId) {
-      const packetRow = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
-        .get(runId, dispatchId) as { packet_json: string };
-      const context = (JSON.parse(packetRow.packet_json) as { context?: Record<string, unknown> }).context ?? {};
-      if (context.phase === "reconcile_worktree_ownership") {
-        const tasks = Array.isArray(context.task_worktrees) ? context.task_worktrees as Array<Record<string, unknown>> : [];
-        const authorized = tasks.some((task) => task.path === canonical && task.branch === branch && task.base_commit === baseCommit && task.commit === head);
-        if (!authorized) throw new ValidationError("ownership reconciliation may adopt only its listed task worktree");
-      }
+    const packetRow = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+      .get(runId, dispatchId) as { packet_json: string };
+    const context = (JSON.parse(packetRow.packet_json) as { context?: Record<string, unknown> }).context ?? {};
+    if (context.phase === "reconcile_worktree_ownership") {
+      const tasks = Array.isArray(context.task_worktrees) ? context.task_worktrees as Array<Record<string, unknown>> : [];
+      const authorized = tasks.some((task) => task.path === canonical && task.branch === branch && task.base_commit === baseCommit && task.commit === head);
+      if (!authorized) throw new ValidationError("ownership reconciliation may adopt only its listed task worktree");
     }
     const existing = store.db.prepare("SELECT * FROM worktrees WHERE path=? OR branch=? ORDER BY created_at DESC LIMIT 1").get(canonical, branch) as any;
     if (existing?.state === "active") {
@@ -226,7 +224,7 @@ export async function adopt(store: common.StateStore, ops: common.GitOperations,
     return { worktree_id: worktreeId, branch, path: canonical, base_commit: baseCommit, reused: operation.reused };
   }
 
-export async function adoptCommit(store: common.StateStore, ops: common.GitOperations, runId: string, commit: string, taskId = "implementation", dispatchId?: string): Promise<common.PreparedWorktree> {
+export async function adoptCommit(store: common.StateStore, ops: common.GitOperations, runId: string, commit: string, taskId: string, dispatchId: string): Promise<common.PreparedWorktree> {
     ops.assertGitOperator!(store, ops, runId, dispatchId);
     const { root, run } = ops.repositoryForRun!(store, ops, runId);
     const integration = common.isPlannedRun(run) ? ops.activeIntegrationWorktree!(store, ops, runId, root, run) : undefined;
@@ -260,7 +258,7 @@ export async function adoptCommit(store: common.StateStore, ops: common.GitOpera
     return { worktree_id: adopted.worktree_id, branch, path: adopted.path, base_commit: base, reused: true };
   }
 
-export async function transfer(store: common.StateStore, ops: common.GitOperations, runId: string, worktreeId: string, dispatchId?: string): Promise<common.PreparedWorktree> {
+export async function transfer(store: common.StateStore, ops: common.GitOperations, runId: string, worktreeId: string, dispatchId: string): Promise<common.PreparedWorktree> {
     ops.assertGitOperator!(store, ops, runId, dispatchId);
     const { root, run } = ops.repositoryForRun!(store, ops, runId);
     const row = store.db.prepare("SELECT * FROM worktrees WHERE worktree_id=? AND state='active'").get(worktreeId) as any;
@@ -288,6 +286,7 @@ export async function transfer(store: common.StateStore, ops: common.GitOperatio
   }
 
 export async function recoverTaskWorktree(store: common.StateStore, ops: common.GitOperations, request: common.TaskWorktreeRecoveryRequest): Promise<common.TaskWorktreeRecoveryReceipt> {
+    ops.assertGitOperator!(store, ops, request.toRunId, request.dispatchId);
     const target = ops.repositoryForRun!(store, ops, request.toRunId);
     if (!common.isPlannedRun(target.run) || target.run.plan_id !== request.toPlanId || target.run.revision !== request.toRevision) {
       throw new ValidationError("target run does not match the requested planned revision");
@@ -296,7 +295,7 @@ export async function recoverTaskWorktree(store: common.StateStore, ops: common.
     if (!/^[a-f0-9]{40}$/.test(request.expectedHead)) throw new ValidationError("expected HEAD must be a full commit SHA");
     if (await realpath(request.project) !== await realpath(target.root)) throw new ValidationError("recovery project does not match the target run repository");
 
-    const key = `worktree:recover:${request.fromPlanId}:${request.fromRevision}:${request.toRevision}:${request.toRunId}:${request.taskId}:${request.worktreeId}:${request.expectedHead}:${request.expectedSourceArtifact}:${request.replacesStagingId ?? "none"}`;
+    const key = `worktree:recover:${request.fromPlanId}:${request.fromRevision}:${request.toRevision}:${request.toRunId}:${request.taskId}:${request.worktreeId}:${request.expectedHead}:${request.expectedSourceArtifact}`;
     const completed = store.db.prepare("SELECT operation_id,evidence_json FROM operations WHERE idempotency_key=? AND kind='git.worktree.recover' AND state='completed'")
       .get(key) as { operation_id: string; evidence_json: string } | undefined;
     if (completed) return { ...(JSON.parse(completed.evidence_json) as common.TaskWorktreeRecoveryReceipt), reused: true };
@@ -368,44 +367,19 @@ export async function recoverTaskWorktree(store: common.StateStore, ops: common.
       await canonicalizeInside(canonical, path, true);
     }
 
-    const replacementStaging = request.replacesStagingId
-      ? store.db.prepare(`SELECT s.staging_id,s.run_id,s.dispatch_id,s.role,s.kind,s.state,s.content_sha256,d.role AS dispatch_role,d.state AS dispatch_state,d.packet_json
-        FROM staging_entries s JOIN dispatches d ON d.dispatch_id=s.dispatch_id AND d.run_id=s.run_id WHERE s.staging_id=?`)
-        .get(request.replacesStagingId) as any
-      : undefined;
-    let recoveryDispatchId = request.dispatchId;
-    if (request.replacesStagingId) {
-      if (!replacementStaging || replacementStaging.run_id !== request.toRunId || replacementStaging.role !== "git-operator"
-        || replacementStaging.kind !== "dispatch-result" || replacementStaging.state !== "ready" || !replacementStaging.content_sha256
-        || replacementStaging.dispatch_role !== "git-operator" || replacementStaging.dispatch_state !== "claimed") {
-        throw new ValidationError("replacement staging is not a ready claimed Git Operator dispatch result for the target run");
-      }
-      const context = (JSON.parse(replacementStaging.packet_json) as { context?: Record<string, unknown> }).context ?? {};
-      if (context.phase !== "recover_implementation_worktree" || context.task_id !== request.taskId
-        || context.source_worktree_id !== request.worktreeId || context.source_run_id !== row.run_id) {
-        throw new ValidationError("replacement staging does not match the legacy task worktree recovery lineage");
-      }
-      if (request.dispatchId && request.dispatchId !== replacementStaging.dispatch_id) {
-        throw new ValidationError("replacement staging dispatch does not match --dispatch-id");
-      }
-      recoveryDispatchId = replacementStaging.dispatch_id;
-    }
-    if (recoveryDispatchId) {
-      common.assertClaimed(store, common.dispatchOperations, request.toRunId, recoveryDispatchId, "git-operator");
-      const dispatch = store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=? AND run_id=?").get(recoveryDispatchId, request.toRunId) as { packet_json: string };
-      const context = (JSON.parse(dispatch.packet_json) as { context?: Record<string, unknown> }).context ?? {};
-      const legacyReplacement = Boolean(request.replacesStagingId) && context.phase === "recover_implementation_worktree"
-        && context.source_worktree_id === request.worktreeId;
-      if ((!legacyReplacement && !(["recover_task_worktree", "reconcile_worktree_ownership"] as unknown[]).includes(context.phase))
-        || context.task_id !== request.taskId
-        || (!legacyReplacement && ![context.worktree_id, context.task_worktree_id, context.implementation_worktree_id].includes(request.worktreeId))) {
-        throw new ValidationError("Git Operator dispatch is not bound to this task worktree recovery");
-      }
+    const recoveryDispatchId = request.dispatchId;
+    common.assertClaimed(store, common.dispatchOperations, request.toRunId, recoveryDispatchId, "git-operator");
+    const dispatch = store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=? AND run_id=?").get(recoveryDispatchId, request.toRunId) as { packet_json: string };
+    const context = (JSON.parse(dispatch.packet_json) as { context?: Record<string, unknown> }).context ?? {};
+    if (!(["recover_task_worktree", "reconcile_worktree_ownership"] as unknown[]).includes(context.phase)
+      || context.task_id !== request.taskId
+      || ![context.worktree_id, context.task_worktree_id, context.implementation_worktree_id].includes(request.worktreeId)) {
+      throw new ValidationError("Git Operator dispatch is not bound to this task worktree recovery");
     }
     const activeHolder = store.db.prepare(`SELECT d.dispatch_id FROM dispatch_worktree_bindings b
       JOIN dispatches d ON d.dispatch_id=b.dispatch_id AND d.run_id=b.run_id
       WHERE b.worktree_id=? AND d.state='claimed' AND (? IS NULL OR d.dispatch_id!=?) LIMIT 1`)
-      .get(request.worktreeId, recoveryDispatchId ?? null, recoveryDispatchId ?? null) as { dispatch_id: string } | undefined;
+      .get(request.worktreeId, recoveryDispatchId, recoveryDispatchId) as { dispatch_id: string } | undefined;
     if (activeHolder) throw new ValidationError("worktree is held by another active dispatch", { dispatch_id: activeHolder.dispatch_id });
 
     const artifacts = store.db.prepare(`SELECT a.artifact_id,a.sha256,a.dispatch_id,d.packet_json
@@ -418,14 +392,6 @@ export async function recoverTaskWorktree(store: common.StateStore, ops: common.
     if (!artifact) throw new ValidationError("expected source artifact does not match the source task lineage");
 
     const operationId = `op_${sha256(key).slice(0, 26)}`;
-    const replacedStaging = replacementStaging ? {
-      staging_id: replacementStaging.staging_id as string,
-      dispatch_id: replacementStaging.dispatch_id as string,
-      digest: replacementStaging.content_sha256 as string,
-      before_state: "ready" as const,
-      after_state: "canceled" as const,
-      operation_id: operationId,
-    } : undefined;
     const evidence: common.TaskWorktreeRecoveryReceipt = {
       recovery_id: operationId,
       worktree_id: request.worktreeId,
@@ -437,7 +403,6 @@ export async function recoverTaskWorktree(store: common.StateStore, ops: common.
       to_run_id: request.toRunId,
       source_artifact: { artifact_id: artifact.artifact_id, digest: artifact.sha256 },
       dirty_paths: dirtyPaths,
-      ...(replacedStaging ? { replaced_staging: replacedStaging } : {}),
       reused: false,
     };
     const operationRequest = {
@@ -451,7 +416,6 @@ export async function recoverTaskWorktree(store: common.StateStore, ops: common.
       owner_before: row.run_id,
       owner_after: request.toRunId,
       source_artifact: evidence.source_artifact,
-      ...(replacedStaging ? { replaced_staging: replacedStaging } : {}),
     };
     store.db.transaction(() => {
       store.db.prepare("INSERT INTO operations(operation_id,run_id,idempotency_key,kind,state,request_json,evidence_json,created_at,completed_at) VALUES (?,?,?,'git.worktree.recover','completed',?,?,?,?)")
@@ -463,11 +427,6 @@ export async function recoverTaskWorktree(store: common.StateStore, ops: common.
         WHERE run_id=? AND task_id=? AND (worktree_id IS NULL OR worktree_id=?)`)
         .run(request.worktreeId, new Date().toISOString(), request.toRunId, request.taskId, request.worktreeId);
       if (task.changes !== 1) throw new ValidationError("target task binding changed during recovery preflight");
-      if (replacedStaging) {
-        const staging = store.db.prepare(`UPDATE staging_entries SET state='canceled',replaced_by_operation_id=?,updated_at=?
-          WHERE staging_id=? AND state='ready' AND dispatch_id=?`).run(operationId, new Date().toISOString(), replacedStaging.staging_id, replacedStaging.dispatch_id);
-        if (staging.changes !== 1) throw new ValidationError("replacement staging changed during recovery preflight");
-      }
       store.event(row.run_id, "worktree.recovery_released", { ...operationRequest, operation_id: operationId });
       store.event(request.toRunId, "worktree.recovered", { ...operationRequest, operation_id: operationId, receipt: evidence });
     })();
@@ -475,172 +434,17 @@ export async function recoverTaskWorktree(store: common.StateStore, ops: common.
   }
 
 export async function applyTaskAuthority(store: common.StateStore, ops: common.GitOperations, request: common.TaskAuthorityApplyRequest): Promise<common.TaskAuthorityApplyReceipt> {
-    ops.assertGitOperator!(store, ops, request.runId, request.dispatchId, "apply-task-authority");
-    if (!/^[a-f0-9]{40}$/.test(request.authorityCommit) || !/^[a-f0-9]{40}$/.test(request.expectedHead)) {
-      throw new ValidationError("task authority apply requires full authority and expected HEAD commit SHAs");
-    }
-    const { run } = ops.repositoryForRun!(store, ops, request.runId);
-    if (!common.isPlannedRun(run)) throw new ValidationError("task authority apply requires a planned Coding run");
-    const dispatch = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
-      .get(request.runId, request.dispatchId) as { packet_json: string } | undefined;
-    const context = dispatch ? (JSON.parse(dispatch.packet_json) as { context: Record<string, unknown> }).context : undefined;
-    if (!context || context.phase !== "apply_task_authority" || context.operation !== "apply-task-authority" || context.worktree_id !== request.worktreeId
-      || context.authority_commit !== request.authorityCommit || context.expected_head !== request.expectedHead) {
-      throw new ValidationError("Git Operator dispatch is not bound to this task authority recovery");
-    }
-    const row = store.db.prepare("SELECT path,state FROM worktrees WHERE run_id=? AND worktree_id=?")
-      .get(request.runId, request.worktreeId) as { path: string; state: string } | undefined;
-    if (!row || row.state !== "active") throw new ValidationError("task authority apply requires its active frozen worktree");
-    const key = `worktree:apply-authority:${request.runId}:${request.dispatchId}:${request.worktreeId}:${request.authorityCommit}:${request.expectedHead}`;
-    const completed = store.db.prepare("SELECT evidence_json FROM operations WHERE idempotency_key=? AND kind='git.task_authority.apply' AND state='completed'")
-      .get(key) as { evidence_json: string } | undefined;
-    if (completed) return { ...(JSON.parse(completed.evidence_json) as common.TaskAuthorityApplyReceipt), reused: true };
-    const head = await currentHead(row.path);
-    if (head !== request.expectedHead) throw new ValidationError("task authority apply worktree HEAD does not match expected HEAD", { expected: request.expectedHead, actual: head });
-    const status = await git(row.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
-    const dirtyPaths = status.stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3)).sort();
-    if (!dirtyPaths.length) throw new ValidationError("task authority apply requires the recorded dirty task work");
-    const allowed = Array.isArray(context.scope_recovery && (context.scope_recovery as Record<string, unknown>).allowed_write_paths)
-      ? (context.scope_recovery as { allowed_write_paths: string[] }).allowed_write_paths
-      : undefined;
-    if (!allowed || dirtyPaths.some((path) => !pathMatchesScope(path, allowed))) {
-      throw new ValidationError("task authority apply dirty work is outside the frozen replacement scope", { dirty_paths: dirtyPaths });
-    }
-    const authorityPaths = (await git(row.path, ["diff-tree", "--no-commit-id", "--name-only", "-r", request.authorityCommit])).stdout.split("\n").filter(Boolean).sort();
-    if (!authorityPaths.length || authorityPaths.some((path) => !pathMatchesScope(path, allowed))) {
-      throw new ValidationError("task authority apply commit is outside the frozen replacement scope", { authority_paths: authorityPaths });
-    }
-    let operationKey = key;
-    let operation: { operationId: string; reused: boolean; state: string };
-    while (true) {
-      operation = store.beginOperation("git.task_authority.apply", operationKey, { ...request, dirty_paths: dirtyPaths }, request.runId);
-      if (!operation.reused) break;
-      if (operation.state === "completed") {
-        const completed = store.db.prepare("SELECT evidence_json FROM operations WHERE operation_id=?")
-          .get(operation.operationId) as { evidence_json: string };
-        return { ...(JSON.parse(completed.evidence_json) as common.TaskAuthorityApplyReceipt), reused: true };
-      }
-      const failed = operation.state === "failed"
-        ? store.db.prepare("SELECT evidence_json FROM operations WHERE operation_id=?")
-          .get(operation.operationId) as { evidence_json: string | null } | undefined
-        : undefined;
-      try {
-        if (JSON.parse(failed?.evidence_json ?? "{}").reconciliation === "not_applied") {
-          operationKey = `${operationKey}:retry:${operation.operationId}`;
-          continue;
-        }
-      } catch { /* malformed reconciliation evidence is not retry authorization */ }
-      throw new ValidationError("task authority apply has an unknown side effect; reconcile required");
-    }
-    let stashCommit: string;
-    try {
-      stashCommit = await applyAuthorityCommitPreservingDirtyWork(row.path, request.authorityCommit, `ai-team authority ${request.dispatchId}`);
-    } catch (error) {
-      if (error instanceof AuthorityApplyConflictError) {
-        const evidence: common.AuthorityApplyConflictEvidence = {
-          state: "conflicted",
-          worktree_id: request.worktreeId,
-          authority_commit: request.authorityCommit,
-          expected_head: request.expectedHead,
-          dirty_paths: dirtyPaths,
-          authority_paths: authorityPaths,
-          conflict_paths: error.conflictPaths,
-          stash_commit: error.stashCommit,
-        };
-        store.recordPendingOperationEvidence(operation.operationId, evidence);
-        store.event(request.runId, "worktree.task_authority_conflicted", { dispatch_id: request.dispatchId, operation_id: operation.operationId, ...evidence });
-        common.createAuthorityConflictContinuation(store, common.dispatchOperations, {
-          runId: request.runId,
-          authorityDispatchId: request.dispatchId,
-          operationId: operation.operationId,
-          worktreeId: request.worktreeId,
-          authorityCommit: request.authorityCommit,
-          expectedHead: request.expectedHead,
-          dirtyPaths,
-          authorityPaths,
-          conflictPaths: error.conflictPaths,
-          stashCommit: error.stashCommit,
-        });
-      }
-      throw error;
-    }
-    const receipt: common.TaskAuthorityApplyReceipt = {
-      operation_id: operation.operationId,
-      worktree_id: request.worktreeId,
-      authority_commit: request.authorityCommit,
-      head: await currentHead(row.path),
-      dirty_paths: dirtyPaths,
-      stash_commit: stashCommit,
-      reused: false,
-    };
-    store.finishOperation(operation.operationId, receipt);
-    store.event(request.runId, "worktree.task_authority_applied", receipt);
-    return receipt;
-  }
+  ops.assertGitOperator!(store, ops, request.runId, request.dispatchId, "apply-task-authority");
+  throw new IncompatibleError("task authority replacement is unsupported", {
+    reason_code: "legacy_task_authority_replacement",
+    next_action: "start_new_run",
+  });
+}
 
 export async function continueTaskAuthorityConflict(store: common.StateStore, ops: common.GitOperations, runId: string, dispatchId: string): Promise<common.TaskAuthorityApplyReceipt> {
-    ops.assertGitOperator!(store, ops, runId, dispatchId, "continue-task-authority-conflict");
-    const dispatch = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
-      .get(runId, dispatchId) as { packet_json: string } | undefined;
-    const context = dispatch ? (JSON.parse(dispatch.packet_json) as { context: Record<string, unknown> }).context : undefined;
-    const required = ["worktree_id", "authority_commit", "expected_head", "authority_apply_operation_id", "authority_apply_dispatch_id", "stash_commit"] as const;
-    if (!context || context.phase !== "continue_task_authority_conflict" || context.operation !== "continue-task-authority-conflict"
-      || required.some((key) => typeof context[key] !== "string" || !context[key])) {
-      throw new ValidationError("Git Operator dispatch is not bound to an authority conflict continuation");
-    }
-    const worktreeId = context.worktree_id as string;
-    const authorityCommit = context.authority_commit as string;
-    const expectedHead = context.expected_head as string;
-    const originalOperationId = context.authority_apply_operation_id as string;
-    const originalDispatchId = context.authority_apply_dispatch_id as string;
-    const stashCommit = context.stash_commit as string;
-    const continuationKey = `authority-conflict-continue:${runId}:${originalOperationId}:${dispatchId}`;
-    const existingContinuation = store.db.prepare("SELECT state,evidence_json FROM operations WHERE idempotency_key=? AND kind='git.task_authority.continue'")
-      .get(continuationKey) as { state: string; evidence_json?: string } | undefined;
-    if (existingContinuation) {
-      if (existingContinuation.state !== "completed") throw new ValidationError("authority conflict continuation side effect is unknown; reconcile required");
-      return { ...(JSON.parse(existingContinuation.evidence_json ?? "{}") as common.TaskAuthorityApplyReceipt), reused: true };
-    }
-    const operation = store.db.prepare("SELECT state,request_json,evidence_json FROM operations WHERE operation_id=? AND run_id=? AND kind='git.task_authority.apply'")
-      .get(originalOperationId, runId) as { state: string; request_json: string; evidence_json?: string } | undefined;
-    const evidence = JSON.parse(operation?.evidence_json ?? "{}") as Partial<common.AuthorityApplyConflictEvidence>;
-    if (!operation || operation.state !== "pending" || evidence.state !== "conflicted" || evidence.worktree_id !== worktreeId
-      || evidence.authority_commit !== authorityCommit || evidence.expected_head !== expectedHead || evidence.stash_commit !== stashCommit) {
-      throw new ValidationError("authority conflict continuation evidence does not match its frozen packet");
-    }
-    const request = JSON.parse(operation.request_json) as common.TaskAuthorityApplyRequest & { dirty_paths?: unknown };
-    const recordedDirtyPaths = Array.isArray(request.dirty_paths) && request.dirty_paths.every((path) => typeof path === "string") ? [...request.dirty_paths].sort() : [];
-    const packetDirtyPaths = Array.isArray(context.dirty_paths) && context.dirty_paths.every((path) => typeof path === "string") ? [...context.dirty_paths].sort() : [];
-    const authorityPaths = Array.isArray(context.authority_paths) && context.authority_paths.every((path) => typeof path === "string") ? [...context.authority_paths].sort() : [];
-    if (request.dispatchId !== originalDispatchId || request.worktreeId !== worktreeId || request.authorityCommit !== authorityCommit || request.expectedHead !== expectedHead
-      || stableJson(recordedDirtyPaths) !== stableJson(packetDirtyPaths) || stableJson(recordedDirtyPaths) !== stableJson([...(evidence.dirty_paths ?? [])].sort())
-      || !authorityPaths.length || stableJson(authorityPaths) !== stableJson([...(evidence.authority_paths ?? [])].sort())) {
-      throw new ValidationError("authority conflict continuation dirty-work lineage does not match its frozen packet");
-    }
-    const row = store.db.prepare("SELECT path,state FROM worktrees WHERE run_id=? AND worktree_id=?").get(runId, worktreeId) as { path: string; state: string } | undefined;
-    if (!row || row.state !== "active" || await currentHead(row.path) !== expectedHead) throw new ValidationError("authority conflict continuation worktree HEAD does not match expected HEAD");
-    const unresolved = (await git(row.path, ["diff", "--name-only", "--diff-filter=U"])).stdout.split("\n").filter(Boolean);
-    if (unresolved.length) throw new ValidationError("authority conflict continuation has unresolved paths", unresolved);
-    await applyAuthorityPaths(row.path, authorityCommit, authorityPaths.filter((path) => !recordedDirtyPaths.includes(path)));
-    const status = await git(row.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
-    const dirtyPaths = status.stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3)).sort();
-    const requiredPaths = [...new Set([...recordedDirtyPaths, ...authorityPaths])].sort();
-    if (requiredPaths.some((path) => !dirtyPaths.includes(path)) || dirtyPaths.some((path) => !requiredPaths.includes(path))) {
-      throw new ValidationError("authority conflict continuation dirty work changed", { expected: requiredPaths, actual: dirtyPaths });
-    }
-    const allowed = Array.isArray(context.allowed_write_paths) && context.allowed_write_paths.every((path) => typeof path === "string") ? context.allowed_write_paths as string[] : [];
-    if (!allowed.length || dirtyPaths.some((path) => !pathMatchesScope(path, allowed))) throw new ValidationError("authority conflict continuation dirty work is outside the frozen replacement scope", { dirty_paths: dirtyPaths });
-    const continuation = store.beginOperation("git.task_authority.continue", continuationKey, {
-      authority_apply_operation_id: originalOperationId, worktree_id: worktreeId, authority_commit: authorityCommit, expected_head: expectedHead, dirty_paths: dirtyPaths,
-    }, runId);
-    if (continuation.reused) {
-      if (continuation.state !== "completed") throw new ValidationError("authority conflict continuation side effect is unknown; reconcile required");
-      const completed = store.db.prepare("SELECT evidence_json FROM operations WHERE operation_id=?").get(continuation.operationId) as { evidence_json: string };
-      return { ...(JSON.parse(completed.evidence_json) as common.TaskAuthorityApplyReceipt), reused: true };
-    }
-    const receipt: common.TaskAuthorityApplyReceipt = { operation_id: originalOperationId, worktree_id: worktreeId, authority_commit: authorityCommit, head: expectedHead, dirty_paths: dirtyPaths, stash_commit: stashCommit, reused: false };
-    store.finishOperation(continuation.operationId, receipt);
-    store.finishOperation(originalOperationId, { ...receipt, continued_by: continuation.operationId });
-    store.event(runId, "worktree.task_authority_conflict_continued", { dispatch_id: dispatchId, ...receipt, continuation_operation_id: continuation.operationId });
-    return receipt;
-  }
+  ops.assertGitOperator!(store, ops, runId, dispatchId, "continue-task-authority-conflict");
+  throw new IncompatibleError("task authority conflict continuation is unsupported", {
+    reason_code: "legacy_task_authority_continuation",
+    next_action: "start_new_run",
+  });
+}

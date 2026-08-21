@@ -23,7 +23,7 @@ test("task graph produces non-overlapping dependency batches and rejects cycles"
   assert.throws(() => validateTaskGraph(unknown), /unknown dependencies/);
 });
 
-test("client version gates use persisted probe facts and never silently downgrade", async (t) => {
+test("client version gates require the exact persisted verified version", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ai-team-version-gate-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const aiTeamHome = join(root, "config"); const userHome = join(root, "user"); const bin = join(root, "bin");
@@ -39,8 +39,27 @@ test("client version gates use persisted probe facts and never silently downgrad
     await assert.rejects(service.validateClientVersions(["codex"]), /version gate blocked/);
     await writeFile(join(bin, "codex"), "#!/bin/sh\necho codex-cli 99.0.0\n");
     await service.doctor(true);
-    assert.deepEqual(await service.validateClientVersions(["codex"]), [{ platform: "codex", status: "warning-unverified", version: "99.0.0" }]);
+    await assert.rejects(service.validateClientVersions(["codex"]), (error: unknown) => {
+      assert.equal((error as { code?: number }).code, 4);
+      assert.deepEqual((error as { details?: { reason_code?: string; next_action?: string } }).details, {
+        reason_code: "client_version_not_verified",
+        next_action: "reset",
+        clients: [{ platform: "codex", status: "incompatible", version: "99.0.0" }],
+      });
+      return true;
+    });
     const config = YAML.parse(await readFile(join(aiTeamHome, "config.yaml"), "utf8"));
     assert.equal(config.client_versions.codex.detected_version, "99.0.0");
+    config.client_versions.codex.detected_version = "0.145.0";
+    config.client_versions.codex.verified = "99.0.0";
+    await writeFile(join(aiTeamHome, "config.yaml"), YAML.stringify(config));
+    await assert.rejects(service.validateClientVersions(["codex"]), (error: unknown) => {
+      assert.deepEqual((error as { details?: unknown }).details, {
+        reason_code: "client_version_metadata_mismatch",
+        next_action: "reset",
+        platform: "codex",
+      });
+      return true;
+    });
   } finally { if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath; }
 });

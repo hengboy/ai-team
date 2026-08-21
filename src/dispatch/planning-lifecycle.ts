@@ -1,6 +1,6 @@
 import { Role } from "../constants.js";
 import { type ResultEnvelope } from "../contracts.js";
-import { ValidationError } from "../errors.js";
+import { IncompatibleError, ValidationError } from "../errors.js";
 import { pathMatchesScope } from "../security.js";
 import { assertRevisionRunStage } from "../planning.js";
 import { sha256, stableJson } from "../utils.js";
@@ -198,6 +198,12 @@ export function resolveDecision(store: common.StateStore, ops: common.DispatchOp
         && typeof sourcePacket.context.authority_apply_dispatch_id === "string"
         ? sourcePacket.context.authority_apply_dispatch_id
         : undefined;
+      if (authorityApplyDispatchId) {
+        throw new IncompatibleError("legacy task authority conflict receipt cannot be resumed", {
+          reason_code: "legacy_task_authority_conflict_receipt",
+          next_action: "start_new_run",
+        });
+      }
       let replacementId = "";
       store.db.transaction(() => {
         store.decide(runId, decisionId, choice, note);
@@ -207,10 +213,7 @@ export function resolveDecision(store: common.StateStore, ops: common.DispatchOp
           .run(new Date().toISOString(), existingDecision.dispatch_id);
         store.db.prepare("UPDATE runs SET state='active',stage=?,updated_at=? WHERE run_id=?")
           .run(authorityApplyDispatchId ? "coding" : source.role, new Date().toISOString(), runId);
-        replacementId = authorityApplyDispatchId
-          ? ops.ensureRecoveredTaskDeveloperDispatch!(store, ops, runId, authorityApplyDispatchId, true) ?? ""
-          : ops.recoveryReplacement!(store, ops, runId, source, resolvedDecision);
-        if (!replacementId) throw new ValidationError("completed authority conflict receipt has no recoverable developer continuation");
+        replacementId = ops.recoveryReplacement!(store, ops, runId, source, resolvedDecision);
         const successor = store.db.prepare("SELECT packet_digest FROM dispatches WHERE dispatch_id=?").get(replacementId) as { packet_digest?: string };
         store.db.prepare("UPDATE decisions SET receipt_json=? WHERE decision_id=?")
           .run(stableJson({ ...resolvedDecision, successor_dispatch_id: replacementId, successor_packet_digest: successor.packet_digest ?? null }), decisionId);

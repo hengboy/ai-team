@@ -1,6 +1,5 @@
 import Database from "better-sqlite3";
-import { copyFile, mkdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir } from "node:fs/promises";
 import lockfile from "proper-lockfile";
 import { getHomePaths, type HomePaths } from "./home.js";
 import { ValidationError } from "./errors.js";
@@ -14,13 +13,12 @@ import {
   type StagingKind,
 } from "./constants.js";
 import { ensureManagedDirectory } from "./security.js";
-import { migrateStagingFiles, StagingStore, type StagingBinding, type StagingCleanupSelector, type StagingEntry } from "./staging.js";
+import { assertCanonicalStagingFiles, StagingStore, type StagingBinding, type StagingCleanupSelector, type StagingEntry } from "./staging.js";
 import { registerInvocationFinalizer } from "./resource-registry.js";
 import type { PlanVerification, TaskVerification } from "./planning.js";
 
 export type { StagingBinding, StagingCleanupSelector, StagingEntry } from "./staging.js";
-import { Umzug } from "umzug";
-import { backupLegacyState, migrations, pruneDatabaseBackups, removeDatabase, requiresStateEpochReset } from "./state/migrations.js";
+import { assertCurrentSchema, createCurrentSchema, isEmptyStateDatabase } from "./state/migrations.js";
 export { STATE_SCHEMA_EPOCH } from "./state/migrations.js";
 export const EVENT_SCHEMA_VERSION = 1;
 
@@ -80,8 +78,15 @@ export class StateStore {
     const paths = getHomePaths(home);
     if (options.readonly) {
       const db = new Database(paths.database, { readonly: true, fileMustExist: true });
-      db.pragma("foreign_keys = ON");
-      return new StateStore(paths, db, () => {});
+      try {
+        db.pragma("foreign_keys = ON");
+        assertCurrentSchema(db);
+        await assertCanonicalStagingFiles(paths, db);
+        return new StateStore(paths, db, () => {});
+      } catch (error) {
+        db.close();
+        throw error;
+      }
     }
     await Promise.all([paths.state, paths.backups, paths.artifacts, paths.environments, paths.schemas, paths.templates].map((path) => mkdir(path, { recursive: true })));
     await ensureManagedDirectory(paths.root, paths.staging);
@@ -90,59 +95,18 @@ export class StateStore {
       stale: 30_000,
       retries: { retries: 20, factor: 1, minTimeout: 50, maxTimeout: 50 },
     });
-    let existing = false;
-    try { existing = (await stat(paths.database)).size > 0; } catch { /* new database */ }
-    if (existing && await requiresStateEpochReset(paths.database, paths.root)) {
-      await backupLegacyState(paths, new Date().toISOString().replace(/[:.]/g, "-"));
-      await removeDatabase(paths.database);
-      existing = false;
-    }
-    const backup = join(paths.backups, `state-${Date.now()}.sqlite`);
-    if (existing) {
-      await copyFile(paths.database, backup);
-      for (const configFile of [join(paths.root, "config.yaml"), join(paths.root, "manifest.json")]) {
-        try { await copyFile(configFile, `${backup}-${configFile.endsWith(".yaml") ? "config.yaml" : "manifest.json"}`); } catch { /* optional before first install */ }
-      }
-    }
     const db = new Database(paths.database);
-    db.pragma("journal_mode = WAL");
-    db.pragma("foreign_keys = ON");
-    const umzug = new Umzug({
-      migrations,
-      context: db,
-      logger: undefined,
-      storage: {
-        executed: async () => {
-          try { return db.prepare("SELECT name FROM schema_migrations ORDER BY name").all().map((row: any) => row.name as string); }
-          catch { return []; }
-        },
-        logMigration: async ({ name }) => { db.prepare("INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)").run(name, new Date().toISOString()); },
-        unlogMigration: async () => { throw new Error("forward-only migrations"); },
-      },
-    });
-    try { await umzug.up(); }
-    catch (error) {
+    try {
+      db.pragma("journal_mode = WAL");
+      db.pragma("foreign_keys = ON");
+      if (isEmptyStateDatabase(db)) createCurrentSchema(db);
+      else assertCurrentSchema(db);
+      await assertCanonicalStagingFiles(paths, db);
+    } catch (error) {
       db.close();
-      if (existing) {
-        await copyFile(backup, paths.database);
-        for (const configFile of [join(paths.root, "config.yaml"), join(paths.root, "manifest.json")]) {
-          const snapshot = `${backup}-${configFile.endsWith(".yaml") ? "config.yaml" : "manifest.json"}`;
-          try { await copyFile(snapshot, configFile); } catch { /* optional snapshot */ }
-        }
-      }
-      // A reset starts from an empty state. The complete legacy snapshot is kept
-      // for explicit recovery, but is intentionally never auto-restored.
-      releaseLock();
+      await releaseLock();
       throw error;
     }
-    try { await migrateStagingFiles(paths, db); }
-    catch (error) {
-      db.close();
-      releaseLock();
-      throw error;
-    }
-    try { await pruneDatabaseBackups(paths); }
-    catch { /* Retention cleanup is retried on the next writable open. */ }
     return new StateStore(paths, db, releaseLock);
   }
 

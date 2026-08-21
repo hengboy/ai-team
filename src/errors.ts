@@ -39,7 +39,7 @@ export const validationCause = (error: unknown): ValidationCause => {
   const details = Array.isArray(failure.details) ? failure.details : failure.details ? [failure.details] : [];
   const issues = details.map((detail) => {
     const value = detail && typeof detail === "object" && !Array.isArray(detail) ? detail as Record<string, unknown> : {};
-    const pointer = typeof value.pointer === "string" ? value.pointer : typeof value.path === "string" ? value.path : "/";
+    const pointer = typeof value.pointer === "string" ? value.pointer : "/";
     const constraint = typeof value.constraint === "string" ? value.constraint : "validation";
     const message = typeof value.message === "string" ? value.message : failure.message;
     const suggestion = typeof value.suggestion === "string" ? value.suggestion : `Correct ${pointer} to satisfy ${constraint}, then validate the same staging entry again.`;
@@ -49,5 +49,12 @@ export const validationCause = (error: unknown): ValidationCause => {
 };
 
 export class IncompatibleError extends AiTeamError {
-  constructor(message: string, details?: unknown) { super(message, 4, details); }
+  constructor(message: string, details?: unknown) {
+    const context = details && typeof details === "object" && !Array.isArray(details) ? details as Record<string, unknown> : { context: details };
+    super(message, 4, {
+      ...context,
+      reason_code: typeof context.reason_code === "string" ? context.reason_code : "incompatible_input",
+      next_action: typeof context.next_action === "string" ? context.next_action : "reset",
+    });
+  }
 }

@@ -12,7 +12,7 @@ import { DispatchService, dispatchPacketSchema, dispatchPacketTemplate, type Dis
 import { IncompatibleError, ValidationError } from "../src/errors.js";
 import { assertCoverage, assertRevisionCreateRunStage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, parsePlanVerification, parseTaskVerification, preflightRevision, serializeDocumentMetadata, taskSourceDigest, triage, validateCoverage, verificationDigest } from "../src/planning.js";
 import { StateStore } from "../src/state.js";
-import { legacyStagingFilePath, pathMatchesScope, stagingFilePath } from "../src/security.js";
+import { pathMatchesScope, stagingFilePath } from "../src/security.js";
 import { makePlanId, sha256 } from "../src/utils.js";
 import { recoveryProjection } from "../src/run-recovery.js";
 import { execFileForInvocation, InvocationResources, setInvocationResources } from "../src/resource-registry.js";
@@ -41,7 +41,7 @@ const createRun = (store: StateStore): string => {
 
 test("command contract exposes only an explicit task worktree recovery command", () => {
   assert.deepEqual(COMMAND_SYNTAX["git recover-task-worktree"], [
-    "ai-team git recover-task-worktree --project <path> --worktree-id <opaque-id> --from-plan-id <plan-id> --from-revision <revision> --to-plan-id <plan-id> --to-revision <revision> --to-run-id <run-id> --task-id <task-id> --expected-head <commit> --expected-source-artifact <artifact-id-or-digest> [--dispatch-id <dispatch-id>] [--replaces-staging-id <staging-id>]",
+    "ai-team git recover-task-worktree --project <path> --worktree-id <opaque-id> --from-plan-id <plan-id> --from-revision <revision> --to-plan-id <plan-id> --to-revision <revision> --to-run-id <run-id> --task-id <task-id> --expected-head <commit> --expected-source-artifact <artifact-id-or-digest> --dispatch-id <dispatch-id>",
   ]);
   assert.ok((COMMAND_CONTRACT_BASE.commands.agent as readonly string[]).includes("git recover-task-worktree"));
   assert.equal((COMMAND_CONTRACT_BASE.commands.agent as readonly string[]).filter((command) => command === "git recover-task-worktree").length, 1);
@@ -175,14 +175,11 @@ test("task revisions can take the managed draft to plan_ready transition", () =>
   assert.doesNotThrow(() => assertRevisionRunStage("draft", "tasks_preview", "plan_ready"));
 });
 
-test("state migration is recorded once and survives reopening", async () => {
+test("empty state database creates the current schema and survives reopening", async () => {
   const home = await temporaryHome();
   let store = await StateStore.open(home);
   try {
-    assert.deepEqual(
-      store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }, { name: "017-recovery-staging-lineage" }, { name: "018-planning-clarifications" }],
-    );
+    assert.deepEqual(store.db.prepare("SELECT value FROM state_meta WHERE key='schema_epoch'").get(), { value: "2" });
     assert.equal(
       (store.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'").get() as { count: number }).count > 0,
       true,
@@ -190,10 +187,7 @@ test("state migration is recorded once and survives reopening", async () => {
     store.close();
 
     store = await StateStore.open(home);
-    assert.deepEqual(
-      store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all(),
-      [{ name: "001-initial" }, { name: "002-review-barriers" }, { name: "003-run-stages-and-reconcile" }, { name: "004-repository-scoped-revisions" }, { name: "005-staging-entries" }, { name: "006-recovery-provenance" }, { name: "007-review-barrier-reconciliation" }, { name: "008-run-planning-handoff" }, { name: "009-readable-staging-filenames" }, { name: "010-cancelable-staging-entries" }, { name: "011-dispatch-worktree-bindings" }, { name: "012-run-task-states" }, { name: "013-run-task-write-paths" }, { name: "014-command-lifecycle" }, { name: "015-tdd-verification-contracts" }, { name: "016-test-repair-lineage" }, { name: "017-recovery-staging-lineage" }, { name: "018-planning-clarifications" }],
-    );
+    assert.deepEqual(store.db.prepare("SELECT value FROM state_meta WHERE key='schema_epoch'").get(), { value: "2" });
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });
@@ -248,17 +242,14 @@ test("failed planned runs can replace only unintegrated task contracts", async (
   });
 });
 
-test("readonly state opens alongside a writer without locks, backups, or migrations", async () => {
+test("readonly state opens alongside a writer without locks or mutations", async () => {
   const home = await temporaryHome();
   const writer = await StateStore.open(home);
   try {
     const backupsBefore = await readdir(join(home, "backups"));
     const reader = await StateStore.open(home, { readonly: true });
     try {
-      assert.equal(
-        (reader.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count,
-        18,
-      );
+      assert.deepEqual(reader.db.prepare("SELECT value FROM state_meta WHERE key='schema_epoch'").get(), { value: "2" });
       assert.throws(() => reader.db.prepare("UPDATE runs SET state='failed'").run(), /readonly|read-only/i);
     } finally {
       reader.close();
@@ -270,7 +261,7 @@ test("readonly state opens alongside a writer without locks, backups, or migrati
   }
 });
 
-test("writer state opens retain only the ten most recent database backups", async () => {
+test("writer state opens do not create or prune automatic database backups", async () => {
   const home = await temporaryHome();
   const initial = await StateStore.open(home);
   initial.close();
@@ -289,10 +280,10 @@ test("writer state opens retain only the ten most recent database backups", asyn
 
     const entries = await readdir(backups);
     const snapshots = entries.filter((name) => /^state-\d+\.sqlite$/.test(name));
-    assert.equal(snapshots.length, 10);
-    assert.ok(!entries.includes("state-1.sqlite"));
-    assert.ok(!entries.includes("state-1.sqlite-config.yaml"));
-    assert.ok(!entries.includes("state-1.sqlite-manifest.json"));
+    assert.equal(snapshots.length, 12);
+    assert.ok(entries.includes("state-1.sqlite"));
+    assert.ok(entries.includes("state-1.sqlite-config.yaml"));
+    assert.ok(entries.includes("state-1.sqlite-manifest.json"));
     assert.ok(entries.includes("state-12.sqlite"));
     assert.ok(entries.includes("manual-preserved"));
   } finally {
@@ -392,67 +383,24 @@ test("concurrent staging creation allocates distinct filenames", async () => {
   });
 });
 
-test("migration 009 renames legacy staging files and continues their run sequence", async () => {
+test("legacy staging filenames are rejected without rewriting state", async () => {
   const home = await temporaryHome();
   let store: StateStore | undefined = await StateStore.open(home);
   try {
     const runId = createRun(store);
     const entry = await store.createStagingEntry({ runId, role: "file-explorer", kind: "dispatch-result" });
     const current = stagingFilePath(store.paths.staging, runId, 1, "dispatch-result", "file-explorer");
-    const legacy = legacyStagingFilePath(store.paths.staging, runId, entry.stagingId);
+    const legacy = join(store.paths.staging, runId, `${entry.stagingId}.json`);
     store.close();
     store = undefined;
     await rename(current, legacy);
-
-    const database = new Database(join(home, "state", "state.sqlite"));
-    database.prepare("UPDATE staging_entries SET sequence_no=NULL,file_dev='0',file_ino='0' WHERE staging_id=?").run(entry.stagingId);
-    database.prepare("UPDATE runs SET next_staging_sequence=1 WHERE run_id=?").run(runId);
-    database.prepare("DELETE FROM state_meta WHERE key='staging_filename_migration'").run();
-    database.prepare("DELETE FROM schema_migrations WHERE name='009-readable-staging-filenames'").run();
+    await assert.rejects(StateStore.open(home), (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string; next_action?: string }).reason_code === "legacy_staging_filename"
+      && (error.details as { next_action?: string }).next_action === "reset");
+    await stat(legacy);
+    const database = new Database(join(home, "state", "state.sqlite"), { readonly: true });
+    assert.deepEqual(database.prepare("SELECT sequence_no FROM staging_entries WHERE staging_id=?").get(entry.stagingId), { sequence_no: 1 });
     database.close();
-
-    store = await StateStore.open(home);
-    const migrated = store.db.prepare("SELECT sequence_no,file_dev,file_ino FROM staging_entries WHERE staging_id=?").get(entry.stagingId) as {
-      sequence_no: number;
-      file_dev: string;
-      file_ino: string;
-    };
-    const migratedInfo = await stat(current, { bigint: true });
-    assert.deepEqual(migrated, { sequence_no: 1, file_dev: String(migratedInfo.dev), file_ino: String(migratedInfo.ino) });
-    assert.equal((await stat(current)).mode & 0o777, 0o600);
-    await assert.rejects(stat(legacy), { code: "ENOENT" });
-
-    const planningDocuments = await store.createStagingEntry({ runId, role: "planning", kind: "planning-documents" });
-    assert.equal((await stat(stagingFilePath(store.paths.staging, runId, 2, "planning-documents", "planning"))).mode & 0o777, 0o600);
-    const stagingValue = (await store.inspectStagingEntry(planningDocuments.stagingId)).value as { spec: string; plan: string; planMetadata: { extensions: { acceptance_contract: { acceptance_criteria: string[] } } } };
-    assert.equal(stagingValue.spec, "");
-    assert.equal(stagingValue.plan, "");
-    assert.deepEqual(stagingValue.planMetadata.extensions.acceptance_contract.acceptance_criteria, ["AC-001"]);
-  } finally {
-    store?.close();
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("migration 009 rejects legacy staging content that does not match persisted metadata", async () => {
-  const home = await temporaryHome();
-  let store: StateStore | undefined = await StateStore.open(home);
-  try {
-    const runId = createRun(store);
-    const entry = await store.createStagingEntry({ runId, role: "test", kind: "dispatch-result" });
-    const current = stagingFilePath(store.paths.staging, runId, 1, "dispatch-result", "test");
-    const legacy = legacyStagingFilePath(store.paths.staging, runId, entry.stagingId);
-    store.close();
-    store = undefined;
-    await rename(current, legacy);
-    await writeFile(legacy, "{\"tampered\":true}", { mode: 0o600 });
-
-    const database = new Database(join(home, "state", "state.sqlite"));
-    database.prepare("DELETE FROM state_meta WHERE key='staging_filename_migration'").run();
-    database.prepare("DELETE FROM schema_migrations WHERE name='009-readable-staging-filenames'").run();
-    database.close();
-
-    await assert.rejects(StateStore.open(home), /legacy staging content does not match persisted metadata/);
   } finally {
     store?.close();
     await rm(home, { recursive: true, force: true });
@@ -511,90 +459,41 @@ test("managed staging expires and cleans only selected entries", async () => {
   });
 });
 
-test("migration 004 preserves legacy revisions and scopes identical revisions by repository", async () => {
+test("legacy schema is rejected without backup, deletion, or reset", async () => {
   const home = await temporaryHome();
-  let store = await StateStore.open(home);
+  const store = await StateStore.open(home);
   try {
-    store.registerRepository("repo-a", "/tmp/repo-a.git", "/tmp/repo-a");
-    store.registerRepository("repo-b", "/tmp/repo-b.git", "/tmp/repo-b");
-    store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
-      .run("20260814-shared", "001", "repo-a", "ready", "main", "2026-08-14T00:00:00.000Z");
     store.close();
 
     const database = new Database(join(home, "state", "state.sqlite"));
-    database.pragma("foreign_keys = OFF");
-    database.exec(`
-      ALTER TABLE revisions RENAME TO revisions_v4;
-      CREATE TABLE revisions (
-        plan_id TEXT NOT NULL, revision TEXT NOT NULL, repo_id TEXT NOT NULL REFERENCES repositories(repo_id),
-        state TEXT NOT NULL, target_branch TEXT NOT NULL, digest TEXT, plan_commit TEXT, supersedes TEXT,
-        created_at TEXT NOT NULL, PRIMARY KEY(plan_id, revision)
-      );
-      INSERT INTO revisions SELECT plan_id,revision,repo_id,state,target_branch,digest,plan_commit,supersedes,created_at FROM revisions_v4;
-      DROP TABLE revisions_v4;
-      DELETE FROM schema_migrations WHERE name='004-repository-scoped-revisions';
-    `);
+    database.prepare("DELETE FROM state_meta WHERE key='schema_epoch'").run();
     database.close();
 
-    store = await StateStore.open(home);
-    store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at) VALUES (?,?,?,?,?,?)")
-      .run("20260814-shared", "001", "repo-b", "draft", "develop", "2026-08-14T00:01:00.000Z");
-    const rows = store.db.prepare("SELECT repo_id,state,target_branch FROM revisions WHERE plan_id=? AND revision=? ORDER BY repo_id")
-      .all("20260814-shared", "001");
-    assert.deepEqual(rows, [
-      { repo_id: "repo-a", state: "ready", target_branch: "main" },
-      { repo_id: "repo-b", state: "draft", target_branch: "develop" },
-    ]);
+    await assert.rejects(StateStore.open(home), (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string; next_action?: string }).reason_code === "state_schema_epoch_mismatch"
+      && (error.details as { next_action?: string }).next_action === "reset");
+    const unchanged = new Database(join(home, "state", "state.sqlite"), { readonly: true });
+    assert.equal(unchanged.prepare("SELECT value FROM state_meta WHERE key='schema_epoch'").get(), undefined);
+    unchanged.close();
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });
   }
 });
 
-test("migration 011 backfills integration and multiple task bindings from frozen dispatch packets", async () => {
+test("missing current schema tables are rejected instead of reconstructed", async () => {
   const home = await temporaryHome();
-  let store = await StateStore.open(home);
+  const store = await StateStore.open(home);
   try {
-    const runId = createRun(store);
-    const createdAt = new Date().toISOString();
-    const worktrees = [
-      ["worktree_binding_integration", "integration/test/main"],
-      ["worktree_binding_task_1", "task/test/task-001"],
-      ["worktree_binding_task_2", "task/test/task-002"],
-    ];
-    for (const [worktreeId, branch] of worktrees) {
-      store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
-        .run(worktreeId, runId, branch, `/tmp/${worktreeId}`, "a".repeat(40), createdAt);
-    }
-    const packet = {
-      objective: "Merge both tasks",
-      allowed_read_paths: [],
-      allowed_write_paths: [],
-      acceptance_criteria: ["Merge exactly once"],
-      context: {
-        phase: "integrate_implementation",
-        integration_worktree_id: worktrees[0]![0],
-        task_worktree_id: worktrees[1]![0],
-        task_worktree_ids: [worktrees[1]![0], worktrees[2]![0]],
-      },
-    };
-    store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,created_at)
-      VALUES (?,?,?,'pending',?,?,?,?,?)`).run(DISPATCH_ID, runId, "git-operator", JSON.stringify(packet), "", "{}", "{}", createdAt);
     store.close();
 
     const database = new Database(join(home, "state", "state.sqlite"));
-    database.exec("DROP TABLE dispatch_worktree_bindings; DELETE FROM schema_migrations WHERE name='011-dispatch-worktree-bindings';");
+    database.exec("DROP TABLE dispatch_worktree_bindings;");
     database.close();
 
-    store = await StateStore.open(home);
-    assert.deepEqual(
-      store.db.prepare("SELECT binding_kind,worktree_id FROM dispatch_worktree_bindings WHERE dispatch_id=? ORDER BY binding_kind,worktree_id").all(DISPATCH_ID),
-      [
-        { binding_kind: "integration", worktree_id: worktrees[0]![0] },
-        { binding_kind: "task", worktree_id: worktrees[1]![0] },
-        { binding_kind: "task", worktree_id: worktrees[2]![0] },
-      ],
-    );
+    await assert.rejects(StateStore.open(home), (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string; next_action?: string }).reason_code === "state_schema_missing_table"
+      && (error.details as { next_action?: string }).next_action === "reset");
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });
@@ -848,7 +747,7 @@ test("execution requests are server-frozen and replacements can only narrow the 
   });
 });
 
-test("legacy claim bundles remain byte-preserving and manifest mismatch blocks replacement", async () => {
+test("legacy claim bundles are rejected", async () => {
   await withStore((store) => {
     const runId = createRun(store);
     const dispatches = new DispatchService(store);
@@ -862,47 +761,29 @@ test("legacy claim bundles remain byte-preserving and manifest mismatch blocks r
     const dispatchId = dispatches.create(runId, "backend-developer", packet);
     store.db.prepare("UPDATE dispatches SET packet_json=?,packet_digest=NULL,prompt_digest=NULL,renderer_version=NULL WHERE dispatch_id=?")
       .run(JSON.stringify(packet), dispatchId);
-    const bundle = dispatches.claimBundle(runId, dispatchId, "backend-developer");
-    assert.deepEqual(bundle.packet, packet);
-    assert.equal(bundle.renderer_version, "dispatch-renderer-v2");
-    assert.equal(bundle.execution_enforcement.contract_status, "legacy_unspecified");
-
-    store.db.prepare("UPDATE runs SET role_manifest_digest='legacy' WHERE run_id=?").run(runId);
     assert.throws(
-      () => dispatches.supersede(runId, dispatchId, "backend-developer", "coding", "replace legacy", packet),
+      () => dispatches.claimBundle(runId, dispatchId, "backend-developer"),
       (error: unknown) => error instanceof IncompatibleError && error.code === 4
-        && (error.details as { reason_code?: string }).reason_code === "role_manifest_mismatch",
+        && (error.details as { reason_code?: string }).reason_code === "legacy_dispatch_renderer"
+        && (error.details as { next_action?: string }).next_action === "start_new_run",
     );
   });
 });
 
-test("authority conflict continuations preserve only a frozen git-operator manifest contract", async () => {
+test("authority conflict continuations reject legacy manifest contracts", async () => {
   const { freezeAuthorityConflictContinuationExecutionContract, freezeExecutionContract } = await import("../src/execution-contract.js");
   const source = freezeExecutionContract("git-operator", {
     allowed_write_paths: ["README.md"],
     context: { phase: "apply_task_authority", operation: "apply-task-authority", worktree_id: "worktree_authority" },
   });
   source.execution_contract.source.role_manifest_digest = "legacy-git-operator-manifest";
-  const continuation = freezeAuthorityConflictContinuationExecutionContract({
+  assert.throws(() => freezeAuthorityConflictContinuationExecutionContract({
     allowed_write_paths: ["README.md"],
     context: { phase: "continue_task_authority_conflict", operation: "continue-task-authority-conflict", worktree_id: "worktree_authority" },
-  }, source);
-  assert.equal(continuation.execution_contract.source.role_manifest_digest, "legacy-git-operator-manifest");
+  }, source), (error: unknown) => error instanceof IncompatibleError
+    && (error.details as { reason_code?: string }).reason_code === "execution_contract_mismatch"
+    && (error.details as { next_action?: string }).next_action === "start_new_run");
 
-  assert.throws(() => freezeAuthorityConflictContinuationExecutionContract({
-    allowed_write_paths: ["README.md"],
-    context: { phase: "continue_task_authority_conflict", operation: "continue-task-authority-conflict", worktree_id: "worktree_authority" },
-  }, {
-    ...source,
-    execution_contract: { ...source.execution_contract, source: { ...source.execution_contract.source, role: "backend-developer" } },
-  }), /frozen git-operator authority contract/);
-  assert.throws(() => freezeAuthorityConflictContinuationExecutionContract({
-    allowed_write_paths: ["README.md"],
-    context: { phase: "continue_task_authority_conflict", operation: "continue-task-authority-conflict", worktree_id: "worktree_authority" },
-  }, {
-    ...source,
-    context: { phase: "integration", operation: "merge-task" },
-  }), /frozen git-operator authority contract/);
 });
 
 test("command lifecycle is terminal once and recovery actions are stable and blocked by priority", async () => {
@@ -973,7 +854,7 @@ test("invocation quiesce aborts registered child processes and interrupts pendin
   });
 });
 
-test("dispatch prompt preserves the frozen v2 renderer for existing dispatches", async () => {
+test("dispatch prompt rejects a frozen v2 renderer", async () => {
   await withStore((store) => {
     const runId = createRun(store);
     const dispatches = new DispatchService(store);
@@ -998,7 +879,9 @@ test("dispatch prompt preserves the frozen v2 renderer for existing dispatches",
     ].join("\n");
     store.db.prepare("UPDATE dispatches SET renderer_version='dispatch-renderer-v2',prompt_digest=? WHERE dispatch_id=?")
       .run(sha256(legacyPrompt), dispatchId);
-    assert.equal(dispatches.prompt(runId, dispatchId, "backend-developer"), legacyPrompt);
+    assert.throws(() => dispatches.prompt(runId, dispatchId, "backend-developer"), (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string }).reason_code === "legacy_dispatch_renderer"
+      && (error.details as { next_action?: string }).next_action === "start_new_run");
   });
 });
 

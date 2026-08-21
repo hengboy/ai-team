@@ -26,15 +26,13 @@ test("CLI help and contract expose the installed command contract", async (t) =>
   assert.ok(contract.roles.includes("test"));
 });
 
-test("CLI JSON output is stable by default and exposes top-level fields only in legacy mode", async (t) => {
+test("CLI JSON output always uses the stable success envelope", async (t) => {
   const sandbox = await makeSandbox(t);
   const current = JSON.parse((await cli(sandbox, ["contract"])).stdout) as Record<string, unknown>;
   assert.deepEqual(Object.keys(current).sort(), ["data", "ok"]);
 
-  const legacy = JSON.parse((await cli(sandbox, ["--legacy-output", "contract"])).stdout) as Record<string, unknown>;
-  assert.equal(legacy.ok, true);
-  assert.ok(legacy.data);
-  assert.equal(typeof legacy.contract_digest, "string");
+  const legacy = await cli(sandbox, ["--legacy-output", "contract"]);
+  assert.equal(legacy.status, 5);
 
   const failure = await cli(sandbox, ["planning", "start", "--project", sandbox.repo]);
   assert.equal(failure.status, 2);

@@ -1,10 +1,11 @@
 import { join } from "node:path";
+import { IncompatibleError } from "./errors.js";
 import type { StateStore } from "./state.js";
 
 export interface ReviewWorktree {
   worktree_id: string;
   path: string;
-  kind: "integration" | "plan" | "legacy integration";
+  kind: "integration" | "plan";
 }
 
 export const resolveReviewWorktree = (store: StateStore, runId: string): ReviewWorktree | undefined => {
@@ -29,18 +30,13 @@ export const resolveReviewWorktree = (store: StateStore, runId: string): ReviewW
   const short = runId.slice(-8).toLowerCase();
   const legacyBranch = `integration/${run.plan_id}/${short}`;
   const legacyPath = join(repository.project_path, ".worktrees", "integration", run.plan_id, short);
-  const legacy = store.db.prepare("SELECT worktree_id,path FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
+  const legacy = store.db.prepare("SELECT 1 FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
     .get(runId, legacyBranch, legacyPath) as { worktree_id: string; path: string } | undefined;
-  if (!legacy) return undefined;
-  const created = store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='run.created' ORDER BY event_id LIMIT 1")
-    .get(runId) as { payload_json: string } | undefined;
-  const operation = store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.integration.create' AND state='completed'
-    AND json_extract(request_json,'$.branch')=? AND json_extract(request_json,'$.path')=?`).get(runId, legacyBranch, legacyPath);
-  try {
-    return JSON.parse(created?.payload_json ?? "{}").mode === "planned" && operation
-      ? { ...legacy, kind: "legacy integration" }
-      : undefined;
-  } catch {
-    return undefined;
-  }
+  if (legacy) throw new IncompatibleError("legacy planned integration worktree layout is unsupported", {
+    reason_code: "legacy_plan_worktree_layout",
+    next_action: "recreate_worktree",
+    branch: legacyBranch,
+    path: legacyPath,
+  });
+  return undefined;
 };

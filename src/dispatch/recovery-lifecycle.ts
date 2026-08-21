@@ -2,10 +2,7 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { Role } from "../constants.js";
 import { type ResultEnvelope } from "../contracts.js";
-import { ValidationError } from "../errors.js";
-import { pathMatchesScope } from "../security.js";
-import { assertExplicitTaskWritePaths } from "../state.js";
-import { taskSourceDigest } from "../planning.js";
+import { IncompatibleError, ValidationError } from "../errors.js";
 import { sha256, stableJson } from "../utils.js";
 import { completedMergeOwnershipPartialEffect, type MergeOwnershipPartialEffect } from "../worktree-ownership.js";
 import { livenessRecoveryIntent, reconciliationIntent, retryableResultHasNoSideEffects } from "./recovery.js";
@@ -490,6 +487,10 @@ export function resume(store: common.StateStore, ops: common.DispatchOperations,
       const pendingOperation = store.db.prepare("SELECT operation_id,kind,request_json,evidence_json FROM operations WHERE run_id=? AND state='pending' ORDER BY created_at LIMIT 1")
         .get(runId) as { operation_id: string; kind: string; request_json?: string; evidence_json?: string } | undefined;
       if (pendingOperation) {
+        if (pendingOperation.kind === "git.task_authority.apply") throw new IncompatibleError("task authority recovery is unsupported", {
+          reason_code: "legacy_task_authority_recovery",
+          next_action: "start_new_run",
+        });
         const cleanupRequest = JSON.parse(pendingOperation.request_json ?? "{}") as Record<string, unknown>;
         if (pendingOperation.kind === "git.cleanup" && typeof cleanupRequest.task_worktree_id === "string"
           && typeof cleanupRequest.integration_worktree_id === "string" && typeof cleanupRequest.merge_operation_id === "string") {
@@ -512,155 +513,16 @@ export function resume(store: common.StateStore, ops: common.DispatchOperations,
         run = store.getRun(runId) as { profile: string; state: string; stage: string };
       }
       if (run.profile === "coding" && run.state === "frozen" && run.stage === "test") {
-        const driftRow = store.db.prepare("SELECT event_id,payload_json,created_at FROM run_events WHERE run_id=? AND type='scope.pre_commit_drift' ORDER BY event_id DESC LIMIT 1")
-          .get(runId) as { event_id: number; payload_json: string; created_at: string } | undefined;
-        const eventsAfterDrift = driftRow ? store.db.prepare("SELECT type FROM run_events WHERE run_id=? AND event_id>? AND type NOT LIKE 'command.%' ORDER BY event_id")
-          .all(runId, driftRow.event_id) as Array<{ type: string }> : [];
-        const drift = driftRow && eventsAfterDrift.every(({ type }) => type === "staging.validation_failed") ? JSON.parse(driftRow.payload_json) as {
-          offending_test_dispatch_id?: string;
-          offending_worktree_id?: string;
-          original_snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null;
-          snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null;
-        } : undefined;
-        const pendingDispatches = store.db.prepare("SELECT dispatch_id,role FROM dispatches WHERE run_id=? AND state IN ('pending','claimed') ORDER BY created_at")
-          .all(runId) as Array<{ dispatch_id: string; role: string }>;
-        const laterOperation = driftRow ? store.db.prepare("SELECT 1 FROM operations WHERE run_id=? AND created_at>? LIMIT 1").get(runId, driftRow.created_at) : undefined;
-        const worktree = drift?.offending_worktree_id
-          ? store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, drift.offending_worktree_id) as { path: string } | undefined
-          : undefined;
-        const currentSnapshot = worktree ? common.plannedWorktreeSnapshot(worktree.path) : null;
-        const driftScopeRow = drift?.offending_worktree_id ? store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
-          .get(runId, drift.offending_worktree_id) as { payload_json: string } | undefined : undefined;
-        const driftScopeSnapshot = driftScopeRow
-          ? (JSON.parse(driftScopeRow.payload_json) as { snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null }).snapshot
-          : undefined;
-        const driftExpectedSnapshot = driftScopeSnapshot ?? drift?.original_snapshot ?? null;
-        const allTasks = store.runTasks(runId);
-        const tasks = allTasks.filter((task) => task.developer_dispatch_id && task.worktree_id);
-        const restoredScopes: Array<{ task_id: string; worktree_id: string; paths: string[]; digest: string; write_paths: string[] }> = [];
-        const actualByTask = new Map<string, string[]>();
-        const scopeCreatedByTask = new Map<string, string>();
-        const scopeSnapshotByTask = new Map<string, { head: string; dirty_paths: string[]; diff_digest: string }>();
-        let valid = Boolean(drift?.offending_test_dispatch_id && drift.offending_worktree_id && driftExpectedSnapshot && currentSnapshot
-          && stableJson(driftExpectedSnapshot) === stableJson(currentSnapshot) && !laterOperation && tasks.length
-          && pendingDispatches.length === 1 && pendingDispatches[0]!.role === "test"
-          && pendingDispatches[0]!.dispatch_id === drift.offending_test_dispatch_id);
-        let evidenceValid = Boolean(tasks.length);
-        const recoveryRun = store.getRun(runId) as { repo_id: string; plan_id?: string; revision?: string; plan_digest?: string };
-        const recoveryRevision = recoveryRun.plan_id && recoveryRun.revision
-          ? store.db.prepare("SELECT digest,plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?")
-            .get(recoveryRun.repo_id, recoveryRun.plan_id, recoveryRun.revision) as { digest?: string; plan_commit?: string } | undefined
-          : undefined;
-        const recoveryRepository = store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(recoveryRun.repo_id) as { project_path: string } | undefined;
-        for (const task of tasks) {
-          const developer = task.developer_dispatch_id ? store.db.prepare("SELECT packet_json,result_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role IN ('frontend-developer','backend-developer') AND state='completed'")
-            .get(runId, task.developer_dispatch_id) as { packet_json: string; result_json?: string } | undefined : undefined;
-          const packet = developer ? JSON.parse(developer.packet_json) as common.DispatchPacket : undefined;
-          const actual = developer?.result_json
-            ? [...new Set((((JSON.parse(developer.result_json) as ResultEnvelope).payload as { modified_paths?: string[] }).modified_paths ?? []))].sort()
-            : [];
-          const scopeRow = task.worktree_id ? store.db.prepare("SELECT payload_json,created_at FROM run_events WHERE run_id=? AND type='scope.pre_commit' AND json_extract(payload_json,'$.worktree_id')=? ORDER BY event_id DESC LIMIT 1")
-            .get(runId, task.worktree_id) as { payload_json: string; created_at: string } | undefined : undefined;
-          const scope = scopeRow ? JSON.parse(scopeRow.payload_json) as { paths?: string[]; digest?: string; snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null } : undefined;
-          const scopePaths = [...new Set(scope?.paths ?? [])].sort();
-          let developerAllowedPaths: string[] = [];
-          let frozenPaths: string[] = [];
-          let sourceValid = false;
-          try {
-            developerAllowedPaths = [...new Set(packet?.allowed_write_paths ?? [])].sort();
-            if (!developerAllowedPaths.length || developerAllowedPaths.some((path) => typeof path !== "string" || !path)) throw new Error("missing developer ceiling");
-            frozenPaths = task.write_paths_json
-              ? assertExplicitTaskWritePaths(JSON.parse(task.write_paths_json) as string[], task.source_path)
-              : scopePaths;
-            const metadataPath = task.source_path.replace(/\.md$/, ".metadata.json");
-            if (metadataPath === task.source_path) throw new Error("invalid task source path");
-            const source = recoveryRevision?.plan_commit && recoveryRepository
-              ? execFileSync("git", ["-C", recoveryRepository.project_path, "show", `${recoveryRevision.plan_commit}:${task.source_path}`], { encoding: "utf8" })
-              : "";
-            const metadata = recoveryRevision?.plan_commit && recoveryRepository
-              ? execFileSync("git", ["-C", recoveryRepository.project_path, "show", `${recoveryRevision.plan_commit}:${metadataPath}`], { encoding: "utf8" })
-              : "";
-            sourceValid = Boolean(recoveryRevision?.digest && recoveryRevision.digest === recoveryRun.plan_digest
-              && /^[a-f0-9]{40}$/.test(recoveryRevision.plan_commit ?? "")
-              && taskSourceDigest(task.source_path, source, metadataPath, metadata) === task.source_digest);
-          } catch { sourceValid = false; }
-          const taskEvidenceValid = Boolean(task.developer_dispatch_id && task.worktree_id && packet
-            && packet.context.task_id === task.task_id && packet.context.worktree_id === task.worktree_id
-            && actual.length && stableJson(actual) === stableJson(scopePaths)
-            && scope?.digest === sha256(stableJson(scopePaths))
-            && sourceValid
-            && actual.every((path) => pathMatchesScope(path, developerAllowedPaths) && pathMatchesScope(path, frozenPaths)));
-          valid &&= taskEvidenceValid;
-          evidenceValid &&= taskEvidenceValid;
-          actualByTask.set(task.task_id, actual);
-          if (scopeRow) scopeCreatedByTask.set(task.task_id, scopeRow.created_at);
-          if (scope?.snapshot) scopeSnapshotByTask.set(task.task_id, scope.snapshot);
-          if (task.worktree_id && scope?.digest) restoredScopes.push({
-            task_id: task.task_id, worktree_id: task.worktree_id, paths: scopePaths, digest: scope.digest, write_paths: frozenPaths,
-          });
-        }
-        const priorDrift = store.db.prepare("SELECT 1 FROM run_events WHERE run_id=? AND type='scope.pre_commit_drift' LIMIT 1").get(runId);
-        const pendingTest = pendingDispatches.length === 1 && pendingDispatches[0]!.role === "test" ? pendingDispatches[0] : undefined;
-        const pendingTestPacket = pendingTest ? store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(runId, pendingTest.dispatch_id) as { packet_json: string } : undefined;
-        const testContext = pendingTestPacket ? (JSON.parse(pendingTestPacket.packet_json) as common.DispatchPacket).context : {};
-        const currentTask = allTasks.find((task) => task.state !== "integrated");
-        const currentWorktree = currentTask?.worktree_id
-          ? store.db.prepare("SELECT path,base_commit FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, currentTask.worktree_id) as { path: string; base_commit: string } | undefined
-          : undefined;
-        const legacySnapshot = currentWorktree ? common.plannedWorktreeSnapshot(currentWorktree.path) : null;
-        let legacyValid = Boolean(!drift && !priorDrift && !pendingDecision && evidenceValid && pendingTest && allTasks.length && tasks.length === allTasks.length
-          && allTasks.filter((task) => task.state !== "integrated").length === 1
-          && allTasks.every((task) => task.state === "integrated" || task.state === "implemented" || task.state === "tested")
-          && currentTask && currentWorktree && legacySnapshot
-          && testContext.phase === "task_test" && testContext.task_id === currentTask.task_id && testContext.worktree_id === currentTask.worktree_id
-          && legacySnapshot.head === currentWorktree.base_commit
-          && stableJson(legacySnapshot.dirty_paths) === stableJson(actualByTask.get(currentTask.task_id) ?? []));
-        const currentScopeSnapshot = currentTask ? scopeSnapshotByTask.get(currentTask.task_id) : undefined;
-        if (currentScopeSnapshot) legacyValid &&= stableJson(currentScopeSnapshot) === stableJson(legacySnapshot);
-        for (const task of allTasks.filter((candidate) => candidate.state === "integrated")) {
-          const commit = store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.commit' AND state='completed' AND json_extract(evidence_json,'$.worktree_id')=? ORDER BY completed_at DESC LIMIT 1")
-            .get(runId, task.worktree_id) as { evidence_json?: string } | undefined;
-          const merge = store.db.prepare("SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.merge.task' AND state='completed' AND json_extract(evidence_json,'$.task_worktree_id')=? ORDER BY completed_at DESC LIMIT 1")
-            .get(runId, task.worktree_id) as { evidence_json?: string } | undefined;
-          const commitEvidence = JSON.parse(commit?.evidence_json ?? "{}") as { commit?: string; paths?: string[] };
-          const mergeEvidence = JSON.parse(merge?.evidence_json ?? "{}") as { commit?: string };
-          legacyValid &&= Boolean(commitEvidence.commit && mergeEvidence.commit
-            && stableJson([...(commitEvidence.paths ?? [])].sort()) === stableJson(actualByTask.get(task.task_id) ?? [])
-            && (!task.implementation_commit || task.implementation_commit === commitEvidence.commit)
-            && (!task.integration_commit || task.integration_commit === mergeEvidence.commit));
-        }
-        const currentScopeCreated = currentTask ? scopeCreatedByTask.get(currentTask.task_id) : undefined;
-        const laterGitOperation = currentScopeCreated ? store.db.prepare("SELECT 1 FROM operations WHERE run_id=? AND kind LIKE 'git.%' AND created_at>? LIMIT 1").get(runId, currentScopeCreated) : undefined;
-        legacyValid &&= Boolean(currentScopeCreated && !laterGitOperation);
-        const recovered = valid || legacyValid;
-        if (recovered) {
-          const updateLegacy = store.db.prepare("UPDATE run_tasks SET write_paths_json=?,updated_at=? WHERE run_id=? AND task_id=? AND write_paths_json IS NULL");
-          const now = new Date().toISOString();
-          for (const scope of restoredScopes) updateLegacy.run(stableJson(scope.write_paths), now, runId, scope.task_id);
-          if (legacyValid && currentTask && legacySnapshot) {
-            const currentScope = restoredScopes.find(({ task_id }) => task_id === currentTask.task_id)!;
-            store.event(runId, "scope.pre_commit_snapshot_recovered", {
-              original_scope_digest: currentScope.digest,
-              original_scope_paths: currentScope.paths,
-              task_id: currentTask.task_id,
-              developer_dispatch_id: currentTask.developer_dispatch_id,
-              worktree_id: currentTask.worktree_id,
-              snapshot: legacySnapshot,
-            });
-          }
-          store.db.prepare("UPDATE runs SET state='active',updated_at=? WHERE run_id=?").run(new Date().toISOString(), runId);
-          store.event(runId, valid ? "scope.pre_commit_restored" : "scope.pre_commit_legacy_restored", {
-            test_dispatch_id: drift?.offending_test_dispatch_id ?? pendingTest!.dispatch_id,
-            worktree_snapshot: valid ? currentSnapshot : legacySnapshot,
-            scopes: restoredScopes,
-            ...(legacyValid ? {
-              evidence: "immutable scopes + developer results + integrated operation chains + current tested worktree snapshot",
-              frozen_task_scope_status: "unavailable_or_ambiguous",
-              recovery_authority: "existing immutable pre_commit actual paths",
-            } : {}),
-          });
-          run = store.getRun(runId) as { profile: string; state: string; stage: string };
-        }
+        const missingScope = store.db.prepare("SELECT 1 FROM run_tasks WHERE run_id=? AND write_paths_json IS NULL LIMIT 1").get(runId);
+        if (missingScope) throw new IncompatibleError("frozen planned scope is incomplete and cannot be recovered", {
+          reason_code: "missing_frozen_task_scope",
+          next_action: "start_new_run",
+        });
+        const drift = store.db.prepare("SELECT 1 FROM run_events WHERE run_id=? AND type='scope.pre_commit_drift' LIMIT 1").get(runId);
+        if (drift) throw new IncompatibleError("frozen planned scope recovery is unsupported", {
+          reason_code: "legacy_scope_recovery",
+          next_action: "start_new_run",
+        });
       }
       if (run.state === "frozen") return;
       if (run.profile === "coding" && run.state === "failed" && !pendingDecision && ops.createBlockedTestRepairRecovery!(store, ops, runId)) return;
@@ -709,16 +571,10 @@ export function resume(store: common.StateStore, ops: common.DispatchOperations,
             ? pendingPacket.context.authority_apply_dispatch_id
             : undefined;
           if (authorityApplyDispatchId) {
-            store.db.transaction(() => {
-              store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=? AND state IN ('pending','claimed')")
-                .run(new Date().toISOString(), pendingDispatch.dispatch_id);
-              store.db.prepare("UPDATE runs SET state='active',stage='coding',updated_at=? WHERE run_id=?")
-                .run(new Date().toISOString(), runId);
-              if (!ops.ensureRecoveredTaskDeveloperDispatch!(store, ops, runId, authorityApplyDispatchId, true)) {
-                throw new ValidationError("completed authority conflict receipt has no recoverable developer continuation");
-              }
-            })();
-            return;
+            throw new IncompatibleError("legacy task authority conflict receipt cannot be resumed", {
+              reason_code: "legacy_task_authority_conflict_receipt",
+              next_action: "start_new_run",
+            });
           }
           if (pendingDispatch.role === "git-operator" && pendingPacket.context.phase === "prepare_implementation_worktree"
             && typeof pendingPacket.context.task_id === "string" && ops.pendingPlannedTaskRecovery!(store, ops, runId, pendingPacket.context.task_id)) {
@@ -795,21 +651,6 @@ export function resume(store: common.StateStore, ops: common.DispatchOperations,
             evidence_template: {
               integration_worktree_id: "<worktree-id>", conflict_paths: ["<repository-relative-conflict-path>"],
               integration_head_before: "<40-character-commit-sha>", target_head: "<40-character-commit-sha>",
-            },
-          };
-        } else if (operation.kind === "git.task_authority.apply" && evidence.state === "conflicted") {
-          recovery = {
-            state: "action_required", dispatch_id: claimed.dispatch_id, side_effect_state: "unknown",
-            next_command: `ai-team git continue-authority-conflict --run-id ${runId} --dispatch-id ${claimed.dispatch_id}`,
-          };
-        } else if (operation.kind === "git.task_authority.apply") {
-          recovery = {
-            state: "action_required", dispatch_id: claimed.dispatch_id, side_effect_state: "unknown",
-            next_command: `ai-team git reconcile --run-id ${runId} --dispatch-id ${claimed.dispatch_id} --operation-id ${operation.operation_id} --state conflicted --input-stdin`,
-            evidence_template: {
-              worktree_id: "<worktree-id>", authority_commit: "<40-character-commit-sha>", expected_head: "<40-character-commit-sha>",
-              dirty_paths: ["<repository-relative-dirty-path>"], authority_paths: ["<repository-relative-authority-path>"],
-              conflict_paths: ["<repository-relative-conflict-path>"], stash_commit: "<40-character-commit-sha>",
             },
           };
         } else {

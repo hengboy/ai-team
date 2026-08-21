@@ -1,5 +1,5 @@
 
-import { ValidationError } from "../errors.js";
+import { IncompatibleError, ValidationError } from "../errors.js";
 import { join } from "node:path";
 import { StateStore } from "../state.js";
 import { sha256, stableJson } from "../utils.js";
@@ -29,8 +29,7 @@ export interface TaskWorktreeRecoveryRequest {
   taskId: string;
   expectedHead: string;
   expectedSourceArtifact: string;
-  dispatchId?: string;
-  replacesStagingId?: string;
+  dispatchId: string;
 }
 
 export interface TaskWorktreeRecoveryReceipt {
@@ -44,14 +43,6 @@ export interface TaskWorktreeRecoveryReceipt {
   to_run_id: string;
   source_artifact: { artifact_id: string; digest: string };
   dirty_paths: string[];
-  replaced_staging?: {
-    staging_id: string;
-    dispatch_id: string;
-    digest: string;
-    before_state: "ready";
-    after_state: "canceled";
-    operation_id: string;
-  };
   reused: boolean;
 }
 
@@ -92,6 +83,7 @@ export interface SyncConflictEvidence {
 }
 
 export interface TaskMergeRequest {
+  dispatch_id: string;
   integration: string;
   task: string;
   integration_worktree_id: string;
@@ -123,22 +115,13 @@ export const worktreeNames = (root: string, run: any, runId: string, taskId?: st
   return { branch: `task/${plan}/${short}/${task}`, path: join(root, ".worktrees", "tasks", plan, short, task) };
 };
 
-export const legacyIntegrationNames = (root: string, run: any, runId: string): { branch: string; path: string } => {
-  const plan = safeSegment(run.plan_id);
-  const short = safeSegment(runId.slice(-8).toLowerCase());
-  return { branch: `integration/${plan}/${short}`, path: join(root, ".worktrees", "integration", plan, short) };
-};
-
-
-
 import { dispatchOperations } from "../dispatch/coordinator.js";
 import { assertClaimed, assertMergeWorktreeBindings, create as createDispatch, mergeWorktreeBindings } from "../dispatch/submission-lifecycle.js";
 import { assertFinalizingCleanup, finalizationContext } from "../dispatch/recovery-lifecycle.js";
-import { createAuthorityConflictContinuation } from "../dispatch/task-lifecycle.js";
 import { assertPreCommitScope } from "../dispatch/store.js";
 
 export { StateStore } from "../state.js";
-export { dispatchOperations, assertClaimed, assertMergeWorktreeBindings, createAuthorityConflictContinuation, createDispatch, mergeWorktreeBindings, assertFinalizingCleanup, finalizationContext, assertPreCommitScope };
+export { dispatchOperations, assertClaimed, assertMergeWorktreeBindings, createDispatch, mergeWorktreeBindings, assertFinalizingCleanup, finalizationContext, assertPreCommitScope };
 
 export const assertDirectScopePassed = (store: StateStore, runId: string, stage: "triage" | "pre_write"): void => {
   const event = store.db.prepare("SELECT 1 FROM run_events WHERE run_id=? AND type=?").get(runId, "scope." + stage);
@@ -163,8 +146,7 @@ export const checkDirectPreCommit = (store: StateStore, runId: string, _stage: "
 
 export type GitOperations = Record<string, (store: StateStore, ops: GitOperations, ...args: any[]) => any>;
 
-export function assertGitOperator(store: StateStore, ops: GitOperations, runId: string, dispatchId?: string, operation?: "apply-task-authority" | "reconcile-task-authority-conflict" | "continue-task-authority-conflict" | "cleanup-integrated-task"): void {
-    if (!dispatchId) return;
+export function assertGitOperator(store: StateStore, ops: GitOperations, runId: string, dispatchId: string, operation?: "apply-task-authority" | "reconcile-task-authority-conflict" | "continue-task-authority-conflict" | "cleanup-integrated-task"): void {
     assertClaimed(store, dispatchOperations, runId, dispatchId, "git-operator");
     const row = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
       .get(runId, dispatchId) as { packet_json: string } | undefined;
@@ -193,18 +175,16 @@ export function activeIntegrationWorktree(store: StateStore, ops: GitOperations,
     const exact = store.db.prepare("SELECT * FROM worktrees WHERE branch=? AND path=? AND state='active'")
       .get(expected.branch, expected.path) as any;
     if (exact) return exact;
-
-    const legacy = legacyIntegrationNames(root, run, runId);
-    const row = store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=? AND path=? AND state='active'")
-      .get(runId, legacy.branch, legacy.path) as any;
-    if (!row) return undefined;
-    const created = store.db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND type='run.created' ORDER BY event_id LIMIT 1")
-      .get(runId) as { payload_json: string } | undefined;
-    const operation = store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.integration.create' AND state='completed'
-      AND json_extract(request_json,'$.branch')=? AND json_extract(request_json,'$.path')=?`).get(runId, legacy.branch, legacy.path);
-    try {
-      if (JSON.parse(created?.payload_json ?? "{}").mode === "planned" && operation) return row;
-    } catch { /* malformed legacy provenance is not ownership evidence */ }
+    const legacy = store.db.prepare("SELECT branch,path FROM worktrees WHERE run_id=? AND state='active' AND (branch LIKE 'integration/%' OR branch LIKE 'plan/%') ORDER BY created_at DESC LIMIT 1")
+      .get(runId) as { branch: string; path: string } | undefined;
+    if (legacy) {
+      throw new IncompatibleError("planned run has a non-canonical plan worktree layout", {
+        reason_code: "legacy_plan_worktree_layout",
+        next_action: "recreate_worktree",
+        branch: legacy.branch,
+        path: legacy.path,
+      });
+    }
     return undefined;
   }
 
@@ -213,7 +193,19 @@ export function worktree(store: StateStore, ops: GitOperations, runId: string, w
   }
 
 export function plannedIntegrationWorktree(store: StateStore, ops: GitOperations, runId: string, worktreeId: string): any {
-    return resolveMergeIntegrationWorktree(store, runId, worktreeId);
+    const integration = resolveMergeIntegrationWorktree(store, runId, worktreeId);
+    const { root, run } = repositoryForRun(store, ops, runId);
+    if (!isPlannedRun(run)) return integration;
+    const expected = worktreeNames(root, run, runId);
+    if (integration.branch !== expected.branch || integration.path !== expected.path) {
+      throw new IncompatibleError("planned run has a non-canonical plan worktree layout", {
+        reason_code: "legacy_plan_worktree_layout",
+        next_action: "recreate_worktree",
+        branch: integration.branch,
+        path: integration.path,
+      });
+    }
+    return integration;
   }
 
 export function worktreeForCommit(store: StateStore, ops: GitOperations, runId: string, worktreeId: string): any {

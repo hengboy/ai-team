@@ -783,7 +783,7 @@ test("active run recovery retries the last durable stage instead of creating an 
   });
 });
 
-test("active run recovery skips a completed authority conflict receipt and restores its developer", async () => {
+test("active run recovery rejects a completed legacy authority conflict receipt", async () => {
   await withStore(async (store) => {
     const repoId = "repo-review-fixture";
     store.registerRepository(repoId, join(process.cwd(), "."), process.cwd());
@@ -839,8 +839,12 @@ test("active run recovery skips a completed authority conflict receipt and resto
       dispatches.submitValue(runId, authorityId, "git-operator", completedResult(runId, authorityId, "git-operator", {
         operations: [{ command: "apply task authority", outcome: "completed" }],
       })),
-      /authority application task is no longer ready for its replacement developer/,
+      (error: unknown) => error instanceof Error
+        && error.message === "legacy task authority dispatch cannot continue"
+        && (error as Error & { details?: { reason_code?: string; next_action?: string } }).details?.reason_code === "legacy_task_authority_dispatch"
+        && (error as Error & { details?: { reason_code?: string; next_action?: string } }).details?.next_action === "start_new_run",
     );
+    return;
     store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), authorityId);
     store.db.prepare("UPDATE run_tasks SET developer_dispatch_id=? WHERE run_id=? AND task_id=?")
       .run(developerId, runId, taskId);
@@ -892,7 +896,7 @@ test("active run recovery skips a completed authority conflict receipt and resto
   });
 });
 
-test("run resume consumes a claimed completed authority conflict receipt and restores its developer", () => {
+test("run resume rejects a claimed completed legacy authority conflict receipt", () => {
   return withStore((store) => {
     const repoId = "repo-review-fixture";
     store.registerRepository(repoId, join(process.cwd(), "."), process.cwd());
@@ -963,6 +967,14 @@ test("run resume consumes a claimed completed authority conflict receipt and res
       .run(authorityId, new Date().toISOString(), receiptId);
     store.db.prepare("UPDATE runs SET state='active',stage='git-operator' WHERE run_id=?").run(runId);
 
+    assert.throws(
+      () => dispatches.resume(runId),
+      (error: unknown) => error instanceof Error
+        && error.message === "legacy task authority conflict receipt cannot be resumed"
+        && (error as Error & { details?: { reason_code?: string; next_action?: string } }).details?.reason_code === "legacy_task_authority_conflict_receipt"
+        && (error as Error & { details?: { reason_code?: string; next_action?: string } }).details?.next_action === "start_new_run",
+    );
+    return;
     const resumed = dispatches.resume(runId);
     const replacement = store.db.prepare("SELECT dispatch_id,role,replacement_for FROM dispatches WHERE run_id=? AND role='backend-developer' AND replacement_for=?")
       .get(runId, developerId) as { dispatch_id: string; role: string; replacement_for: string };

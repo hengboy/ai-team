@@ -117,9 +117,6 @@ export const stagingFileName = (sequenceNo: number, kind: StagingKind, role: Rol
 export const stagingFilePath = (root: string, runId: string, sequenceNo: number, kind: StagingKind, role: Role): string =>
   assertInside(root, join(stagingRunDirectory(root, runId), stagingFileName(sequenceNo, kind, role)));
 
-export const legacyStagingFilePath = (root: string, runId: string, stagingId: string): string =>
-  assertInside(root, join(stagingRunDirectory(root, runId), `${assertStagingId(stagingId)}.json`));
-
 export const ensureManagedDirectory = async (homeRoot: string, directory: string): Promise<void> => {
   assertInside(homeRoot, directory);
   await mkdir(directory, { recursive: true, mode: 0o700 });

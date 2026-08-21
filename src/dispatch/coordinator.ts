@@ -1,6 +1,6 @@
 import { Role } from "../constants.js";
 import { type ResultEnvelope } from "../contracts.js";
-import { ValidationError } from "../errors.js";
+import { IncompatibleError, ValidationError } from "../errors.js";
 import * as common from "./store.js";
 import * as verification from "./verification.js";
 import * as submission from "./submission-lifecycle.js";
@@ -82,16 +82,16 @@ export function advanceRun(store: common.StateStore, ops: common.DispatchOperati
         return;
       }
       if (run.mode === "planned" && context.phase === "apply_task_authority") {
-        ops.ensureRecoveredTaskDeveloperDispatch!(store, ops, runId, result.dispatch_id);
-        return;
+        throw new IncompatibleError("legacy task authority dispatch cannot continue", {
+          reason_code: "legacy_task_authority_dispatch",
+          next_action: "start_new_run",
+        });
       }
       if (run.mode === "planned" && context.phase === "continue_task_authority_conflict") {
-        const authorityDispatchId = typeof (context as { authority_apply_dispatch_id?: unknown }).authority_apply_dispatch_id === "string"
-          ? (context as { authority_apply_dispatch_id: string }).authority_apply_dispatch_id
-          : undefined;
-        if (!authorityDispatchId) throw new ValidationError("authority conflict continuation is missing its authority dispatch");
-        ops.ensureRecoveredTaskDeveloperDispatch!(store, ops, runId, authorityDispatchId, true);
-        return;
+        throw new IncompatibleError("legacy task authority conflict continuation cannot continue", {
+          reason_code: "legacy_task_authority_conflict_continuation",
+          next_action: "start_new_run",
+        });
       }
       if (run.mode === "planned" && context.phase === "reconcile_worktree_ownership") {
         if (typeof context.source_dispatch_id !== "string") throw new ValidationError("ownership reconciliation is missing its source merge dispatch");

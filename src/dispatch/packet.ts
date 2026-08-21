@@ -1,5 +1,5 @@
 import { ROLES, type Role } from "../constants.js";
-import { ValidationError } from "../errors.js";
+import { IncompatibleError, ValidationError } from "../errors.js";
 import { assertReadablePath, assertWritablePath } from "../security.js";
 import { assertRelativePosixPath, stableJson } from "../utils.js";
 import type { ExecutionContract, ExecutionRequest } from "../execution-contract.js";
@@ -22,6 +22,13 @@ export interface MergeWorktreeBindings {
 export const RENDERER_VERSION = "dispatch-renderer-v5";
 export const EXPLORER_CONTEXT_PATHS = ["MEMORY.md", ".ai-team/index/feature-navigation.md"] as const;
 export const isBroadReadPath = (path: string): boolean => path === "**" || path === "." || path.endsWith("/**");
+
+const incompatiblePacket = (message: string, reasonCode: string): IncompatibleError => new IncompatibleError(message, {
+  reason_code: reasonCode,
+  next_action: "start_new_run",
+});
+
+const LEGACY_ACCEPTANCE_HEADINGS = /(^|\n)#{1,6}\s*(?:acceptance\s+(?:criteria|contract)|验收(?:标准|契约))(?:\s|$)/im;
 
 export const mergeBindingsFromPacket = (role: Role, packet: DispatchPacket): MergeWorktreeBindings | undefined => {
   if (role !== "git-operator" || !["integrate_implementation", "reconcile_worktree_ownership"].includes(String(packet.context.phase))) return undefined;
@@ -164,16 +171,6 @@ const promptLines = (runId: string, dispatchId: string, role: Role, packet: Disp
   `Acceptance criteria: ${packet.acceptance_criteria.join("; ")}`, `Context: ${stableJson(packet.context)}`,
 ];
 
-export const promptForV2 = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
-  ...promptLines(runId, dispatchId, role, packet), "Return only the frozen result envelope and role payload schema.",
-].join("\n");
-
-export const promptForV3 = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
-  ...promptLines(runId, dispatchId, role, packet),
-  "Build the frozen result envelope from the template and schema, then submit it exactly once with dispatch submit --input-stdin.",
-  "Return the CLI submission receipt containing submission and continuation; do not return an unsubmitted envelope.",
-].join("\n");
-
 export const promptFor = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
   ...promptLines(runId, dispatchId, role, packet),
   "Create a dispatch-result staging entry, write the frozen result envelope with staging write --run-id <run-id> --role <role> --staging-id <staging-id> --input-stdin, validate it, then submit it exactly once with dispatch submit --staging-id <staging-id>.",
@@ -226,6 +223,9 @@ export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
     throw new ValidationError("dispatch packet context.task_id is invalid", [{ path: "/context/task_id", pointer: "/context/task_id", field: "task_id", constraint: "pattern", message: "must match TASK- followed by three digits" }]);
   }
   if (!(value.acceptance_criteria as string[]).length) throw new ValidationError("dispatch packet requires acceptance criteria", ["/acceptance_criteria"]);
+  if ((value.acceptance_criteria as string[]).some((criterion) => LEGACY_ACCEPTANCE_HEADINGS.test(criterion))) {
+    throw incompatiblePacket("Markdown acceptance contract headings are not supported", "legacy_acceptance_heading");
+  }
   const reads = role === "file-explorer" ? [...new Set([...EXPLORER_CONTEXT_PATHS, ...(value.allowed_read_paths as string[])])] : value.allowed_read_paths as string[];
   const writes = value.allowed_write_paths as string[];
   if (role === "test" && writes.length) throw new ValidationError("Test dispatch packets must have empty write paths", ["/allowed_write_paths"]);

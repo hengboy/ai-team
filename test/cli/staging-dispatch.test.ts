@@ -18,20 +18,17 @@ test("CLI advertises the explicit task worktree recovery identity and lineage fl
   for (const option of [
     "--project <path>", "--worktree-id <id>", "--from-plan-id <id>", "--from-revision <revision>",
     "--to-plan-id <id>", "--to-revision <revision>", "--to-run-id <id>", "--task-id <id>",
-    "--expected-head <sha>", "--expected-source-artifact <id-or-digest>", "--dispatch-id <id>", "--replaces-staging-id <id>",
+    "--expected-head <sha>", "--expected-source-artifact <id-or-digest>", "--dispatch-id <id>",
   ]) assert.match(help.stdout, new RegExp(option.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-});
 
-test("CLI advertises the supported claimed task scope recovery authority flags", async (t) => {
-  const sandbox = await makeSandbox(t);
-  const help = await cli(sandbox, ["dispatch", "recover-claimed-task-scope", "--help"]);
-  assert.equal(help.status, 0, help.stderr);
-  for (const option of ["--role <role>", "--authority-commit <sha>", "--expected-head <sha>", "--add-write-path <path...>"]) {
-    assert.ok(help.stdout.includes(option));
-  }
-  const repairHelp = await cli(sandbox, ["dispatch", "repair-claimed-task-scope-replacement", "--help"]);
-  assert.equal(repairHelp.status, 0, repairHelp.stderr);
-  for (const option of ["--run-id <id>", "--dispatch-id <id>"]) assert.ok(repairHelp.stdout.includes(option));
+  const missingDispatch = await cli(sandbox, [
+    "git", "recover-task-worktree", "--project", sandbox.repo, "--worktree-id", "worktree_01",
+    "--from-plan-id", "20260816-source", "--from-revision", "001", "--to-plan-id", "20260816-target",
+    "--to-revision", "001", "--to-run-id", "run_01ARZ3NDEKTSV4RRFFQ69G5FAV", "--task-id", "TASK-001",
+    "--expected-head", "a".repeat(40), "--expected-source-artifact", "artifact_01",
+  ]);
+  assert.equal(missingDispatch.status, 5);
+  assert.match(missingDispatch.stderr, /--dispatch-id/);
 });
 
 test("CLI keeps authority conflict continuation separate from integration conflict continuation", async (t) => {

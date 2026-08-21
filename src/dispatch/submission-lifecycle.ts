@@ -1,14 +1,14 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Role } from "../constants.js";
 import { checkDecisionInput, createResultTemplate, resultSchemaForRole, type ResultEnvelope } from "../contracts.js";
 import { IncompatibleError, ValidationError, validationCause } from "../errors.js";
-import { ROLE_MANIFEST, ROLE_MANIFEST_DIGEST } from "../roles.js";
+import { ROLE_MANIFEST } from "../roles.js";
 import { assertReadablePath, pathMatchesScope } from "../security.js";
 import { makeId, redact, sha256, stableJson, writeJson } from "../utils.js";
 import { resolveTaskIdentityWorktree } from "../worktree-ownership.js";
-import { executionEnforcement, freezeExecutionContract } from "../execution-contract.js";
+import { assertCurrentExecutionContract, executionEnforcement, freezeExecutionContract } from "../execution-contract.js";
+import { assertCurrentProjectContext } from "../context.js";
 import * as common from "./store.js";
 export function create(store: common.StateStore, ops: common.DispatchOperations, runId: string, role: Role, packet: common.DispatchPacket, actorRole?: Role, actorDispatchId?: string): string {
     const run = store.getRun(runId) as { profile: Role; state: string };
@@ -71,10 +71,11 @@ export function create(store: common.StateStore, ops: common.DispatchOperations,
     validated = freezeExecutionContract(role, ops.freezeVerificationContext!(store, ops, runId, role, validated)) as common.DispatchPacket;
     if (role === "file-explorer") {
       const repository = store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get((store.getRun(runId) as { repo_id: string }).repo_id) as { project_path: string } | undefined;
-      const missing = repository ? common.EXPLORER_CONTEXT_PATHS.filter((path) => !existsSync(join(repository.project_path, path))) : [...common.EXPLORER_CONTEXT_PATHS];
-      if (missing.length) throw new ValidationError("File Explorer packet requires initialized project context", missing.map((path) => ({
-        path: `/${path}`, pointer: `/${path}`, constraint: "exists", message: `${path} does not exist`, suggestion: `Run ai-team init ${repository?.project_path ?? "<project>"} --yes, then retry the run start.`,
-      })));
+      if (!repository) throw new IncompatibleError("File Explorer packet has no repository context", {
+        reason_code: "canonical_context_missing",
+        next_action: "reinitialize_context",
+      });
+      assertCurrentProjectContext(repository.project_path);
     }
     common.assertExplorerAuthorization(store, runId, role, validated);
     if (actorRole === "coding" && (role === "frontend-developer" || role === "backend-developer")) {
@@ -155,6 +156,7 @@ export function createPlanningCommit(store: common.StateStore, ops: common.Dispa
 
 export function insert(store: common.StateStore, ops: common.DispatchOperations, runId: string, role: Role, packet: common.DispatchPacket, replacementFor?: string): string {
     packet = ops.freezeVerificationContext!(store, ops, runId, role, packet);
+    if (packet.execution_contract) assertCurrentExecutionContract(packet.execution_contract, role);
     packet = packet.execution_contract ? packet : freezeExecutionContract(role, packet);
     const dispatchId = makeId("dispatch");
     const packetJson = redact(stableJson(packet));
@@ -171,15 +173,9 @@ export function insert(store: common.StateStore, ops: common.DispatchOperations,
     const schemaJson = stableJson(resultSchemaForRole(role));
     const templateJson = stableJson(template);
     const digests = { packet: sha256(packetJson), schema: sha256(schemaJson), template: sha256(templateJson), prompt: sha256(prompt) };
-    const columns = new Set((store.db.prepare("PRAGMA table_info(dispatches)").all() as Array<{ name: string }>).map((item) => item.name));
     store.db.transaction(() => {
-      if (["packet_digest", "prompt_digest", "schema_digest", "template_digest", "renderer_version"].every((column) => columns.has(column))) {
-        store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,packet_digest,prompt_digest,schema_digest,template_digest,renderer_version,created_at)
-          VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?)`).run(dispatchId, runId, role, packetJson, "", schemaJson, templateJson, digests.packet, digests.prompt, digests.schema, digests.template, common.RENDERER_VERSION, new Date().toISOString());
-      } else {
-        store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,created_at)
-          VALUES (?,?,?,'pending',?,?,?,?,?)`).run(dispatchId, runId, role, packetJson, "", schemaJson, templateJson, new Date().toISOString());
-      }
+      store.db.prepare(`INSERT INTO dispatches(dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,packet_digest,prompt_digest,schema_digest,template_digest,renderer_version,created_at)
+        VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?)`).run(dispatchId, runId, role, packetJson, "", schemaJson, templateJson, digests.packet, digests.prompt, digests.schema, digests.template, common.RENDERER_VERSION, new Date().toISOString());
       if (replacementFor) store.db.prepare("UPDATE dispatches SET replacement_for=? WHERE dispatch_id=?").run(replacementFor, dispatchId);
       const bindings = common.mergeBindingsFromPacket(role, frozenPacket);
       if (bindings) {
@@ -261,12 +257,15 @@ export function get(store: common.StateStore, ops: common.DispatchOperations, ru
 
 export function claim(store: common.StateStore, ops: common.DispatchOperations, runId: string, dispatchId: string, role: Role): { reused: boolean; packet: common.DispatchPacket } {
     const row = ops.get!(store, ops, runId, dispatchId, role);
+    common.assertCurrentDispatchRenderer(row.renderer_version);
+    const packet = JSON.parse(row.packet_json) as common.DispatchPacket;
+    assertCurrentExecutionContract(packet.execution_contract, role);
     const run = store.getRun(runId) as { state: string };
     if (run.state !== "active") throw new ValidationError(`run must be active before dispatch claim: ${run.state}`);
     if (!["pending", "claimed"].includes(row.state)) throw new ValidationError(`dispatch cannot be claimed from ${row.state}`);
     const reused = row.state === "claimed";
     if (!reused) store.db.prepare("UPDATE dispatches SET state='claimed',claimed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), dispatchId);
-    return { reused, packet: JSON.parse(row.packet_json) as common.DispatchPacket };
+    return { reused, packet };
   }
 
 export function claimBundle(store: common.StateStore, ops: common.DispatchOperations, runId: string, dispatchId: string, role: Role): common.DispatchBundle {
@@ -279,7 +278,7 @@ export function claimBundle(store: common.StateStore, ops: common.DispatchOperat
       prompt_digest?: string;
       schema_digest?: string;
       template_digest?: string;
-      renderer_version?: string;
+      renderer_version: string;
     };
     const prompt = ops.prompt!(store, ops, runId, dispatchId, role);
     return {
@@ -290,13 +289,13 @@ export function claimBundle(store: common.StateStore, ops: common.DispatchOperat
       packet_schema: ops.packetSchema!(store, ops, runId, dispatchId, role),
       packet_template: ops.packetTemplate!(store, ops, runId, dispatchId, role),
       digests: {
-        packet: row.packet_digest ?? sha256(row.packet_json),
-        prompt: row.prompt_digest ?? sha256(prompt),
-        schema: row.schema_digest ?? sha256(row.schema_json),
-        template: row.template_digest ?? sha256(row.template_json),
+        packet: row.packet_digest,
+        prompt: row.prompt_digest,
+        schema: row.schema_digest,
+        template: row.template_digest,
       },
-      renderer_version: row.renderer_version ?? "dispatch-renderer-v2",
-      execution_enforcement: executionEnforcement(claimed.packet.execution_contract),
+      renderer_version: row.renderer_version,
+      execution_enforcement: executionEnforcement(claimed.packet.execution_contract!, role),
     };
   }
 
@@ -400,13 +399,7 @@ export function replaceDispatch<Action extends common.ReplacementAction>(store: 
       }
     }
     const sourceContract = sourcePacket.execution_contract;
-    if (!sourceContract) {
-      const frozen = store.getRun(runId) as { role_manifest_digest?: string };
-      if (frozen.role_manifest_digest !== ROLE_MANIFEST_DIGEST) throw new IncompatibleError("legacy dispatch role manifest does not match the current role manifest", {
-        reason_code: "role_manifest_mismatch",
-        next_action: "start_new_run",
-      });
-    }
+    assertCurrentExecutionContract(sourceContract, role);
     const requestedPacket = { ...packet };
     delete requestedPacket.execution_contract;
     packet = freezeExecutionContract(role, requestedPacket, sourceContract) as common.DispatchPacket;
@@ -437,8 +430,10 @@ export function assertLifecycleActor(store: common.StateStore, ops: common.Dispa
 
 export function prompt(store: common.StateStore, ops: common.DispatchOperations, runId: string, dispatchId: string, role: Role): string {
     const row = ops.get!(store, ops, runId, dispatchId, role);
-    const renderer = row.renderer_version === common.RENDERER_VERSION ? common.promptFor : row.renderer_version === "dispatch-renderer-v3" ? common.promptForV3 : common.promptForV2;
-    const rendered = renderer(runId, dispatchId, role, JSON.parse(row.packet_json) as common.DispatchPacket);
+    common.assertCurrentDispatchRenderer(row.renderer_version);
+    const packet = JSON.parse(row.packet_json) as common.DispatchPacket;
+    assertCurrentExecutionContract(packet.execution_contract, role);
+    const rendered = common.promptFor(runId, dispatchId, role, packet);
     if (row.prompt_digest && row.prompt_digest !== sha256(rendered)) throw new ValidationError("dispatch prompt digest mismatch; frozen asset is corrupted");
     return rendered;
   }

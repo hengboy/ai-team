@@ -82,7 +82,7 @@
       "required": ["model", "variant", "options"],
       "properties": {
         "model": { "type": "string", "minLength": 1 },
-        "variant": { "enum": ["low", "medium", "high"] },
+        "variant": { "enum": ["low", "medium", "high", "xhigh"] },
         "options": { "type": "object" }
       }
     },

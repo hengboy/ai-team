@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { currentBranch, currentHead, git, repositoryIdentity, worktreeStatus } from "./git.js";
 import { frozenTaskWritePathsFromDocument, StateStore } from "./state.js";
 import { DispatchService } from "./dispatch.js";
-import { ValidationError } from "./errors.js";
+import { IncompatibleError, ValidationError } from "./errors.js";
 import { parsePlanVerification, parseTaskVerification, taskSourceDigest, triageRequest, type PlanVerification, type TaskVerification } from "./planning.js";
 import { AGENT_BUILD } from "./roles.js";
 import { assertReadablePath } from "./security.js";
@@ -60,42 +60,12 @@ export class WorkflowService {
   }
 
   handoffToPlanning(sourceRunId: string, request: string): { run_id: string; dispatch_id: string; source_run_id: string; reused: boolean } {
-    if (!request.trim()) throw new ValidationError("planning handoff request cannot be empty");
-    return this.store.db.transaction(() => {
-      const source = this.store.getRun(sourceRunId) as { repo_id: string; profile: string; state: string; target_branch?: string; base_commit?: string };
-      if (source.profile !== "coding" || !["frozen", "failed"].includes(source.state)) throw new ValidationError("planning handoff requires a frozen or failed coding run");
-      const pendingOperation = this.store.db.prepare("SELECT operation_id FROM operations WHERE run_id=? AND state='pending'").get(sourceRunId) as { operation_id: string } | undefined;
-      if (pendingOperation) throw new ValidationError(`planning handoff requires operation reconciliation: ${pendingOperation.operation_id}`);
-      const worktrees = this.store.db.prepare("SELECT worktree_id,branch,path,base_commit,state FROM worktrees WHERE run_id=? AND state='active' ORDER BY created_at").all(sourceRunId) as Array<Record<string, unknown>>;
-      if (!worktrees.some((worktree) => String(worktree.branch).startsWith("task/"))) throw new ValidationError("planning handoff requires an active task worktree to preserve");
-      const existing = this.store.db.prepare("SELECT run_id FROM runs WHERE source_run_id=?").get(sourceRunId) as { run_id: string } | undefined;
-      if (existing) {
-        const dispatch = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? ORDER BY created_at LIMIT 1").get(existing.run_id) as { dispatch_id: string };
-        return { run_id: existing.run_id, dispatch_id: dispatch.dispatch_id, source_run_id: sourceRunId, reused: true };
-      }
-      const runId = this.store.createRun({
-        repoId: source.repo_id,
-        profile: "planning",
-        mode: "planned",
-        ...(source.target_branch ? { targetBranch: source.target_branch } : {}),
-        ...(source.base_commit ? { baseCommit: source.base_commit } : {}),
-        request,
-        clientPlatform: clientPlatform(),
-        sourceRunId,
-      });
-      const dispatchId = this.dispatches.create(runId, "file-explorer", {
-        objective: "Reconcile the frozen or failed source run through Planning while preserving its managed task worktrees.",
-        allowed_read_paths: ["."],
-        allowed_write_paths: [],
-        acceptance_criteria: ["Produce a planning revision linked to the source run", "Preserve every source worktree and its audit identity"],
-        context: { request, source_run_id: sourceRunId, source_run_state: source.state, preserved_worktrees: worktrees },
-      }, "planning");
-      const now = new Date().toISOString();
-      this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE run_id=? AND state IN ('pending','claimed')").run(now, sourceRunId);
-      this.store.event(sourceRunId, "run.planning_handoff_started", { planning_run_id: runId, source_run_state: source.state, preserved_worktree_ids: worktrees.map((worktree) => worktree.worktree_id) });
-      this.store.event(runId, "planning.source_run_linked", { source_run_id: sourceRunId, preserved_worktree_ids: worktrees.map((worktree) => worktree.worktree_id) });
-      return { run_id: runId, dispatch_id: dispatchId, source_run_id: sourceRunId, reused: false };
-    })();
+    void sourceRunId;
+    void request;
+    throw new IncompatibleError("frozen or failed Coding runs cannot be resumed through Planning", {
+      reason_code: "legacy_run_handoff",
+      next_action: "start_new_run",
+    });
   }
 
   completePlanningHandoff(
@@ -106,17 +76,16 @@ export class WorkflowService {
     planCommit: string,
     contract?: { planVerification: PlanVerification; tasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[]; verification: TaskVerification }> },
   ): string | undefined {
-    const planningRun = this.store.getRun(planningRunId) as { profile: string; source_run_id?: string };
-    if (planningRun.profile !== "planning" || !planningRun.source_run_id) return undefined;
-    const source = this.store.getRun(planningRun.source_run_id) as { profile: string; state: string };
-    if (source.profile !== "coding" || !["frozen", "failed", "active"].includes(source.state)) throw new ValidationError("planning handoff source is not a recoverable coding run");
-    if (source.state === "active") return planningRun.source_run_id;
-    if (contract) this.store.replaceRunTaskManifest(planningRun.source_run_id, contract.tasks);
-    this.store.db.prepare("UPDATE runs SET state='active',stage='coding',plan_id=?,revision=?,plan_digest=?,plan_verification_json=COALESCE(?,plan_verification_json),updated_at=? WHERE run_id=? AND state IN ('frozen','failed')")
-      .run(planId, revision, planDigest, contract ? JSON.stringify(contract.planVerification) : null, new Date().toISOString(), planningRun.source_run_id);
-    this.store.event(planningRun.source_run_id, "run.planning_handoff_completed", { planning_run_id: planningRunId, plan_id: planId, revision, plan_commit: planCommit });
-    this.store.event(planningRunId, "planning.source_run_resumed", { source_run_id: planningRun.source_run_id });
-    return planningRun.source_run_id;
+    void planningRunId;
+    void planId;
+    void revision;
+    void planDigest;
+    void planCommit;
+    void contract;
+    throw new IncompatibleError("Planning cannot resume a prior Coding run", {
+      reason_code: "legacy_run_handoff",
+      next_action: "start_new_run",
+    });
   }
 
   async bindPlanningRevision(runId: string, project: string, planId: string, revision: string): Promise<void> {
@@ -261,7 +230,15 @@ export class WorkflowService {
     if (input.mode === "planned") {
       this.store.initializeRunTasks(runId, planTasks);
       try {
-        const planWorktree = await new GitOrchestrator(this.store).prepareIntegration(runId);
+        const prepareDispatchId = this.dispatches.create(runId, "git-operator", {
+          objective: "Create the canonical plan worktree for this planned Coding run.",
+          allowed_read_paths: [],
+          allowed_write_paths: [],
+          acceptance_criteria: ["Create only the canonical plan worktree for this run"],
+          context: { stage: "git-operator", phase: "prepare_initial_plan_worktree", base_commit: head },
+        }, "coding");
+        this.dispatches.claim(runId, prepareDispatchId, "git-operator");
+        const planWorktree = await new GitOrchestrator(this.store).prepareIntegration(runId, prepareDispatchId);
         await Promise.all(planPaths.map((path) => readFile(join(planWorktree.path, path), "utf8")));
       } catch (error) {
         const cause = error instanceof Error ? error.message : String(error);

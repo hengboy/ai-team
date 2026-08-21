@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { CONTEXT_RULE, atomicReplaceFiles, initializeProjectContext, updateProjectContext, validateProjectContext } from "../src/context.js";
 import { initializeProject } from "../src/project.js";
-import { ValidationError } from "../src/errors.js";
+import { IncompatibleError, ValidationError } from "../src/errors.js";
 import { DispatchService } from "../src/dispatch.js";
 import { StateStore } from "../src/state.js";
 
@@ -58,7 +58,7 @@ test("context initialization is idempotent and preserves existing instructions",
   assert.equal((await validateProjectContext(root)).valid, true);
 });
 
-test("File Explorer packet generation rejects missing project context with an init remedy", async (t) => {
+test("File Explorer packet generation rejects missing project context as incompatible", async (t) => {
   const root = await repository();
   const home = await mkdtemp(join(tmpdir(), "ai-team-context-state-"));
   t.after(() => Promise.all([rm(root, { recursive: true, force: true }), rm(home, { recursive: true, force: true })]));
@@ -68,12 +68,12 @@ test("File Explorer packet generation rejects missing project context with an in
   const runId = store.createRun({ repoId: "repo-context-missing", profile: "planning", mode: "planned", request: "inspect" });
   assert.throws(() => new DispatchService(store).create(runId, "file-explorer", {
     objective: "inspect", allowed_read_paths: ["."], allowed_write_paths: [], acceptance_criteria: ["report"], context: {},
-  }), (error: unknown) => error instanceof ValidationError
-    && /initialized project context/.test(error.message)
-    && JSON.stringify(error.details).includes("ai-team init"));
+  }), (error: unknown) => error instanceof IncompatibleError
+    && (error.details as { reason_code?: string }).reason_code === "canonical_context_missing"
+    && (error.details as { next_action?: string }).next_action === "reinitialize_context");
 });
 
-test("context initialization migrates the legacy navigation path and MEMORY reference", async (t) => {
+test("context initialization rejects the legacy navigation path and MEMORY reference", async (t) => {
   const root = await repository();
   t.after(() => rm(root, { recursive: true, force: true }));
   await initializeProjectContext(root, true);
@@ -89,17 +89,35 @@ test("context initialization migrates the legacy navigation path and MEMORY refe
 
   const legacy = await validateProjectContext(root);
   assert.equal(legacy.valid, false);
-  assert.ok(legacy.navigation.issues.some((issue) => issue.includes(".ai-work-flow/index/feature-navigation.md") && issue.includes("ai-team init")));
+  assert.ok(legacy.navigation.issues.some((issue) => issue.includes(".ai-work-flow/index/feature-navigation.md") && issue.includes("reinitialize context")));
 
-  const migrated = await initializeProjectContext(root, true);
-  assert.equal(migrated.navigation_path, ".ai-team/index/feature-navigation.md");
-  assert.equal(migrated.navigation_status, "created");
-  assert.match(await readFile(canonicalPath, "utf8"), /# 功能导航/);
-  await assert.rejects(stat(legacyPath));
-  const memory = await readFile(join(root, "MEMORY.md"), "utf8");
-  assert.doesNotMatch(memory, /\.ai-work-flow\/index\/feature-navigation\.md/);
-  assert.match(memory, /\.ai-team\/index\/feature-navigation\.md/);
-  assert.equal((await validateProjectContext(root)).valid, true);
+  await assert.rejects(
+    () => initializeProjectContext(root, true),
+    (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string }).reason_code === "legacy_navigation_path"
+      && (error.details as { next_action?: string }).next_action === "reinitialize_context",
+  );
+  assert.ok(await readFile(legacyPath, "utf8"));
+  assert.equal((await validateProjectContext(root)).valid, false);
+});
+
+test("context update rejects a missing canonical navigation file and old managed format", async (t) => {
+  const root = await repository();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await initializeProjectContext(root, true);
+  const navigationPath = join(root, ".ai-team", "index", "feature-navigation.md");
+  await rm(navigationPath);
+  await assert.rejects(
+    () => updateProjectContext(root, context()),
+    (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string }).reason_code === "canonical_context_missing",
+  );
+  await writeFile(navigationPath, "<!-- ai-team:feature-navigation:start -->\n# Feature Navigation\n<!-- ai-team:feature-navigation:end -->\n");
+  await assert.rejects(
+    () => updateProjectContext(root, context()),
+    (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string }).reason_code === "legacy_navigation_heading",
+  );
 });
 
 test("context update merges and deduplicates managed entries while retaining user content", async (t) => {

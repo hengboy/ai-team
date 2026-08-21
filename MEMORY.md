@@ -46,6 +46,11 @@
 - acceptance check
 - test repair lineage
 - context owner
+- current state schema
+- IncompatibleError
+- canonical plan worktree
+- verified client version
+- review worktree
 
 ### 仓库约束
 - 要求 Node.js >=22.13.0，并必须通过 npm 验证脚本。
@@ -57,6 +62,7 @@
 - Git Operator merge authorization must use frozen dispatch-worktree bindings
 - planned revision 进入 ready 前必须具备完整且可映射的 TDD 验收合同
 - Test dispatch 始终保持空写入范围并逐条报告 acceptance checks
+- Runtime accepts only the current state schema, canonical .ai-team context path, current execution contract, renderer v5, and verified client versions.
 
 ### 职责
 - `src/cli.ts` 保留规范输出、全局错误处理和注册组合；`src/commands/` 按项目、规划运行、staging/dispatch、Git/review 与环境职责注册命令。
@@ -92,6 +98,11 @@
 - src/state.ts persists verification contracts and test repair lineage
 - src/dispatch.ts enforces Developer/Test evidence, context ownership, and repair loops
 - src/contracts.ts defines Developer TDD evidence and Test acceptance-check schemas
+- src/state.ts and src/staging.ts create and validate only the current state schema and sequence-named staging entries.
+- src/context.ts, src/dispatch/packet.ts, and src/execution-contract.ts reject legacy context, packet, renderer, and execution contract inputs.
+- src/git-orchestrator.ts and src/workflow.ts require claimed Git Operator dispatches for canonical planned worktrees.
+- src/environment.ts requires complete staging configuration, indexed backups, and exact verified client versions.
+- src/worktree-review.ts resolves only canonical active worktrees and rejects legacy planned integration layouts.
 
 ### 模块边界
 - `src/git-orchestrator.ts` 与 `src/git.ts` 负责 planned revision-scoped plan/task worktree、direct run-scoped integration/task 编排、精确 plan ownership 接受、已有直接子提交 TASK adoption、planned pre_commit worktree scope 与 no-ff merge，并将相关身份写入操作证据。
@@ -112,4 +123,6 @@
 - role YAML execution policy 是 default/ceiling 的事实源；legacy dispatch packet 与 digest 不回写，manifest 不匹配的 replacement 必须启动新 run。
 - Planning templates define testable ACs; src/planning.ts validates them before src/workflow.ts freezes the contracts
 - src/dispatch.ts and src/dispatch/implementation.ts coordinate task/final/review-repair retest lineage while Test remains read-only; a successful review-repair Test never opens another review barrier
+- Legacy state migration, renderer fallback, context path fallback, scope recovery, and worktree-layout recovery are unsupported runtime inputs and return IncompatibleError.
+- Review worktree resolution does not infer provenance from events or operations for a legacy layout.
 <!-- ai-team:project-context:end -->

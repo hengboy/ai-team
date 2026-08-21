@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
+import { readdir } from "node:fs/promises";
 import type { HomePaths } from "./home.js";
-import { ValidationError, validationCause } from "./errors.js";
+import { IncompatibleError, ValidationError, validationCause } from "./errors.js";
 import { makeId, redact } from "./utils.js";
 import {
   STAGING_DEFAULT_RETENTION_HOURS,
@@ -14,10 +15,8 @@ import {
 import { ROLE_MANIFEST } from "./roles.js";
 import {
   ensureManagedDirectory,
-  legacyStagingFilePath,
   readManagedJsonFile,
   removeManagedFile,
-  renameManagedFile,
   stagingFilePath,
   stagingRunDirectory,
   writeManagedJsonFile,
@@ -85,34 +84,35 @@ export interface StagingContext {
   getRun(runId: string): Record<string, unknown>;
 }
 
-export const migrateStagingFiles = async (paths: HomePaths, db: Database.Database): Promise<void> => {
-  const completed = db.prepare("SELECT value FROM state_meta WHERE key='staging_filename_migration'").get() as { value: string } | undefined;
-  if (completed?.value === "complete") return;
-  const rows = db.prepare(`SELECT * FROM staging_entries
-    WHERE file_dev IS NOT NULL AND file_ino IS NOT NULL AND state <> 'consumed'
-    ORDER BY run_id,sequence_no`).all() as StagingEntryRow[];
-  for (const row of rows) {
-    const inspectCandidate = async (path: string): Promise<ManagedFileIdentity> => {
-      const content = await readManagedJsonFile(paths.staging, path);
-      if (content.digest !== row.content_sha256 || content.bytes !== row.content_bytes) {
-        throw new ValidationError(`legacy staging content does not match persisted metadata: ${row.staging_id}`);
-      }
-      return content.identity;
-    };
-    const destination = stagingFilePath(paths.staging, row.run_id, row.sequence_no, row.kind, row.role);
-    try {
-      const identity = await inspectCandidate(destination);
-      db.prepare("UPDATE staging_entries SET file_dev=?,file_ino=? WHERE staging_id=?").run(identity.dev, identity.ino, row.staging_id);
-      continue;
-    } catch (error: any) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-    const source = legacyStagingFilePath(paths.staging, row.run_id, row.staging_id);
-    const identity = await inspectCandidate(source);
-    await renameManagedFile(paths.staging, source, destination, identity);
-    db.prepare("UPDATE staging_entries SET file_dev=?,file_ino=? WHERE staging_id=?").run(identity.dev, identity.ino, row.staging_id);
+export const assertCanonicalStagingFiles = async (paths: HomePaths, db: Database.Database): Promise<void> => {
+  const invalidSequence = db.prepare("SELECT staging_id,run_id,sequence_no FROM staging_entries WHERE sequence_no IS NULL OR sequence_no < 1 LIMIT 1")
+    .get() as { staging_id: string; run_id: string; sequence_no: number | null } | undefined;
+  if (invalidSequence) {
+    throw new IncompatibleError("staging metadata is incompatible with canonical filenames", {
+      reason_code: "legacy_staging_metadata",
+      next_action: "reset",
+      staging_id: invalidSequence.staging_id,
+      run_id: invalidSequence.run_id,
+    });
   }
-  db.prepare("INSERT INTO state_meta(key,value) VALUES ('staging_filename_migration','complete') ON CONFLICT(key) DO UPDATE SET value=excluded.value").run();
+  const runIds = db.prepare("SELECT DISTINCT run_id FROM staging_entries").all() as Array<{ run_id: string }>;
+  for (const { run_id: runId } of runIds) {
+    let entries: string[];
+    try { entries = await readdir(stagingRunDirectory(paths.staging, runId)); }
+    catch (error: any) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    const legacyFile = entries.find((entry) => /^staging_[A-Za-z0-9]+\.json$/.test(entry));
+    if (legacyFile) {
+      throw new IncompatibleError("legacy staging filenames are not supported", {
+        reason_code: "legacy_staging_filename",
+        next_action: "reset",
+        run_id: runId,
+        file: legacyFile,
+      });
+    }
+  }
 };
 
 export class StagingStore {

@@ -1,5 +1,5 @@
 import type { Role } from "./constants.js";
-import { ValidationError } from "./errors.js";
+import { IncompatibleError, ValidationError } from "./errors.js";
 import { ROLE_MANIFEST, ROLE_MANIFEST_DIGEST } from "./roles.js";
 import type { ApprovalPolicy, ExecutionCwdKind, ExecutionTool } from "./agent-build.js";
 
@@ -76,17 +76,55 @@ const validateRequest = (request: ExecutionRequest, role: Role): void => {
   }
 };
 
-const freezeExecutionContractWithCompatibleSource = <T extends ExecutionPacketFields>(role: Role, packet: T, source?: ExecutionContract, compatibleSourceManifestDigest?: string): Omit<T, "execution_request" | "execution_contract"> & { execution_contract: ExecutionContract } => {
+const incompatibleContract = (message: string, reasonCode: string): IncompatibleError => new IncompatibleError(message, {
+  reason_code: reasonCode,
+  next_action: "start_new_run",
+});
+
+export function assertCurrentExecutionContract(contract: unknown, role: Role): asserts contract is ExecutionContract {
+  if (!contract || typeof contract !== "object" || Array.isArray(contract)) {
+    throw incompatibleContract("dispatch execution contract is missing", "missing_execution_contract");
+  }
+  const value = contract as Record<string, unknown>;
+  const source = value.source;
+  const cwd = value.cwd;
+  const tools = value.tools;
+  const topLevelKeys = Object.keys(value).sort();
+  const sourceKeys = source && typeof source === "object" && !Array.isArray(source) ? Object.keys(source).sort() : [];
+  const cwdKeys = cwd && typeof cwd === "object" && !Array.isArray(cwd) ? Object.keys(cwd).sort() : [];
+  const policy = ROLE_MANIFEST[role].execution;
+  const validTopLevel = topLevelKeys.join(",") === "approval_policy,cwd,schema_version,source,tools";
+  const validSource = source && typeof source === "object" && !Array.isArray(source)
+    && sourceKeys.join(",") === "kind,role,role_manifest_digest"
+    && (source as ExecutionContract["source"]).role === role
+    && (source as ExecutionContract["source"]).role_manifest_digest === ROLE_MANIFEST_DIGEST
+    && ["role_default", "dispatch_request", "source_contract"].includes((source as ExecutionContract["source"]).kind);
+  const validCwd = cwd && typeof cwd === "object" && !Array.isArray(cwd)
+    && cwdKeys.every((key) => key === "kind" || key === "worktree_id")
+    && typeof (cwd as ExecutionContract["cwd"]).kind === "string"
+    && cwdKinds.has((cwd as ExecutionContract["cwd"]).kind)
+    && policy.ceiling.cwd.includes((cwd as ExecutionContract["cwd"]).kind)
+    && ((cwd as ExecutionContract["cwd"]).kind === "worktree"
+      ? ((cwd as ExecutionContract["cwd"]).worktree_id === undefined || typeof (cwd as ExecutionContract["cwd"]).worktree_id === "string" && Boolean((cwd as ExecutionContract["cwd"]).worktree_id))
+      : (cwd as ExecutionContract["cwd"]).worktree_id === undefined);
+  const validTools = Array.isArray(tools) && tools.length > 0 && new Set(tools).size === tools.length
+    && tools.every((tool) => typeof tool === "string" && policy.ceiling.tools.includes(tool as ExecutionTool));
+  const validApproval = typeof value.approval_policy === "string"
+    && policy.ceiling.approval_policies.includes(value.approval_policy as ApprovalPolicy)
+    && approvalRank[value.approval_policy as ApprovalPolicy] >= approvalRank[policy.default.approval_policy];
+  if (!validTopLevel || value.schema_version !== EXECUTION_CONTRACT_SCHEMA_VERSION || !validSource || !validCwd || !validTools
+    || !validApproval) {
+    throw incompatibleContract("dispatch execution contract is not current", "execution_contract_mismatch");
+  }
+}
+
+const freezeExecutionContractWithSource = <T extends ExecutionPacketFields>(role: Role, packet: T, source?: ExecutionContract): Omit<T, "execution_request" | "execution_contract"> & { execution_contract: ExecutionContract } => {
   if (packet.execution_contract && !source) throw new ValidationError("execution_contract is server-generated", ["/execution_contract"]);
   const request = packet.execution_request;
   if (request) validateRequest(request, role);
   const policy = ROLE_MANIFEST[role].execution;
-  const sourceContract = source && (source.source.role_manifest_digest === ROLE_MANIFEST_DIGEST
-    || source.source.role_manifest_digest === compatibleSourceManifestDigest) ? source : undefined;
-  if (source && !sourceContract) throw new ValidationError("source dispatch role manifest does not match the current role manifest", {
-    reason_code: "role_manifest_mismatch",
-    next_action: "start_new_run",
-  });
+  if (source) assertCurrentExecutionContract(source, role);
+  const sourceContract = source;
   const requestedCwd = request?.cwd;
   const sourceCwd = sourceContract?.cwd;
   const worktreeId = boundWorktreeId(packet.context);
@@ -135,7 +173,7 @@ const freezeExecutionContractWithCompatibleSource = <T extends ExecutionPacketFi
 };
 
 export const freezeExecutionContract = <T extends ExecutionPacketFields>(role: Role, packet: T, source?: ExecutionContract): Omit<T, "execution_request" | "execution_contract"> & { execution_contract: ExecutionContract } =>
-  freezeExecutionContractWithCompatibleSource(role, packet, source);
+  freezeExecutionContractWithSource(role, packet, source);
 
 export const freezeAuthorityConflictContinuationExecutionContract = <T extends ExecutionPacketFields>(
   packet: T,
@@ -147,20 +185,17 @@ export const freezeAuthorityConflictContinuationExecutionContract = <T extends E
     || packet.context.phase !== "continue_task_authority_conflict" || packet.context.operation !== "continue-task-authority-conflict") {
     throw new ValidationError("authority conflict continuation requires the frozen git-operator authority contract");
   }
-  return freezeExecutionContractWithCompatibleSource("git-operator", packet, sourceContract, sourceContract.source.role_manifest_digest);
+  return freezeExecutionContractWithSource("git-operator", packet, sourceContract);
 };
 
-export const executionEnforcement = (contract?: ExecutionContract): Record<string, unknown> => contract ? {
+export const executionEnforcement = (contract: ExecutionContract, role: Role): Record<string, unknown> => {
+  assertCurrentExecutionContract(contract, role);
+  return {
   contract_status: "specified",
   schema_version: contract.schema_version,
   tool_scope: "instruction",
   cwd: "delegated",
   approval_policy: "unverified",
   process_isolation: "unverified",
-} : {
-  contract_status: "legacy_unspecified",
-  tool_scope: "unverified",
-  cwd: "unverified",
-  approval_policy: "unverified",
-  process_isolation: "unverified",
+  };
 };

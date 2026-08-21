@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createResultTemplate } from "../../src/contracts.js";
@@ -54,3 +54,35 @@ export const projectContext = (entryPaths: string[] = ["src/dispatch.ts"]) => ({
   navigation: [{ feature: "Dispatch", keywords: ["dispatch"], entry_paths: entryPaths, module_boundary: "runtime" }],
   maintenance: { status: "current", paths: ["MEMORY.md", ".ai-team/index/feature-navigation.md"] },
 });
+
+export const writeCurrentProjectContext = async (repository: string): Promise<void> => {
+  await mkdir(join(repository, ".ai-team", "index"), { recursive: true });
+  await writeFile(join(repository, "MEMORY.md"), `<!-- ai-team:project-context:start -->
+<!-- ai-team:context-format {"renderer_version":"context-renderer-v2","schema_version":2} -->
+## 项目上下文
+
+### 项目形态
+TypeScript CLI
+
+### 领域术语
+_待补充_
+
+### 仓库约束
+_待补充_
+
+### 职责
+_待补充_
+
+### 模块边界
+_待补充_
+<!-- ai-team:project-context:end -->
+`);
+  await writeFile(join(repository, ".ai-team", "index", "feature-navigation.md"), `<!-- ai-team:feature-navigation:start -->
+<!-- ai-team:context-format {"renderer_version":"context-renderer-v2","schema_version":2} -->
+# 功能导航
+
+| 功能 | 关键词 | 入口路径 | 模块边界 |
+| --- | --- | --- | --- |
+<!-- ai-team:feature-navigation:end -->
+`);
+};

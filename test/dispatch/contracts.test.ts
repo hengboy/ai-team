@@ -6,6 +6,10 @@ import test from "node:test";
 import { validateCommand } from "../../src/command-contract.js";
 import { checkDecisionInput, checkProjectContext, checkResultEnvelope, createResultTemplate, resultSchemaForRole, ROLE_PAYLOAD_SCHEMAS } from "../../src/contracts.js";
 import { DispatchService } from "../../src/dispatch.js";
+import { IncompatibleError } from "../../src/errors.js";
+import { assertCurrentExecutionContract } from "../../src/execution-contract.js";
+import { RENDERER_VERSION, validatePacket } from "../../src/dispatch/packet.js";
+import { assertCurrentDispatchRenderer } from "../../src/dispatch/store.js";
 import { completedResult, createRun, dispatchPacket, projectContext, withStore } from "../helpers/dispatch.js";
 
 const fileExplorerResult = (runId: string, dispatchId: string) => completedResult(runId, dispatchId, "file-explorer", {
@@ -30,6 +34,36 @@ test("only File Explorer may receive broad read paths including ./**", async () 
     assert.doesNotThrow(() => dispatches.create(runId, "coding", dispatchPacket(["src/dispatch.ts"])));
     assert.doesNotThrow(() => dispatches.create(runId, "file-explorer", dispatchPacket(["./**"])));
   });
+});
+
+test("packet validation rejects legacy Markdown acceptance headings", () => {
+  assert.throws(
+    () => validatePacket({ ...dispatchPacket(), acceptance_criteria: ["# Acceptance Criteria\n- legacy contract"] }, "coding"),
+    (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string }).reason_code === "legacy_acceptance_heading"
+      && (error.details as { next_action?: string }).next_action === "start_new_run",
+  );
+});
+
+test("dispatch execution assets require the current contract and renderer", () => {
+  const contract = {
+    schema_version: 1 as const,
+    cwd: { kind: "project" as const },
+    tools: ["filesystem.read" as const],
+    approval_policy: "never" as const,
+    source: { kind: "role_default" as const, role: "planning" as const, role_manifest_digest: "a".repeat(64) },
+  };
+  assert.doesNotThrow(() => assertCurrentDispatchRenderer(RENDERER_VERSION));
+  assert.throws(
+    () => assertCurrentExecutionContract(contract, "planning"),
+    (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string }).reason_code === "execution_contract_mismatch",
+  );
+  assert.throws(
+    () => assertCurrentDispatchRenderer("dispatch-renderer-v3"),
+    (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string }).reason_code === "legacy_dispatch_renderer",
+  );
 });
 
 test("dispatch creation enforces actor command and delegation authorization", async () => {

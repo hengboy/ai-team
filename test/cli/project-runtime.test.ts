@@ -61,8 +61,6 @@ test("CLI git prepare preserves omitted task-id for a planned prepare_worktrees 
       baseCommit,
       targetBranch: "main",
     });
-    const plan = await new GitOrchestrator(store).prepareIntegration(runId);
-    planWorktreeId = plan.worktree_id;
     const dispatches = new DispatchService(store);
     dispatchId = dispatches.create(runId, "git-operator", {
       objective: "Verify the plan worktree prepared for this planned run.",
@@ -72,6 +70,8 @@ test("CLI git prepare preserves omitted task-id for a planned prepare_worktrees 
       context: { phase: "prepare_worktrees", base_commit: baseCommit },
     });
     dispatches.claim(runId, dispatchId, "git-operator");
+    const plan = await new GitOrchestrator(store).prepareIntegration(runId, dispatchId);
+    planWorktreeId = plan.worktree_id;
   } finally {
     store.close();
   }
@@ -135,15 +135,17 @@ test("context update accepts File Explorer output and validate reports maintenan
   );
   assert.equal(legacy.valid, false);
   assert.equal(legacy.maintenance.status, "needs_update");
-  assert.ok(legacy.navigation.issues.some((issue) => issue.includes("ai-team context update")));
+  assert.ok(legacy.navigation.issues.some((issue) => issue.includes("unsupported")));
   const businessBefore = await readFile(join(sandbox.repo, "README.md"), "utf8");
-  json(await cli(sandbox, ["context", "update", "--project", sandbox.repo, "--context-file", explorerResult]));
-  assert.equal((json<{ valid: boolean }>(await cli(sandbox, ["context", "validate", "--project", sandbox.repo]))).valid, true);
-  assert.match(await readFile(navigationPath, "utf8"), /schema_version.*2/);
+  const rejected = await cli(sandbox, ["context", "update", "--project", sandbox.repo, "--context-file", explorerResult]);
+  assert.equal(rejected.status, 4);
+  const failure = JSON.parse(rejected.stderr) as { details: { reason_code: string; next_action: string } };
+  assert.deepEqual(failure.details, { reason_code: "legacy_navigation_heading", next_action: "reinitialize_context" });
+  assert.equal((json<{ valid: boolean }>(await cli(sandbox, ["context", "validate", "--project", sandbox.repo]))).valid, false);
   assert.equal(await readFile(join(sandbox.repo, "README.md"), "utf8"), businessBefore);
 });
 
-test("context validate diagnoses and init migrates the legacy navigation path", async (t) => {
+test("context validate and init reject the legacy navigation path", async (t) => {
   const sandbox = await makeSandbox(t);
   json(await cli(sandbox, ["init", sandbox.repo]));
   const canonicalPath = join(sandbox.repo, ".ai-team", "index", "feature-navigation.md");
@@ -154,13 +156,15 @@ test("context validate diagnoses and init migrates the legacy navigation path", 
 
   const diagnosed = json<{ valid: boolean; navigation: { issues: string[] } }>(await cli(sandbox, ["context", "validate", "--project", sandbox.repo]));
   assert.equal(diagnosed.valid, false);
-  assert.ok(diagnosed.navigation.issues.some((issue) => issue.includes(".ai-work-flow/index/feature-navigation.md") && issue.includes("ai-team init")));
+  assert.ok(diagnosed.navigation.issues.some((issue) => issue.includes(".ai-work-flow/index/feature-navigation.md") && issue.includes("reinitialize context")));
 
-  json(await cli(sandbox, ["init", sandbox.repo, "--yes"]));
-  await stat(canonicalPath);
-  await assert.rejects(stat(legacyPath));
-  assert.doesNotMatch(await readFile(join(sandbox.repo, "MEMORY.md"), "utf8"), /\.ai-work-flow\/index\/feature-navigation\.md/);
-  assert.equal(json<{ valid: boolean }>(await cli(sandbox, ["context", "validate", "--project", sandbox.repo])).valid, true);
+  const rejected = await cli(sandbox, ["init", sandbox.repo, "--yes"]);
+  assert.equal(rejected.status, 4);
+  const failure = JSON.parse(rejected.stderr) as { details: { reason_code: string; next_action: string } };
+  assert.deepEqual(failure.details, { reason_code: "legacy_navigation_path", next_action: "reinitialize_context" });
+  await assert.rejects(stat(canonicalPath));
+  await stat(legacyPath);
+  assert.match(await readFile(join(sandbox.repo, "MEMORY.md"), "utf8"), /\.ai-work-flow\/index\/feature-navigation\.md/);
 });
 
 test("run show opens read-only while a writer lock is held and creates no backup", async (t) => {

@@ -1,16 +1,17 @@
 import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { lstat, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, posix } from "node:path";
 import { checkProjectContext, type ProjectContext } from "./contracts.js";
 import { PROJECT_CONTEXT_RENDERER_VERSION, PROJECT_CONTEXT_SCHEMA_VERSION } from "./constants.js";
-import { ValidationError } from "./errors.js";
+import { IncompatibleError, ValidationError } from "./errors.js";
 import { git, repositoryIdentity } from "./git.js";
 import { canonicalizeInside, isSensitivePath } from "./security.js";
 import { assertRelativePosixPath, stableJson } from "./utils.js";
 
 export const MEMORY_PATH = "MEMORY.md";
 export const NAVIGATION_PATH = ".ai-team/index/feature-navigation.md";
-export const LEGACY_NAVIGATION_PATH = ".ai-work-flow/index/feature-navigation.md";
+const LEGACY_NAVIGATION_PATH = ".ai-work-flow/index/feature-navigation.md";
 export const INSTRUCTION_PATHS = ["AGENTS.md", "CLAUDE.md"] as const;
 export const CONTEXT_RULE = "所有`仓库文件检索`、`目录遍历`、`文件名/全文搜索`、`入口定位`、`调用链`和`未知依赖探索`必须委派给 **File Explorer**；其他代理只能读取 `packet` 明确授权或 **File Explorer** 返回的精确路径，遇到未知路径时请求支持，不得自行使用 `rg`、`find`、`glob` 或`全仓扫描`。测试过程中产生的所有截图必须保存到对应计划的 `.ai-team/plans/<planId>/screenshot/` 目录；执行角色必须使用 `packet` 提供的 `plan_id` 和精确截图目录，缺失时停止并请求支持。入口、职责或模块边界变化时，同轮更新根 `MEMORY.md` 与唯一权威路径 `.ai-team/index/feature-navigation.md`。评审以已提交 `MEMORY.md` 为 standards source。";
 
@@ -25,6 +26,28 @@ const NAVIGATION_ENTRY = "<!-- ai-team:feature-navigation-entry ";
 const CONTEXT_FORMAT_PREFIX = "<!-- ai-team:context-format ";
 const CONTEXT_FORMAT = `${CONTEXT_FORMAT_PREFIX}${stableJson({ renderer_version: PROJECT_CONTEXT_RENDERER_VERSION, schema_version: PROJECT_CONTEXT_SCHEMA_VERSION })} -->`;
 const EMPTY = "_待补充_";
+
+const incompatibleContext = (message: string, reasonCode: string): IncompatibleError => new IncompatibleError(message, {
+  reason_code: reasonCode,
+  next_action: "reinitialize_context",
+});
+
+const hasCurrentContextFormat = (source: string): boolean => occurrences(source, CONTEXT_FORMAT) === 1
+  && occurrences(source, CONTEXT_FORMAT_PREFIX) === 1;
+
+const assertCurrentContextFormat = (source: string, path: string): void => {
+  if (hasCurrentContextFormat(source)) return;
+  if (source.includes(CONTEXT_FORMAT_PREFIX)) {
+    throw new ValidationError(`${path} has a malformed current context format marker`);
+  }
+  throw incompatibleContext(`${path} uses an unsupported project context format`, "legacy_context_format");
+};
+
+const assertNoLegacyNavigation = (root: string): void => {
+  if (existsSync(join(root, LEGACY_NAVIGATION_PATH))) {
+    throw incompatibleContext(`${LEGACY_NAVIGATION_PATH} is not supported`, "legacy_navigation_path");
+  }
+};
 
 interface MemoryData {
   projectShape: string;
@@ -112,6 +135,7 @@ const parseList = (source: string, heading: string, next: string): string[] => {
 };
 
 const parseMemory = (source: string): { data: MemoryData; start: number; end: number } => {
+  assertCurrentContextFormat(source, MEMORY_PATH);
   if (occurrences(source, MEMORY_START) !== 1 || occurrences(source, MEMORY_END) !== 1 || occurrences(source, MEMORY_HEADING) !== 1) {
     throw new ValidationError("MEMORY.md must contain exactly one well-formed project context section");
   }
@@ -145,9 +169,10 @@ const ensureSingleManagedSection = (source: string | undefined, kind: "memory" |
     : [NAVIGATION_START, NAVIGATION_END, NAVIGATION_HEADING];
   const starts = occurrences(source, start);
   const ends = occurrences(source, end);
-  const headings = kind === "navigation"
-    ? [heading, ...LEGACY_NAVIGATION_HEADINGS].reduce((count, candidate) => count + occurrences(source, candidate), 0)
-    : occurrences(source, heading);
+  if (kind === "navigation" && LEGACY_NAVIGATION_HEADINGS.some((candidate) => source.includes(candidate))) {
+    throw incompatibleContext(`${NAVIGATION_PATH} uses an unsupported navigation heading`, "legacy_navigation_heading");
+  }
+  const headings = occurrences(source, heading);
   if (starts === 0 && ends === 0 && headings === 0) return;
   if (starts !== 1 || ends !== 1 || headings !== 1 || source.indexOf(start) > source.indexOf(end)) {
     throw new ValidationError(`${kind === "memory" ? "MEMORY.md" : NAVIGATION_PATH} has duplicate or malformed managed sections`);
@@ -176,13 +201,13 @@ const renderNavigationSection = (entries: ProjectContext["navigation"]): string 
 
 const parseNavigation = (source: string): { entries: ProjectContext["navigation"]; start: number; end: number } => {
   ensureSingleManagedSection(source, "navigation");
+  assertCurrentContextFormat(source, NAVIGATION_PATH);
   const start = source.indexOf(NAVIGATION_START);
   const endMarker = source.indexOf(NAVIGATION_END);
   if (start < 0 || endMarker < start) throw new ValidationError(`${NAVIGATION_PATH} managed section is missing`);
   const end = endMarker + NAVIGATION_END.length;
   const managed = source.slice(start, end);
-  const headings = [NAVIGATION_HEADING, ...LEGACY_NAVIGATION_HEADINGS].reduce((count, heading) => count + occurrences(managed, heading), 0);
-  if (headings !== 1) throw new ValidationError(`${NAVIGATION_PATH} must contain exactly one supported heading`);
+  if (occurrences(managed, NAVIGATION_HEADING) !== 1) throw new ValidationError(`${NAVIGATION_PATH} must contain exactly one ${NAVIGATION_HEADING} heading`);
   const lines = managed.split("\n");
   const headerIndex = lines.indexOf("| 功能 | 关键词 | 入口路径 | 模块边界 |");
   const separatorIndex = lines.indexOf("| --- | --- | --- | --- |");
@@ -241,15 +266,17 @@ const prepareInitialization = async (root: string): Promise<{ plan: ContextInitP
   const navigationFile = join(root, NAVIGATION_PATH);
   const memory = await readOptional(memoryFile);
   const canonicalNavigation = await readOptional(navigationFile);
-  const legacyNavigation = canonicalNavigation === undefined ? await readOptional(join(root, LEGACY_NAVIGATION_PATH)) : undefined;
-  const navigation = canonicalNavigation ?? legacyNavigation;
+  assertNoLegacyNavigation(root);
+  const navigation = canonicalNavigation;
   ensureSingleManagedSection(memory, "memory");
   ensureSingleManagedSection(navigation, "navigation");
 
-  const canonicalMemory = memory?.replaceAll(LEGACY_NAVIGATION_PATH, NAVIGATION_PATH);
-  const memoryContent = canonicalMemory === undefined
+  if (memory?.includes(LEGACY_NAVIGATION_PATH)) {
+    throw incompatibleContext(`MEMORY.md references unsupported ${LEGACY_NAVIGATION_PATH}`, "legacy_navigation_reference");
+  }
+  const memoryContent = memory === undefined
     ? `${renderMemorySection(emptyMemory())}\n`
-    : canonicalMemory.includes(MEMORY_START) ? (parseMemory(canonicalMemory), canonicalMemory) : appendSection(canonicalMemory, renderMemorySection(emptyMemory()));
+    : memory.includes(MEMORY_START) ? (parseMemory(memory), memory) : appendSection(memory, renderMemorySection(emptyMemory()));
   const navigationContent = navigation === undefined
     ? `${renderNavigationSection([])}\n`
     : navigation.includes(NAVIGATION_START)
@@ -349,7 +376,6 @@ export const initializeProjectContext = async (project: string, confirmDirty = f
     throw new ValidationError("project context or instruction files have uncommitted changes; confirmation required", { paths: prepared.plan.dirty_paths });
   }
   await atomicReplaceFiles(prepared.writes);
-  if (prepared.plan.navigation_status === "created") await rm(join(identity.root, LEGACY_NAVIGATION_PATH), { force: true });
   return prepared.plan;
 };
 
@@ -364,14 +390,21 @@ export const updateProjectContext = async (project: string, value: unknown): Pro
   const navigationPath = join(root, NAVIGATION_PATH);
   const memorySource = await readOptional(memoryPath);
   const navigationSource = await readOptional(navigationPath);
+  assertNoLegacyNavigation(root);
+  if (memorySource === undefined || navigationSource === undefined) {
+    throw incompatibleContext("project context files are missing", "canonical_context_missing");
+  }
+  if (memorySource.includes(LEGACY_NAVIGATION_PATH)) {
+    throw incompatibleContext(`MEMORY.md references unsupported ${LEGACY_NAVIGATION_PATH}`, "legacy_navigation_reference");
+  }
   ensureSingleManagedSection(memorySource, "memory");
   ensureSingleManagedSection(navigationSource, "navigation");
+  assertCurrentContextFormat(memorySource, MEMORY_PATH);
+  assertCurrentContextFormat(navigationSource, NAVIGATION_PATH);
 
-  const baseMemory = memorySource === undefined
-    ? `${renderMemorySection(emptyMemory())}\n`
-    : memorySource.replaceAll(LEGACY_NAVIGATION_PATH, NAVIGATION_PATH).includes(MEMORY_START)
-      ? memorySource.replaceAll(LEGACY_NAVIGATION_PATH, NAVIGATION_PATH)
-      : appendSection(memorySource.replaceAll(LEGACY_NAVIGATION_PATH, NAVIGATION_PATH), renderMemorySection(emptyMemory()));
+  const baseMemory = memorySource.includes(MEMORY_START)
+    ? memorySource
+    : appendSection(memorySource, renderMemorySection(emptyMemory()));
   const parsedMemory = parseMemory(baseMemory);
   const mergedMemory: MemoryData = {
     projectShape: parsedMemory.data.projectShape || context.project_shape.trim(),
@@ -382,9 +415,7 @@ export const updateProjectContext = async (project: string, value: unknown): Pro
   };
   const memoryContent = replaceSection(baseMemory, parsedMemory.start, parsedMemory.end, renderMemorySection(mergedMemory));
 
-  const baseNavigation = navigationSource === undefined
-    ? `${renderNavigationSection([])}\n`
-    : navigationSource.includes(NAVIGATION_START) ? navigationSource : appendSection(navigationSource, renderNavigationSection([]));
+  const baseNavigation = navigationSource.includes(NAVIGATION_START) ? navigationSource : appendSection(navigationSource, renderNavigationSection([]));
   const parsedNavigation = parseNavigation(baseNavigation);
   const entries: ProjectContext["navigation"] = [];
   const positions = new Map<string, number>();
@@ -413,7 +444,7 @@ export const validateProjectContext = async (project: string): Promise<ContextVa
   const root = identity.root;
   const memorySource = await readOptional(join(root, MEMORY_PATH));
   const navigationSource = await readOptional(join(root, NAVIGATION_PATH));
-  const legacyNavigationSource = navigationSource === undefined ? await readOptional(join(root, LEGACY_NAVIGATION_PATH)) : undefined;
+  const legacyNavigationExists = existsSync(join(root, LEGACY_NAVIGATION_PATH));
   const memoryIssues: string[] = [];
   const navigationIssues: string[] = [];
   let memorySections = 0;
@@ -423,18 +454,18 @@ export const validateProjectContext = async (project: string): Promise<ContextVa
     memorySections = occurrences(memorySource, MEMORY_START);
     try {
       parseMemory(memorySource);
-      if (!memorySource.includes(CONTEXT_FORMAT)) memoryIssues.push(`legacy context format; run ai-team context update --project ${root} with the current File Explorer project_context`);
-      if (memorySource.includes(LEGACY_NAVIGATION_PATH)) memoryIssues.push(`MEMORY.md references legacy ${LEGACY_NAVIGATION_PATH}; run ai-team init ${root} --yes to migrate to ${NAVIGATION_PATH}`);
+      if (!hasCurrentContextFormat(memorySource)) memoryIssues.push("unsupported context format; reinitialize context before starting a new run");
+      if (memorySource.includes(LEGACY_NAVIGATION_PATH)) memoryIssues.push(`MEMORY.md references unsupported ${LEGACY_NAVIGATION_PATH}; reinitialize context`);
     } catch (error) { memoryIssues.push((error as Error).message); }
   } else memoryIssues.push("MEMORY.md is missing");
   if (navigationSource !== undefined) {
     navigationSections = occurrences(navigationSource, NAVIGATION_START);
     try {
       navigationEntries = parseNavigation(navigationSource).entries;
-      if (!navigationSource.includes(CONTEXT_FORMAT)) navigationIssues.push(`legacy context format; run ai-team context update --project ${root} with the current File Explorer project_context`);
+      if (!hasCurrentContextFormat(navigationSource)) navigationIssues.push("unsupported context format; reinitialize context before starting a new run");
     } catch (error) { navigationIssues.push((error as Error).message); }
-  } else if (legacyNavigationSource !== undefined) {
-    navigationIssues.push(`${NAVIGATION_PATH} is missing while legacy ${LEGACY_NAVIGATION_PATH} exists; run ai-team init ${root} --yes to migrate it`);
+  } else if (legacyNavigationExists) {
+    navigationIssues.push(`${NAVIGATION_PATH} is missing and unsupported ${LEGACY_NAVIGATION_PATH} exists; reinitialize context`);
   } else navigationIssues.push(`${NAVIGATION_PATH} is missing`);
   const invalidPaths: string[] = [];
   for (const entry of navigationEntries) for (const path of entry.entry_paths) {
@@ -458,6 +489,21 @@ export const validateProjectContext = async (project: string): Promise<ContextVa
     instructions,
     maintenance: { status: pending.length ? "needs_update" : "current", paths: unique(pending) },
   };
+};
+
+export const assertCurrentProjectContext = (root: string): void => {
+  assertNoLegacyNavigation(root);
+  for (const path of [MEMORY_PATH, NAVIGATION_PATH]) {
+    const file = join(root, path);
+    if (!existsSync(file)) throw incompatibleContext(`${path} is missing`, "canonical_context_missing");
+    const source = readFileSync(file, "utf8");
+    if (path === MEMORY_PATH && source.includes(LEGACY_NAVIGATION_PATH)) {
+      throw incompatibleContext(`MEMORY.md references unsupported ${LEGACY_NAVIGATION_PATH}`, "legacy_navigation_reference");
+    }
+    assertCurrentContextFormat(source, path);
+    if (path === MEMORY_PATH) parseMemory(source);
+    else parseNavigation(source);
+  }
 };
 
 export class ProjectContextService {

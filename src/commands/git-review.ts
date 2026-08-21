@@ -70,8 +70,7 @@ export const registerGitCommands = (program: Command, dependencies: GitDependenc
     .requiredOption("--task-id <id>")
     .requiredOption("--expected-head <sha>")
     .requiredOption("--expected-source-artifact <id-or-digest>")
-    .option("--dispatch-id <id>")
-    .option("--replaces-staging-id <id>")
+    .requiredOption("--dispatch-id <id>")
     .action(async (options) => output(await withStore((store) => new GitOrchestrator(store).recoverTaskWorktree({
       project: options.project,
       worktreeId: options.worktreeId,
@@ -84,7 +83,6 @@ export const registerGitCommands = (program: Command, dependencies: GitDependenc
       expectedHead: options.expectedHead,
       expectedSourceArtifact: options.expectedSourceArtifact,
       dispatchId: options.dispatchId,
-      replacesStagingId: options.replacesStagingId,
     }))));
   gitCommand.command("apply-task-authority").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--worktree-id <id>").requiredOption("--authority-commit <sha>").requiredOption("--expected-head <sha>")
     .action(async (options) => output(await withStore((store) => new GitOrchestrator(store).applyTaskAuthority({

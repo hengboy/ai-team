@@ -24,16 +24,10 @@ import { HUMAN_RENDERER_VERSION, renderHuman } from "./human-renderer.js";
 import { validateCommand } from "./command-contract.js";
 
 let humanOutput = false;
-let legacyOutput = false;
 let invocation: InvocationResources | undefined;
-const output = (value: unknown, options: { legacyRaw?: boolean } = {}): void => {
-  if (legacyOutput && options.legacyRaw) { process.stdout.write(`${String(value)}\n`); return; }
+const output = (value: unknown): void => {
   if (humanOutput) { process.stdout.write(`${renderHuman(value)}\n`); return; }
-  const envelope = {
-    ok: true,
-    data: value,
-    ...(legacyOutput && value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}),
-  };
+  const envelope = { ok: true, data: value };
   process.stdout.write(`${JSON.stringify(envelope, null, 2)}\n`);
 };
 const withStore = async <T>(action: (store: StateStore) => Promise<T> | T, options: { readonly?: boolean } = {}): Promise<T> => {
@@ -195,8 +189,7 @@ const retentionHours = (): Promise<number> => new EnvironmentService().stagingRe
 
 export const buildProgram = (): Command => {
   const program = new Command().exitOverride().name("ai-team").description("Local AI coding team workflow orchestration").version(PACKAGE_VERSION)
-    .option("--human", "render human-readable output")
-    .option("--legacy-output", "include legacy top-level success fields");
+    .option("--human", "render human-readable output");
   program.configureOutput({ outputError: () => {} });
 
   registerProjectCommands(program, { output, withStore, jsonOptions, retentionHours, loadJsonInput, withStagingResult });
@@ -235,7 +228,6 @@ export const buildProgram = (): Command => {
 
 export const main = async (argv = process.argv): Promise<void> => {
   humanOutput = argv.includes("--human");
-  legacyOutput = argv.includes("--legacy-output");
   invocation = new InvocationResources();
   setInvocationResources(invocation);
   let receivedSignal: ShutdownSignal | undefined;

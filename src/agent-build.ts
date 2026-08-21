@@ -25,7 +25,7 @@ export interface RenderContext { role: Role; purpose: string; allowed_commands: 
 const supportedPlatforms: AgentBuildPlatform[] = ["codex", "claude", "opencode"];
 const reasoningValues = new Set(["low", "medium", "high", "xhigh"]);
 const effortValues = new Set(["low", "medium", "high"]);
-const variantValues = new Set(["low", "medium", "high"]);
+const variantValues = new Set(["low", "medium", "high", "xhigh"]);
 const supportedCommandPrefixes = ["planning start", "planning revision ", "planning tasks ", "coding start", "context ", "dispatch ", "decision create", "staging ", "scope check", "run ", "review ", "research ", "git ", "install", "env ", "backup restore", "uninstall"];
 const allowedVariables = new Set(["role", "purpose", "allowed_commands", "delegates", "discovery", "stop_conditions", "platform", "environment", "contract_digest", "role_manifest_digest", "template_version", "spec_template", "plan_template", "task_template", "plan_metadata_template", "task_metadata_template"]);
 const packageRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));

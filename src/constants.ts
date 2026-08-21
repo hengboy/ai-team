@@ -30,11 +30,6 @@ export const EXIT = {
   git: 6,
   security: 7,
   internal: 8,
-  // Compatibility aliases used by existing service errors.
-  validation: 2,
-  state: 3,
-  conflict: 4,
-  environment: 5,
 } as const;
 
 export const PLAN_STATES = [

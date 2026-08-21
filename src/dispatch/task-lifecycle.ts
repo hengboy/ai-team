@@ -2,229 +2,15 @@ import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { Role } from "../constants.js";
-import { createResultTemplate, resultSchemaForRole, type ResultEnvelope } from "../contracts.js";
-import { ValidationError } from "../errors.js";
+import { type ResultEnvelope } from "../contracts.js";
+import { IncompatibleError, ValidationError } from "../errors.js";
 import { pathMatchesScope } from "../security.js";
-import { assertExplicitTaskWritePaths } from "../state.js";
-import { redact, sha256, stableJson } from "../utils.js";
+import { sha256, stableJson } from "../utils.js";
 import { resolveReviewWorktree } from "../worktree-review.js";
 import { isBroadReadPath } from "./packet.js";
 import { buildTestPacket } from "./implementation.js";
-import { freezeAuthorityConflictContinuationExecutionContract, freezeExecutionContract } from "../execution-contract.js";
+import { freezeExecutionContract } from "../execution-contract.js";
 import * as common from "./store.js";
-export function recoverClaimedTaskScope(store: common.StateStore, ops: common.DispatchOperations, input: {
-    runId: string;
-    dispatchId: string;
-    authorityCommit: string;
-    expectedHead: string;
-    addedWritePaths: string[];
-  }): common.ReplacementResult<"superseded"> & { role: "git-operator"; claim_command: string; authority_commit: string; allowed_write_paths: string[]; dirty_paths: string[] } {
-    const run = store.getRun(input.runId) as { profile: string; mode?: string; state: string; repo_id: string };
-    if (run.profile !== "coding" || run.mode !== "planned" || run.state !== "active") throw new ValidationError("claimed task scope recovery requires an active planned Coding run");
-    ops.assertCommandAllowed!(store, ops, "coding", "dispatch supersede");
-    if (!/^[a-f0-9]{40}$/.test(input.authorityCommit) || !/^[a-f0-9]{40}$/.test(input.expectedHead)) throw new ValidationError("scope recovery requires full authority and expected HEAD commit SHAs");
-    const row = ops.get!(store, ops, input.runId, input.dispatchId, "backend-developer") as { state: string; packet_json: string; result_json?: string };
-    const sourcePacket = JSON.parse(row.packet_json) as common.DispatchPacket;
-    const taskId = typeof sourcePacket.context.task_id === "string" ? sourcePacket.context.task_id : undefined;
-    const worktreeId = typeof sourcePacket.context.worktree_id === "string" ? sourcePacket.context.worktree_id : undefined;
-    const worktreePath = typeof sourcePacket.context.worktree_path === "string" ? sourcePacket.context.worktree_path : undefined;
-    if (!taskId || !worktreeId || !worktreePath) throw new ValidationError("claimed developer dispatch lacks frozen task worktree identity");
-    const normalizedAddedPaths = assertExplicitTaskWritePaths(input.addedWritePaths, `scope recovery ${taskId}`);
-    const existing = store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
-      .get(input.runId, input.dispatchId) as { dispatch_id: string; packet_json: string } | undefined;
-    if (existing) {
-      const packet = JSON.parse(existing.packet_json) as common.DispatchPacket;
-      const recovery = packet.context.scope_recovery as { authority_commit?: string; dirty_paths?: string[] } | undefined;
-      if (recovery?.authority_commit !== input.authorityCommit || !normalizedAddedPaths.every((path) => packet.allowed_write_paths.includes(path))) {
-        throw new ValidationError("claimed developer dispatch already has a different scope recovery replacement");
-      }
-      return {
-        action: "superseded", dispatch_id: existing.dispatch_id, replacement_for: input.dispatchId, reused: true,
-        role: "git-operator", claim_command: ops.claimCommand!(store, ops, input.runId, existing.dispatch_id),
-        authority_commit: input.authorityCommit, allowed_write_paths: packet.allowed_write_paths, dirty_paths: recovery.dirty_paths ?? [],
-      };
-    }
-    const task = ops.plannedTaskRows!(store, ops, input.runId).find((candidate) => candidate.task_id === taskId);
-    if (!task || task.state === "integrated" || task.developer_dispatch_id && task.developer_dispatch_id !== input.dispatchId) {
-      throw new ValidationError("claimed developer dispatch is not the active unintegrated task owner");
-    }
-    const originalPaths = ops.frozenTaskWritePaths!(store, ops, input.runId, taskId);
-    const allowedWritePaths = [...new Set([...originalPaths, ...normalizedAddedPaths])].sort();
-    if (row.state !== "claimed" || row.result_json) throw new ValidationError("scope recovery requires a claimed developer dispatch with no result");
-    const sideEffects = store.db.prepare(`SELECT
-      (SELECT COUNT(*) FROM artifacts WHERE run_id=? AND dispatch_id=?) AS artifacts,
-      (SELECT COUNT(*) FROM staging_entries WHERE run_id=? AND dispatch_id=?) AS staging`).get(input.runId, input.dispatchId, input.runId, input.dispatchId) as { artifacts: number; staging: number };
-    if (sideEffects.artifacts || sideEffects.staging) throw new ValidationError("scope recovery requires a developer dispatch with no side effects", sideEffects);
-    const worktree = store.db.prepare("SELECT path,state FROM worktrees WHERE run_id=? AND worktree_id=?")
-      .get(input.runId, worktreeId) as { path: string; state: string } | undefined;
-    if (!worktree || worktree.state !== "active" || worktree.path !== worktreePath) throw new ValidationError("scope recovery worktree does not match its frozen task identity");
-    const head = execFileSync("git", ["-C", worktree.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-    if (head !== input.expectedHead) throw new ValidationError("scope recovery worktree HEAD does not match --expected-head", { expected: input.expectedHead, actual: head });
-    const repository = store.db.prepare("SELECT project_path FROM repositories WHERE repo_id=?").get(run.repo_id) as { project_path: string } | undefined;
-    if (!repository) throw new ValidationError("scope recovery repository is missing");
-    const authority = execFileSync("git", ["-C", repository.project_path, "rev-parse", `${input.authorityCommit}^{commit}`], { encoding: "utf8" }).trim();
-    if (authority !== input.authorityCommit) throw new ValidationError("scope recovery authority commit does not resolve exactly");
-    try { execFileSync("git", ["-C", repository.project_path, "merge-base", "--is-ancestor", authority, "HEAD"], { stdio: "ignore" }); }
-    catch { throw new ValidationError("scope recovery authority commit is not reachable from the current main checkout"); }
-    const authorityPaths = execFileSync("git", ["-C", repository.project_path, "diff-tree", "--no-commit-id", "--name-only", "-r", authority], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
-    const unsupported = normalizedAddedPaths.filter((path) => !authorityPaths.includes(path));
-    if (unsupported.length) throw new ValidationError("scope recovery authority commit does not contain every added write path", { authority_commit: authority, unsupported_paths: unsupported });
-    const dirtyPaths = common.dirtyWorktreePaths(worktree.path);
-    const outOfScope = dirtyPaths.filter((path) => !pathMatchesScope(path, allowedWritePaths));
-    if (outOfScope.length) throw new ValidationError("scope recovery would not preserve dirty paths within the replacement scope", { dirty_paths: outOfScope });
-    const packet = common.validatePacket({
-      ...sourcePacket,
-      objective: `Apply the recorded authority commit for ${taskId} without changing its task worktree HEAD or losing its dirty work.`,
-      allowed_read_paths: [],
-      allowed_write_paths: allowedWritePaths,
-      acceptance_criteria: [
-        "Apply only the recorded authority commit into the frozen task worktree",
-        "Preserve the frozen task worktree identity, HEAD, and dirty work",
-        "Record only the authority application receipt",
-      ],
-      context: {
-        ...sourcePacket.context,
-        stage: "git-operator",
-        phase: "apply_task_authority",
-        operation: "apply-task-authority",
-        authority_commit: authority,
-        expected_head: input.expectedHead,
-        superseded_developer_dispatch_id: input.dispatchId,
-        scope_recovery: {
-          authority_commit: authority,
-          expected_head: input.expectedHead,
-          original_allowed_write_paths: originalPaths,
-          added_write_paths: normalizedAddedPaths,
-          allowed_write_paths: allowedWritePaths,
-          dirty_paths: dirtyPaths,
-        },
-      },
-    }, "git-operator");
-    let replacementId = "";
-    store.db.transaction(() => {
-      store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=? AND state='claimed'").run(new Date().toISOString(), input.dispatchId);
-      replacementId = ops.insert!(store, ops, input.runId, "git-operator", packet, input.dispatchId);
-      const updated = store.db.prepare(`UPDATE run_tasks SET write_paths_json=?,developer_dispatch_id=?,updated_at=?
-        WHERE run_id=? AND task_id=? AND (developer_dispatch_id=? OR developer_dispatch_id IS NULL) AND state!='integrated'`).run(stableJson(allowedWritePaths), null, new Date().toISOString(), input.runId, taskId, input.dispatchId);
-      if (updated.changes !== 1) throw new ValidationError("task ownership changed during claimed scope recovery");
-      store.event(input.runId, "dispatch.superseded", { dispatchId: input.dispatchId, replacement_dispatch_id: replacementId, role: "backend-developer", actor_role: "coding", reason: "frozen task scope expanded by explicit authority commit" });
-      store.event(input.runId, "task.scope_recovered", { task_id: taskId, worktree_id: worktreeId, authority_commit: authority, expected_head: input.expectedHead, original_allowed_write_paths: originalPaths, allowed_write_paths: allowedWritePaths, dirty_paths: dirtyPaths, superseded_dispatch_id: input.dispatchId, replacement_dispatch_id: replacementId });
-    })();
-    return {
-      action: "superseded", dispatch_id: replacementId, replacement_for: input.dispatchId, reused: false,
-      role: "git-operator", claim_command: ops.claimCommand!(store, ops, input.runId, replacementId),
-      authority_commit: authority, allowed_write_paths: allowedWritePaths, dirty_paths: dirtyPaths,
-    };
-  }
-
-export function repairClaimedTaskScopeReplacement(store: common.StateStore, ops: common.DispatchOperations, input: { runId: string; dispatchId: string }): {
-    action: "repaired";
-    dispatch_id: string;
-    role: "git-operator";
-    claim_command: string;
-    reused: boolean;
-  } {
-    const run = store.getRun(input.runId) as { profile: string; mode?: string; state: string };
-    if (run.profile !== "coding" || run.mode !== "planned" || run.state !== "active") {
-      throw new ValidationError("claimed task scope replacement repair requires an active planned Coding run");
-    }
-    const row = store.db.prepare(`SELECT role,state,packet_json,result_json,replacement_for FROM dispatches
-      WHERE run_id=? AND dispatch_id=?`).get(input.runId, input.dispatchId) as {
-      role: Role; state: string; packet_json: string; result_json?: string; replacement_for?: string;
-    } | undefined;
-    if (!row) throw new ValidationError("dispatch identity does not match run");
-    const packet = JSON.parse(row.packet_json) as common.DispatchPacket;
-    const context = packet.context as Record<string, unknown>;
-    const claimCommand = ops.claimCommand!(store, ops, input.runId, input.dispatchId);
-    if (row.role === "git-operator" && context.operation === "apply-task-authority") {
-      if (row.state !== "pending" || context.phase !== "apply_task_authority" || context.operation !== "apply-task-authority") {
-        throw new ValidationError("dispatch is not a repaired task authority replacement");
-      }
-      return { action: "repaired", dispatch_id: input.dispatchId, role: "git-operator", claim_command: claimCommand, reused: true };
-    }
-    if ((row.role !== "backend-developer" && row.role !== "git-operator") || row.state !== "pending" || row.result_json || !row.replacement_for) {
-      throw new ValidationError("dispatch is not an unclaimed legacy task authority replacement");
-    }
-    const source = store.db.prepare(`SELECT role,state,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=?`)
-      .get(input.runId, row.replacement_for) as { role: Role; state: string; packet_json: string } | undefined;
-    if (!source || source.role !== "backend-developer" || source.state !== "failed") {
-      throw new ValidationError("legacy task authority replacement has invalid superseded developer lineage");
-    }
-    const sourceContext = (JSON.parse(source.packet_json) as common.DispatchPacket).context as Record<string, unknown>;
-    const recovery = context.scope_recovery as Record<string, unknown> | undefined;
-    const sourceFields = ["task_id", "worktree_id", "worktree_path", "explorer_dispatch_id", "coordinator_dispatch_id", "prepare_git_dispatch_id"];
-    const scopeFields = ["authority_commit", "expected_head"];
-    const originalPaths = recovery?.original_allowed_write_paths;
-    const addedPaths = recovery?.added_write_paths;
-    const recoveredPaths = Array.isArray(originalPaths) && Array.isArray(addedPaths)
-      && [...originalPaths, ...addedPaths].every((path) => typeof path === "string")
-      ? [...new Set([...originalPaths, ...addedPaths] as string[])].sort() : undefined;
-    if (sourceFields.some((key) => typeof sourceContext[key] !== "string" || !sourceContext[key])
-      || scopeFields.some((key) => typeof recovery?.[key] !== "string" || !recovery?.[key])
-      || (context.task_id !== undefined && context.task_id !== sourceContext.task_id)
-      || (context.worktree_id !== undefined && context.worktree_id !== sourceContext.worktree_id)
-      || (context.worktree_path !== undefined && context.worktree_path !== sourceContext.worktree_path)
-      || (context.superseded_developer_dispatch_id !== undefined && context.superseded_developer_dispatch_id !== row.replacement_for)
-      || !recoveredPaths || stableJson(recoveredPaths) !== stableJson([...packet.allowed_write_paths].sort())) {
-      throw new ValidationError("legacy task authority replacement is missing frozen recovery lineage");
-    }
-    const sideEffects = store.db.prepare(`SELECT
-      (SELECT COUNT(*) FROM artifacts WHERE run_id=? AND dispatch_id=?) AS artifacts,
-      (SELECT COUNT(*) FROM staging_entries WHERE run_id=? AND dispatch_id=?) AS staging`).get(input.runId, input.dispatchId, input.runId, input.dispatchId) as { artifacts: number; staging: number };
-    if (sideEffects.artifacts || sideEffects.staging) throw new ValidationError("legacy task authority replacement already has side effects");
-    const unfrozen = { ...packet };
-    delete unfrozen.execution_contract;
-    delete unfrozen.execution_request;
-    const lineageContext = { ...context };
-    delete lineageContext.context_owner;
-    delete lineageContext.context_maintenance;
-    const corrected = freezeExecutionContract("git-operator", ops.freezeVerificationContext!(store, ops, input.runId, "git-operator", common.validatePacket({
-      ...unfrozen,
-      objective: `Apply the recorded authority commit for ${context.task_id} without changing its task worktree HEAD or losing its dirty work.`,
-      allowed_read_paths: [],
-      acceptance_criteria: [
-        "Apply only the recorded authority commit into the frozen task worktree",
-        "Preserve the frozen task worktree identity, HEAD, and dirty work",
-        "Record only the authority application receipt",
-      ],
-      context: {
-        ...lineageContext,
-        stage: "git-operator",
-        phase: "apply_task_authority",
-        operation: "apply-task-authority",
-        task_id: sourceContext.task_id,
-        worktree_id: sourceContext.worktree_id,
-        worktree_path: sourceContext.worktree_path,
-        explorer_dispatch_id: sourceContext.explorer_dispatch_id,
-        coordinator_dispatch_id: sourceContext.coordinator_dispatch_id,
-        prepare_git_dispatch_id: sourceContext.prepare_git_dispatch_id,
-        authority_commit: recovery!.authority_commit,
-        expected_head: recovery!.expected_head,
-        superseded_developer_dispatch_id: row.replacement_for,
-        scope_recovery: { ...recovery, allowed_write_paths: [...packet.allowed_write_paths].sort() },
-      },
-    }, "git-operator"))) as common.DispatchPacket;
-    const packetJson = redact(stableJson(corrected));
-    const prompt = redact(common.promptFor(input.runId, input.dispatchId, "git-operator", corrected));
-    const schemaJson = stableJson(resultSchemaForRole("git-operator"));
-    const templateJson = stableJson(createResultTemplate(input.runId, input.dispatchId, "git-operator"));
-    store.db.transaction(() => {
-      store.db.prepare(`UPDATE dispatches SET role='git-operator',packet_json=?,prompt='',schema_json=?,template_json=?,
-        packet_digest=?,prompt_digest=?,schema_digest=?,template_digest=?,renderer_version=? WHERE run_id=? AND dispatch_id=? AND role IN ('backend-developer','git-operator') AND state='pending'`)
-      .run(packetJson, schemaJson, templateJson, sha256(packetJson), sha256(prompt), sha256(schemaJson), sha256(templateJson), common.RENDERER_VERSION, input.runId, input.dispatchId);
-      store.event(input.runId, "dispatch.claimed_task_scope_replacement_repaired", {
-        dispatch_id: input.dispatchId,
-        replacement_for: row.replacement_for,
-        from_role: row.role,
-        role: "git-operator",
-        operation: "apply-task-authority",
-        authority_commit: context.authority_commit,
-        expected_head: context.expected_head,
-      });
-    })();
-    return { action: "repaired", dispatch_id: input.dispatchId, role: "git-operator", claim_command: claimCommand, reused: false };
-  }
-
 export function claimedRecoveryMayFinish(store: common.StateStore, ops: common.DispatchOperations, runId: string, dispatchId: string, role: Role, dispatch: { state: string; packet_json: string }, runState: string): boolean {
     if (role !== "git-operator" || dispatch.state !== "claimed" || runState !== "retryable_failure") return false;
     const packet = JSON.parse(dispatch.packet_json) as common.DispatchPacket;
@@ -261,7 +47,10 @@ export function assertPlannedTaskTestScope(store: common.StateStore, ops: common
         offending_task_id: taskId, offending_dispatch_id: task.developer_dispatch_id, offending_worktree_id: worktreeId,
       });
     }
-    if (!task.write_paths_json) throw new ValidationError(`legacy frozen Task paths require managed scope recovery: ${taskId}`);
+    if (!task.write_paths_json) throw new IncompatibleError("planned Test requires explicit frozen Task write paths", {
+      reason_code: "missing_frozen_task_scope",
+      next_action: "start_new_run",
+    });
     const actual = [...new Set((((JSON.parse(developer.result_json) as ResultEnvelope).payload as { modified_paths?: string[] }).modified_paths ?? []))].sort();
     if (!actual.length) throw new ValidationError("planned Test requires non-empty developer modified_paths");
     const frozenPaths = JSON.parse(task.write_paths_json) as string[];
@@ -274,15 +63,11 @@ export function assertPlannedTaskTestScope(store: common.StateStore, ops: common
     });
     const scope = JSON.parse(scopeRow.payload_json) as { paths?: string[]; digest?: string; snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } | null };
     const preCommitPaths = [...new Set(scope.paths ?? [])].sort();
-    const recoveredSnapshotRow = !scope.snapshot ? store.db.prepare(`SELECT payload_json FROM run_events
-      WHERE run_id=? AND type='scope.pre_commit_snapshot_recovered'
-      AND json_extract(payload_json,'$.worktree_id')=? AND json_extract(payload_json,'$.original_scope_digest')=?
-      AND json_extract(payload_json,'$.task_id')=? AND json_extract(payload_json,'$.developer_dispatch_id')=?
-      ORDER BY event_id DESC LIMIT 1`).get(runId, worktreeId, scope.digest, taskId, task.developer_dispatch_id) as { payload_json: string } | undefined : undefined;
-    const recoveredSnapshot = recoveredSnapshotRow
-      ? (JSON.parse(recoveredSnapshotRow.payload_json) as { snapshot?: { head: string; dirty_paths: string[]; diff_digest: string } }).snapshot
-      : undefined;
-    const expectedSnapshot = scope.snapshot ?? recoveredSnapshot ?? null;
+    if (!scope.snapshot) throw new IncompatibleError("planned Test requires an explicit immutable pre_commit snapshot", {
+      reason_code: "missing_frozen_scope_snapshot",
+      next_action: "start_new_run",
+    });
+    const expectedSnapshot = scope.snapshot;
     const worktree = store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'").get(runId, worktreeId) as { path: string } | undefined;
     const snapshot = worktree ? common.plannedWorktreeSnapshot(worktree.path) : null;
     const unauthorized = [...new Set([
@@ -335,7 +120,10 @@ export function plannedTaskRows(store: common.StateStore, ops: common.DispatchOp
 export function frozenTaskWritePaths(store: common.StateStore, ops: common.DispatchOperations, runId: string, taskId: string): string[] {
     const task = ops.plannedTaskRows!(store, ops, runId).find((candidate) => candidate.task_id === taskId);
     if (!task) throw new ValidationError(`unknown frozen run task: ${taskId}`);
-    if (!task.write_paths_json) throw new ValidationError(`legacy frozen Task paths require managed scope recovery: ${taskId}`);
+    if (!task.write_paths_json) throw new IncompatibleError("planned task requires explicit frozen write paths", {
+      reason_code: "missing_frozen_task_scope",
+      next_action: "start_new_run",
+    });
     return JSON.parse(task.write_paths_json) as string[];
   }
 
@@ -679,7 +467,7 @@ export function completedImplementationOperation(store: common.StateStore, ops: 
       try {
         const evidence = JSON.parse(row.evidence_json ?? "{}") as { commit?: string; paths?: string[] };
         if (/^[a-f0-9]{40}$/.test(evidence.commit ?? "")) return { commit: evidence.commit!, paths: evidence.paths ?? [], kind: row.kind };
-      } catch { /* malformed legacy evidence is not implementation proof */ }
+      } catch { /* malformed evidence is not implementation proof */ }
     }
     return undefined;
   }
@@ -799,76 +587,6 @@ export function ensurePlannedTaskContinuation(store: common.StateStore, ops: com
     });
     ops.changeStage!(store, ops, runId, "coding", dispatchId);
     return dispatchId;
-  }
-
-export function ensureRecoveredTaskDeveloperDispatch(store: common.StateStore, ops: common.DispatchOperations, runId: string, authorityDispatchId: string, allowReconciledTaskRecovery = false): string | undefined {
-    const authority = store.db.prepare(`SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator' AND state IN ('completed','failed')
-      AND json_extract(packet_json,'$.context.phase')='apply_task_authority'`).get(runId, authorityDispatchId) as { packet_json: string } | undefined;
-    if (!authority) return undefined;
-    const authorityPacket = JSON.parse(authority.packet_json) as common.DispatchPacket;
-    const context = authorityPacket.context as Record<string, unknown>;
-    const taskId = typeof context.task_id === "string" ? context.task_id : undefined;
-    const sourceId = typeof context.superseded_developer_dispatch_id === "string" ? context.superseded_developer_dispatch_id : undefined;
-    const worktreeId = typeof context.worktree_id === "string" ? context.worktree_id : undefined;
-    const worktreePath = typeof context.worktree_path === "string" ? context.worktree_path : undefined;
-    if (!taskId || !sourceId || !worktreeId || !worktreePath) throw new ValidationError("authority application continuation lacks frozen developer lineage");
-    const existing = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND replacement_for=? AND role='backend-developer' ORDER BY created_at LIMIT 1")
-      .get(runId, sourceId) as { dispatch_id: string } | undefined;
-    if (existing) return existing.dispatch_id;
-    const source = store.db.prepare("SELECT packet_json,state FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='backend-developer'")
-      .get(runId, sourceId) as { packet_json: string; state: string } | undefined;
-    if (!source || source.state !== "failed") throw new ValidationError("authority application source developer was not superseded");
-    const task = ops.plannedTaskRows!(store, ops, runId).find((candidate) => candidate.task_id === taskId);
-    const isReconciledTaskOwner = task?.developer_dispatch_id === sourceId
-      || task?.developer_dispatch_id === authorityDispatchId;
-    const recoveringReconciledTask = allowReconciledTaskRecovery
-      && (task?.state === "prepared" || task?.state === "implemented")
-      && isReconciledTaskOwner;
-    const normallyReadyTask = task?.state === "prepared" && !task.developer_dispatch_id;
-    if (!normallyReadyTask && !recoveringReconciledTask) {
-      throw new ValidationError("authority application task is no longer ready for its replacement developer");
-    }
-    const worktree = store.db.prepare("SELECT path,state FROM worktrees WHERE run_id=? AND worktree_id=?")
-      .get(runId, worktreeId) as { path: string; state: string } | undefined;
-    if (!worktree || worktree.state !== "active" || worktree.path !== worktreePath) throw new ValidationError("authority application worktree identity changed before developer replacement");
-    const sourcePacket = JSON.parse(source.packet_json) as common.DispatchPacket;
-    const unfrozenSource = { ...sourcePacket };
-    delete unfrozenSource.execution_contract;
-    const packet = common.validatePacket({
-      ...unfrozenSource,
-      allowed_write_paths: authorityPacket.allowed_write_paths,
-      context: {
-        ...sourcePacket.context,
-        phase: "implementation",
-        authority_apply_git_dispatch_id: authorityDispatchId,
-        scope_recovery: {
-          ...(context.scope_recovery as Record<string, unknown>),
-          authority_apply_git_dispatch_id: authorityDispatchId,
-        },
-      },
-    }, "backend-developer");
-    let replacementId = "";
-    store.db.transaction(() => {
-      replacementId = ops.insert!(store, ops, runId, "backend-developer", packet, sourceId);
-      const updated = recoveringReconciledTask
-        ? store.db.prepare(`UPDATE run_tasks SET state='prepared',developer_dispatch_id=?,updated_at=?
-          WHERE run_id=? AND task_id=? AND developer_dispatch_id IN (?,?) AND state IN ('prepared','implemented')`)
-          .run(replacementId, new Date().toISOString(), runId, taskId, sourceId, authorityDispatchId)
-        : store.db.prepare(`UPDATE run_tasks SET developer_dispatch_id=?,updated_at=?
-          WHERE run_id=? AND task_id=? AND developer_dispatch_id IS NULL AND state='prepared'`)
-          .run(replacementId, new Date().toISOString(), runId, taskId);
-      if (updated.changes !== 1) throw new ValidationError("authority application task ownership changed during developer replacement");
-      store.event(runId, "coding.developer_dispatch_created", {
-        dispatch_id: replacementId,
-        source: "scope_recovery",
-        task_id: taskId,
-        worktree_id: worktreeId,
-        superseded_developer_dispatch_id: sourceId,
-        authority_apply_git_dispatch_id: authorityDispatchId,
-      });
-    })();
-    ops.changeStage!(store, ops, runId, "coding", replacementId);
-    return replacementId;
   }
 
 export function ensurePlannedTaskDeveloperDispatch(store: common.StateStore, ops: common.DispatchOperations, runId: string, continuationDispatchId?: string, source: "completion" | "resume" = "resume"): string | undefined {
@@ -1198,81 +916,4 @@ export function advanceImplementation(store: common.StateStore, ops: common.Disp
     if (existing) return;
     const dispatchId = ops.createTestDispatch!(store, ops, runId, snapshot);
     store.event(runId, "test.dispatch_created", { dispatchId, implementation_dispatch_id: snapshot.implementationDispatchId, implementation_artifact_id: snapshot.implementationArtifact.artifact_id });
-  }
-
-export function createAuthorityConflictContinuation(store: common.StateStore, ops: common.DispatchOperations, input: {
-    runId: string;
-    authorityDispatchId: string;
-    operationId: string;
-    worktreeId: string;
-    authorityCommit: string;
-    expectedHead: string;
-    dirtyPaths: string[];
-    authorityPaths: string[];
-    conflictPaths: string[];
-    stashCommit: string;
-  }): { dispatch_id: string; reused: boolean } {
-    const source = store.db.prepare("SELECT state,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
-      .get(input.runId, input.authorityDispatchId) as { state: string; packet_json: string } | undefined;
-    const sourcePacket = source ? JSON.parse(source.packet_json) as common.DispatchPacket : undefined;
-    const context = sourcePacket?.context;
-    const dirtyPaths = [...new Set(input.dirtyPaths)].sort();
-    const authorityPaths = [...new Set(input.authorityPaths)].sort();
-    const conflictPaths = [...new Set(input.conflictPaths)].sort();
-    if (!source || !sourcePacket || source.state !== "claimed" || context?.phase !== "apply_task_authority" || context.operation !== "apply-task-authority"
-      || context.worktree_id !== input.worktreeId || context.authority_commit !== input.authorityCommit || context.expected_head !== input.expectedHead
-      || !Array.isArray(context.scope_recovery && (context.scope_recovery as Record<string, unknown>).allowed_write_paths)
-      || [...dirtyPaths, ...authorityPaths].some((path) => !pathMatchesScope(path, sourcePacket.allowed_write_paths))) {
-      throw new ValidationError("authority conflict continuation does not match the claimed frozen authority packet");
-    }
-    const continuationContext = {
-      ...context,
-      stage: "git-operator",
-      phase: "continue_task_authority_conflict",
-      operation: "continue-task-authority-conflict",
-      authority_apply_operation_id: input.operationId,
-      authority_apply_dispatch_id: input.authorityDispatchId,
-      dirty_paths: dirtyPaths,
-      authority_paths: authorityPaths,
-      conflict_paths: conflictPaths,
-      stash_commit: input.stashCommit,
-      allowed_write_paths: [...sourcePacket.allowed_write_paths].sort(),
-    };
-    const packet = freezeAuthorityConflictContinuationExecutionContract(common.validatePacket({
-      objective: `Resolve the recorded authority content conflict for ${String(context.task_id)} without changing its frozen task worktree HEAD or losing its dirty work.`,
-      allowed_read_paths: [],
-      allowed_write_paths: [...sourcePacket.allowed_write_paths],
-      acceptance_criteria: [
-        "Resolve only the recorded authority content conflict within the frozen task write paths",
-        "Preserve the frozen task worktree HEAD and recorded dirty paths",
-        "Record only the authority application receipt",
-      ],
-      context: continuationContext,
-    }, "git-operator"), sourcePacket);
-    const packetJson = redact(stableJson(packet));
-    const existing = store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
-      .get(input.runId, input.authorityDispatchId) as { dispatch_id: string; packet_json: string } | undefined;
-    if (existing) {
-      if (existing.packet_json !== packetJson) throw new ValidationError("authority conflict already has a different continuation");
-      return { dispatch_id: existing.dispatch_id, reused: true };
-    }
-    let dispatchId = "";
-    store.db.transaction(() => {
-      store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE run_id=? AND dispatch_id=? AND state='claimed'")
-        .run(new Date().toISOString(), input.runId, input.authorityDispatchId);
-      dispatchId = ops.insert!(store, ops, input.runId, "git-operator", packet, input.authorityDispatchId);
-      store.event(input.runId, "worktree.task_authority_conflict_continuation_created", {
-        authority_apply_dispatch_id: input.authorityDispatchId,
-        continuation_dispatch_id: dispatchId,
-        operation_id: input.operationId,
-        worktree_id: input.worktreeId,
-        authority_commit: input.authorityCommit,
-        expected_head: input.expectedHead,
-        dirty_paths: dirtyPaths,
-        authority_paths: authorityPaths,
-        conflict_paths: conflictPaths,
-        stash_commit: input.stashCommit,
-      });
-    })();
-    return { dispatch_id: dispatchId, reused: false };
   }

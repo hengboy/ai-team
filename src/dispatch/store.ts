@@ -3,12 +3,12 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import type { Role } from "../constants.js";
 import { type ResultEnvelope } from "../contracts.js";
-import { ValidationError } from "../errors.js";
+import { IncompatibleError, ValidationError } from "../errors.js";
 import { pathMatchesScope } from "../security.js";
 import { StateStore } from "../state.js";
 import { sha256, stableJson } from "../utils.js";
 import { type ReviewResult } from "../review.js";
-import { dispatchPacketSchema as packetSchema, dispatchPacketTemplate as packetTemplate, EXPLORER_CONTEXT_PATHS as PACKET_EXPLORER_CONTEXT_PATHS, mergeBindingsFromPacket as packetMergeBindings, promptFor as renderPrompt, promptForV2 as renderPromptV2, promptForV3 as renderPromptV3, RENDERER_VERSION as PACKET_RENDERER_VERSION, validatePacket as validateDispatchPacket } from "./packet.js";
+import { dispatchPacketSchema as packetSchema, dispatchPacketTemplate as packetTemplate, EXPLORER_CONTEXT_PATHS as PACKET_EXPLORER_CONTEXT_PATHS, mergeBindingsFromPacket as packetMergeBindings, promptFor as renderPrompt, RENDERER_VERSION as PACKET_RENDERER_VERSION, validatePacket as validateDispatchPacket } from "./packet.js";
 import { type ExecutionContract, type ExecutionRequest } from "../execution-contract.js";
 import { type NextAction, type TimelineEntry } from "../run-recovery.js";
 
@@ -145,18 +145,20 @@ export const dirtyWorktreePaths = (worktreePath: string): string[] => {
 export const successfulOutcome = (value: unknown): boolean => typeof value === "string"
   && ["passed", "success", "succeeded", "completed", "ok"].includes(value.trim().toLowerCase());
 
-export const promptForV2 = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
-  renderPromptV2(runId, dispatchId, role, packet),
-].join("");
-export const promptForV3 = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
-  renderPromptV3(runId, dispatchId, role, packet),
-].join("");
 export const promptFor = (runId: string, dispatchId: string, role: Role, packet: DispatchPacket): string => [
   renderPrompt(runId, dispatchId, role, packet),
 ].join("");
 
 export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   return validateDispatchPacket(packet, role);
+};
+
+export const assertCurrentDispatchRenderer = (rendererVersion: unknown): void => {
+  if (rendererVersion === RENDERER_VERSION) return;
+  throw new IncompatibleError("dispatch renderer is not supported", {
+    reason_code: "legacy_dispatch_renderer",
+    next_action: "start_new_run",
+  });
 };
 
 export const validateReviewResult = (result: ReviewResult): void => {

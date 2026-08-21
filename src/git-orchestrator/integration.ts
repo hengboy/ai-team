@@ -1,16 +1,24 @@
 import { mkdir, stat } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
-import { ValidationError } from "../errors.js";
+import { IncompatibleError, ValidationError } from "../errors.js";
 import { commitPaths, createWorktree, currentBranch, currentHead, git, mergeNoFastForward, worktreeStatus } from "../git.js";
 import { assertWritablePath, canonicalizeInside, pathMatchesScope } from "../security.js";
 import { sha256, toPosix } from "../utils.js";
 import * as common from "./runtime.js";
-export async function prepareIntegration(store: common.StateStore, ops: common.GitOperations, runId: string, dispatchId?: string): Promise<common.PreparedWorktree> {
+export async function prepareIntegration(store: common.StateStore, ops: common.GitOperations, runId: string, dispatchId: string): Promise<common.PreparedWorktree> {
     ops.assertGitOperator!(store, ops, runId, dispatchId);
     const { root, run } = ops.repositoryForRun!(store, ops, runId);
     const { branch, path } = common.worktreeNames(root, run, runId);
     const base = run.base_commit;
     const named = store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=?").get(runId, branch) as any;
+    if (named && common.isPlannedRun(run) && named.path !== path) {
+      throw new IncompatibleError("planned run has a non-canonical plan worktree layout", {
+        reason_code: "legacy_plan_worktree_layout",
+        next_action: "recreate_worktree",
+        branch: named.branch,
+        path: named.path,
+      });
+    }
     const existing = named ?? (common.isPlannedRun(run) ? ops.activeIntegrationWorktree!(store, ops, runId, root, run) : undefined);
     const key = `integration:create:${runId}:${base}`;
     if (existing) {
@@ -51,7 +59,7 @@ export async function status(store: common.StateStore, ops: common.GitOperations
     }));
   }
 
-export async function commit(store: common.StateStore, ops: common.GitOperations, runId: string, worktreeId: string, message: string, allowedScopes: string[], dispatchId?: string): Promise<{ commit: string; paths: string[]; reused: boolean }> {
+export async function commit(store: common.StateStore, ops: common.GitOperations, runId: string, worktreeId: string, message: string, allowedScopes: string[], dispatchId: string): Promise<{ commit: string; paths: string[]; reused: boolean }> {
     ops.assertGitOperator!(store, ops, runId, dispatchId);
     const worktree = ops.worktreeForCommit!(store, ops, runId, worktreeId);
     const integratedTask = store.db.prepare("SELECT task_id FROM run_tasks WHERE run_id=? AND worktree_id=? AND state='integrated' ORDER BY ordinal LIMIT 1")
@@ -65,19 +73,17 @@ export async function commit(store: common.StateStore, ops: common.GitOperations
     }
     const changed = (await git(worktree.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3));
     if (!changed.length) throw new ValidationError("implementation has no changes to commit");
-    if (dispatchId) {
-      const row = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
-        .get(runId, dispatchId) as { packet_json: string };
-      const packet = JSON.parse(row.packet_json) as { allowed_write_paths?: string[]; context?: { phase?: string; worktree_id?: string; changed_paths?: string[] } };
-      if (packet.context?.phase === "pre_commit_implementation") {
-        if (packet.context.worktree_id !== worktreeId) throw new ValidationError("pre-commit dispatch does not match the requested worktree");
-        const frozenScopes = [...new Set(packet.allowed_write_paths ?? [])].sort();
-        if (JSON.stringify([...new Set(allowedScopes)].sort()) !== JSON.stringify(frozenScopes)) {
-          throw new ValidationError("pre-commit scopes do not match the frozen developer write paths");
-        }
-        if (JSON.stringify([...new Set(changed)].sort()) !== JSON.stringify([...(packet.context.changed_paths ?? [])].sort())) {
-          throw new ValidationError("real dirty diff changed after the pre-commit dispatch was frozen");
-        }
+    const row = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+      .get(runId, dispatchId) as { packet_json: string };
+    const packet = JSON.parse(row.packet_json) as { allowed_write_paths?: string[]; context?: { phase?: string; worktree_id?: string; changed_paths?: string[] } };
+    if (packet.context?.phase === "pre_commit_implementation") {
+      if (packet.context.worktree_id !== worktreeId) throw new ValidationError("pre-commit dispatch does not match the requested worktree");
+      const frozenScopes = [...new Set(packet.allowed_write_paths ?? [])].sort();
+      if (JSON.stringify([...new Set(allowedScopes)].sort()) !== JSON.stringify(frozenScopes)) {
+        throw new ValidationError("pre-commit scopes do not match the frozen developer write paths");
+      }
+      if (JSON.stringify([...new Set(changed)].sort()) !== JSON.stringify([...(packet.context.changed_paths ?? [])].sort())) {
+        throw new ValidationError("real dirty diff changed after the pre-commit dispatch was frozen");
       }
     }
     for (const path of changed) {
@@ -99,12 +105,9 @@ export async function commit(store: common.StateStore, ops: common.GitOperations
     return { commit, paths: changed, reused: false };
   }
 
-export async function mergeTask(store: common.StateStore, ops: common.GitOperations, runId: string, integrationId: string, taskId: string, dispatchId?: string): Promise<string> {
+export async function mergeTask(store: common.StateStore, ops: common.GitOperations, runId: string, integrationId: string, taskId: string, dispatchId: string): Promise<string> {
     ops.assertGitOperator!(store, ops, runId, dispatchId);
-    let taskWorktreeId = taskId;
-    if (dispatchId) {
-      taskWorktreeId = common.assertMergeWorktreeBindings(store, common.dispatchOperations, runId, dispatchId, integrationId, taskId).task_worktree_id;
-    }
+    const taskWorktreeId = common.assertMergeWorktreeBindings(store, common.dispatchOperations, runId, dispatchId, integrationId, taskId).task_worktree_id;
 
     // A completed merge remains the durable fact after its task worktree is removed.
     const completed = store.db.prepare(`SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.merge.task' AND state='completed'
@@ -126,6 +129,7 @@ export async function mergeTask(store: common.StateStore, ops: common.GitOperati
     const branchTaskId = task.branch.split("--").at(-1)?.toUpperCase();
     const logicalTaskId = run.mode === "planned" ? boundTask?.task_id ?? branchTaskId ?? taskId : "implementation";
     const request: common.TaskMergeRequest = {
+      dispatch_id: dispatchId,
       integration: integration.branch,
       task: task.branch,
       integration_worktree_id: integrationId,
@@ -147,7 +151,7 @@ export async function mergeTask(store: common.StateStore, ops: common.GitOperati
       const recovered = await ops.confirmTaskMerge!(store, ops, integration.path, recordedRequest);
       if (!recovered) throw new ValidationError("merge side effect is unknown; reconcile required");
       ops.finishTaskMerge!(store, ops, runId, operation.operationId, recordedRequest, recovered);
-      await ops.cleanupIntegratedTask!(store, ops, runId, taskWorktreeId, integrationId, operation.operationId);
+      await ops.cleanupIntegratedTask!(store, ops, runId, taskWorktreeId, integrationId, operation.operationId, dispatchId);
       return recovered;
     }
     const commit = await mergeNoFastForward(integration.path, task.branch, `Merge ${task.branch} into ${integration.branch}`);
@@ -155,7 +159,7 @@ export async function mergeTask(store: common.StateStore, ops: common.GitOperati
       throw new ValidationError("task merge did not produce the expected non-fast-forward merge commit");
     }
     ops.finishTaskMerge!(store, ops, runId, operation.operationId, request, commit);
-    await ops.cleanupIntegratedTask!(store, ops, runId, taskWorktreeId, integrationId, operation.operationId);
+    await ops.cleanupIntegratedTask!(store, ops, runId, taskWorktreeId, integrationId, operation.operationId, dispatchId);
     return commit;
   }
 
@@ -189,16 +193,14 @@ export function finishTaskMerge(store: common.StateStore, ops: common.GitOperati
     })();
   }
 
-export async function cleanupIntegratedTask(store: common.StateStore, ops: common.GitOperations, runId: string, taskWorktreeId: string, integrationId: string, mergeOperationId: string, dispatchId?: string): Promise<string | undefined> {
+export async function cleanupIntegratedTask(store: common.StateStore, ops: common.GitOperations, runId: string, taskWorktreeId: string, integrationId: string, mergeOperationId: string, dispatchId: string): Promise<string | undefined> {
     ops.assertGitOperator!(store, ops, runId, dispatchId, "cleanup-integrated-task");
-    if (dispatchId) {
-      const row = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
-        .get(runId, dispatchId) as { packet_json: string } | undefined;
-      const context = row ? (JSON.parse(row.packet_json) as { context?: Record<string, unknown> }).context : undefined;
-      if (!context || context.phase !== "cleanup_integrated_task" || context.task_worktree_id !== taskWorktreeId
-        || context.integration_worktree_id !== integrationId || context.merge_operation_id !== mergeOperationId) {
-        throw new ValidationError("cleanup dispatch is not bound to the integrated task");
-      }
+    const row = store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+      .get(runId, dispatchId) as { packet_json: string } | undefined;
+    const context = row ? (JSON.parse(row.packet_json) as { context?: Record<string, unknown> }).context : undefined;
+    if (context?.phase === "cleanup_integrated_task" && (context.task_worktree_id !== taskWorktreeId
+      || context.integration_worktree_id !== integrationId || context.merge_operation_id !== mergeOperationId)) {
+      throw new ValidationError("cleanup dispatch is not bound to the integrated task");
     }
     const { root } = ops.repositoryForRun!(store, ops, runId);
     const integration = ops.plannedIntegrationWorktree!(store, ops, runId, integrationId);
@@ -267,10 +269,10 @@ export async function cleanupIntegratedTask(store: common.StateStore, ops: commo
     }
   }
 
-export async function integrateTarget(store: common.StateStore, ops: common.GitOperations, runId: string, integrationId: string, dispatchId?: string): Promise<string> {
+export async function integrateTarget(store: common.StateStore, ops: common.GitOperations, runId: string, integrationId: string, dispatchId: string): Promise<string> {
     ops.assertGitOperator!(store, ops, runId, dispatchId);
     const { root, run } = ops.repositoryForRun!(store, ops, runId);
-    const dispatchFinalContext = dispatchId ? common.finalizationContext(store, common.dispatchOperations, runId, dispatchId) : undefined;
+    const dispatchFinalContext = common.finalizationContext(store, common.dispatchOperations, runId, dispatchId);
     if (dispatchFinalContext) {
       const completed = store.db.prepare("SELECT evidence_json FROM operations WHERE idempotency_key=? AND state='completed'")
         .get(`integrate:${runId}:${run.target_branch}:${dispatchFinalContext.revision_sha}`) as { evidence_json?: string } | undefined;
@@ -367,7 +369,7 @@ export async function integrateTarget(store: common.StateStore, ops: common.GitO
     return commit;
   }
 
-export async function continueConflict(store: common.StateStore, ops: common.GitOperations, runId: string, integrationId: string, allowedScopes: string[], dispatchId?: string): Promise<string> {
+export async function continueConflict(store: common.StateStore, ops: common.GitOperations, runId: string, integrationId: string, allowedScopes: string[], dispatchId: string): Promise<string> {
     ops.assertGitOperator!(store, ops, runId, dispatchId);
     const integration = ops.plannedIntegrationWorktree!(store, ops, runId, integrationId);
     try { await git(integration.path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]); }

@@ -26,22 +26,6 @@ export class DispatchService {
 
   supersede(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string, packet: DispatchPacket): ReplacementResult<"superseded"> { return dispatchOperations.supersede!(this.store, dispatchOperations, runId, dispatchId, role, actorRole, reason, packet); }
 
-  recoverClaimedTaskScope(input: {
-    runId: string;
-    dispatchId: string;
-    authorityCommit: string;
-    expectedHead: string;
-    addedWritePaths: string[];
-  }): ReplacementResult<"superseded"> & { role: "git-operator"; claim_command: string; authority_commit: string; allowed_write_paths: string[]; dirty_paths: string[] } { return dispatchOperations.recoverClaimedTaskScope!(this.store, dispatchOperations, input); }
-
-  repairClaimedTaskScopeReplacement(input: { runId: string; dispatchId: string }): {
-    action: "repaired";
-    dispatch_id: string;
-    role: "git-operator";
-    claim_command: string;
-    reused: boolean;
-  } { return dispatchOperations.repairClaimedTaskScopeReplacement!(this.store, dispatchOperations, input); }
-
   reconcile(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): ReplacementResult<"reconciled"> & { resumed_finalization?: boolean } { return dispatchOperations.reconcile!(this.store, dispatchOperations, runId, dispatchId, role, actorRole, reason); }
 
   finalizationContext(runId: string, dispatchId: string, requiredState: "claimed" | "completed" = "claimed"): {

@@ -6,7 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
-import { ValidationError } from "../src/errors.js";
+import { IncompatibleError, ValidationError } from "../src/errors.js";
 import { createResultTemplate } from "../src/contracts.js";
 import { repositoryIdentity } from "../src/git.js";
 import { assertCoverage, preflightRevision, validateCoverage, writeRevision } from "../src/planning.js";
@@ -442,30 +442,13 @@ test("run resume creates one continue_testing replacement with inherited evidenc
   }
 });
 
-test("formal review accepts a provenance-bound legacy planned integration worktree", async () => {
+test("formal review rejects a legacy planned integration worktree", async () => {
   const { store, home } = await openStore();
   try {
     const runId = createRun(store, "planned");
-    await completeTest(store, runId, true);
-    const barrier = new ReviewService(store).create(runId, REVIEW_HEAD, true);
-    assert.deepEqual(barrier.axes, ["spec", "standards"]);
-  } finally {
-    await cleanupTestPlanWorktrees(store);
-    store.close();
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("formal review rejects a legacy planned integration worktree without provenance", async () => {
-  const { store, home } = await openStore();
-  try {
-    const runId = createRun(store, "planned");
-    await completeTest(store, runId, true);
-    store.db.prepare("DELETE FROM operations WHERE run_id=?").run(runId);
-    assert.throws(
-      () => new ReviewService(store).create(runId, REVIEW_HEAD, true),
-      /prepared active plan worktree/,
-    );
+    await assert.rejects(completeTest(store, runId, true), (error: unknown) => error instanceof IncompatibleError
+      && (error.details as { reason_code?: string }).reason_code === "legacy_plan_worktree_layout"
+      && (error.details as { next_action?: string }).next_action === "recreate_worktree");
   } finally {
     await cleanupTestPlanWorktrees(store);
     store.close();
@@ -890,7 +873,9 @@ test("coding start validates planned parameters, branch, clean worktree, and HEA
     await readFile(path.join(planWorktree.path, ".ai-team", "plans", "plan", "revisions", "001", "plan.md"), "utf8");
     await readFile(path.join(planWorktree.path, ".ai-team", "plans", "plan", "revisions", "001", "tasks", "TASK-001.md"), "utf8");
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=?").get(started.run_id) as { count: number }).count, 1);
-    await assert.rejects(new GitOrchestrator(store).prepareTask(started.run_id, "TASK-001"), /uses its plan worktree directly/);
+    const initialGitDispatch = store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator' AND state='claimed'")
+      .get(started.run_id) as { dispatch_id: string };
+    await assert.rejects(new GitOrchestrator(store).prepareTask(started.run_id, "TASK-001", undefined, undefined, initialGitDispatch.dispatch_id), /uses its plan worktree directly/);
 
     await commitPlanRevision(repository, "plan", "002");
     store.db.prepare(`INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,created_at)
@@ -919,7 +904,7 @@ test("coding start validates planned parameters, branch, clean worktree, and HEA
       },
     );
     assert.equal(store.getRun(failedRunId).state, "failed");
-    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=?").get(failedRunId) as { count: number }).count, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=?").get(failedRunId) as { count: number }).count, 1);
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM run_events WHERE run_id=? AND type='run.start_failed'").get(failedRunId) as { count: number }).count, 1);
     await git(repository.directory, "branch", "-D", blockedBranch);
     const retried = await workflow.codingStart({ project: repository.directory, mode: "planned", planId: blockedPlan, revision: "001" });
@@ -1055,73 +1040,6 @@ test("managed planned reconciliation cleans legacy worktrees, audits failed star
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=? AND state='active'").get(replacement.run_id) as { count: number }).count, 1);
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=? AND state='active' AND branch LIKE 'task/%'").get(replacement.run_id) as { count: number }).count, 0);
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND status='pending'").get(replacement.run_id) as { count: number }).count, 0);
-  } finally {
-    store.close();
-    await rm(home, { recursive: true, force: true });
-    await rm(repository.directory, { recursive: true, force: true });
-  }
-});
-
-test("frozen coding runs hand off to one linked planning run without transferring task worktrees", async () => {
-  const repository = await createRepository();
-  await initializeRepositoryContext(repository);
-  const { store, home } = await openStore();
-  try {
-    const workflow = new WorkflowService(store);
-    const started = await workflow.codingStart({
-      project: repository.directory,
-      mode: "bug",
-      request: "actual: scope drift\nexpected: planning reconciliation\nevidence: frozen run",
-    });
-    const now = new Date().toISOString();
-    store.db.prepare("UPDATE runs SET state='frozen' WHERE run_id=?").run(started.run_id);
-    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
-      .run("worktree_handoff", started.run_id, "task/direct/handoff/implementation", path.join(repository.directory, ".worktrees", "handoff"), repository.head, now);
-
-    const first = workflow.handoffToPlanning(started.run_id, "Reconcile the frozen scope through Planning.");
-    const second = workflow.handoffToPlanning(started.run_id, "Reconcile the frozen scope through Planning.");
-    assert.equal(first.reused, false);
-    assert.equal(second.reused, true);
-    assert.equal(second.run_id, first.run_id);
-    assert.equal(store.getRun(first.run_id).source_run_id, started.run_id);
-    assert.equal((store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id='worktree_handoff'").get() as { run_id: string }).run_id, started.run_id);
-    assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(started.dispatch_id) as { state: string }).state, "failed");
-    assert.equal(workflow.completePlanningHandoff(first.run_id, "20260816-handoff", "001", "digest", "a".repeat(40)), started.run_id);
-    const resumed = store.getRun(started.run_id);
-    assert.equal(resumed.state, "active");
-    assert.equal(resumed.stage, "coding");
-    assert.equal(resumed.plan_id, "20260816-handoff");
-    assert.equal(resumed.revision, "001");
-    assert.equal((store.db.prepare("SELECT run_id FROM worktrees WHERE worktree_id='worktree_handoff'").get() as { run_id: string }).run_id, started.run_id);
-  } finally {
-    store.close();
-    await rm(home, { recursive: true, force: true });
-    await rm(repository.directory, { recursive: true, force: true });
-  }
-});
-
-test("failed coding runs can hand off to Planning and resume only after the handoff revision", async () => {
-  const repository = await createRepository();
-  await initializeRepositoryContext(repository);
-  const { store, home } = await openStore();
-  try {
-    const workflow = new WorkflowService(store);
-    const started = await workflow.codingStart({
-      project: repository.directory,
-      mode: "bug",
-      request: "actual: test failed\nexpected: planning reconciliation\nevidence: failed run",
-    });
-    const now = new Date().toISOString();
-    store.db.prepare("UPDATE runs SET state='failed',stage='test' WHERE run_id=?").run(started.run_id);
-    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
-      .run("worktree_failed_handoff", started.run_id, "task/direct/failed-handoff/implementation", path.join(repository.directory, ".worktrees", "failed-handoff"), repository.head, now);
-
-    const handoff = workflow.handoffToPlanning(started.run_id, "Reconcile the failed scope through Planning.");
-    assert.equal(store.getRun(handoff.run_id).source_run_id, started.run_id);
-    assert.equal(workflow.completePlanningHandoff(handoff.run_id, "20260816-failed-handoff", "002", "digest", "b".repeat(40)), started.run_id);
-    assert.deepEqual(store.db.prepare("SELECT state,stage,revision FROM runs WHERE run_id=?").get(started.run_id), {
-      state: "active", stage: "coding", revision: "002",
-    });
   } finally {
     store.close();
     await rm(home, { recursive: true, force: true });

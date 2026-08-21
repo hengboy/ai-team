@@ -12,13 +12,13 @@ const gitOperations: runtime.GitOperations = { assertGitOperator: runtime.assert
 export class GitOrchestrator {
   constructor(readonly store: StateStore) {}
 
-  async prepareTask(runId: string, taskId?: string, baseCommit?: string, dependsOn?: string, dispatchId?: string): Promise<PreparedWorktree> { return gitOperations.prepareTask!(this.store, gitOperations, runId, taskId, baseCommit, dependsOn, dispatchId); }
+  async prepareTask(runId: string, taskId: string | undefined, baseCommit: string | undefined, dependsOn: string | undefined, dispatchId: string): Promise<PreparedWorktree> { return gitOperations.prepareTask!(this.store, gitOperations, runId, taskId, baseCommit, dependsOn, dispatchId); }
 
-  async adopt(runId: string, path: string, branch: string, baseCommit: string, commit?: string, dispatchId?: string): Promise<PreparedWorktree> { return gitOperations.adopt!(this.store, gitOperations, runId, path, branch, baseCommit, commit, dispatchId); }
+  async adopt(runId: string, path: string, branch: string, baseCommit: string, commit: string | undefined, dispatchId: string): Promise<PreparedWorktree> { return gitOperations.adopt!(this.store, gitOperations, runId, path, branch, baseCommit, commit, dispatchId); }
 
-  async adoptCommit(runId: string, commit: string, taskId = "implementation", dispatchId?: string): Promise<PreparedWorktree> { return gitOperations.adoptCommit!(this.store, gitOperations, runId, commit, taskId, dispatchId); }
+  async adoptCommit(runId: string, commit: string, taskId: string, dispatchId: string): Promise<PreparedWorktree> { return gitOperations.adoptCommit!(this.store, gitOperations, runId, commit, taskId, dispatchId); }
 
-  async transfer(runId: string, worktreeId: string, dispatchId?: string): Promise<PreparedWorktree> { return gitOperations.transfer!(this.store, gitOperations, runId, worktreeId, dispatchId); }
+  async transfer(runId: string, worktreeId: string, dispatchId: string): Promise<PreparedWorktree> { return gitOperations.transfer!(this.store, gitOperations, runId, worktreeId, dispatchId); }
 
   async recoverTaskWorktree(request: TaskWorktreeRecoveryRequest): Promise<TaskWorktreeRecoveryReceipt> { return gitOperations.recoverTaskWorktree!(this.store, gitOperations, request); }
 
@@ -26,25 +26,25 @@ export class GitOrchestrator {
 
   async continueTaskAuthorityConflict(runId: string, dispatchId: string): Promise<TaskAuthorityApplyReceipt> { return gitOperations.continueTaskAuthorityConflict!(this.store, gitOperations, runId, dispatchId); }
 
-  async prepareIntegration(runId: string, dispatchId?: string): Promise<PreparedWorktree> { return gitOperations.prepareIntegration!(this.store, gitOperations, runId, dispatchId); }
+  async prepareIntegration(runId: string, dispatchId: string): Promise<PreparedWorktree> { return gitOperations.prepareIntegration!(this.store, gitOperations, runId, dispatchId); }
 
   async status(runId: string): Promise<WorktreeStatus[]> { return gitOperations.status!(this.store, gitOperations, runId); }
 
-  async commit(runId: string, worktreeId: string, message: string, allowedScopes: string[], dispatchId?: string): Promise<{ commit: string; paths: string[]; reused: boolean }> { return gitOperations.commit!(this.store, gitOperations, runId, worktreeId, message, allowedScopes, dispatchId); }
+  async commit(runId: string, worktreeId: string, message: string, allowedScopes: string[], dispatchId: string): Promise<{ commit: string; paths: string[]; reused: boolean }> { return gitOperations.commit!(this.store, gitOperations, runId, worktreeId, message, allowedScopes, dispatchId); }
 
-  async mergeTask(runId: string, integrationId: string, taskId: string, dispatchId?: string): Promise<string> { return gitOperations.mergeTask!(this.store, gitOperations, runId, integrationId, taskId, dispatchId); }
+  async mergeTask(runId: string, integrationId: string, taskId: string, dispatchId: string): Promise<string> { return gitOperations.mergeTask!(this.store, gitOperations, runId, integrationId, taskId, dispatchId); }
 
-  async cleanupIntegratedTask(runId: string, taskWorktreeId: string, integrationId: string, mergeOperationId: string, dispatchId?: string): Promise<string | undefined> { return gitOperations.cleanupIntegratedTask!(this.store, gitOperations, runId, taskWorktreeId, integrationId, mergeOperationId, dispatchId); }
+  async cleanupIntegratedTask(runId: string, taskWorktreeId: string, integrationId: string, mergeOperationId: string, dispatchId: string): Promise<string | undefined> { return gitOperations.cleanupIntegratedTask!(this.store, gitOperations, runId, taskWorktreeId, integrationId, mergeOperationId, dispatchId); }
 
-  async integrateTarget(runId: string, integrationId: string, dispatchId?: string): Promise<string> { return gitOperations.integrateTarget!(this.store, gitOperations, runId, integrationId, dispatchId); }
+  async integrateTarget(runId: string, integrationId: string, dispatchId: string): Promise<string> { return gitOperations.integrateTarget!(this.store, gitOperations, runId, integrationId, dispatchId); }
 
-  async continueConflict(runId: string, integrationId: string, allowedScopes: string[], dispatchId?: string): Promise<string> { return gitOperations.continueConflict!(this.store, gitOperations, runId, integrationId, allowedScopes, dispatchId); }
+  async continueConflict(runId: string, integrationId: string, allowedScopes: string[], dispatchId: string): Promise<string> { return gitOperations.continueConflict!(this.store, gitOperations, runId, integrationId, allowedScopes, dispatchId); }
 
-  async reconcileSyncConflict(runId: string, operationId: string, evidence: unknown, dispatchId?: string): Promise<Array<{ operation_id: string; state: string; fact: string; next_command?: string }>> { return gitOperations.reconcileSyncConflict!(this.store, gitOperations, runId, operationId, evidence, dispatchId); }
+  async reconcileSyncConflict(runId: string, operationId: string, evidence: unknown, dispatchId: string): Promise<Array<{ operation_id: string; state: string; fact: string; next_command?: string }>> { return gitOperations.reconcileSyncConflict!(this.store, gitOperations, runId, operationId, evidence, dispatchId); }
 
-  async reconcileTaskAuthorityConflict(runId: string, operationId: string, evidence: unknown, dispatchId?: string): Promise<Array<{ operation_id: string; state: string; fact: string; next_command?: string }>> { return gitOperations.reconcileTaskAuthorityConflict!(this.store, gitOperations, runId, operationId, evidence, dispatchId); }
+  async reconcileTaskAuthorityConflict(runId: string, operationId: string, evidence: unknown, dispatchId: string): Promise<Array<{ operation_id: string; state: string; fact: string; next_command?: string }>> { return gitOperations.reconcileTaskAuthorityConflict!(this.store, gitOperations, runId, operationId, evidence, dispatchId); }
 
-  async cleanup(runId: string, dispatchId?: string): Promise<string[]> { return gitOperations.cleanup!(this.store, gitOperations, runId, dispatchId); }
+  async cleanup(runId: string, dispatchId: string): Promise<string[]> { return gitOperations.cleanup!(this.store, gitOperations, runId, dispatchId); }
 
   async reconcile(runId: string): Promise<Array<{ operation_id: string; state: string; fact: string; next_command?: string }>> { return gitOperations.reconcile!(this.store, gitOperations, runId); }
 }
