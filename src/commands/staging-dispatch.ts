@@ -140,6 +140,14 @@ export const registerDispatchCommands = (program: Command, dependencies: Dispatc
       expectedHead: options.expectedHead,
       addedWritePaths: options.addWritePath,
     }))));
+  dispatch.command("repair-claimed-task-scope-replacement").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>")
+    .action(async (options) => {
+      validateCommand("dispatch.repair-claimed-task-scope-replacement", { runId: options.runId, dispatchId: options.dispatchId });
+      output(await withStore((store) => new DispatchService(store).repairClaimedTaskScopeReplacement({
+        runId: options.runId,
+        dispatchId: options.dispatchId,
+      })));
+    });
   dispatchCommand("prompt").action(async (options) => output(await withStore((store) => new DispatchService(store).prompt(options.runId, options.dispatchId, options.role), { readonly: true }), { legacyRaw: true }));
   dispatchCommand("schema").action(async (options) => output(await withStore((store) => new DispatchService(store).schema(options.runId, options.dispatchId, options.role), { readonly: true })));
   dispatchCommand("template").action(async (options) => output(await withStore((store) => new DispatchService(store).template(options.runId, options.dispatchId, options.role), { readonly: true })));

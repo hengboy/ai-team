@@ -910,7 +910,7 @@ export class DispatchService {
     authorityCommit: string;
     expectedHead: string;
     addedWritePaths: string[];
-  }): ReplacementResult<"superseded"> & { authority_commit: string; allowed_write_paths: string[]; dirty_paths: string[] } {
+  }): ReplacementResult<"superseded"> & { role: "git-operator"; claim_command: string; authority_commit: string; allowed_write_paths: string[]; dirty_paths: string[] } {
     const run = this.store.getRun(input.runId) as { profile: string; mode?: string; state: string; repo_id: string };
     if (run.profile !== "coding" || run.mode !== "planned" || run.state !== "active") throw new ValidationError("claimed task scope recovery requires an active planned Coding run");
     this.assertCommandAllowed("coding", "dispatch supersede");
@@ -930,7 +930,11 @@ export class DispatchService {
       if (recovery?.authority_commit !== input.authorityCommit || !normalizedAddedPaths.every((path) => packet.allowed_write_paths.includes(path))) {
         throw new ValidationError("claimed developer dispatch already has a different scope recovery replacement");
       }
-      return { action: "superseded", dispatch_id: existing.dispatch_id, replacement_for: input.dispatchId, reused: true, authority_commit: input.authorityCommit, allowed_write_paths: packet.allowed_write_paths, dirty_paths: recovery.dirty_paths ?? [] };
+      return {
+        action: "superseded", dispatch_id: existing.dispatch_id, replacement_for: input.dispatchId, reused: true,
+        role: "git-operator", claim_command: this.claimCommand(input.runId, existing.dispatch_id),
+        authority_commit: input.authorityCommit, allowed_write_paths: packet.allowed_write_paths, dirty_paths: recovery.dirty_paths ?? [],
+      };
     }
     const task = this.plannedTaskRows(input.runId).find((candidate) => candidate.task_id === taskId);
     if (!task || task.state === "integrated" || task.developer_dispatch_id && task.developer_dispatch_id !== input.dispatchId) {
@@ -963,16 +967,18 @@ export class DispatchService {
     const packet = validatePacket({
       ...sourcePacket,
       objective: `Apply the recorded authority commit for ${taskId} without changing its task worktree HEAD or losing its dirty work.`,
+      allowed_read_paths: [],
       allowed_write_paths: allowedWritePaths,
       acceptance_criteria: [
         "Apply only the recorded authority commit into the frozen task worktree",
         "Preserve the frozen task worktree identity, HEAD, and dirty work",
-        "Leave the replacement developer packet to continue the frozen Task scope",
+        "Record only the authority application receipt",
       ],
       context: {
         ...sourcePacket.context,
         stage: "git-operator",
         phase: "apply_task_authority",
+        operation: "apply-task-authority",
         authority_commit: authority,
         expected_head: input.expectedHead,
         superseded_developer_dispatch_id: input.dispatchId,
@@ -996,7 +1002,92 @@ export class DispatchService {
       this.store.event(input.runId, "dispatch.superseded", { dispatchId: input.dispatchId, replacement_dispatch_id: replacementId, role: "backend-developer", actor_role: "coding", reason: "frozen task scope expanded by explicit authority commit" });
       this.store.event(input.runId, "task.scope_recovered", { task_id: taskId, worktree_id: worktreeId, authority_commit: authority, expected_head: input.expectedHead, original_allowed_write_paths: originalPaths, allowed_write_paths: allowedWritePaths, dirty_paths: dirtyPaths, superseded_dispatch_id: input.dispatchId, replacement_dispatch_id: replacementId });
     })();
-    return { action: "superseded", dispatch_id: replacementId, replacement_for: input.dispatchId, reused: false, authority_commit: authority, allowed_write_paths: allowedWritePaths, dirty_paths: dirtyPaths };
+    return {
+      action: "superseded", dispatch_id: replacementId, replacement_for: input.dispatchId, reused: false,
+      role: "git-operator", claim_command: this.claimCommand(input.runId, replacementId),
+      authority_commit: authority, allowed_write_paths: allowedWritePaths, dirty_paths: dirtyPaths,
+    };
+  }
+
+  repairClaimedTaskScopeReplacement(input: { runId: string; dispatchId: string }): {
+    action: "repaired";
+    dispatch_id: string;
+    role: "git-operator";
+    claim_command: string;
+    reused: boolean;
+  } {
+    const run = this.store.getRun(input.runId) as { profile: string; mode?: string; state: string };
+    if (run.profile !== "coding" || run.mode !== "planned" || run.state !== "active") {
+      throw new ValidationError("claimed task scope replacement repair requires an active planned Coding run");
+    }
+    const row = this.store.db.prepare(`SELECT role,state,packet_json,result_json,replacement_for FROM dispatches
+      WHERE run_id=? AND dispatch_id=?`).get(input.runId, input.dispatchId) as {
+      role: Role; state: string; packet_json: string; result_json?: string; replacement_for?: string;
+    } | undefined;
+    if (!row) throw new ValidationError("dispatch identity does not match run");
+    const packet = JSON.parse(row.packet_json) as DispatchPacket;
+    const context = packet.context as Record<string, unknown>;
+    const claimCommand = this.claimCommand(input.runId, input.dispatchId);
+    if (row.role === "git-operator" && context.operation === "apply-task-authority") {
+      if (row.state !== "pending" || context.phase !== "apply_task_authority" || context.operation !== "apply-task-authority") {
+        throw new ValidationError("dispatch is not a repaired task authority replacement");
+      }
+      return { action: "repaired", dispatch_id: input.dispatchId, role: "git-operator", claim_command: claimCommand, reused: true };
+    }
+    if ((row.role !== "backend-developer" && row.role !== "git-operator") || row.state !== "pending" || row.result_json || !row.replacement_for) {
+      throw new ValidationError("dispatch is not an unclaimed legacy task authority replacement");
+    }
+    const source = this.store.db.prepare(`SELECT role,state,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=?`)
+      .get(input.runId, row.replacement_for) as { role: Role; state: string; packet_json: string } | undefined;
+    if (!source || source.role !== "backend-developer" || source.state !== "failed") {
+      throw new ValidationError("legacy task authority replacement has invalid superseded developer lineage");
+    }
+    const sourceContext = (JSON.parse(source.packet_json) as DispatchPacket).context as Record<string, unknown>;
+    const recovery = context.scope_recovery as Record<string, unknown> | undefined;
+    const required = ["task_id", "worktree_id", "worktree_path", "authority_commit", "expected_head", "superseded_developer_dispatch_id"];
+    if (context.phase !== "apply_task_authority" || required.some((key) => typeof context[key] !== "string" || !context[key])
+      || context.superseded_developer_dispatch_id !== row.replacement_for || context.task_id !== sourceContext.task_id
+      || !recovery || recovery.authority_commit !== context.authority_commit || recovery.expected_head !== context.expected_head
+      || stableJson(recovery.allowed_write_paths) !== stableJson(packet.allowed_write_paths)) {
+      throw new ValidationError("legacy task authority replacement is missing frozen recovery lineage");
+    }
+    const sideEffects = this.store.db.prepare(`SELECT
+      (SELECT COUNT(*) FROM artifacts WHERE run_id=? AND dispatch_id=?) AS artifacts,
+      (SELECT COUNT(*) FROM staging_entries WHERE run_id=? AND dispatch_id=?) AS staging`).get(input.runId, input.dispatchId, input.runId, input.dispatchId) as { artifacts: number; staging: number };
+    if (sideEffects.artifacts || sideEffects.staging) throw new ValidationError("legacy task authority replacement already has side effects");
+    const unfrozen = { ...packet };
+    delete unfrozen.execution_contract;
+    delete unfrozen.execution_request;
+    const corrected = freezeExecutionContract("git-operator", this.freezeVerificationContext(input.runId, "git-operator", validatePacket({
+      ...unfrozen,
+      objective: `Apply the recorded authority commit for ${context.task_id} without changing its task worktree HEAD or losing its dirty work.`,
+      allowed_read_paths: [],
+      acceptance_criteria: [
+        "Apply only the recorded authority commit into the frozen task worktree",
+        "Preserve the frozen task worktree identity, HEAD, and dirty work",
+        "Record only the authority application receipt",
+      ],
+      context: { ...context, stage: "git-operator", phase: "apply_task_authority", operation: "apply-task-authority" },
+    }, "git-operator")));
+    const packetJson = redact(stableJson(corrected));
+    const prompt = redact(promptFor(input.runId, input.dispatchId, "git-operator", corrected));
+    const schemaJson = stableJson(resultSchemaForRole("git-operator"));
+    const templateJson = stableJson(createResultTemplate(input.runId, input.dispatchId, "git-operator"));
+    this.store.db.transaction(() => {
+      this.store.db.prepare(`UPDATE dispatches SET role='git-operator',packet_json=?,prompt='',schema_json=?,template_json=?,
+        packet_digest=?,prompt_digest=?,schema_digest=?,template_digest=?,renderer_version=? WHERE run_id=? AND dispatch_id=? AND role IN ('backend-developer','git-operator') AND state='pending'`)
+      .run(packetJson, schemaJson, templateJson, sha256(packetJson), sha256(prompt), sha256(schemaJson), sha256(templateJson), RENDERER_VERSION, input.runId, input.dispatchId);
+      this.store.event(input.runId, "dispatch.claimed_task_scope_replacement_repaired", {
+        dispatch_id: input.dispatchId,
+        replacement_for: row.replacement_for,
+        from_role: row.role,
+        role: "git-operator",
+        operation: "apply-task-authority",
+        authority_commit: context.authority_commit,
+        expected_head: context.expected_head,
+      });
+    })();
+    return { action: "repaired", dispatch_id: input.dispatchId, role: "git-operator", claim_command: claimCommand, reused: false };
   }
 
   reconcile(runId: string, dispatchId: string, role: Role, actorRole: Role, reason: string): ReplacementResult<"reconciled"> & { resumed_finalization?: boolean } {
@@ -1250,6 +1341,9 @@ export class DispatchService {
     const rendered = renderer(runId, dispatchId, role, JSON.parse(row.packet_json) as DispatchPacket);
     if (row.prompt_digest && row.prompt_digest !== sha256(rendered)) throw new ValidationError("dispatch prompt digest mismatch; frozen asset is corrupted");
     return rendered;
+  }
+  private claimCommand(runId: string, dispatchId: string): string {
+    return `ai-team dispatch claim --run-id ${runId} --dispatch-id ${dispatchId} --role git-operator --bundle`;
   }
   schema(runId: string, dispatchId: string, role: Role): unknown { return JSON.parse(this.get(runId, dispatchId, role).schema_json); }
   template(runId: string, dispatchId: string, role: Role): ResultEnvelope { return JSON.parse(this.get(runId, dispatchId, role).template_json) as ResultEnvelope; }

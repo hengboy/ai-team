@@ -1290,6 +1290,8 @@ test("claimed planned developer scope recovery supersedes without touching its d
       addedWritePaths: ["src/contracts.ts", "src/commands/planning-run.ts"],
     });
     assert.equal(recovered.action, "superseded");
+    assert.equal(recovered.role, "git-operator");
+    assert.equal(recovered.claim_command, `ai-team dispatch claim --run-id ${runId} --dispatch-id ${recovered.dispatch_id} --role git-operator --bundle`);
     assert.deepEqual(recovered.allowed_write_paths, ["README.md", "dirty.txt", "src/commands/planning-run.ts", "src/contracts.ts"]);
     assert.deepEqual(recovered.dirty_paths, ["README.md", "dirty.txt"]);
     assert.deepEqual(fixture.store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(sourceId), { state: "failed" });
@@ -1298,6 +1300,7 @@ test("claimed planned developer scope recovery supersedes without touching its d
     const packet = JSON.parse(replacement.packet_json) as { allowed_write_paths: string[]; context: Record<string, unknown> };
     assert.deepEqual(packet.allowed_write_paths, recovered.allowed_write_paths);
     assert.equal(packet.context.phase, "apply_task_authority");
+    assert.equal(packet.context.operation, "apply-task-authority");
     assert.equal(packet.context.superseded_developer_dispatch_id, sourceId);
     assert.deepEqual(packet.context.scope_recovery, {
       authority_commit: authorityCommit,
@@ -1320,6 +1323,37 @@ test("claimed planned developer scope recovery supersedes without touching its d
       unstaged: await rawGit(prepared.path, ["diff", "--binary"]),
       untracked: await readFile(join(prepared.path, "dirty.txt"), "utf8"),
     }, before);
+    const legacyPacket = structuredClone(packet) as unknown as { context: Record<string, unknown>; execution_contract: { source: { role: string } } };
+    delete legacyPacket.context.operation;
+    legacyPacket.execution_contract.source.role = "backend-developer";
+    fixture.store.db.prepare("UPDATE dispatches SET role='backend-developer',packet_json=? WHERE dispatch_id=?")
+      .run(JSON.stringify(legacyPacket), recovered.dispatch_id);
+    assert.throws(() => dispatches.claim(runId, recovered.dispatch_id, "git-operator"), /identity does not match/);
+    const repaired = dispatches.repairClaimedTaskScopeReplacement({ runId, dispatchId: recovered.dispatch_id });
+    assert.deepEqual(repaired, {
+      action: "repaired",
+      dispatch_id: recovered.dispatch_id,
+      role: "git-operator",
+      claim_command: recovered.claim_command,
+      reused: false,
+    });
+    assert.deepEqual(dispatches.repairClaimedTaskScopeReplacement({ runId, dispatchId: recovered.dispatch_id }), { ...repaired, reused: true });
+    const repairedRow = fixture.store.db.prepare("SELECT role,state,packet_json,schema_json,template_json FROM dispatches WHERE dispatch_id=?")
+      .get(recovered.dispatch_id) as { role: string; state: string; packet_json: string; schema_json: string; template_json: string };
+    const repairedPacket = JSON.parse(repairedRow.packet_json) as { allowed_read_paths: string[]; allowed_write_paths: string[]; context: Record<string, unknown>; execution_contract: { source: { role: string } } };
+    assert.equal(repairedRow.role, "git-operator");
+    assert.equal(repairedRow.state, "pending");
+    assert.deepEqual(repairedPacket.allowed_read_paths, []);
+    assert.deepEqual(repairedPacket.allowed_write_paths, recovered.allowed_write_paths);
+    assert.equal(repairedPacket.context.operation, "apply-task-authority");
+    assert.equal(repairedPacket.execution_contract.source.role, "git-operator");
+    assert.equal(JSON.parse(repairedRow.template_json).role, "git-operator");
+    assert.equal(JSON.parse(repairedRow.schema_json).properties.payload.properties.operations.items.properties.command.type, "string");
+    assert.deepEqual(fixture.store.db.prepare("SELECT type FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT 1").get(runId), {
+      type: "dispatch.claimed_task_scope_replacement_repaired",
+    });
+    const resumed = dispatches.resume(runId);
+    assert.equal(resumed.next_action?.command, recovered.claim_command);
     assert.deepEqual(dispatches.recoverClaimedTaskScope({
       runId, dispatchId: sourceId, authorityCommit, expectedHead: baseCommit,
       addedWritePaths: ["src/contracts.ts", "src/commands/planning-run.ts"],

@@ -558,7 +558,7 @@ export class GitOrchestrator {
     const dispatch = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
       .get(request.runId, request.dispatchId) as { packet_json: string } | undefined;
     const context = dispatch ? (JSON.parse(dispatch.packet_json) as { context: Record<string, unknown> }).context : undefined;
-    if (!context || context.phase !== "apply_task_authority" || context.worktree_id !== request.worktreeId
+    if (!context || context.phase !== "apply_task_authority" || context.operation !== "apply-task-authority" || context.worktree_id !== request.worktreeId
       || context.authority_commit !== request.authorityCommit || context.expected_head !== request.expectedHead) {
       throw new ValidationError("Git Operator dispatch is not bound to this task authority recovery");
     }

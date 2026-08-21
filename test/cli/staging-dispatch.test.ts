@@ -29,6 +29,9 @@ test("CLI advertises the supported claimed task scope recovery authority flags",
   for (const option of ["--role <role>", "--authority-commit <sha>", "--expected-head <sha>", "--add-write-path <path...>"]) {
     assert.ok(help.stdout.includes(option));
   }
+  const repairHelp = await cli(sandbox, ["dispatch", "repair-claimed-task-scope-replacement", "--help"]);
+  assert.equal(repairHelp.status, 0, repairHelp.stderr);
+  for (const option of ["--run-id <id>", "--dispatch-id <id>"]) assert.ok(repairHelp.stdout.includes(option));
 });
 
 

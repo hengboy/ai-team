@@ -54,7 +54,7 @@ const packetContextRequirements = (role: Role, phase?: unknown, taskId?: unknown
     return ["phase", "task_id", "worktree_id"];
   }
   if (phase === "apply_task_authority") {
-    return ["phase", "task_id", "worktree_id", "worktree_path", "authority_commit", "expected_head", "superseded_developer_dispatch_id"];
+    return ["phase", "operation", "task_id", "worktree_id", "worktree_path", "authority_commit", "expected_head", "superseded_developer_dispatch_id"];
   }
   if (role === "frontend-developer" || role === "backend-developer") return ["explorer_dispatch_id", "worktree_id"];
   return [];
@@ -66,6 +66,7 @@ export const dispatchPacketSchema = (role: Role, phase?: unknown, taskId?: unkno
     type: "string",
     ...(key === "task_id" ? { pattern: phase === "continue_implementation" ? "^TASK-[0-9]{3}$" : "^(?:TASK-[0-9]{3}|implementation)$" } : {}),
     ...(key === "operation" && phase === "recover_task_worktree" ? { const: "recover-task-worktree" } : {}),
+    ...(key === "operation" && phase === "apply_task_authority" ? { const: "apply-task-authority" } : {}),
   }]));
   return {
     $schema: "https://json-schema.org/draft/2020-12/schema", type: "object", additionalProperties: false,
@@ -191,7 +192,7 @@ export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   }
   if (value.execution_request && value.execution_contract) throw new ValidationError("dispatch packet cannot contain both execution_request and execution_contract");
   const context = value.context as Record<string, unknown>;
-  const enforcedContext = context.phase === "continue_implementation" || context.phase === "prepare_implementation_worktree" || context.phase === "recover_task_worktree"
+  const enforcedContext = context.phase === "continue_implementation" || context.phase === "prepare_implementation_worktree" || context.phase === "recover_task_worktree" || context.phase === "apply_task_authority"
     ? packetContextRequirements(role, context.phase, context.task_id)
     : [];
   const missingContext = enforcedContext.filter((key) => typeof context[key] !== "string" || !(context[key] as string).trim());
@@ -205,6 +206,9 @@ export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
     const missingRecoveryFields = recoveryFields.filter((key) => typeof context[key] !== "string" || !(context[key] as string).trim());
     if (missingRecoveryFields.length) throw new ValidationError("recovery dispatch packet context is incomplete", missingRecoveryFields.map((key) => ({ path: `/context/${key}`, pointer: `/context/${key}`, field: key, constraint: "required", message: "required recovery context field is missing" })));
     if (context.operation !== "recover-task-worktree") throw new ValidationError("recovery dispatch packet operation must be recover-task-worktree", ["/context/operation"]);
+  }
+  if (context.phase === "apply_task_authority" && context.operation !== "apply-task-authority") {
+    throw new ValidationError("task authority packet operation must be apply-task-authority", ["/context/operation"]);
   }
   if (typeof context.task_id === "string" && context.task_id !== "implementation" && !/^TASK-\d{3}$/.test(context.task_id)) {
     throw new ValidationError("dispatch packet context.task_id is invalid", [{ path: "/context/task_id", pointer: "/context/task_id", field: "task_id", constraint: "pattern", message: "must match TASK- followed by three digits" }]);
