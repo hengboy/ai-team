@@ -598,7 +598,7 @@ export class GitOrchestrator {
     if (!allowed || dirtyPaths.some((path) => !pathMatchesScope(path, allowed))) {
       throw new ValidationError("task authority apply dirty work is outside the frozen replacement scope", { dirty_paths: dirtyPaths });
     }
-    const authorityPaths = (await git(row.path, ["diff", "--name-only", request.expectedHead, request.authorityCommit])).stdout.split("\n").filter(Boolean).sort();
+    const authorityPaths = (await git(row.path, ["diff-tree", "--no-commit-id", "--name-only", "-r", request.authorityCommit])).stdout.split("\n").filter(Boolean).sort();
     if (!authorityPaths.length || authorityPaths.some((path) => !pathMatchesScope(path, allowed))) {
       throw new ValidationError("task authority apply commit is outside the frozen replacement scope", { authority_paths: authorityPaths });
     }
@@ -1161,7 +1161,7 @@ export class GitOrchestrator {
     if (mergeHead || unmerged.length) throw new ValidationError("authority conflict reconciliation worktree must have no active merge or unmerged paths");
     const actualDirtyPaths = (await git(worktree.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3)).sort();
     if (stableJson(actualDirtyPaths) !== stableJson(normalized.dirty_paths)) throw new ValidationError("authority conflict reconciliation dirty paths do not match the worktree", { expected: normalized.dirty_paths, actual: actualDirtyPaths });
-    const actualAuthorityPaths = (await git(worktree.path, ["diff", "--name-only", normalized.expected_head, normalized.authority_commit])).stdout.split("\n").filter(Boolean).sort();
+    const actualAuthorityPaths = (await git(worktree.path, ["diff-tree", "--no-commit-id", "--name-only", "-r", normalized.authority_commit])).stdout.split("\n").filter(Boolean).sort();
     if (stableJson(actualAuthorityPaths) !== stableJson(normalized.authority_paths)) throw new ValidationError("authority conflict reconciliation authority paths do not match the authority commit");
     await git(worktree.path, ["cat-file", "-e", `${normalized.stash_commit}^{commit}`]).catch(() => { throw new ValidationError("authority conflict reconciliation stash_commit is not available"); });
 

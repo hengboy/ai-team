@@ -66,7 +66,7 @@ export const applyAuthorityCommitPreservingDirtyWork = async (cwd: string, autho
   const status = await run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
   const dirtyPaths = status.stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3));
   const untrackedPaths = status.stdout.split("\0").filter((entry) => entry.startsWith("?? ")).map((entry) => entry.slice(3));
-  const authorityPaths = (await run(["diff", "--name-only", "HEAD", authorityCommit])).stdout.split("\n").filter(Boolean);
+  const authorityPaths = (await run(["diff-tree", "--no-commit-id", "--name-only", "-r", authorityCommit])).stdout.split("\n").filter(Boolean);
   await run(["stash", "push", "--include-untracked", "--message", label]);
   const stashCommit = (await run(["rev-parse", "refs/stash"])).stdout;
   try {
