@@ -456,12 +456,24 @@ export const registerRunCommands = (program: Command, dependencies: PlanningRunD
     const note = options.noteFile ? await readSafeFile(options.noteFile) : undefined;
     const dispatchId = new DispatchService(store).resolveDecision(options.runId, options.decisionId, options.choice, note);
     const dispatch = store.db.prepare("SELECT role,replacement_for,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=?").get(options.runId, dispatchId) as { role: string; replacement_for?: string; packet_json: string } | undefined;
+    const decision = store.db.prepare("SELECT decision_type,choice FROM decisions WHERE run_id=? AND decision_id=?").get(options.runId, options.decisionId) as { decision_type: string; choice?: string } | undefined;
     const context = dispatch ? (JSON.parse(dispatch.packet_json) as DispatchPacket).context : {};
-    output({ status: "resolved", dispatch_id: dispatchId, role: dispatch?.role ?? null, recovery_action: dispatch?.replacement_for || context.resolved_decision ? {
-      type: "dispatch_replacement",
-      replacement_for: dispatch?.replacement_for ?? null,
-      resolved_decision: context.resolved_decision ?? null,
-      next_command: dispatch ? `ai-team dispatch claim --run-id ${options.runId} --dispatch-id ${dispatchId} --role ${dispatch.role} --bundle` : null,
-    } : null });
+    const terminalRecovery = decision?.decision_type === "active_run_recovery"
+      && (decision.choice === "abort" || decision.choice === "new_plan_required");
+    output({
+      status: "resolved",
+      dispatch_id: dispatchId,
+      role: dispatch?.role ?? null,
+      run_state: (store.getRun(options.runId) as { state: string }).state,
+      recovery_action: terminalRecovery ? {
+        type: "run_terminated",
+        choice: decision!.choice,
+      } : dispatch?.replacement_for || context.resolved_decision ? {
+        type: "dispatch_replacement",
+        replacement_for: dispatch?.replacement_for ?? null,
+        resolved_decision: context.resolved_decision ?? null,
+        next_command: dispatch ? `ai-team dispatch claim --run-id ${options.runId} --dispatch-id ${dispatchId} --role ${dispatch.role} --bundle` : null,
+      } : null,
+    });
   }));
 };

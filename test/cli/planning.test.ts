@@ -9,6 +9,71 @@ import { StateStore } from "../../src/state.js";
 
 import { cli, cliWithInput, git, json, makeSandbox } from "../helpers/cli.js";
 
+test("run decide projects a scope-blocked new-plan recovery as terminal", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const store = await StateStore.open(sandbox.aiTeamHome);
+  const repoId = "repo-terminal-recovery";
+  store.registerRepository(repoId, sandbox.repo, sandbox.repo);
+  const runId = store.createRun({ repoId, profile: "coding", mode: "feature", request: "Terminal recovery projection." });
+  const dispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FB2";
+  const now = new Date().toISOString();
+  store.db.prepare(`INSERT INTO dispatches(
+    dispatch_id,run_id,role,state,packet_json,result_json,prompt,schema_json,template_json,completed_at,created_at
+  ) VALUES (?,?,?,'failed',?,?,?,?,?,?,?)`).run(
+    dispatchId,
+    runId,
+    "backend-developer",
+    JSON.stringify({
+      objective: "Repair frozen Test failures",
+      allowed_read_paths: ["src/dispatch.ts"],
+      allowed_write_paths: ["src/dispatch.ts"],
+      acceptance_criteria: ["Resolve frozen checks"],
+      context: { phase: "test_repair" },
+    }),
+    JSON.stringify({ status: "failed", failure_class: "allowed_path_blocked", side_effect_state: "none" }),
+    "",
+    "{}",
+    "{}",
+    now,
+    now,
+  );
+  const decisionId = store.createDecision(
+    runId,
+    "Frozen scope cannot repair the blocked path.",
+    [
+      { id: "abort", label: "Abort", impact: "Stop this run" },
+      { id: "new_plan_required", label: "New plan required", impact: "Stop this run without a replacement" },
+    ],
+    "new_plan_required",
+    "active_run_recovery",
+  );
+  store.db.prepare("UPDATE decisions SET dispatch_id=? WHERE decision_id=?").run(dispatchId, decisionId);
+  store.db.prepare("UPDATE runs SET state='needs_decision',stage='coding' WHERE run_id=?").run(runId);
+  store.close();
+
+  const result = json<{
+    status: string;
+    dispatch_id: string;
+    role: string;
+    run_state: string;
+    recovery_action: { type: string; choice: string };
+  }>(await cli(sandbox, [
+    "run", "decide", "--run-id", runId, "--decision-id", decisionId, "--choice", "new_plan_required",
+  ]));
+  assert.deepEqual(result, {
+    status: "resolved",
+    dispatch_id: dispatchId,
+    role: "backend-developer",
+    run_state: "canceled",
+    recovery_action: { type: "run_terminated", choice: "new_plan_required" },
+  });
+
+  const resumed = json<{ run: { state: string }; pending_dispatches: unknown[]; pending_decision: unknown }>(await cli(sandbox, ["run", "resume", runId]));
+  assert.equal(resumed.run.state, "canceled");
+  assert.deepEqual(resumed.pending_dispatches, []);
+  assert.equal(resumed.pending_decision, null);
+});
+
 
 test("planning revision creation enforces task preview approval and preserves retry state", async (t) => {
   const sandbox = await makeSandbox(t);
