@@ -3332,6 +3332,12 @@ export class DispatchService {
         ORDER BY COALESCE(completed_at,created_at) DESC,created_at DESC LIMIT 1`)
         .get(runId, existingDecision.dispatch_id) as { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string } | undefined;
       if (!source) throw new ValidationError("active run recovery has no durable stage dispatch to retry");
+      const sourcePacket = JSON.parse(source.packet_json) as DispatchPacket;
+      const authorityApplyDispatchId = source.role === "git-operator"
+        && sourcePacket.context.phase === "continue_task_authority_conflict"
+        && typeof sourcePacket.context.authority_apply_dispatch_id === "string"
+        ? sourcePacket.context.authority_apply_dispatch_id
+        : undefined;
       let replacementId = "";
       this.store.db.transaction(() => {
         this.store.decide(runId, decisionId, choice, note);
@@ -3340,8 +3346,11 @@ export class DispatchService {
         this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=?")
           .run(new Date().toISOString(), existingDecision.dispatch_id);
         this.store.db.prepare("UPDATE runs SET state='active',stage=?,updated_at=? WHERE run_id=?")
-          .run(source.role, new Date().toISOString(), runId);
-        replacementId = this.recoveryReplacement(runId, source, resolvedDecision);
+          .run(authorityApplyDispatchId ? "coding" : source.role, new Date().toISOString(), runId);
+        replacementId = authorityApplyDispatchId
+          ? this.ensureRecoveredTaskDeveloperDispatch(runId, authorityApplyDispatchId) ?? ""
+          : this.recoveryReplacement(runId, source, resolvedDecision);
+        if (!replacementId) throw new ValidationError("completed authority conflict receipt has no recoverable developer continuation");
         const successor = this.store.db.prepare("SELECT packet_digest FROM dispatches WHERE dispatch_id=?").get(replacementId) as { packet_digest?: string };
         this.store.db.prepare("UPDATE decisions SET receipt_json=? WHERE decision_id=?")
           .run(stableJson({ ...resolvedDecision, successor_dispatch_id: replacementId, successor_packet_digest: successor.packet_digest ?? null }), decisionId);

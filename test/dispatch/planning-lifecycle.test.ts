@@ -783,6 +783,92 @@ test("active run recovery retries the last durable stage instead of creating an 
   });
 });
 
+test("active run recovery skips a completed authority conflict receipt and restores its developer", () => {
+  return withStore((store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), "."), process.cwd());
+    const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "20260820-authority-recovery", revision: "003" });
+    const dispatches = new DispatchService(store);
+    const taskId = "TASK-001";
+    const worktreeId = "worktree_authority_recovery";
+    const worktreePath = `/tmp/${runId}-task-001`;
+    store.initializeRunTasks(runId, [{
+      task_id: taskId,
+      source_path: ".ai-team/plans/20260820-authority-recovery/revisions/003/tasks/TASK-001.md",
+      source_digest: "a".repeat(64),
+      write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
+    }]);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run(worktreeId, runId, "task/20260820/task-001", worktreePath, "a".repeat(40), new Date().toISOString());
+    store.advanceRunTask(runId, taskId, "prepared", { worktree_id: worktreeId });
+
+    const developerId = dispatches.create(runId, "backend-developer", {
+      objective: "Implement TASK-001 in its frozen prepared task worktree.",
+      allowed_read_paths: ["src/dispatch.ts"],
+      allowed_write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
+      acceptance_criteria: ["Implement only the frozen Task scope"],
+      context: { stage: "coding", phase: "implementation", task_id: taskId, worktree_id: worktreeId, worktree_path: worktreePath },
+    });
+    store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), developerId);
+    const authorityId = dispatches.create(runId, "git-operator", {
+      ...dispatchPacket(),
+      allowed_write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
+      context: {
+        phase: "apply_task_authority",
+        operation: "apply-task-authority",
+        task_id: taskId,
+        superseded_developer_dispatch_id: developerId,
+        worktree_id: worktreeId,
+        worktree_path: worktreePath,
+        authority_commit: "b".repeat(40),
+        expected_head: "a".repeat(40),
+      },
+    });
+    store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), authorityId);
+    const receiptId = dispatches.create(runId, "git-operator", {
+      ...dispatchPacket(),
+      allowed_write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
+      acceptance_criteria: ["Record only the authority application receipt"],
+      context: {
+        phase: "continue_task_authority_conflict",
+        operation: "continue-task-authority-conflict",
+        authority_apply_dispatch_id: authorityId,
+        authority_apply_operation_id: "op_authority_recovery",
+        task_id: taskId,
+        worktree_id: worktreeId,
+        worktree_path: worktreePath,
+        authority_commit: "b".repeat(40),
+        expected_head: "a".repeat(40),
+        stash_commit: "c".repeat(40),
+        dirty_paths: ["src/dispatch.ts"],
+        authority_paths: ["src/dispatch.ts"],
+        conflict_paths: ["src/dispatch.ts"],
+        recovery: { completed_verification: [{ command: "git status", outcome: "clean" }, { command: "git status", outcome: "clean" }] },
+      },
+    });
+    store.db.prepare("UPDATE dispatches SET replacement_for=? WHERE dispatch_id=?").run(authorityId, receiptId);
+    store.db.prepare("UPDATE dispatches SET state='completed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), receiptId);
+    store.db.prepare("UPDATE runs SET state='active',stage='git-operator' WHERE run_id=?").run(runId);
+
+    dispatches.resume(runId);
+    const decision = store.db.prepare("SELECT decision_id FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string };
+    const replacementId = dispatches.resolveDecision(runId, decision.decision_id, "retry");
+    const replacement = store.db.prepare("SELECT role,replacement_for,packet_json FROM dispatches WHERE dispatch_id=?").get(replacementId) as { role: string; replacement_for: string; packet_json: string };
+    assert.equal(replacement.role, "backend-developer");
+    assert.equal(replacement.replacement_for, developerId);
+    assert.equal(JSON.parse(replacement.packet_json).context.phase, "implementation");
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='git-operator' AND json_extract(packet_json,'$.context.phase')='continue_task_authority_conflict'").get(runId) as { count: number }).count, 1);
+    assert.equal((store.db.prepare("SELECT status FROM decisions WHERE decision_id=?").get(decision.decision_id) as { status: string }).status, "resolved");
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='active_run_recovery' AND status='pending'").get(runId) as { count: number }).count, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='active_run_recovery'").get(runId) as { count: number }).count, 1);
+
+    const resumed = dispatches.resume(runId);
+    assert.equal(resumed.pending_dispatches[0]?.dispatch_id, replacementId);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='active_run_recovery' AND status='pending'").get(runId) as { count: number }).count, 0);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='active_run_recovery'").get(runId) as { count: number }).count, 1);
+  });
+});
+
 test("run resume repairs a stale planning retryable failure without crossing blockers or profiles", async () => {
   await withStore(async (store, home) => {
     const dispatches = new DispatchService(store);
