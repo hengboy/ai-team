@@ -1,7 +1,7 @@
 import { mkdir, readdir, realpath, stat } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ValidationError } from "./errors.js";
-import { applyAuthorityCommitPreservingDirtyWork, applyAuthorityPaths, AuthorityApplyConflictError, commitPaths, createWorktree, currentBranch, currentHead, git, mergeNoFastForward, worktreeStatus } from "./git.js";
+import { applyAuthorityCommitPreservingDirtyWork, applyAuthorityPaths, attachWorktree, AuthorityApplyConflictError, commitPaths, createWorktree, currentBranch, currentHead, git, mergeNoFastForward, worktreeStatus } from "./git.js";
 import { assertWritablePath, canonicalizeInside, pathMatchesScope } from "./security.js";
 import { StateStore } from "./state.js";
 import { sha256, stableJson, toPosix } from "./utils.js";
@@ -100,6 +100,16 @@ export interface SyncConflictEvidence {
   target_head: string;
 }
 
+interface TaskMergeRequest {
+  integration: string;
+  task: string;
+  integration_worktree_id: string;
+  task_id: string;
+  task_worktree_id: string;
+  task_commit: string;
+  integration_head_before: string;
+}
+
 const safeSegment = (value: string): string => {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) throw new ValidationError(`unsafe Git name segment: ${value}`);
   return value;
@@ -134,15 +144,18 @@ export class GitOrchestrator {
   /** Every mutating operation can be tied to the claimed git-operator dispatch.
    * The optional argument preserves the programmatic API used by older
    * integrations; CLI callers should always provide it. */
-  private assertGitOperator(runId: string, dispatchId?: string, operation?: "apply-task-authority" | "reconcile-task-authority-conflict" | "continue-task-authority-conflict"): void {
+  private assertGitOperator(runId: string, dispatchId?: string, operation?: "apply-task-authority" | "reconcile-task-authority-conflict" | "continue-task-authority-conflict" | "cleanup-integrated-task"): void {
     if (!dispatchId) return;
     new DispatchService(this.store).assertClaimed(runId, dispatchId, "git-operator");
     const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
       .get(runId, dispatchId) as { packet_json: string } | undefined;
     const context = row ? (JSON.parse(row.packet_json) as { context?: Record<string, unknown> }).context : undefined;
-    if (context?.phase === "apply_task_authority" && operation !== "apply-task-authority" && operation !== "reconcile-task-authority-conflict"
-      || context?.phase === "continue_task_authority_conflict" && operation !== "continue-task-authority-conflict") {
-      throw new ValidationError("task authority dispatch only authorizes apply-task-authority");
+    if (context?.phase === "apply_task_authority" && operation !== "apply-task-authority" && operation !== "reconcile-task-authority-conflict") {
+      throw new ValidationError("apply-task-authority dispatch only authorizes apply-task-authority operations");
+    }
+    if (context?.phase === "continue_task_authority_conflict" && operation !== "continue-task-authority-conflict"
+      || context?.phase === "cleanup_integrated_task" && operation !== "cleanup-integrated-task") {
+      throw new ValidationError("Git Operator dispatch does not authorize this operation");
     }
   }
 
@@ -203,47 +216,103 @@ export class GitOrchestrator {
     }
     let base = integrationHead ?? baseCommit ?? run.base_commit;
     if (dependsOn) {
-      const dependency = this.worktree(runId, dependsOn);
-      if (dependency.state !== "active") throw new ValidationError("dependent Task worktree is not active");
       const integrationWorktree = integration ?? this.activeIntegrationWorktree(runId, root, run);
       if (!integrationWorktree) throw new ValidationError("dependent Task requires an active integration worktree");
+      const dependency = this.store.db.prepare("SELECT state FROM worktrees WHERE run_id=? AND worktree_id=?")
+        .get(runId, dependsOn) as { state: string } | undefined;
+      if (!dependency) throw new ValidationError("dependent Task worktree is not owned by this run");
+      if (dependency.state === "active") this.worktree(runId, dependsOn);
+      else {
+        const merged = this.store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.merge.task' AND state='completed'
+          AND json_extract(evidence_json,'$.task_worktree_id')=? LIMIT 1`).get(runId, dependsOn);
+        if (!merged) throw new ValidationError("dependent Task requires a completed predecessor merge");
+      }
       base = await currentHead(integrationWorktree.path);
     }
     if (!/^[a-f0-9]{40}$/.test(base)) throw new ValidationError("worktree base must be a 40-character commit SHA");
     const key = `worktree:create:${runId}:${branch}:${base}`;
-    const existing = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=?").get(runId, branch) as any;
+    const existing = this.store.db.prepare("SELECT * FROM worktrees WHERE run_id=? AND branch=? AND state='active'").get(runId, branch) as any;
     if (existing) {
-      if (existing.base_commit !== base) {
+      if (existing.base_commit !== base || dispatchId) {
         if (!dispatchId) throw new ValidationError("stale planned Task worktree requires its managed replacement dispatch");
         const dispatch = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
           .get(runId, dispatchId) as { packet_json: string };
         const context = (JSON.parse(dispatch.packet_json) as { context?: Record<string, unknown> }).context ?? {};
+        const reuseTaskBranch = context.reuse_task_branch === true;
+        if (!reuseTaskBranch && existing.base_commit === base) {
+          const operation = this.store.beginOperation("git.worktree.create", key, { branch, path, base }, runId);
+          if (operation.state !== "completed") throw new ValidationError("worktree operation has unknown side effect; reconcile required");
+          return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: true };
+        }
         if (context.phase !== "prepare_implementation_worktree" || context.task_id !== taskId
           || context.replace_worktree_id !== existing.worktree_id || context.base_commit !== base) {
           throw new ValidationError("stale planned Task worktree replacement is not authorized by the frozen dispatch");
         }
-        if (!(await worktreeStatus(existing.path)).clean || await currentHead(existing.path) !== existing.base_commit) {
+        if (!(await worktreeStatus(existing.path)).clean) {
           throw new ValidationError("stale planned Task worktree has implementation changes and cannot be replaced");
         }
-        const replacement = this.store.beginOperation("git.worktree.replace", `worktree:replace:${runId}:${branch}:${existing.base_commit}:${base}`, {
+        if (!reuseTaskBranch) {
+          if (await currentHead(existing.path) !== existing.base_commit) {
+            throw new ValidationError("stale planned Task worktree has implementation changes and cannot be replaced");
+          }
+          const replacement = this.store.beginOperation("git.worktree.replace", `worktree:replace:${runId}:${branch}:${existing.base_commit}:${base}`, {
+            worktree_id: existing.worktree_id, branch, path, stale_base: existing.base_commit, base, dispatch_id: dispatchId,
+          }, runId);
+          if (replacement.reused) {
+            if (replacement.state !== "completed") throw new ValidationError("worktree replacement has unknown side effect; reconcile required");
+            return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: true };
+          }
+          await git(root, ["worktree", "remove", existing.path]);
+          await git(root, ["branch", "-d", existing.branch]);
+          await createWorktree(root, path, branch, base);
+          this.store.db.prepare("UPDATE worktrees SET path=?,base_commit=?,state='active',created_at=? WHERE worktree_id=?")
+            .run(path, base, new Date().toISOString(), existing.worktree_id);
+          this.store.finishOperation(replacement.operationId, { worktree_id: existing.worktree_id, branch, path, base, replaced: true, head: await currentHead(path) });
+          return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: false };
+        }
+        if (existing.base_commit !== base) throw new ValidationError("task retry requires the original integration base");
+        const retry = (this.store.db.prepare("SELECT count(*) AS count FROM worktrees WHERE run_id=? AND branch=?").get(runId, branch) as { count: number }).count;
+        const retryPath = `${path}--retry-${retry}`;
+        const replacementWorktreeId = `worktree_${sha256(`${runId}:${branch}:retry:${retry}`).slice(0, 24)}`;
+        const replacement = this.store.beginOperation("git.worktree.replace", `worktree:replace:${runId}:${existing.worktree_id}:${base}:retry:${retry}`, {
           worktree_id: existing.worktree_id,
+          replacement_worktree_id: replacementWorktreeId,
           branch,
-          path,
+          path: retryPath,
           stale_base: existing.base_commit,
           base,
           dispatch_id: dispatchId,
         }, runId);
         if (replacement.reused) {
           if (replacement.state !== "completed") throw new ValidationError("worktree replacement has unknown side effect; reconcile required");
-          return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: true };
+          const replaced = this.worktree(runId, replacementWorktreeId);
+          return { worktree_id: replaced.worktree_id, branch: replaced.branch, path: replaced.path, base_commit: replaced.base_commit, reused: true };
         }
         await git(root, ["worktree", "remove", existing.path]);
-        await git(root, ["branch", "-d", existing.branch]);
-        await createWorktree(root, path, branch, base);
-        this.store.db.prepare("UPDATE worktrees SET path=?,base_commit=?,state='active',created_at=? WHERE worktree_id=?")
-          .run(path, base, new Date().toISOString(), existing.worktree_id);
-        this.store.finishOperation(replacement.operationId, { worktree_id: existing.worktree_id, branch, path, base, replaced: true, head: await currentHead(path) });
-        return { worktree_id: existing.worktree_id, branch, path, base_commit: base, reused: false };
+        await mkdir(dirname(retryPath), { recursive: true });
+        await attachWorktree(root, retryPath, existing.branch);
+        const head = await currentHead(retryPath);
+        const now = new Date().toISOString();
+        this.store.db.transaction(() => {
+          this.store.db.prepare("UPDATE worktrees SET state='removed' WHERE worktree_id=?").run(existing.worktree_id);
+          this.store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+            .run(replacementWorktreeId, runId, existing.branch, retryPath, existing.base_commit, now);
+          if (isPlannedRun(run)) {
+            this.store.db.prepare("UPDATE run_tasks SET worktree_id=?,updated_at=? WHERE run_id=? AND worktree_id=? AND state!='integrated'")
+              .run(replacementWorktreeId, now, runId, existing.worktree_id);
+          }
+          this.store.finishOperation(replacement.operationId, {
+            worktree_id: existing.worktree_id,
+            replacement_worktree_id: replacementWorktreeId,
+            branch,
+            path: retryPath,
+            base: existing.base_commit,
+            requested_base: base,
+            replaced: true,
+            head,
+          });
+        })();
+        return { worktree_id: replacementWorktreeId, branch, path: retryPath, base_commit: existing.base_commit, reused: false };
       }
       const operation = this.store.beginOperation("git.worktree.create", key, { branch, path, base }, runId);
       if (operation.state !== "completed" || !existing) throw new ValidationError("worktree operation has unknown side effect; reconcile required");
@@ -432,6 +501,12 @@ export class GitOrchestrator {
     const sourceTask = this.store.db.prepare("SELECT * FROM run_tasks WHERE run_id=? AND task_id=?").get(row.run_id, request.taskId) as any;
     const targetTask = this.store.db.prepare("SELECT * FROM run_tasks WHERE run_id=? AND task_id=?").get(request.toRunId, request.taskId) as any;
     if (!sourceTask || !targetTask) throw new ValidationError("task ID must exist in both source and target revisions");
+    const completedMerge = this.store.db.prepare(`SELECT 1 FROM operations WHERE kind='git.merge.task' AND state='completed'
+      AND (run_id=? OR run_id=?) AND (json_extract(request_json,'$.task_worktree_id')=? OR json_extract(evidence_json,'$.task_worktree_id')=?) LIMIT 1`)
+      .get(row.run_id, request.toRunId, request.worktreeId, request.worktreeId);
+    if (completedMerge || sourceTask.state === "integrated" || targetTask.state === "integrated") {
+      throw new ValidationError("integrated task worktree cannot be transferred across runs");
+    }
     if (sourceTask.worktree_id !== request.worktreeId) throw new ValidationError("source task is not bound to the requested worktree");
     if (targetTask.worktree_id && targetTask.worktree_id !== request.worktreeId) throw new ValidationError("target task is already bound to another worktree");
     const sourceScopes = JSON.parse(sourceTask.write_paths_json ?? "[]") as string[];
@@ -854,29 +929,169 @@ export class GitOrchestrator {
     if (dispatchId) {
       taskWorktreeId = new DispatchService(this.store).assertMergeWorktreeBindings(runId, dispatchId, integrationId, taskId).task_worktree_id;
     }
+
+    // A completed merge remains the durable fact after its task worktree is removed.
+    const completed = this.store.db.prepare(`SELECT evidence_json FROM operations WHERE run_id=? AND kind='git.merge.task' AND state='completed'
+      AND json_extract(request_json,'$.integration_worktree_id')=? AND json_extract(request_json,'$.task_worktree_id')=?
+      ORDER BY completed_at DESC LIMIT 1`).get(runId, integrationId, taskWorktreeId) as { evidence_json?: string } | undefined;
+    if (completed) {
+      const evidence = JSON.parse(completed.evidence_json ?? "{}") as { commit?: string };
+      if (!evidence.commit) throw new ValidationError("completed task merge is missing its merge commit evidence");
+      return evidence.commit;
+    }
     const integration = this.plannedIntegrationWorktree(runId, integrationId);
     const task = this.worktree(runId, taskWorktreeId);
     const taskCommit = await currentHead(task.path);
-    const operation = this.store.beginOperation("git.merge.task", `merge-task:${runId}:${integration.branch}:${task.branch}:${taskCommit}`, {
+    const integrationHeadBefore = await currentHead(integration.path);
+    const run = this.store.getRun(runId) as any;
+    const boundTask = run.mode === "planned"
+      ? this.store.db.prepare("SELECT task_id FROM run_tasks WHERE run_id=? AND worktree_id=?").get(runId, taskWorktreeId) as { task_id: string } | undefined
+      : undefined;
+    const branchTaskId = task.branch.split("--").at(-1)?.toUpperCase();
+    const logicalTaskId = run.mode === "planned" ? boundTask?.task_id ?? branchTaskId ?? taskId : "implementation";
+    const request: TaskMergeRequest = {
       integration: integration.branch,
       task: task.branch,
       integration_worktree_id: integrationId,
-      task_id: taskId,
+      task_id: logicalTaskId,
       task_worktree_id: taskWorktreeId,
-    }, runId);
+      task_commit: taskCommit,
+      integration_head_before: integrationHeadBefore,
+    };
+    const operation = this.store.beginOperation("git.merge.task", `merge-task:${runId}:${integration.branch}:${task.branch}:${taskCommit}`, request, runId);
     if (operation.reused) {
-      if (operation.state !== "completed") throw new ValidationError("merge side effect is unknown; reconcile required");
-      return currentHead(integration.path);
+      if (operation.state !== "pending") throw new ValidationError("merge side effect is unknown; reconcile required");
+      const persisted = this.store.db.prepare("SELECT request_json FROM operations WHERE operation_id=? AND run_id=? AND kind='git.merge.task'")
+        .get(operation.operationId, runId) as { request_json: string } | undefined;
+      if (!persisted) throw new ValidationError("pending task merge is missing its recorded request");
+      const recordedRequest = JSON.parse(persisted.request_json) as TaskMergeRequest;
+      if (recordedRequest.integration_worktree_id !== integrationId || recordedRequest.task_worktree_id !== taskWorktreeId) {
+        throw new ValidationError("pending task merge does not match the requested worktree bindings");
+      }
+      const recovered = await this.confirmTaskMerge(integration.path, recordedRequest);
+      if (!recovered) throw new ValidationError("merge side effect is unknown; reconcile required");
+      this.finishTaskMerge(runId, operation.operationId, recordedRequest, recovered);
+      await this.cleanupIntegratedTask(runId, taskWorktreeId, integrationId, operation.operationId);
+      return recovered;
     }
     const commit = await mergeNoFastForward(integration.path, task.branch, `Merge ${task.branch} into ${integration.branch}`);
-    this.store.finishOperation(operation.operationId, {
-      commit,
-      task_commit: taskCommit,
-      task_id: taskId,
+    if (!(await this.confirmTaskMerge(integration.path, request, commit))) {
+      throw new ValidationError("task merge did not produce the expected non-fast-forward merge commit");
+    }
+    this.finishTaskMerge(runId, operation.operationId, request, commit);
+    await this.cleanupIntegratedTask(runId, taskWorktreeId, integrationId, operation.operationId);
+    return commit;
+  }
+
+  private async confirmTaskMerge(integrationPath: string, request: TaskMergeRequest, expectedCommit?: string): Promise<string | undefined> {
+    const head = await currentHead(integrationPath);
+    if (expectedCommit && head !== expectedCommit) return undefined;
+    const parents = (await git(integrationPath, ["rev-list", "--parents", "-n", "1", head])).stdout.split(" ");
+    return parents.length === 3 && parents[1] === request.integration_head_before && parents[2] === request.task_commit ? head : undefined;
+  }
+
+  private finishTaskMerge(runId: string, operationId: string, request: TaskMergeRequest, commit: string): void {
+    this.store.db.transaction(() => {
+      this.store.finishOperation(operationId, {
+        commit,
+        task_commit: request.task_commit,
+        task_id: request.task_id,
+        task_worktree_id: request.task_worktree_id,
+        integration_worktree_id: request.integration_worktree_id,
+        integration_head_before: request.integration_head_before,
+      });
+      const run = this.store.getRun(runId) as any;
+      if (isPlannedRun(run)) {
+        const task = this.store.db.prepare("SELECT 1 FROM run_tasks WHERE run_id=? AND task_id=?")
+          .get(runId, request.task_id);
+        if (task) this.store.advanceRunTask(runId, request.task_id, "integrated", {
+          worktree_id: request.task_worktree_id,
+          integration_commit: commit,
+          recovered: true,
+        });
+      }
+    })();
+  }
+
+  /** Removes one merged, independently-owned task worktree. This is deliberately
+   * separate from final cleanup so recovery can converge without touching the plan
+   * or integration worktree. */
+  async cleanupIntegratedTask(runId: string, taskWorktreeId: string, integrationId: string, mergeOperationId: string, dispatchId?: string): Promise<string | undefined> {
+    this.assertGitOperator(runId, dispatchId, "cleanup-integrated-task");
+    if (dispatchId) {
+      const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+        .get(runId, dispatchId) as { packet_json: string } | undefined;
+      const context = row ? (JSON.parse(row.packet_json) as { context?: Record<string, unknown> }).context : undefined;
+      if (!context || context.phase !== "cleanup_integrated_task" || context.task_worktree_id !== taskWorktreeId
+        || context.integration_worktree_id !== integrationId || context.merge_operation_id !== mergeOperationId) {
+        throw new ValidationError("cleanup dispatch is not bound to the integrated task");
+      }
+    }
+    const { root } = this.repositoryForRun(runId);
+    const integration = this.plannedIntegrationWorktree(runId, integrationId);
+    const merge = this.store.db.prepare("SELECT state,request_json,evidence_json FROM operations WHERE operation_id=? AND run_id=? AND kind='git.merge.task'")
+      .get(mergeOperationId, runId) as { state: string; request_json: string; evidence_json?: string } | undefined;
+    if (!merge || merge.state !== "completed") throw new ValidationError("integrated task cleanup requires its completed merge operation");
+    const request = JSON.parse(merge.request_json) as TaskMergeRequest;
+    if (request.task_worktree_id !== taskWorktreeId || request.integration_worktree_id !== integrationId) {
+      throw new ValidationError("integrated task cleanup merge lineage does not match the requested worktree");
+    }
+    const task = this.store.db.prepare("SELECT * FROM worktrees WHERE worktree_id=? AND run_id=?")
+      .get(taskWorktreeId, runId) as any;
+    if (!task) throw new ValidationError("integrated task cleanup worktree is not owned by this run");
+    if (task.state === "removed") return undefined;
+    if (task.state !== "active" || !task.branch.startsWith("task/")) throw new ValidationError("integrated task cleanup requires an active independent task worktree");
+    const relativePath = toPosix(relative(resolve(root), resolve(task.path)));
+    if (!relativePath.startsWith(".worktrees/")) throw new ValidationError("refusing to remove task worktree outside managed root");
+    const cleanup = this.store.beginOperation("git.cleanup", `cleanup:${runId}:${taskWorktreeId}`, {
+      worktreeId: taskWorktreeId,
+      path: task.path,
+      branch: task.branch,
+      task_id: request.task_id,
       task_worktree_id: taskWorktreeId,
       integration_worktree_id: integrationId,
-    });
-    return commit;
+      merge_operation_id: mergeOperationId,
+      task_commit: request.task_commit,
+    }, runId);
+    if (cleanup.reused && cleanup.state === "completed") {
+      this.store.db.prepare("UPDATE worktrees SET state='removed' WHERE worktree_id=?").run(taskWorktreeId);
+      return task.path;
+    }
+    try {
+      const listed = (await git(root, ["worktree", "list", "--porcelain"])).stdout;
+      const worktreeExists = listed.includes(`worktree ${task.path}`);
+      const branchExists = await git(root, ["show-ref", "--verify", `refs/heads/${task.branch}`]).then(() => true, () => false);
+      if (worktreeExists) {
+        if (!(await worktreeStatus(task.path)).clean) throw new ValidationError(`worktree is dirty and cannot be removed: ${task.path}`);
+        if (await currentBranch(task.path) !== task.branch) throw new ValidationError("task worktree branch no longer matches its managed record");
+        await git(root, ["worktree", "remove", task.path]);
+      }
+      if (branchExists) {
+        const contains = await git(integration.path, ["merge-base", "--is-ancestor", request.task_commit, "HEAD"]).then(() => true, () => false);
+        if (!contains) throw new ValidationError("integration HEAD does not contain the task commit required for branch cleanup");
+        await git(integration.path, ["branch", "-d", task.branch]);
+      }
+      this.store.finishOperation(cleanup.operationId, {
+        path: task.path,
+        branch: task.branch,
+        task_id: request.task_id,
+        task_worktree_id: taskWorktreeId,
+        integration_worktree_id: integrationId,
+        merge_operation_id: mergeOperationId,
+        removed: true,
+      });
+      this.store.db.prepare("UPDATE worktrees SET state='removed' WHERE worktree_id=?").run(taskWorktreeId);
+      return task.path;
+    } catch (error) {
+      this.store.recordPendingOperationEvidence(cleanup.operationId, {
+        state: "cleanup_failed",
+        task_worktree_id: taskWorktreeId,
+        integration_worktree_id: integrationId,
+        merge_operation_id: mergeOperationId,
+        failure: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 
   async integrateTarget(runId: string, integrationId: string, dispatchId?: string): Promise<string> {
@@ -1213,7 +1428,32 @@ export class GitOrchestrator {
     const result: Array<{ operation_id: string; state: string; fact: string; next_command?: string }> = [];
     for (const operation of pending) {
       const request = JSON.parse(operation.request_json);
-      if (operation.kind === "git.cleanup") {
+      if (operation.kind === "git.merge.task") {
+        const merge = request as TaskMergeRequest;
+        const integration = typeof merge.integration_worktree_id === "string"
+          ? this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'")
+            .get(runId, merge.integration_worktree_id) as { path: string } | undefined
+          : undefined;
+        const commit = integration ? await this.confirmTaskMerge(integration.path, merge) : undefined;
+        if (!commit) {
+          result.push({ operation_id: operation.operation_id, state: "unknown", fact: "task merge cannot be proven from its recorded parents" });
+          continue;
+        }
+        this.finishTaskMerge(runId, operation.operation_id, merge, commit);
+        try {
+          await this.cleanupIntegratedTask(runId, merge.task_worktree_id, merge.integration_worktree_id, operation.operation_id);
+          result.push({ operation_id: operation.operation_id, state: "completed", fact: "recorded task merge parents match and task cleanup converged" });
+        } catch (error) {
+          result.push({ operation_id: operation.operation_id, state: "completed", fact: `recorded task merge parents match; task cleanup remains pending: ${error instanceof Error ? error.message : String(error)}` });
+        }
+      } else if (operation.kind === "git.cleanup" && typeof request.task_worktree_id === "string" && typeof request.integration_worktree_id === "string" && typeof request.merge_operation_id === "string") {
+        try {
+          await this.cleanupIntegratedTask(runId, request.task_worktree_id, request.integration_worktree_id, request.merge_operation_id);
+          result.push({ operation_id: operation.operation_id, state: "completed", fact: "integrated task worktree and branch cleanup converged" });
+        } catch (error) {
+          result.push({ operation_id: operation.operation_id, state: "unknown", fact: `integrated task cleanup remains blocked: ${error instanceof Error ? error.message : String(error)}` });
+        }
+      } else if (operation.kind === "git.cleanup") {
         const listed = (await git(root, ["worktree", "list", "--porcelain"])).stdout;
         const branchExists = await git(root, ["show-ref", "--verify", `refs/heads/${request.branch}`]).then(() => true, () => false);
         const exists = listed.includes(`worktree ${request.path}`) || branchExists;

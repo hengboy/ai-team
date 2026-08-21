@@ -36,8 +36,7 @@ export const git = async (cwd: string, args: readonly string[]): Promise<GitResu
   const forbiddenArgument = args.some((arg) => FORBIDDEN_FLAGS.has(arg) || ["--force", "-f", "-D", "--hard", "-C", "-A", "--all"].includes(arg));
   const malformedTemplate = command === "add" && !args.includes("--")
     || command === "commit" && !(args.includes("--no-edit") || args.includes("-m"))
-    || command === "merge" && !args.includes("--no-ff")
-    || command === "worktree" && subcommand === "add" && !args.includes("-b");
+    || command === "merge" && !args.includes("--no-ff");
   if (!command || command.startsWith("-") || FORBIDDEN.has(command) || !ALLOWED.has(command) || invalidSubcommand || forbiddenArgument || malformedTemplate) {
     throw new GitGateError(`forbidden Git operation: ${args.join(" ")}`);
   }
@@ -144,6 +143,11 @@ export const currentBranch = async (project: string): Promise<string> =>
 
 export const createWorktree = async (project: string, path: string, branch: string, base: string): Promise<void> => {
   await git(project, ["worktree", "add", "-b", branch, path, base]);
+};
+
+/** Reattach an existing managed branch without changing its committed progress. */
+export const attachWorktree = async (project: string, path: string, branch: string): Promise<void> => {
+  await git(project, ["worktree", "add", path, branch]);
 };
 
 export const commitPaths = async (project: string, paths: string[], message: string): Promise<string> => {
