@@ -393,6 +393,24 @@ test("blocked frozen Test repair preserves evidence and creates an explicit reco
     const successor = dispatches.resolveDecision(runId, resumedDecision.decision_id, "retry");
     assert.ok(store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND dispatch_id=? AND state IN ('pending','claimed')").get(runId, successor));
     assert.equal((store.getRun(runId) as { state: string }).state, "active");
+    assert.equal(dispatches.resolveDecision(runId, resumedDecision.decision_id, "retry"), successor);
+
+    dispatches.claim(runId, successor, "coding");
+    await dispatches.submitValue(runId, successor, "coding", completedResult(runId, successor, "coding", { actions: ["repair"] }));
+
+    const replacementRepair = (store.db.prepare("SELECT repair_developer_dispatch_id FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(failedTest) as { repair_developer_dispatch_id: string }).repair_developer_dispatch_id;
+    assert.notEqual(replacementRepair, repairDeveloper);
+    assert.equal((JSON.parse((store.db.prepare("SELECT result_json FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { result_json: string }).result_json) as { status: string }).status, "failed");
+    const afterRetry = dispatches.continuation(runId);
+    assert.equal(afterRetry.run_state, "active");
+    assert.equal(afterRetry.pending_decision, null);
+    assert.deepEqual(afterRetry.pending_dispatches.map(({ dispatch_id, role }) => ({ dispatch_id, role })), [{ dispatch_id: replacementRepair, role: "backend-developer" }]);
+
+    const resumedAfterRetry = dispatches.resume(runId);
+    const resumedAgainAfterRetry = dispatches.resume(runId);
+    assert.deepEqual(resumedAfterRetry.pending_dispatches.map(({ dispatch_id, role }) => ({ dispatch_id, role })), [{ dispatch_id: replacementRepair, role: "backend-developer" }]);
+    assert.deepEqual(resumedAgainAfterRetry.pending_dispatches.map(({ dispatch_id, role }) => ({ dispatch_id, role })), [{ dispatch_id: replacementRepair, role: "backend-developer" }]);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='backend-developer' AND state IN ('pending','claimed')").get(runId) as { count: number }).count, 1);
   });
 });
 
