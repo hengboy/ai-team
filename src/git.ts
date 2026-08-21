@@ -17,6 +17,16 @@ export interface GitResult {
   stderr: string;
 }
 
+export class AuthorityApplyConflictError extends GitGateError {
+  constructor(
+    readonly stashCommit: string,
+    readonly conflictPaths: string[],
+    cause: unknown,
+  ) {
+    super(`task authority apply requires Git conflict reconciliation; original dirty work restored and dirty-work stash retained at ${stashCommit}: ${cause instanceof Error ? cause.message : String(cause)}`);
+  }
+}
+
 export const git = async (cwd: string, args: readonly string[]): Promise<GitResult> => {
   const command = args[0];
   // Reject option injection before command parsing as well as known dangerous verbs.
@@ -54,7 +64,9 @@ export const applyAuthorityCommitPreservingDirtyWork = async (cwd: string, autho
     }
   };
   const status = await run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  const dirtyPaths = status.stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3));
   const untrackedPaths = status.stdout.split("\0").filter((entry) => entry.startsWith("?? ")).map((entry) => entry.slice(3));
+  const authorityPaths = (await run(["diff", "--name-only", "HEAD", authorityCommit])).stdout.split("\n").filter(Boolean);
   await run(["stash", "push", "--include-untracked", "--message", label]);
   const stashCommit = (await run(["rev-parse", "refs/stash"])).stdout;
   try {
@@ -63,14 +75,32 @@ export const applyAuthorityCommitPreservingDirtyWork = async (cwd: string, autho
     await run(["stash", "apply", "--index", stashCommit]);
     return stashCommit;
   } catch (error) {
+    const unmergedPaths = await run(["diff", "--name-only", "--diff-filter=U"])
+      .then(({ stdout }) => stdout.split("\n").filter(Boolean), () => [] as string[]);
+    // stash apply can reject a patch before Git writes unmerged index entries.
+    const conflictPaths = unmergedPaths.length ? unmergedPaths : await run(["diff", "--name-only"])
+      .then(({ stdout }) => stdout.split("\n").filter(Boolean), () => [] as string[]);
     try {
       await run(["reset", "--hard", "HEAD"]);
       if (untrackedPaths.length) await run(["clean", "-f", "--", ...untrackedPaths]);
+      const authorityOnlyPaths = authorityPaths.filter((path) => !dirtyPaths.includes(path));
+      if (authorityOnlyPaths.length) await run(["clean", "-f", "--", ...authorityOnlyPaths]);
       await run(["stash", "apply", "--index", stashCommit]);
     } catch (cleanupError) {
       throw new GitGateError(`task authority apply failed and cleanup could not restore dirty work; dirty-work stash retained at ${stashCommit}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
     }
-    throw new GitGateError(`task authority apply requires Git conflict reconciliation; original dirty work restored and dirty-work stash retained at ${stashCommit}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new AuthorityApplyConflictError(stashCommit, conflictPaths, error);
+  }
+};
+
+/** Applies authority-owned paths that were clean before a conflict continuation. */
+export const applyAuthorityPaths = async (cwd: string, authorityCommit: string, paths: readonly string[]): Promise<void> => {
+  if (!paths.length) return;
+  try {
+    await execFileForInvocation("git", ["checkout", authorityCommit, "--", ...paths], { cwd, maxBuffer: 10 * 1024 * 1024 });
+  } catch (error) {
+    const detail = error as { stderr?: string; message?: string };
+    throw new GitGateError(`task authority conflict continuation failed to apply clean authority paths: ${detail.stderr?.trim() || detail.message}`);
   }
 };
 

@@ -1393,7 +1393,7 @@ test("claimed planned developer scope recovery supersedes without touching its d
     const key = `worktree:apply-authority:${runId}:${recovered.dispatch_id}:${prepared.worktree_id}:${authorityCommit}:${baseCommit}`;
     const pending = fixture.store.beginOperation("git.task_authority.apply", key, { ...applyRequest, dirty_paths: ["README.md", "dirty.txt"] }, runId);
     await assert.rejects(fixture.orchestrator.applyTaskAuthority(applyRequest), /unknown side effect; reconcile required/);
-    const failedPacket = structuredClone(packet) as typeof packet & { execution_contract?: unknown };
+    const failedPacket = structuredClone(packet) as Parameters<typeof dispatches.create>[2] & { execution_contract?: unknown };
     delete failedPacket.execution_contract;
     const failedDispatchId = dispatches.create(runId, "git-operator", failedPacket);
     dispatches.claim(runId, failedDispatchId, "git-operator");
@@ -1474,6 +1474,111 @@ test("authority application restores dirty work after a content conflict", async
       untracked: await readFile(join(fixture.root, "dirty.txt"), "utf8"),
       unmerged: await rawGit(fixture.root, ["ls-files", "-u"]),
     }, { ...before, unmerged: "" });
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("authority content conflict creates a frozen continuation and records its receipt without changing task HEAD", async () => {
+  const fixture = await createFixture();
+  try {
+    const identity = await repositoryIdentity(fixture.root);
+    const taskRoot = join(fixture.root, ".ai-team", "plans", "20260821-authority-conflict", "revisions", "001", "tasks");
+    await mkdir(taskRoot, { recursive: true });
+    await writeFile(join(taskRoot, "TASK-001.md"), "# TASK-001\n");
+    await writeFile(join(taskRoot, "TASK-002.md"), "# TASK-002\n");
+    await rawGit(fixture.root, ["add", ".ai-team"]);
+    await rawGit(fixture.root, ["commit", "-m", "Freeze authority conflict tasks"]);
+    const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    const runId = fixture.store.createRun({
+      repoId: identity.repoId, profile: "coding", mode: "planned", planId: "20260821-authority-conflict", revision: "001",
+      baseCommit, targetBranch: "main", request: "continue authority content conflict",
+    });
+    fixture.store.initializeRunTasks(runId, [{
+      task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "a".repeat(64), write_paths: ["README.md", "dirty.txt", "authority.txt"],
+    }, {
+      task_id: "TASK-002", source_path: "tasks/TASK-002.md", source_digest: "b".repeat(64), write_paths: ["README.md"],
+    }]);
+    await fixture.orchestrator.prepareIntegration(runId);
+    const task = await fixture.orchestrator.prepareTask(runId, "TASK-001");
+    await writeFile(join(fixture.root, "README.md"), "authority\n");
+    await writeFile(join(fixture.root, "authority.txt"), "authority-only\n");
+    await rawGit(fixture.root, ["add", "README.md", "authority.txt"]);
+    await rawGit(fixture.root, ["commit", "-m", "Authority changes README"]);
+    const authorityCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    await rawGit(fixture.root, ["reset", "--hard", baseCommit]);
+
+    await writeFile(join(task.path, "README.md"), "task work\n");
+    await rawGit(task.path, ["add", "README.md"]);
+    await writeFile(join(task.path, "README.md"), "task work\nunstaged work\n");
+    await writeFile(join(task.path, "dirty.txt"), "untracked\n");
+    const before = {
+      head: await rawGit(task.path, ["rev-parse", "HEAD"]),
+      staged: await rawGit(task.path, ["diff", "--cached", "--binary"]),
+      unstaged: await rawGit(task.path, ["diff", "--binary"]),
+      status: await rawGit(task.path, ["status", "--porcelain=v1"]),
+    };
+
+    const dispatches = new DispatchService(fixture.store);
+    const authorityDispatchId = dispatches.create(runId, "git-operator", {
+      objective: "Apply authority", allowed_read_paths: [], allowed_write_paths: ["README.md", "dirty.txt", "authority.txt"],
+      acceptance_criteria: ["Apply authority"],
+      context: {
+        stage: "git-operator", phase: "apply_task_authority", operation: "apply-task-authority", task_id: "TASK-001",
+        worktree_id: task.worktree_id, worktree_path: task.path, authority_commit: authorityCommit, expected_head: baseCommit,
+        superseded_developer_dispatch_id: "dispatch_source", scope_recovery: {
+          authority_commit: authorityCommit, expected_head: baseCommit, original_allowed_write_paths: ["README.md", "dirty.txt", "authority.txt"],
+          added_write_paths: [], allowed_write_paths: ["README.md", "dirty.txt", "authority.txt"], dirty_paths: ["README.md", "dirty.txt"],
+        },
+      },
+    });
+    dispatches.claim(runId, authorityDispatchId, "git-operator");
+    await assert.rejects(
+      fixture.orchestrator.applyTaskAuthority({ runId, dispatchId: authorityDispatchId, worktreeId: task.worktree_id, authorityCommit, expectedHead: baseCommit }),
+      /requires Git conflict reconciliation/,
+    );
+    const conflicted = fixture.store.db.prepare("SELECT operation_id,state,evidence_json FROM operations WHERE run_id=? AND kind='git.task_authority.apply'").get(runId) as { operation_id: string; state: string; evidence_json: string };
+    const evidence = JSON.parse(conflicted.evidence_json);
+    assert.equal(conflicted.state, "pending");
+    assert.deepEqual(evidence, {
+      state: "conflicted", worktree_id: task.worktree_id, authority_commit: authorityCommit, expected_head: baseCommit,
+      dirty_paths: ["README.md", "dirty.txt"], authority_paths: ["README.md", "authority.txt"], conflict_paths: ["README.md"], stash_commit: evidence.stash_commit,
+    });
+    assert.match(evidence.stash_commit, /^[a-f0-9]{40}$/);
+    assert.deepEqual({
+      head: await rawGit(task.path, ["rev-parse", "HEAD"]), staged: await rawGit(task.path, ["diff", "--cached", "--binary"]),
+      unstaged: await rawGit(task.path, ["diff", "--binary"]), status: await rawGit(task.path, ["status", "--porcelain=v1"]),
+      unmerged: await rawGit(task.path, ["ls-files", "-u"]),
+    }, { ...before, unmerged: "" });
+    const continuation = fixture.store.db.prepare("SELECT dispatch_id,state,packet_json,replacement_for FROM dispatches WHERE run_id=? AND replacement_for=?")
+      .get(runId, authorityDispatchId) as { dispatch_id: string; state: string; packet_json: string; replacement_for: string };
+    const packet = JSON.parse(continuation.packet_json) as { allowed_write_paths: string[]; context: Record<string, unknown> };
+    assert.equal(continuation.state, "pending");
+    assert.equal(continuation.replacement_for, authorityDispatchId);
+    assert.deepEqual(packet.allowed_write_paths, ["README.md", "dirty.txt", "authority.txt"]);
+    assert.deepEqual({
+      phase: packet.context.phase, operation: packet.context.operation, authority_apply_operation_id: packet.context.authority_apply_operation_id,
+      authority_apply_dispatch_id: packet.context.authority_apply_dispatch_id, worktree_id: packet.context.worktree_id,
+      authority_commit: packet.context.authority_commit, expected_head: packet.context.expected_head, dirty_paths: packet.context.dirty_paths, authority_paths: packet.context.authority_paths,
+    }, {
+      phase: "continue_task_authority_conflict", operation: "continue-task-authority-conflict", authority_apply_operation_id: conflicted.operation_id,
+      authority_apply_dispatch_id: authorityDispatchId, worktree_id: task.worktree_id, authority_commit: authorityCommit, expected_head: baseCommit,
+      dirty_paths: ["README.md", "dirty.txt"], authority_paths: ["README.md", "authority.txt"],
+    });
+
+    dispatches.claim(runId, continuation.dispatch_id, "git-operator");
+    await writeFile(join(task.path, "README.md"), "authority\nresolved task work\n");
+    const receipt = await fixture.orchestrator.continueTaskAuthorityConflict(runId, continuation.dispatch_id);
+    assert.deepEqual(receipt, {
+      operation_id: conflicted.operation_id, worktree_id: task.worktree_id, authority_commit: authorityCommit, head: baseCommit,
+      dirty_paths: ["README.md", "authority.txt", "dirty.txt"], stash_commit: evidence.stash_commit, reused: false,
+    });
+    assert.deepEqual(await fixture.orchestrator.continueTaskAuthorityConflict(runId, continuation.dispatch_id), { ...receipt, reused: true });
+    assert.equal((fixture.store.db.prepare("SELECT state FROM operations WHERE operation_id=?").get(conflicted.operation_id) as { state: string }).state, "completed");
+    assert.equal(await rawGit(task.path, ["rev-parse", "HEAD"]), baseCommit);
+    assert.equal(await rawGit(task.path, ["ls-files", "-u"]), "");
+    assert.equal(await readFile(join(task.path, "authority.txt"), "utf8"), "authority-only\n");
+    assert.deepEqual((await rawGit(task.path, ["status", "--porcelain=v1"])).split("\n").map((line) => line.slice(3)).sort(), ["README.md", "authority.txt", "dirty.txt"]);
   } finally {
     await fixture.dispose();
   }

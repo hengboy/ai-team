@@ -56,6 +56,9 @@ const packetContextRequirements = (role: Role, phase?: unknown, taskId?: unknown
   if (phase === "apply_task_authority") {
     return ["phase", "operation", "task_id", "worktree_id", "worktree_path", "authority_commit", "expected_head", "superseded_developer_dispatch_id"];
   }
+  if (phase === "continue_task_authority_conflict") {
+    return ["phase", "operation", "task_id", "worktree_id", "worktree_path", "authority_commit", "expected_head", "authority_apply_operation_id", "authority_apply_dispatch_id", "stash_commit", "dirty_paths", "authority_paths", "conflict_paths"];
+  }
   if (role === "frontend-developer" || role === "backend-developer") return ["explorer_dispatch_id", "worktree_id"];
   return [];
 };
@@ -63,10 +66,11 @@ const packetContextRequirements = (role: Role, phase?: unknown, taskId?: unknown
 export const dispatchPacketSchema = (role: Role, phase?: unknown, taskId?: unknown): Record<string, unknown> => {
   const contextRequired = packetContextRequirements(role, phase, taskId);
   const contextProperties = Object.fromEntries(contextRequired.map((key) => [key, {
-    type: "string",
+    ...(key.endsWith("_paths") ? { type: "array", items: { type: "string", minLength: 1 } } : { type: "string" }),
     ...(key === "task_id" ? { pattern: phase === "continue_implementation" ? "^TASK-[0-9]{3}$" : "^(?:TASK-[0-9]{3}|implementation)$" } : {}),
     ...(key === "operation" && phase === "recover_task_worktree" ? { const: "recover-task-worktree" } : {}),
     ...(key === "operation" && phase === "apply_task_authority" ? { const: "apply-task-authority" } : {}),
+    ...(key === "operation" && phase === "continue_task_authority_conflict" ? { const: "continue-task-authority-conflict" } : {}),
   }]));
   return {
     $schema: "https://json-schema.org/draft/2020-12/schema", type: "object", additionalProperties: false,
@@ -192,10 +196,12 @@ export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   }
   if (value.execution_request && value.execution_contract) throw new ValidationError("dispatch packet cannot contain both execution_request and execution_contract");
   const context = value.context as Record<string, unknown>;
-  const enforcedContext = context.phase === "continue_implementation" || context.phase === "prepare_implementation_worktree" || context.phase === "recover_task_worktree" || context.phase === "apply_task_authority"
+  const enforcedContext = context.phase === "continue_implementation" || context.phase === "prepare_implementation_worktree" || context.phase === "recover_task_worktree" || context.phase === "apply_task_authority" || context.phase === "continue_task_authority_conflict"
     ? packetContextRequirements(role, context.phase, context.task_id)
     : [];
-  const missingContext = enforcedContext.filter((key) => typeof context[key] !== "string" || !(context[key] as string).trim());
+  const missingContext = enforcedContext.filter((key) => key.endsWith("_paths")
+    ? !Array.isArray(context[key]) || !(context[key] as unknown[]).length || (context[key] as unknown[]).some((path) => typeof path !== "string" || !path.trim())
+    : typeof context[key] !== "string" || !(context[key] as string).trim());
   if (missingContext.length) throw new ValidationError("dispatch packet context is incomplete for role and phase", missingContext.map((key) => ({ path: `/context/${key}`, pointer: `/context/${key}`, field: key, constraint: "required", message: "required context field is missing" })));
   if (context.phase === "recover_task_worktree" && context.operation !== undefined) {
     const recoveryFields = [
@@ -209,6 +215,9 @@ export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   }
   if (context.phase === "apply_task_authority" && context.operation !== "apply-task-authority") {
     throw new ValidationError("task authority packet operation must be apply-task-authority", ["/context/operation"]);
+  }
+  if (context.phase === "continue_task_authority_conflict" && context.operation !== "continue-task-authority-conflict") {
+    throw new ValidationError("task authority conflict packet operation must be continue-task-authority-conflict", ["/context/operation"]);
   }
   if (typeof context.task_id === "string" && context.task_id !== "implementation" && !/^TASK-\d{3}$/.test(context.task_id)) {
     throw new ValidationError("dispatch packet context.task_id is invalid", [{ path: "/context/task_id", pointer: "/context/task_id", field: "task_id", constraint: "pattern", message: "must match TASK- followed by three digits" }]);

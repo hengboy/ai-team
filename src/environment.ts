@@ -260,6 +260,7 @@ const LEGACY_RENDERER_NOT_USED: Record<string, string[]> = {
   "git commit": ["ai-team git commit --run-id <run-id> --worktree-id <opaque-id> --message <text> --scope <paths>"],
   "git merge-task": ["ai-team git merge-task --run-id <run-id> --integration-id <opaque-id> --task-id <task-id>"],
   "git continue-conflict": ["ai-team git continue-conflict --run-id <run-id> --integration-id <opaque-id> --scope <paths>"],
+  "git continue-authority-conflict": ["ai-team git continue-authority-conflict --run-id <run-id> --dispatch-id <dispatch-id>"],
   "git integrate": ["ai-team git integrate --run-id <run-id> --integration-id <opaque-id>"],
   "git reconcile": ["ai-team git reconcile --run-id <run-id> [--operation-id <opaque-id> --state <state> --evidence-file <json>]"],
   "git cleanup": ["ai-team git cleanup --run-id <run-id>"],

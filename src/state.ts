@@ -37,6 +37,7 @@ const operationCommand = (kind: string): string => ({
   "git.merge.task": "git merge-task",
   "git.sync": "git integrate",
   "git.merge.continue": "git continue-conflict",
+  "git.task_authority.continue": "git continue-authority-conflict",
   "git.integrate": "git integrate",
   "git.cleanup": "git cleanup",
   "planning.revision.commit": "planning revision commit",

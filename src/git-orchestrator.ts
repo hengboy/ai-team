@@ -1,7 +1,7 @@
 import { mkdir, readdir, realpath, stat } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { ValidationError } from "./errors.js";
-import { applyAuthorityCommitPreservingDirtyWork, commitPaths, createWorktree, currentBranch, currentHead, git, mergeNoFastForward, worktreeStatus } from "./git.js";
+import { applyAuthorityCommitPreservingDirtyWork, applyAuthorityPaths, AuthorityApplyConflictError, commitPaths, createWorktree, currentBranch, currentHead, git, mergeNoFastForward, worktreeStatus } from "./git.js";
 import { assertWritablePath, canonicalizeInside, pathMatchesScope } from "./security.js";
 import { StateStore } from "./state.js";
 import { sha256, stableJson, toPosix } from "./utils.js";
@@ -82,6 +82,17 @@ export interface TaskAuthorityApplyReceipt {
   reused: boolean;
 }
 
+interface AuthorityApplyConflictEvidence {
+  state: "conflicted";
+  worktree_id: string;
+  authority_commit: string;
+  expected_head: string;
+  dirty_paths: string[];
+  authority_paths: string[];
+  conflict_paths: string[];
+  stash_commit: string;
+}
+
 export interface SyncConflictEvidence {
   integration_worktree_id: string;
   conflict_paths: string[];
@@ -123,13 +134,14 @@ export class GitOrchestrator {
   /** Every mutating operation can be tied to the claimed git-operator dispatch.
    * The optional argument preserves the programmatic API used by older
    * integrations; CLI callers should always provide it. */
-  private assertGitOperator(runId: string, dispatchId?: string, operation?: "apply-task-authority"): void {
+  private assertGitOperator(runId: string, dispatchId?: string, operation?: "apply-task-authority" | "continue-task-authority-conflict"): void {
     if (!dispatchId) return;
     new DispatchService(this.store).assertClaimed(runId, dispatchId, "git-operator");
     const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
       .get(runId, dispatchId) as { packet_json: string } | undefined;
     const context = row ? (JSON.parse(row.packet_json) as { context?: Record<string, unknown> }).context : undefined;
-    if (context?.phase === "apply_task_authority" && operation !== "apply-task-authority") {
+    if (context?.phase === "apply_task_authority" && operation !== "apply-task-authority"
+      || context?.phase === "continue_task_authority_conflict" && operation !== "continue-task-authority-conflict") {
       throw new ValidationError("task authority dispatch only authorizes apply-task-authority");
     }
   }
@@ -586,6 +598,10 @@ export class GitOrchestrator {
     if (!allowed || dirtyPaths.some((path) => !pathMatchesScope(path, allowed))) {
       throw new ValidationError("task authority apply dirty work is outside the frozen replacement scope", { dirty_paths: dirtyPaths });
     }
+    const authorityPaths = (await git(row.path, ["diff", "--name-only", request.expectedHead, request.authorityCommit])).stdout.split("\n").filter(Boolean).sort();
+    if (!authorityPaths.length || authorityPaths.some((path) => !pathMatchesScope(path, allowed))) {
+      throw new ValidationError("task authority apply commit is outside the frozen replacement scope", { authority_paths: authorityPaths });
+    }
     let operationKey = key;
     let operation: { operationId: string; reused: boolean; state: string };
     while (true) {
@@ -608,7 +624,38 @@ export class GitOrchestrator {
       } catch { /* malformed reconciliation evidence is not retry authorization */ }
       throw new ValidationError("task authority apply has an unknown side effect; reconcile required");
     }
-    const stashCommit = await applyAuthorityCommitPreservingDirtyWork(row.path, request.authorityCommit, `ai-team authority ${request.dispatchId}`);
+    let stashCommit: string;
+    try {
+      stashCommit = await applyAuthorityCommitPreservingDirtyWork(row.path, request.authorityCommit, `ai-team authority ${request.dispatchId}`);
+    } catch (error) {
+      if (error instanceof AuthorityApplyConflictError) {
+        const evidence: AuthorityApplyConflictEvidence = {
+          state: "conflicted",
+          worktree_id: request.worktreeId,
+          authority_commit: request.authorityCommit,
+          expected_head: request.expectedHead,
+          dirty_paths: dirtyPaths,
+          authority_paths: authorityPaths,
+          conflict_paths: error.conflictPaths,
+          stash_commit: error.stashCommit,
+        };
+        this.store.recordPendingOperationEvidence(operation.operationId, evidence);
+        this.store.event(request.runId, "worktree.task_authority_conflicted", { dispatch_id: request.dispatchId, operation_id: operation.operationId, ...evidence });
+        new DispatchService(this.store).createAuthorityConflictContinuation({
+          runId: request.runId,
+          authorityDispatchId: request.dispatchId,
+          operationId: operation.operationId,
+          worktreeId: request.worktreeId,
+          authorityCommit: request.authorityCommit,
+          expectedHead: request.expectedHead,
+          dirtyPaths,
+          authorityPaths,
+          conflictPaths: error.conflictPaths,
+          stashCommit: error.stashCommit,
+        });
+      }
+      throw error;
+    }
     const receipt: TaskAuthorityApplyReceipt = {
       operation_id: operation.operationId,
       worktree_id: request.worktreeId,
@@ -620,6 +667,73 @@ export class GitOrchestrator {
     };
     this.store.finishOperation(operation.operationId, receipt);
     this.store.event(request.runId, "worktree.task_authority_applied", receipt);
+    return receipt;
+  }
+
+  async continueTaskAuthorityConflict(runId: string, dispatchId: string): Promise<TaskAuthorityApplyReceipt> {
+    this.assertGitOperator(runId, dispatchId, "continue-task-authority-conflict");
+    const dispatch = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+      .get(runId, dispatchId) as { packet_json: string } | undefined;
+    const context = dispatch ? (JSON.parse(dispatch.packet_json) as { context: Record<string, unknown> }).context : undefined;
+    const required = ["worktree_id", "authority_commit", "expected_head", "authority_apply_operation_id", "authority_apply_dispatch_id", "stash_commit"] as const;
+    if (!context || context.phase !== "continue_task_authority_conflict" || context.operation !== "continue-task-authority-conflict"
+      || required.some((key) => typeof context[key] !== "string" || !context[key])) {
+      throw new ValidationError("Git Operator dispatch is not bound to an authority conflict continuation");
+    }
+    const worktreeId = context.worktree_id as string;
+    const authorityCommit = context.authority_commit as string;
+    const expectedHead = context.expected_head as string;
+    const originalOperationId = context.authority_apply_operation_id as string;
+    const originalDispatchId = context.authority_apply_dispatch_id as string;
+    const stashCommit = context.stash_commit as string;
+    const continuationKey = `authority-conflict-continue:${runId}:${originalOperationId}:${dispatchId}`;
+    const existingContinuation = this.store.db.prepare("SELECT state,evidence_json FROM operations WHERE idempotency_key=? AND kind='git.task_authority.continue'")
+      .get(continuationKey) as { state: string; evidence_json?: string } | undefined;
+    if (existingContinuation) {
+      if (existingContinuation.state !== "completed") throw new ValidationError("authority conflict continuation side effect is unknown; reconcile required");
+      return { ...(JSON.parse(existingContinuation.evidence_json ?? "{}") as TaskAuthorityApplyReceipt), reused: true };
+    }
+    const operation = this.store.db.prepare("SELECT state,request_json,evidence_json FROM operations WHERE operation_id=? AND run_id=? AND kind='git.task_authority.apply'")
+      .get(originalOperationId, runId) as { state: string; request_json: string; evidence_json?: string } | undefined;
+    const evidence = JSON.parse(operation?.evidence_json ?? "{}") as Partial<AuthorityApplyConflictEvidence>;
+    if (!operation || operation.state !== "pending" || evidence.state !== "conflicted" || evidence.worktree_id !== worktreeId
+      || evidence.authority_commit !== authorityCommit || evidence.expected_head !== expectedHead || evidence.stash_commit !== stashCommit) {
+      throw new ValidationError("authority conflict continuation evidence does not match its frozen packet");
+    }
+    const request = JSON.parse(operation.request_json) as TaskAuthorityApplyRequest & { dirty_paths?: unknown };
+    const recordedDirtyPaths = Array.isArray(request.dirty_paths) && request.dirty_paths.every((path) => typeof path === "string") ? [...request.dirty_paths].sort() : [];
+    const packetDirtyPaths = Array.isArray(context.dirty_paths) && context.dirty_paths.every((path) => typeof path === "string") ? [...context.dirty_paths].sort() : [];
+    const authorityPaths = Array.isArray(context.authority_paths) && context.authority_paths.every((path) => typeof path === "string") ? [...context.authority_paths].sort() : [];
+    if (request.dispatchId !== originalDispatchId || request.worktreeId !== worktreeId || request.authorityCommit !== authorityCommit || request.expectedHead !== expectedHead
+      || stableJson(recordedDirtyPaths) !== stableJson(packetDirtyPaths) || stableJson(recordedDirtyPaths) !== stableJson([...(evidence.dirty_paths ?? [])].sort())
+      || !authorityPaths.length || stableJson(authorityPaths) !== stableJson([...(evidence.authority_paths ?? [])].sort())) {
+      throw new ValidationError("authority conflict continuation dirty-work lineage does not match its frozen packet");
+    }
+    const row = this.store.db.prepare("SELECT path,state FROM worktrees WHERE run_id=? AND worktree_id=?").get(runId, worktreeId) as { path: string; state: string } | undefined;
+    if (!row || row.state !== "active" || await currentHead(row.path) !== expectedHead) throw new ValidationError("authority conflict continuation worktree HEAD does not match expected HEAD");
+    const unresolved = (await git(row.path, ["diff", "--name-only", "--diff-filter=U"])).stdout.split("\n").filter(Boolean);
+    if (unresolved.length) throw new ValidationError("authority conflict continuation has unresolved paths", unresolved);
+    await applyAuthorityPaths(row.path, authorityCommit, authorityPaths.filter((path) => !recordedDirtyPaths.includes(path)));
+    const status = await git(row.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const dirtyPaths = status.stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3)).sort();
+    const requiredPaths = [...new Set([...recordedDirtyPaths, ...authorityPaths])].sort();
+    if (requiredPaths.some((path) => !dirtyPaths.includes(path)) || dirtyPaths.some((path) => !requiredPaths.includes(path))) {
+      throw new ValidationError("authority conflict continuation dirty work changed", { expected: requiredPaths, actual: dirtyPaths });
+    }
+    const allowed = Array.isArray(context.allowed_write_paths) && context.allowed_write_paths.every((path) => typeof path === "string") ? context.allowed_write_paths as string[] : [];
+    if (!allowed.length || dirtyPaths.some((path) => !pathMatchesScope(path, allowed))) throw new ValidationError("authority conflict continuation dirty work is outside the frozen replacement scope", { dirty_paths: dirtyPaths });
+    const continuation = this.store.beginOperation("git.task_authority.continue", continuationKey, {
+      authority_apply_operation_id: originalOperationId, worktree_id: worktreeId, authority_commit: authorityCommit, expected_head: expectedHead, dirty_paths: dirtyPaths,
+    }, runId);
+    if (continuation.reused) {
+      if (continuation.state !== "completed") throw new ValidationError("authority conflict continuation side effect is unknown; reconcile required");
+      const completed = this.store.db.prepare("SELECT evidence_json FROM operations WHERE operation_id=?").get(continuation.operationId) as { evidence_json: string };
+      return { ...(JSON.parse(completed.evidence_json) as TaskAuthorityApplyReceipt), reused: true };
+    }
+    const receipt: TaskAuthorityApplyReceipt = { operation_id: originalOperationId, worktree_id: worktreeId, authority_commit: authorityCommit, head: expectedHead, dirty_paths: dirtyPaths, stash_commit: stashCommit, reused: false };
+    this.store.finishOperation(continuation.operationId, receipt);
+    this.store.finishOperation(originalOperationId, { ...receipt, continued_by: continuation.operationId });
+    this.store.event(runId, "worktree.task_authority_conflict_continued", { dispatch_id: dispatchId, ...receipt, continuation_operation_id: continuation.operationId });
     return receipt;
   }
 

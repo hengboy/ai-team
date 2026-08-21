@@ -13,6 +13,7 @@ commands:
   - git commit
   - git merge-task
   - git continue-conflict
+  - git continue-authority-conflict
   - git integrate
   - git reconcile
   - git cleanup

@@ -1378,6 +1378,83 @@ export class DispatchService {
   private claimCommand(runId: string, dispatchId: string): string {
     return `ai-team dispatch claim --run-id ${runId} --dispatch-id ${dispatchId} --role git-operator --bundle`;
   }
+
+  createAuthorityConflictContinuation(input: {
+    runId: string;
+    authorityDispatchId: string;
+    operationId: string;
+    worktreeId: string;
+    authorityCommit: string;
+    expectedHead: string;
+    dirtyPaths: string[];
+    authorityPaths: string[];
+    conflictPaths: string[];
+    stashCommit: string;
+  }): { dispatch_id: string; reused: boolean } {
+    const source = this.store.db.prepare("SELECT state,packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+      .get(input.runId, input.authorityDispatchId) as { state: string; packet_json: string } | undefined;
+    const sourcePacket = source ? JSON.parse(source.packet_json) as DispatchPacket : undefined;
+    const context = sourcePacket?.context;
+    const dirtyPaths = [...new Set(input.dirtyPaths)].sort();
+    const authorityPaths = [...new Set(input.authorityPaths)].sort();
+    const conflictPaths = [...new Set(input.conflictPaths)].sort();
+    if (!source || !sourcePacket || source.state !== "claimed" || context?.phase !== "apply_task_authority" || context.operation !== "apply-task-authority"
+      || context.worktree_id !== input.worktreeId || context.authority_commit !== input.authorityCommit || context.expected_head !== input.expectedHead
+      || !Array.isArray(context.scope_recovery && (context.scope_recovery as Record<string, unknown>).allowed_write_paths)
+      || [...dirtyPaths, ...authorityPaths].some((path) => !pathMatchesScope(path, sourcePacket.allowed_write_paths))) {
+      throw new ValidationError("authority conflict continuation does not match the claimed frozen authority packet");
+    }
+    const continuationContext = {
+      ...context,
+      stage: "git-operator",
+      phase: "continue_task_authority_conflict",
+      operation: "continue-task-authority-conflict",
+      authority_apply_operation_id: input.operationId,
+      authority_apply_dispatch_id: input.authorityDispatchId,
+      dirty_paths: dirtyPaths,
+      authority_paths: authorityPaths,
+      conflict_paths: conflictPaths,
+      stash_commit: input.stashCommit,
+      allowed_write_paths: [...sourcePacket.allowed_write_paths].sort(),
+    };
+    const packet = freezeExecutionContract("git-operator", validatePacket({
+      objective: `Resolve the recorded authority content conflict for ${String(context.task_id)} without changing its frozen task worktree HEAD or losing its dirty work.`,
+      allowed_read_paths: [],
+      allowed_write_paths: [...sourcePacket.allowed_write_paths],
+      acceptance_criteria: [
+        "Resolve only the recorded authority content conflict within the frozen task write paths",
+        "Preserve the frozen task worktree HEAD and recorded dirty paths",
+        "Record only the authority application receipt",
+      ],
+      context: continuationContext,
+    }, "git-operator"), sourcePacket.execution_contract);
+    const packetJson = redact(stableJson(packet));
+    const existing = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
+      .get(input.runId, input.authorityDispatchId) as { dispatch_id: string; packet_json: string } | undefined;
+    if (existing) {
+      if (existing.packet_json !== packetJson) throw new ValidationError("authority conflict already has a different continuation");
+      return { dispatch_id: existing.dispatch_id, reused: true };
+    }
+    let dispatchId = "";
+    this.store.db.transaction(() => {
+      this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE run_id=? AND dispatch_id=? AND state='claimed'")
+        .run(new Date().toISOString(), input.runId, input.authorityDispatchId);
+      dispatchId = this.insert(input.runId, "git-operator", packet, input.authorityDispatchId);
+      this.store.event(input.runId, "worktree.task_authority_conflict_continuation_created", {
+        authority_apply_dispatch_id: input.authorityDispatchId,
+        continuation_dispatch_id: dispatchId,
+        operation_id: input.operationId,
+        worktree_id: input.worktreeId,
+        authority_commit: input.authorityCommit,
+        expected_head: input.expectedHead,
+        dirty_paths: dirtyPaths,
+        authority_paths: authorityPaths,
+        conflict_paths: conflictPaths,
+        stash_commit: input.stashCommit,
+      });
+    })();
+    return { dispatch_id: dispatchId, reused: false };
+  }
   schema(runId: string, dispatchId: string, role: Role): unknown { return JSON.parse(this.get(runId, dispatchId, role).schema_json); }
   template(runId: string, dispatchId: string, role: Role): ResultEnvelope { return JSON.parse(this.get(runId, dispatchId, role).template_json) as ResultEnvelope; }
   packetSchema(runId: string, dispatchId: string, role: Role): unknown {
@@ -2526,7 +2603,8 @@ export class DispatchService {
       .get(runId, worktreeId) as { path: string; state: string } | undefined;
     if (!worktree || worktree.state !== "active" || worktree.path !== worktreePath) throw new ValidationError("authority application worktree identity changed before developer replacement");
     const sourcePacket = JSON.parse(source.packet_json) as DispatchPacket;
-    const { execution_contract: _executionContract, ...unfrozenSource } = sourcePacket;
+    const unfrozenSource = { ...sourcePacket };
+    delete unfrozenSource.execution_contract;
     const packet = validatePacket({
       ...unfrozenSource,
       allowed_write_paths: authorityPacket.allowed_write_paths,

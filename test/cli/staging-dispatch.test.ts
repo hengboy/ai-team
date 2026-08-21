@@ -34,6 +34,20 @@ test("CLI advertises the supported claimed task scope recovery authority flags",
   for (const option of ["--run-id <id>", "--dispatch-id <id>"]) assert.ok(repairHelp.stdout.includes(option));
 });
 
+test("CLI keeps authority conflict continuation separate from integration conflict continuation", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const authority = await cli(sandbox, ["git", "continue-authority-conflict", "--help"]);
+  assert.equal(authority.status, 0, authority.stderr);
+  assert.ok(authority.stdout.includes("--run-id <id>"));
+  assert.ok(authority.stdout.includes("--dispatch-id <id>"));
+  assert.ok(!authority.stdout.includes("--integration-id <id>"));
+
+  const integration = await cli(sandbox, ["git", "continue-conflict", "--help"]);
+  assert.equal(integration.status, 0, integration.stderr);
+  assert.ok(integration.stdout.includes("--integration-id <id>"));
+  assert.ok(integration.stdout.includes("--scope <paths>"));
+});
+
 
 test("CLI manages cancel, reissue, and supersede for a claimed support dispatch", async (t) => {
   const sandbox = await makeSandbox(t);
