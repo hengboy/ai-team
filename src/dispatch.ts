@@ -989,6 +989,20 @@ export class DispatchService {
       state: string; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string;
     };
     const run = this.store.getRun(runId) as { state: string };
+    const cleanup = this.integratedTaskCleanupRecovery(runId, { dispatch_id: dispatchId, role, ...row });
+    if (cleanup) {
+      this.assertLifecycleActor(runId, actorRole, "dispatch reissue");
+      if (!reason.trim()) throw new ValidationError("dispatch reissue requires a reason");
+      let cleanupDispatchId = "";
+      this.store.db.transaction(() => {
+        cleanupDispatchId = this.activateIntegratedTaskCleanup(runId, cleanup.merge_operation_id, cleanup.request, dispatchId);
+        this.store.event(runId, "dispatch.reissued", {
+          dispatchId, replacement_dispatch_id: cleanupDispatchId, role, actor_role: actorRole, reason,
+          revived_run: true, cleanup_only: true,
+        });
+      })();
+      return { action: "reissued", dispatch_id: cleanupDispatchId, replacement_for: dispatchId, reused: false };
+    }
     if (row.state === "failed" && run.state === "failed") {
       this.assertLifecycleActor(runId, actorRole, "dispatch reissue");
       if (!reason.trim()) throw new ValidationError("dispatch reissue requires a reason");
@@ -1277,6 +1291,18 @@ export class DispatchService {
     try { result = JSON.parse(row.result_json ?? ""); }
     catch { throw new ValidationError("dispatch reconciliation requires a valid retryable result envelope"); }
     const partialEffect = this.plannedMergePartialEffect(runId, { dispatch_id: dispatchId, ...row });
+    const cleanup = this.integratedTaskCleanupRecovery(runId, { dispatch_id: dispatchId, ...row });
+    if (cleanup) {
+      let cleanupDispatchId = "";
+      this.store.terminalCommand(commandId, "completed", { command: "dispatch reconcile", retry_safe: true, cleanup_only: true }, () => {
+        cleanupDispatchId = this.activateIntegratedTaskCleanup(runId, cleanup.merge_operation_id, cleanup.request, dispatchId);
+        this.store.event(runId, "dispatch.reconciled", {
+          dispatchId, replacement_dispatch_id: cleanupDispatchId, role, actor_role: actorRole, reason,
+          side_effect_state: "completed", cleanup_only: true,
+        });
+      });
+      return { action: "reconciled", dispatch_id: cleanupDispatchId, replacement_for: dispatchId, reused: false };
+    }
     if (result.status !== "retryable_failure" || (result.side_effect_state !== "completed" && !partialEffect)) {
       throw new ValidationError("dispatch reconciliation requires confirmed completed side effects", [
         { path: "/side_effect_state", pointer: "/side_effect_state", field: "side_effect_state", constraint: "const", message: "must equal completed" },
@@ -1996,6 +2022,10 @@ export class DispatchService {
         if (typeof context.explorer_dispatch_id === "string") this.createPlannedCodingDispatch(runId, context.explorer_dispatch_id, result.dispatch_id);
         return;
       }
+      if (context.phase === "cleanup_integrated_task") {
+        this.ensureNextPlannedTaskPrepare(runId);
+        return;
+      }
       if (run.mode === "planned" && (context.phase === "prepare_implementation_worktree" || context.phase === "recover_task_worktree")) {
         const taskId = typeof (context as { task_id?: unknown }).task_id === "string" ? (context as { task_id: string }).task_id : undefined;
         if (taskId && this.plannedTaskRows(runId).some((task) => task.task_id === taskId)) {
@@ -2345,6 +2375,17 @@ export class DispatchService {
     const next = tasks.find(({ state }) => state !== "integrated");
     if (!next || next.state !== "pending") return undefined;
     if (tasks.slice(0, next.ordinal).some(({ state }) => state !== "integrated")) return undefined;
+    const predecessorCleanupPending = tasks.slice(0, next.ordinal).some((task) => {
+      if (!task.worktree_id) return false;
+      const worktree = this.store.db.prepare("SELECT branch,state FROM worktrees WHERE worktree_id=? AND run_id=?")
+        .get(task.worktree_id, runId) as { branch: string; state: string } | undefined;
+      if (!worktree || !worktree.branch.startsWith("task/")) return false;
+      const cleanup = this.store.db.prepare(`SELECT state FROM operations WHERE run_id=? AND kind='git.cleanup'
+        AND json_extract(request_json,'$.task_worktree_id')=? ORDER BY created_at DESC LIMIT 1`)
+        .get(runId, task.worktree_id) as { state: string } | undefined;
+      return worktree.state !== "removed" || cleanup?.state !== "completed";
+    });
+    if (predecessorCleanupPending) return undefined;
     const integration = this.activeIntegrationWorktree(runId);
     if (!integration) throw new ValidationError("planned task prepare requires the active plan worktree");
     const baseCommit = execFileSync("git", ["-C", integration.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
@@ -2477,6 +2518,89 @@ export class DispatchService {
       stale_base_commit: staleWorktree.base_commit,
       required_base_commit: baseCommit,
     });
+    this.changeStage(runId, "git-operator", dispatchId);
+    return dispatchId;
+  }
+
+  private integratedTaskCleanupRecovery(
+    runId: string,
+    dispatch: { dispatch_id: string; role: Role; packet_json: string },
+  ): { merge_operation_id: string; request: Record<string, unknown> } | undefined {
+    if (dispatch.role !== "git-operator") return undefined;
+    let context: Record<string, unknown>;
+    try { context = (JSON.parse(dispatch.packet_json) as DispatchPacket).context; }
+    catch { return undefined; }
+    if (context.phase !== "integrate_implementation") return undefined;
+    const bindings = this.mergeWorktreeBindings(runId, dispatch.dispatch_id);
+    const integrationWorktreeId = typeof context.integration_worktree_id === "string"
+      ? context.integration_worktree_id
+      : bindings.integration_worktree_id;
+    const taskWorktreeId = typeof context.task_worktree_id === "string"
+      ? context.task_worktree_id
+      : typeof context.implementation_worktree_id === "string"
+        ? context.implementation_worktree_id
+        : bindings.task_worktree_ids.length === 1 ? bindings.task_worktree_ids[0] : undefined;
+    if (!integrationWorktreeId || !taskWorktreeId) return undefined;
+    const merge = this.store.db.prepare(`SELECT operation_id,request_json FROM operations WHERE run_id=? AND kind='git.merge.task' AND state='completed'
+      AND json_extract(request_json,'$.integration_worktree_id')=? AND json_extract(request_json,'$.task_worktree_id')=?
+      ORDER BY completed_at DESC LIMIT 1`).get(runId, integrationWorktreeId, taskWorktreeId) as { operation_id: string; request_json: string } | undefined;
+    if (!merge) return undefined;
+    const cleanup = this.store.db.prepare(`SELECT state FROM operations WHERE run_id=? AND kind='git.cleanup'
+      AND json_extract(request_json,'$.merge_operation_id')=? ORDER BY created_at DESC LIMIT 1`).get(runId, merge.operation_id) as { state: string } | undefined;
+    if (cleanup?.state === "completed") return undefined;
+    return { merge_operation_id: merge.operation_id, request: JSON.parse(merge.request_json) as Record<string, unknown> };
+  }
+
+  private activateIntegratedTaskCleanup(
+    runId: string,
+    mergeOperationId: string,
+    request: Record<string, unknown>,
+    replacementFor?: string,
+  ): string {
+    const taskWorktreeId = request.task_worktree_id;
+    const integrationWorktreeId = request.integration_worktree_id;
+    this.store.db.prepare(`UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND role='git-operator'
+      AND state IN ('pending','claimed','failed','retryable_failure')
+      AND json_extract(packet_json,'$.context.phase')='integrate_implementation'
+      AND json_extract(packet_json,'$.context.integration_worktree_id')=?
+      AND (json_extract(packet_json,'$.context.task_worktree_id')=? OR json_extract(packet_json,'$.context.implementation_worktree_id')=?)`)
+      .run(new Date().toISOString(), runId, integrationWorktreeId, taskWorktreeId, taskWorktreeId);
+    if (replacementFor) {
+      this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND dispatch_id=?")
+        .run(new Date().toISOString(), runId, replacementFor);
+    }
+    this.store.db.prepare("UPDATE runs SET state='active',stage='git-operator',updated_at=? WHERE run_id=?")
+      .run(new Date().toISOString(), runId);
+    const dispatchId = this.ensureIntegratedTaskCleanupDispatch(runId, mergeOperationId, request, replacementFor);
+    if (!dispatchId) throw new ValidationError("completed task merge has no valid integrated-task cleanup dispatch");
+    return dispatchId;
+  }
+
+  private ensureIntegratedTaskCleanupDispatch(runId: string, mergeOperationId: string, request: Record<string, unknown>, replacementFor?: string): string | undefined {
+    const taskWorktreeId = typeof request.task_worktree_id === "string" ? request.task_worktree_id : undefined;
+    const integrationWorktreeId = typeof request.integration_worktree_id === "string" ? request.integration_worktree_id : undefined;
+    const taskId = typeof request.task_id === "string" ? request.task_id : undefined;
+    if (!taskWorktreeId || !integrationWorktreeId || !taskId) return undefined;
+    const task = this.store.db.prepare("SELECT branch FROM worktrees WHERE run_id=? AND worktree_id=?")
+      .get(runId, taskWorktreeId) as { branch: string } | undefined;
+    if (!task?.branch.startsWith("task/")) return undefined;
+    const existing = this.store.db.prepare(`SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator'
+      AND state IN ('pending','claimed') AND json_extract(packet_json,'$.context.phase')='cleanup_integrated_task'
+      AND json_extract(packet_json,'$.context.merge_operation_id')=? ORDER BY created_at DESC LIMIT 1`)
+      .get(runId, mergeOperationId) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
+    const dispatchId = this.insert(runId, "git-operator", validatePacket({
+      objective: `Reconcile and remove the integrated ${taskId} task worktree and branch.`,
+      allowed_read_paths: [],
+      allowed_write_paths: [],
+      acceptance_criteria: ["Reconcile only the bound cleanup operation", "Remove the task worktree before its merged branch", "Do not merge or prepare another task"],
+      context: {
+        stage: "git-operator", phase: "cleanup_integrated_task", task_id: taskId,
+        task_worktree_id: taskWorktreeId, task_branch: task.branch,
+        integration_worktree_id: integrationWorktreeId,
+        merge_operation_id: mergeOperationId,
+      },
+    }, "git-operator"), replacementFor);
     this.changeStage(runId, "git-operator", dispatchId);
     return dispatchId;
   }
@@ -2880,7 +3004,7 @@ export class DispatchService {
   }
 
   private assertGitPrepareResult(runId: string, packet: DispatchPacket): void {
-    const context = packet.context as { phase?: unknown; task_id?: unknown; worktree_id?: unknown; worktree_ids?: unknown; operation?: unknown; authority_commit?: unknown; expected_head?: unknown };
+    const context = packet.context as { phase?: unknown; task_id?: unknown; worktree_id?: unknown; worktree_ids?: unknown; operation?: unknown; authority_commit?: unknown; expected_head?: unknown; task_worktree_id?: unknown; integration_worktree_id?: unknown; merge_operation_id?: unknown };
     if (context.phase === "prepare_worktrees") {
       const worktree = this.activeIntegrationWorktree(runId);
       if (!worktree) throw new ValidationError("prepare_worktrees requires a registered active integration worktree or plan worktree owned by this run");
@@ -2904,6 +3028,16 @@ export class DispatchService {
       const recovered = this.store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.worktree.recover' AND state='completed'
         AND json_extract(evidence_json,'$.worktree_id')=? AND json_extract(evidence_json,'$.task_id')=? LIMIT 1`).get(runId, worktreeId, taskId);
       if (!recovered) throw new ValidationError("recover_task_worktree requires its completed recovery receipt");
+    }
+    if (context.phase === "cleanup_integrated_task") {
+      const taskWorktreeId = typeof context.task_worktree_id === "string" ? context.task_worktree_id : "";
+      const integrationWorktreeId = typeof context.integration_worktree_id === "string" ? context.integration_worktree_id : "";
+      const mergeOperationId = typeof context.merge_operation_id === "string" ? context.merge_operation_id : "";
+      const cleanup = this.store.db.prepare(`SELECT state FROM operations WHERE run_id=? AND kind='git.cleanup'
+        AND json_extract(request_json,'$.task_worktree_id')=? AND json_extract(request_json,'$.integration_worktree_id')=?
+        AND json_extract(request_json,'$.merge_operation_id')=? ORDER BY completed_at DESC LIMIT 1`)
+        .get(runId, taskWorktreeId, integrationWorktreeId, mergeOperationId) as { state: string } | undefined;
+      if (!cleanup || cleanup.state !== "completed") throw new ValidationError("cleanup_integrated_task requires its completed cleanup operation");
     }
     if (context.phase === "apply_task_authority") {
       const worktreeId = typeof context.worktree_id === "string" ? context.worktree_id : "";
@@ -3888,9 +4022,15 @@ export class DispatchService {
     this.store.db.transaction(() => {
       let run = this.store.getRun(runId) as { profile: string; state: string; stage: string };
       const pendingDecision = this.store.db.prepare("SELECT decision_id,dispatch_id,receipt_json FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; dispatch_id?: string; receipt_json?: string } | undefined;
-      const pendingOperation = this.store.db.prepare("SELECT operation_id,kind,evidence_json FROM operations WHERE run_id=? AND state='pending' ORDER BY created_at LIMIT 1")
-        .get(runId) as { operation_id: string; kind: string; evidence_json?: string } | undefined;
+      const pendingOperation = this.store.db.prepare("SELECT operation_id,kind,request_json,evidence_json FROM operations WHERE run_id=? AND state='pending' ORDER BY created_at LIMIT 1")
+        .get(runId) as { operation_id: string; kind: string; request_json?: string; evidence_json?: string } | undefined;
       if (pendingOperation) {
+        const cleanupRequest = JSON.parse(pendingOperation.request_json ?? "{}") as Record<string, unknown>;
+        if (pendingOperation.kind === "git.cleanup" && typeof cleanupRequest.task_worktree_id === "string"
+          && typeof cleanupRequest.integration_worktree_id === "string" && typeof cleanupRequest.merge_operation_id === "string") {
+          this.activateIntegratedTaskCleanup(runId, cleanupRequest.merge_operation_id, cleanupRequest);
+          return;
+        }
         const evidence = JSON.parse(pendingOperation.evidence_json ?? "{}") as { state?: string; conflict_paths?: unknown[] };
         const claimed = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND role='git-operator' AND state='claimed' ORDER BY claimed_at DESC LIMIT 1")
           .get(runId) as { dispatch_id: string } | undefined;
@@ -4071,6 +4211,11 @@ export class DispatchService {
       const retryableDispatch = run.state === "retryable_failure"
         ? this.store.db.prepare("SELECT dispatch_id,role,packet_json,packet_digest,result_json,replacement_for FROM dispatches WHERE run_id=? AND state='retryable_failure' ORDER BY created_at DESC LIMIT 1").get(runId) as { dispatch_id: string; role: Role; packet_json: string; packet_digest?: string; result_json?: string; replacement_for?: string } | undefined
         : undefined;
+      const cleanupRecovery = retryableDispatch ? this.integratedTaskCleanupRecovery(runId, retryableDispatch) : undefined;
+      if (cleanupRecovery && retryableDispatch) {
+        this.activateIntegratedTaskCleanup(runId, cleanupRecovery.merge_operation_id, cleanupRecovery.request, retryableDispatch.dispatch_id);
+        return;
+      }
       const mergePartialEffect = retryableDispatch ? this.plannedMergePartialEffect(runId, retryableDispatch) : undefined;
       if (pendingDecision) {
         if (retryableDispatch && !pendingDecision.dispatch_id) {

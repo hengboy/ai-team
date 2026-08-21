@@ -936,6 +936,18 @@ test("planned multi-Task resume handles a premature final Test and prepares the 
       store.finishOperation(commit.operationId, { commit: currentPlanHead, paths: ["src/dispatch.ts"], worktree_id: "worktree_multi_task_001" });
       const merge = store.beginOperation("git.merge.task", `multi-task-merge:${runId}`, {}, runId);
       store.finishOperation(merge.operationId, { commit: currentPlanHead, task_id: "TASK-001", task_worktree_id: "worktree_multi_task_001", integration_worktree_id: planWorktree.worktree_id });
+      store.advanceRunTask(runId, "TASK-001", "integrated", {
+        worktree_id: "worktree_multi_task_001", integration_commit: currentPlanHead, recovered: true,
+      });
+      const cleanup = store.beginOperation("git.cleanup", `multi-task-cleanup:${runId}`, {
+        worktreeId: "worktree_multi_task_001",
+        task_id: "TASK-001",
+        task_worktree_id: "worktree_multi_task_001",
+        integration_worktree_id: planWorktree.worktree_id,
+        merge_operation_id: merge.operationId,
+      }, runId);
+      store.finishOperation(cleanup.operationId, { removed: true, task_worktree_id: "worktree_multi_task_001" });
+      store.db.prepare("UPDATE worktrees SET state='removed' WHERE worktree_id='worktree_multi_task_001'").run();
       const prematureTest = dispatches.create(runId, "test", {
         ...dispatchPacket(["src/dispatch.ts"]),
         context: { stage: "test", implementation_commit: currentPlanHead, implementation_artifacts: [{ dispatch_id: developerId }] },
@@ -1012,6 +1024,15 @@ test("planned multi-Task resume handles a premature final Test and prepares the 
       assert.ok(taskTest.dispatch_id);
       store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), taskTest.dispatch_id);
       store.advanceRunTask(runId, "TASK-002", "integrated", { recovered: true, worktree_id: taskTwo.worktree_id });
+      const secondCleanup = store.beginOperation("git.cleanup", `multi-task-cleanup:${runId}:task-002`, {
+        worktreeId: taskTwo.worktree_id,
+        task_id: "TASK-002",
+        task_worktree_id: taskTwo.worktree_id,
+        integration_worktree_id: planWorktree.worktree_id,
+        merge_operation_id: "op_fixture_task_002",
+      }, runId);
+      store.finishOperation(secondCleanup.operationId, { removed: true, task_worktree_id: taskTwo.worktree_id });
+      store.db.prepare("UPDATE worktrees SET state='removed' WHERE worktree_id=?").run(taskTwo.worktree_id);
       const nextPrepare = dispatches.resume(runId).pending_dispatches.find(({ role, dispatch_id }) => {
         if (role !== "git-operator") return false;
         const row = store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(dispatch_id) as { packet_json: string };

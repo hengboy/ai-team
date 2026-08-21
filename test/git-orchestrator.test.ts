@@ -341,6 +341,31 @@ test("planned resume replaces a clean stale next-Task worktree from current plan
     assert.equal(refreshed.base_commit, merged);
     assert.equal(await rawGit(refreshed.path, ["rev-parse", "HEAD"]), merged);
     assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.merge.task'").get(runId) as { count: number }).count, 1);
+
+    await writeFile(join(refreshed.path, "retry-progress.txt"), "preserve this commit\n");
+    await rawGit(refreshed.path, ["add", "retry-progress.txt"]);
+    await rawGit(refreshed.path, ["commit", "-m", "Preserve retry progress"]);
+    const retryHead = await rawGit(refreshed.path, ["rev-parse", "HEAD"]);
+    fixture.store.advanceRunTask(runId, "TASK-002", "prepared", { worktree_id: refreshed.worktree_id });
+    const retryDispatchId = dispatches.create(runId, "git-operator", {
+      ...packet,
+      allowed_read_paths: [],
+      context: {
+        phase: "prepare_implementation_worktree", task_id: "TASK-002", base_commit: merged,
+        replace_worktree_id: refreshed.worktree_id, reuse_task_branch: true,
+        explorer_dispatch_id: explorerId, coordinator_dispatch_id: coordinatorId,
+      },
+    });
+    dispatches.claim(runId, retryDispatchId, "git-operator");
+    const retried = await fixture.orchestrator.prepareTask(runId, "TASK-002", merged, undefined, retryDispatchId);
+    assert.notEqual(retried.worktree_id, refreshed.worktree_id);
+    assert.match(retried.path, /--retry-1$/);
+    assert.equal(retried.branch, refreshed.branch);
+    assert.equal(await rawGit(retried.path, ["rev-parse", "HEAD"]), retryHead);
+    assert.match(await rawGit(fixture.root, ["show-ref", "--verify", `refs/heads/${refreshed.branch}`]), new RegExp(`^${retryHead} `));
+    assert.equal((fixture.store.db.prepare("SELECT state FROM worktrees WHERE worktree_id=?").get(refreshed.worktree_id) as { state: string }).state, "removed");
+    assert.equal((fixture.store.db.prepare("SELECT worktree_id FROM run_tasks WHERE run_id=? AND task_id='TASK-002'").get(runId) as { worktree_id: string }).worktree_id, retried.worktree_id);
+    await assert.rejects(fixture.orchestrator.commit(runId, refreshed.worktree_id, "Old binding", ["retry-progress.txt"]), /constraint=state=active/);
   } finally {
     await fixture.dispose();
   }
@@ -1820,7 +1845,7 @@ test("commit keeps integrated task worktrees read-only without side effects", as
   }
 });
 
-test("integration uses no-ff merges and cleanup removes owned worktrees", async () => {
+test("integration keeps only its worktree after task merge, then final cleanup removes it", async () => {
   const fixture = await createFixture();
   try {
     const runId = fixture.createRun();
@@ -1832,6 +1857,11 @@ test("integration uses no-ff merges and cleanup removes owned worktrees", async 
     const integration = await fixture.orchestrator.prepareIntegration(runId);
     const integrationCommit = await fixture.orchestrator.mergeTask(runId, integration.worktree_id, task.worktree_id);
     assert.equal((await rawGit(integration.path, ["rev-list", "--parents", "-n", "1", integrationCommit])).split(" ").length, 3);
+    await assert.rejects(lstat(task.path), { code: "ENOENT" });
+    assert.equal(await rawGit(fixture.root, ["show-ref", "--verify", `refs/heads/${task.branch}`]).then(() => "present", () => "absent"), "absent");
+    assert.equal((fixture.store.db.prepare("SELECT state FROM worktrees WHERE worktree_id=?").get(task.worktree_id) as { state: string }).state, "removed");
+    assert.equal((fixture.store.db.prepare("SELECT state FROM operations WHERE run_id=? AND kind='git.cleanup' AND json_extract(request_json,'$.task_worktree_id')=?")
+      .get(runId, task.worktree_id) as { state: string }).state, "completed");
 
     completeFrozenTest(fixture.store, runId, integrationCommit);
     const reviews = new ReviewService(fixture.store);
@@ -1868,8 +1898,7 @@ test("integration uses no-ff merges and cleanup removes owned worktrees", async 
     );
 
     const removed = await fixture.orchestrator.cleanup(runId, finalDispatch.dispatch_id);
-    assert.deepEqual(new Set(removed), new Set([task.path, integration.path]));
-    await assert.rejects(lstat(task.path), { code: "ENOENT" });
+    assert.deepEqual(new Set(removed), new Set([integration.path]));
     await assert.rejects(lstat(integration.path), { code: "ENOENT" });
     const states = fixture.store.db.prepare("SELECT state FROM worktrees WHERE run_id=?").all(runId) as Array<{ state: string }>;
     assert.ok(states.length > 0);
@@ -1894,6 +1923,138 @@ test("integration uses no-ff merges and cleanup removes owned worktrees", async 
       (fixture.store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND state IN ('pending','claimed')").get(runId) as { count: number }).count,
       0,
     );
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("reconcile confirms an interrupted task merge from exact parents before task cleanup", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun();
+    const task = await fixture.orchestrator.prepareTask(runId, "implementation");
+    await writeFile(join(task.path, "recovered.txt"), "recovered\n");
+    const committed = await fixture.orchestrator.commit(runId, task.worktree_id, "Commit recovered task", ["recovered.txt"]);
+    const integration = await fixture.orchestrator.prepareIntegration(runId);
+    const before = await rawGit(integration.path, ["rev-parse", "HEAD"]);
+    const operation = fixture.store.beginOperation("git.merge.task", `interrupted-merge:${runId}`, {
+      integration: integration.branch,
+      task: task.branch,
+      integration_worktree_id: integration.worktree_id,
+      task_id: "implementation",
+      task_worktree_id: task.worktree_id,
+      task_commit: committed.commit,
+      integration_head_before: before,
+    }, runId);
+    await rawGit(integration.path, ["merge", "--no-ff", task.branch, "-m", "Interrupted persistence fixture"]);
+
+    const reconciled = await fixture.orchestrator.reconcile(runId);
+    assert.equal(reconciled.find(({ operation_id }) => operation_id === operation.operationId)?.state, "completed");
+    assert.equal((fixture.store.db.prepare("SELECT state FROM operations WHERE operation_id=?").get(operation.operationId) as { state: string }).state, "completed");
+    await assert.rejects(lstat(task.path), { code: "ENOENT" });
+    assert.equal((fixture.store.db.prepare("SELECT state FROM worktrees WHERE worktree_id=?").get(task.worktree_id) as { state: string }).state, "removed");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("mergeTask confirms an existing pending merge from its persisted pre-merge request", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun();
+    const task = await fixture.orchestrator.prepareTask(runId, "pending-merge");
+    await writeFile(join(task.path, "pending-merge.txt"), "recovered\n");
+    const committed = await fixture.orchestrator.commit(runId, task.worktree_id, "Commit pending merge", ["pending-merge.txt"]);
+    const integration = await fixture.orchestrator.prepareIntegration(runId);
+    const before = await rawGit(integration.path, ["rev-parse", "HEAD"]);
+    fixture.store.beginOperation("git.merge.task", `merge-task:${runId}:${integration.branch}:${task.branch}:${committed.commit}`, {
+      integration: integration.branch,
+      task: task.branch,
+      integration_worktree_id: integration.worktree_id,
+      task_id: "implementation",
+      task_worktree_id: task.worktree_id,
+      task_commit: committed.commit,
+      integration_head_before: before,
+    }, runId);
+    await rawGit(integration.path, ["merge", "--no-ff", task.branch, "-m", "Interrupted mergeTask fixture"]);
+    const merged = await rawGit(integration.path, ["rev-parse", "HEAD"]);
+
+    assert.equal(await fixture.orchestrator.mergeTask(runId, integration.worktree_id, task.worktree_id), merged);
+    await assert.rejects(lstat(task.path), { code: "ENOENT" });
+    assert.equal((fixture.store.db.prepare("SELECT state FROM operations WHERE run_id=? AND kind='git.merge.task'").get(runId) as { state: string }).state, "completed");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("dirty integrated task worktree freezes cleanup without deleting work or branch", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun();
+    const task = await fixture.orchestrator.prepareTask(runId, "implementation");
+    await writeFile(join(task.path, "committed.txt"), "committed\n");
+    await fixture.orchestrator.commit(runId, task.worktree_id, "Commit task", ["committed.txt"]);
+    await writeFile(join(task.path, "uncommitted.txt"), "preserve me\n");
+    const integration = await fixture.orchestrator.prepareIntegration(runId);
+
+    await assert.rejects(fixture.orchestrator.mergeTask(runId, integration.worktree_id, task.worktree_id), /dirty and cannot be removed/);
+    assert.equal((fixture.store.db.prepare("SELECT state FROM operations WHERE run_id=? AND kind='git.merge.task'").get(runId) as { state: string }).state, "completed");
+    assert.equal((fixture.store.db.prepare("SELECT state FROM operations WHERE run_id=? AND kind='git.cleanup'").get(runId) as { state: string }).state, "pending");
+    assert.equal(await rawGit(task.path, ["status", "--porcelain"]), "?? uncommitted.txt");
+    assert.equal(await rawGit(fixture.root, ["show-ref", "--verify", `refs/heads/${task.branch}`]).then(() => "present", () => "absent"), "present");
+    fixture.store.db.prepare("UPDATE runs SET state='retryable_failure',stage='git-operator' WHERE run_id=?").run(runId);
+    const resumed = new DispatchService(fixture.store).resume(runId);
+    assert.equal((resumed.run as { state: string }).state, "active");
+    assert.equal(resumed.pending_dispatches.length, 1);
+    const cleanupPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(resumed.pending_dispatches[0]!.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(cleanupPacket.context.phase, "cleanup_integrated_task");
+    assert.equal(cleanupPacket.context.merge_operation_id, (fixture.store.db.prepare("SELECT operation_id FROM operations WHERE run_id=? AND kind='git.merge.task'").get(runId) as { operation_id: string }).operation_id);
+    const reconciled = await fixture.orchestrator.reconcile(runId);
+    assert.equal(reconciled.find(({ state }) => state === "unknown")?.state, "unknown");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("reissuing an integrated merge failure creates only the task cleanup dispatch", async () => {
+  const fixture = await createFixture();
+  try {
+    const runId = fixture.createRun();
+    const task = await fixture.orchestrator.prepareTask(runId, "cleanup-reissue");
+    await writeFile(join(task.path, "cleanup-reissue.txt"), "committed\n");
+    const committed = await fixture.orchestrator.commit(runId, task.worktree_id, "Commit cleanup reissue", ["cleanup-reissue.txt"]);
+    const integration = await fixture.orchestrator.prepareIntegration(runId);
+    const before = await rawGit(integration.path, ["rev-parse", "HEAD"]);
+    const merge = fixture.store.beginOperation("git.merge.task", `cleanup-reissue-merge:${runId}`, {
+      integration: integration.branch, task: task.branch,
+      integration_worktree_id: integration.worktree_id, task_id: "implementation", task_worktree_id: task.worktree_id,
+      task_commit: committed.commit, integration_head_before: before,
+    }, runId);
+    fixture.store.finishOperation(merge.operationId, { commit: "a".repeat(40), task_worktree_id: task.worktree_id });
+    fixture.store.beginOperation("git.cleanup", `cleanup-reissue:${runId}`, {
+      worktreeId: task.worktree_id, task_worktree_id: task.worktree_id, integration_worktree_id: integration.worktree_id,
+      merge_operation_id: merge.operationId, task_id: "implementation", branch: task.branch, path: task.path,
+    }, runId);
+    const dispatches = new DispatchService(fixture.store);
+    const mergeDispatchId = dispatches.create(runId, "git-operator", {
+      objective: "Merge implementation", allowed_read_paths: [], allowed_write_paths: [], acceptance_criteria: ["merge once"],
+      context: {
+        phase: "integrate_implementation", integration_worktree_id: integration.worktree_id,
+        task_id: "implementation", task_worktree_id: task.worktree_id, implementation_worktree_id: task.worktree_id,
+        task_worktree_ids: [task.worktree_id],
+      },
+    });
+    fixture.store.db.prepare("UPDATE dispatches SET state='failed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify({ ...createResultTemplate(runId, mergeDispatchId, "git-operator"), status: "failed", failure_class: "temporary_tool_failure", side_effect_state: "none", payload: { operations: [] } }), new Date().toISOString(), mergeDispatchId);
+    fixture.store.db.prepare("UPDATE runs SET state='failed',stage='git-operator' WHERE run_id=?").run(runId);
+
+    const reissued = dispatches.reissue(runId, mergeDispatchId, "git-operator", "coding", "resume pending cleanup");
+    const cleanupPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(reissued.dispatch_id) as { packet_json: string }).packet_json);
+    assert.equal(cleanupPacket.context.phase, "cleanup_integrated_task");
+    assert.equal(cleanupPacket.context.merge_operation_id, merge.operationId);
+    assert.equal((fixture.store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(mergeDispatchId) as { state: string }).state, "completed");
+    assert.equal(fixture.store.getRun(runId).state, "active");
+    assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM operations WHERE run_id=? AND kind='git.merge.task'").get(runId) as { count: number }).count, 1);
   } finally {
     await fixture.dispose();
   }

@@ -59,6 +59,9 @@ const packetContextRequirements = (role: Role, phase?: unknown, taskId?: unknown
   if (phase === "continue_task_authority_conflict") {
     return ["phase", "operation", "task_id", "worktree_id", "worktree_path", "authority_commit", "expected_head", "authority_apply_operation_id", "authority_apply_dispatch_id", "stash_commit", "dirty_paths", "authority_paths", "conflict_paths"];
   }
+  if (phase === "cleanup_integrated_task") {
+    return ["phase", "task_id", "task_worktree_id", "task_branch", "integration_worktree_id", "merge_operation_id"];
+  }
   if (role === "frontend-developer" || role === "backend-developer") return ["explorer_dispatch_id", "worktree_id"];
   return [];
 };
@@ -196,7 +199,7 @@ export const validatePacket = (packet: unknown, role: Role): DispatchPacket => {
   }
   if (value.execution_request && value.execution_contract) throw new ValidationError("dispatch packet cannot contain both execution_request and execution_contract");
   const context = value.context as Record<string, unknown>;
-  const enforcedContext = context.phase === "continue_implementation" || context.phase === "prepare_implementation_worktree" || context.phase === "recover_task_worktree" || context.phase === "apply_task_authority" || context.phase === "continue_task_authority_conflict"
+  const enforcedContext = context.phase === "continue_implementation" || context.phase === "prepare_implementation_worktree" || context.phase === "recover_task_worktree" || context.phase === "apply_task_authority" || context.phase === "continue_task_authority_conflict" || context.phase === "cleanup_integrated_task"
     ? packetContextRequirements(role, context.phase, context.task_id)
     : [];
   const missingContext = enforcedContext.filter((key) => key.endsWith("_paths")
