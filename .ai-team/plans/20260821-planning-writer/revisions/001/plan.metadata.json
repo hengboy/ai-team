@@ -1,0 +1,88 @@
+{
+  "extensions": {
+    "acceptance_contract": {
+      "acceptance_criteria": [
+        "AC-001",
+        "AC-002",
+        "AC-003",
+        "AC-004",
+        "AC-005",
+        "AC-006",
+        "AC-007",
+        "AC-008",
+        "AC-009"
+      ],
+      "acceptance_steps": [
+        {
+          "acceptance_criteria": [
+            "AC-001",
+            "AC-002"
+          ],
+          "command": "node --import tsx --test test/agent-build.test.ts test/dispatch/contracts.test.ts test/cli/staging-dispatch.test.ts",
+          "expected_result": "角色、payload、execution contract 与 staging 权限测试全部通过；planning-writer 作为第 13 角色生成且越权操作被拒绝。",
+          "id": "VERIFY-001"
+        },
+        {
+          "acceptance_criteria": [
+            "AC-003",
+            "AC-004"
+          ],
+          "command": "node --import tsx --test test/dispatch/planning-lifecycle.test.ts test/dispatch/contracts.test.ts test/cli/staging-dispatch.test.ts test/cli/planning.test.ts",
+          "expected_result": "planning 仅在确认门禁后委派 writer，writer staging 来源/digest 校验与单次消费全部通过。",
+          "id": "VERIFY-002"
+        },
+        {
+          "acceptance_criteria": [
+            "AC-005",
+            "AC-006",
+            "AC-007",
+            "AC-008"
+          ],
+          "command": "node --import tsx --test test/agent-build.test.ts test/environment.test.ts test/cli/project-runtime.test.ts test/tasks-and-version-gates.test.ts test/gates-and-planning-commit.test.ts && npm run build && node --import tsx scripts/verify-packed-install.ts",
+          "expected_result": "模型映射、default seed、home-only runtime、用户环境迁移、构建和 packed install 全部通过且无用户无关差异。",
+          "id": "VERIFY-003"
+        },
+        {
+          "acceptance_criteria": [
+            "AC-009"
+          ],
+          "command": "npm run typecheck && npm run lint && npm test && npm run build && node --import tsx scripts/verify-packed-install.ts && ai-team context validate --project .",
+          "expected_result": "静态检查、全量测试、构建、packed install 与规范上下文校验全部退出 0。",
+          "id": "VERIFY-004"
+        }
+      ],
+      "task_mapping": [
+        {
+          "acceptance_criteria": [
+            "AC-001",
+            "AC-002",
+            "AC-003",
+            "AC-004"
+          ],
+          "task_id": "TASK-001"
+        },
+        {
+          "acceptance_criteria": [
+            "AC-005",
+            "AC-006",
+            "AC-007",
+            "AC-008"
+          ],
+          "task_id": "TASK-002"
+        },
+        {
+          "acceptance_criteria": [
+            "AC-009"
+          ],
+          "task_id": "TASK-003"
+        }
+      ],
+      "test_commands": [
+        "node --import tsx --test test/agent-build.test.ts test/dispatch/contracts.test.ts test/cli/staging-dispatch.test.ts",
+        "node --import tsx --test test/dispatch/planning-lifecycle.test.ts test/dispatch/contracts.test.ts test/cli/staging-dispatch.test.ts test/cli/planning.test.ts",
+        "node --import tsx --test test/agent-build.test.ts test/environment.test.ts test/cli/project-runtime.test.ts test/tasks-and-version-gates.test.ts test/gates-and-planning-commit.test.ts",
+        "npm run typecheck && npm run lint && npm test && npm run build && node --import tsx scripts/verify-packed-install.ts && ai-team context validate --project ."
+      ]
+    }
+  }
+}

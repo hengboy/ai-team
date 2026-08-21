@@ -1,0 +1,282 @@
+{
+  "extensions": {
+    "acceptance_contract": {
+      "acceptance_criteria": [
+        "AC-001",
+        "AC-002",
+        "AC-003",
+        "AC-004",
+        "AC-005",
+        "AC-006",
+        "AC-007",
+        "AC-008",
+        "AC-009"
+      ],
+      "acceptance_steps": [
+        {
+          "acceptance_criteria": [
+            "AC-001",
+            "AC-002",
+            "AC-003",
+            "AC-004"
+          ],
+          "command": "node --import tsx --test test/agent-build.test.ts test/dispatch/contracts.test.ts test/dispatch/planning-lifecycle.test.ts test/cli/staging-dispatch.test.ts test/cli/planning.test.ts",
+          "expected_result": "第 13 角色、writer 权限边界、planning 委派和 writer staging 交接全部通过。",
+          "id": "VERIFY-001"
+        },
+        {
+          "acceptance_criteria": [
+            "AC-005",
+            "AC-006",
+            "AC-007",
+            "AC-008"
+          ],
+          "command": "node --import tsx --test test/agent-build.test.ts test/environment.test.ts test/cli/project-runtime.test.ts test/tasks-and-version-gates.test.ts test/gates-and-planning-commit.test.ts && npm run build && node --import tsx scripts/verify-packed-install.ts",
+          "expected_result": "模型、default seed、home-only runtime、迁移与 packed-install 全部通过且无用户无关差异。",
+          "id": "VERIFY-002"
+        },
+        {
+          "acceptance_criteria": [
+            "AC-009"
+          ],
+          "command": "npm run typecheck && npm run lint && npm test && npm run build && node --import tsx scripts/verify-packed-install.ts && ai-team context validate --project .",
+          "expected_result": "静态检查、全量测试、构建、packed-install 和 context validate 全部退出 0。",
+          "id": "VERIFY-003"
+        }
+      ],
+      "task_mapping": [
+        {
+          "acceptance_criteria": [
+            "AC-001",
+            "AC-002",
+            "AC-003",
+            "AC-004"
+          ],
+          "task_id": "TASK-001"
+        },
+        {
+          "acceptance_criteria": [
+            "AC-005",
+            "AC-006",
+            "AC-007",
+            "AC-008"
+          ],
+          "task_id": "TASK-002"
+        },
+        {
+          "acceptance_criteria": [
+            "AC-009"
+          ],
+          "task_id": "TASK-003"
+        }
+      ],
+      "tdd_cycles": [
+        {
+          "acceptance_criterion": "AC-001",
+          "green": {
+            "command": "node --import tsx --test test/agent-build.test.ts test/dispatch/contracts.test.ts",
+            "expected_result": "角色集合、资源、schema、payload 和生成数量一致通过。",
+            "implementation_steps": [
+              "注册第 13 个 Role 和 manifest/schema",
+              "新增 planning-writer YAML/Markdown",
+              "增加专用 payload 和三平台代理生成支持"
+            ]
+          },
+          "red": {
+            "command": "node --import tsx --test test/agent-build.test.ts test/dispatch/contracts.test.ts",
+            "expected_failure": "断言因 planning-writer 不在 ROLES/manifest/schema、角色资源和 payload 映射中而失败。"
+          },
+          "refactor": {
+            "command": "node --import tsx --test test/agent-build.test.ts test/dispatch/contracts.test.ts",
+            "expected_result": "行为与 GREEN 相同，全部测试通过。",
+            "scope": "仅整理本任务新增的角色列表同步逻辑；不改环境 source 或 planning lifecycle 行为。"
+          },
+          "test_path": "test/agent-build.test.ts"
+        },
+        {
+          "acceptance_criterion": "AC-002",
+          "green": {
+            "command": "node --import tsx --test test/dispatch/contracts.test.ts test/cli/staging-dispatch.test.ts",
+            "expected_result": "非法 decision/revision/Git/discovery/write 被拒绝，合法三类 staging 通过。",
+            "implementation_steps": [
+              "冻结 writer owned entries 和空 delegates",
+              "限制 execution tools/commands/writes",
+              "增加 actor/staging 越权拒绝"
+            ]
+          },
+          "red": {
+            "command": "node --import tsx --test test/dispatch/contracts.test.ts test/cli/staging-dispatch.test.ts",
+            "expected_failure": "当前系统无法表达独立 writer ceiling/ownership，新增越权与合法 staging 断言失败。"
+          },
+          "refactor": {
+            "command": "node --import tsx --test test/dispatch/contracts.test.ts test/cli/staging-dispatch.test.ts",
+            "expected_result": "权限断言和旧角色回归全部通过。",
+            "scope": "仅复用现有 role authorization helper；不得放宽 planning 或其他角色 ceiling。"
+          },
+          "test_path": "test/dispatch/contracts.test.ts"
+        },
+        {
+          "acceptance_criterion": "AC-003",
+          "green": {
+            "command": "node --import tsx --test test/dispatch/planning-lifecycle.test.ts test/cli/planning.test.ts",
+            "expected_result": "仅两个确认门禁创建正确 writer dispatch，其他状态不增加 dispatch。",
+            "implementation_steps": [
+              "在需求 confirm 后创建 planning-documents writer dispatch",
+              "在 task preview approve 后创建 planning-tasks writer dispatch",
+              "其他 choice/state 保持不委派"
+            ]
+          },
+          "red": {
+            "command": "node --import tsx --test test/dispatch/planning-lifecycle.test.ts test/cli/planning.test.ts",
+            "expected_failure": "当前 planning continuation 只创建 planning role，确认门禁后的 writer dispatch 断言失败。"
+          },
+          "refactor": {
+            "command": "node --import tsx --test test/dispatch/planning-lifecycle.test.ts test/cli/planning.test.ts",
+            "expected_result": "新旧 planning stage/decision 测试全部通过。",
+            "scope": "整理 planning continuation phase 分支，但不改变既有 decision choice 语义。"
+          },
+          "test_path": "test/dispatch/planning-lifecycle.test.ts"
+        },
+        {
+          "acceptance_criterion": "AC-004",
+          "green": {
+            "command": "node --import tsx --test test/dispatch/planning-lifecycle.test.ts test/dispatch/contracts.test.ts test/cli/staging-dispatch.test.ts test/cli/planning.test.ts",
+            "expected_result": "合法 writer staging 只消费一次，任一 identity/digest 不匹配均无 revision 副作用。",
+            "implementation_steps": [
+              "定义 writer payload 五个审计字段",
+              "绑定 source dispatch/frozen input/kind/digests",
+              "实现 planning-only validate/consume bridge 与重复拒绝"
+            ]
+          },
+          "red": {
+            "command": "node --import tsx --test test/dispatch/planning-lifecycle.test.ts test/dispatch/contracts.test.ts test/cli/staging-dispatch.test.ts test/cli/planning.test.ts",
+            "expected_failure": "当前 planning loader 只接受 planning-owned staging，writer 来源/digest/单次消费断言失败。"
+          },
+          "refactor": {
+            "command": "node --import tsx --test test/dispatch/planning-lifecycle.test.ts test/dispatch/contracts.test.ts test/cli/staging-dispatch.test.ts test/cli/planning.test.ts",
+            "expected_result": "handoff 和旧 staging/revision 测试全部通过。",
+            "scope": "仅提取共享 staging identity 校验；不更改 revision immutable preflight。"
+          },
+          "test_path": "test/cli/staging-dispatch.test.ts"
+        },
+        {
+          "acceptance_criterion": "AC-005",
+          "green": {
+            "command": "node --import tsx --test test/agent-build.test.ts test/environment.test.ts",
+            "expected_result": "三平台 model/intensity/provenance 精确匹配，其他角色不变。",
+            "implementation_steps": [
+              "environment overrides 增加 writer",
+              "Codex 配置 gpt-5.6-terra/high",
+              "OpenCode 配置 roufemad/gpt-5.6-terra/high 并让 Claude 继承 default"
+            ]
+          },
+          "red": {
+            "command": "node --import tsx --test test/agent-build.test.ts test/environment.test.ts",
+            "expected_failure": "environment schema/config 缺 planning-writer 或 resolved model 与确认映射不符。"
+          },
+          "refactor": {
+            "command": "node --import tsx --test test/agent-build.test.ts test/environment.test.ts",
+            "expected_result": "模型解析和环境 schema 回归全部通过。",
+            "scope": "复用 environment fallback/resolution helper；不增加 provider compatibility layer。"
+          },
+          "test_path": "test/environment.test.ts"
+        },
+        {
+          "acceptance_criterion": "AC-006",
+          "green": {
+            "command": "node --import tsx --test test/agent-build.test.ts test/environment.test.ts && npm run build && node --import tsx scripts/verify-packed-install.ts",
+            "expected_result": "仓库和包只提供完整 default seed，packed install 生成 13 角色。",
+            "implementation_steps": [
+              "从 balanced 基线创建完整 default.yaml",
+              "删除 balanced/quality/economy 仓库 seed",
+              "更新 loader、package 和 packed-install 期望"
+            ]
+          },
+          "red": {
+            "command": "node --import tsx --test test/agent-build.test.ts test/environment.test.ts && npm run build && node --import tsx scripts/verify-packed-install.ts",
+            "expected_failure": "default.yaml 缺失、三份旧 seed 仍存在且 packed role 数量仍为 12。"
+          },
+          "refactor": {
+            "command": "node --import tsx --test test/agent-build.test.ts test/environment.test.ts && npm run build && node --import tsx scripts/verify-packed-install.ts",
+            "expected_result": "package/source 测试保持 GREEN。",
+            "scope": "清理仅服务三份 bundled seed 的代码；保留用户 legacy 文件解析能力。"
+          },
+          "test_path": "scripts/verify-packed-install.ts"
+        },
+        {
+          "acceptance_criterion": "AC-007",
+          "green": {
+            "command": "node --import tsx --test test/environment.test.ts test/cli/project-runtime.test.ts",
+            "expected_result": "clean install 激活 default，已有 default 不变，runtime provenance 只指向用户目录。",
+            "implementation_steps": [
+              "显式 install/bootstrap seed-once default",
+              "runtime list/load/resolve 只读 home",
+              "缺失/空/未知环境返回诊断错误"
+            ]
+          },
+          "red": {
+            "command": "node --import tsx --test test/environment.test.ts test/cli/project-runtime.test.ts",
+            "expected_failure": "当前 bootstrap 写入全部 bundled 环境、激活 balanced，并在 runtime read 时隐式同步。"
+          },
+          "refactor": {
+            "command": "node --import tsx --test test/environment.test.ts test/cli/project-runtime.test.ts",
+            "expected_result": "source-of-truth、no-overwrite 和错误边界测试全部通过。",
+            "scope": "分离 seed 与 runtime discovery helper；不保留仓库 fallback。"
+          },
+          "test_path": "test/cli/project-runtime.test.ts"
+        },
+        {
+          "acceptance_criterion": "AC-008",
+          "green": {
+            "command": "node --import tsx --test test/environment.test.ts test/cli/project-runtime.test.ts test/tasks-and-version-gates.test.ts test/gates-and-planning-commit.test.ts",
+            "expected_result": "合法文件差异仅 writer，legacy/custom 保留，非法组合无部分写入，第二次运行幂等。",
+            "implementation_steps": [
+              "读取并 schema 校验全部用户 YAML",
+              "创建受管备份并在全量预检后写",
+              "只收敛 writer 配置并保留其他内容/文件名",
+              "重复执行无差异且失败恢复"
+            ]
+          },
+          "red": {
+            "command": "node --import tsx --test test/environment.test.ts test/cli/project-runtime.test.ts test/tasks-and-version-gates.test.ts test/gates-and-planning-commit.test.ts",
+            "expected_failure": "当前实现不迁移全部用户环境、无全量预检/no-partial-write/幂等 writer 收敛。"
+          },
+          "refactor": {
+            "command": "node --import tsx --test test/environment.test.ts test/cli/project-runtime.test.ts test/tasks-and-version-gates.test.ts test/gates-and-planning-commit.test.ts",
+            "expected_result": "迁移和版本门禁测试保持 GREEN。",
+            "scope": "复用已有 backup/restore 和 YAML parser；不引入通用迁移框架。"
+          },
+          "test_path": "test/environment.test.ts"
+        },
+        {
+          "acceptance_criterion": "AC-009",
+          "green": {
+            "command": "npm run typecheck && npm run lint && npm test && npm run build && node --import tsx scripts/verify-packed-install.ts && ai-team context validate --project .",
+            "expected_result": "所有命令退出 0，文档/上下文/package 与实现一致。",
+            "implementation_steps": [
+              "更新 README",
+              "通过 ai-team context update 同步 MEMORY/navigation",
+              "运行全量静态/测试/build/pack/context 门禁",
+              "交接 Environment Operator dry-run 和真实环境同步"
+            ]
+          },
+          "red": {
+            "command": "npm run typecheck && npm run lint && npm test && npm run build && node --import tsx scripts/verify-packed-install.ts && ai-team context validate --project .",
+            "expected_failure": "README/MEMORY/navigation/packed-install 仍描述旧角色或 bundled balanced 行为，新增一致性断言失败。"
+          },
+          "refactor": {
+            "command": "npm run typecheck && npm run lint && npm test && npm run build && node --import tsx scripts/verify-packed-install.ts && ai-team context validate --project .",
+            "expected_result": "全量门禁继续通过且无未授权写入。",
+            "scope": "仅修正文档和上下文重复表述；代码失败返回责任任务，不在 TASK-003 改产品代码。"
+          },
+          "test_path": "scripts/verify-packed-install.ts"
+        }
+      ],
+      "test_commands": [
+        "node --import tsx --test test/agent-build.test.ts test/dispatch/contracts.test.ts test/dispatch/planning-lifecycle.test.ts test/cli/staging-dispatch.test.ts test/cli/planning.test.ts",
+        "node --import tsx --test test/agent-build.test.ts test/environment.test.ts test/cli/project-runtime.test.ts test/tasks-and-version-gates.test.ts test/gates-and-planning-commit.test.ts && npm run build && node --import tsx scripts/verify-packed-install.ts",
+        "npm run typecheck && npm run lint && npm test && npm run build && node --import tsx scripts/verify-packed-install.ts && ai-team context validate --project ."
+      ]
+    }
+  }
+}
