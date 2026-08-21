@@ -1222,12 +1222,25 @@ test("claimed planned developer scope recovery supersedes without touching its d
       baseCommit,
       targetBranch: "main",
       request: "recover frozen claimed developer scope",
+      planVerification: {
+        acceptance_criteria: ["AC-001"],
+        acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+        task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+        test_commands: ["npm test"],
+      },
     });
     fixture.store.initializeRunTasks(runId, [{
       task_id: "TASK-001",
       source_path: "tasks/TASK-001.md",
       source_digest: "a".repeat(64),
       write_paths: ["README.md"],
+      verification: {
+        acceptance_criteria: ["AC-001"],
+        acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+        task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+        test_commands: ["npm test"],
+        tdd_cycles: [{ acceptance_criterion: "AC-001", test_path: "test/authority.test.ts", red: { command: "npm test", expected_failure: "fails" }, green: { implementation_steps: ["implement"], command: "npm test", expected_result: "passes" }, refactor: { scope: "none", command: "npm test", expected_result: "passes" } }],
+      },
     }, {
       task_id: "TASK-002",
       source_path: "tasks/TASK-002.md",
@@ -1301,6 +1314,7 @@ test("claimed planned developer scope recovery supersedes without touching its d
     assert.deepEqual(packet.allowed_write_paths, recovered.allowed_write_paths);
     assert.equal(packet.context.phase, "apply_task_authority");
     assert.equal(packet.context.operation, "apply-task-authority");
+    assert.equal(typeof packet.context.verification_digest, "string");
     assert.equal(packet.context.superseded_developer_dispatch_id, sourceId);
     assert.deepEqual(packet.context.scope_recovery, {
       authority_commit: authorityCommit,
@@ -1384,12 +1398,14 @@ test("claimed planned developer scope recovery supersedes without touching its d
       unstaged: await rawGit(prepared.path, ["diff", "--binary", "--", "README.md"]),
       untracked: await readFile(join(prepared.path, "dirty.txt"), "utf8"),
     }, { head: baseCommit, staged: before.staged, unstaged: before.unstaged, untracked: "untracked\n" });
-    await dispatches.submitValue(runId, recovered.dispatch_id, "git-operator", {
+    const authorityReceipt = {
       ...createResultTemplate(runId, recovered.dispatch_id, "git-operator"),
       summary: "Applied the recorded task authority commit",
       verification: [{ command: "ai-team git apply-task-authority", outcome: "passed" }],
       payload: { operations: [{ command: "ai-team git apply-task-authority", outcome: applied.operation_id }] },
-    });
+    };
+    assert.doesNotThrow(() => dispatches.validateValue(runId, recovered.dispatch_id, "git-operator", authorityReceipt));
+    await dispatches.submitValue(runId, recovered.dispatch_id, "git-operator", authorityReceipt);
     const developer = fixture.store.db.prepare("SELECT dispatch_id,replacement_for,packet_json FROM dispatches WHERE run_id=? AND role='backend-developer' AND replacement_for=?")
       .get(runId, sourceId) as { dispatch_id: string; replacement_for: string; packet_json: string };
     const developerPacket = JSON.parse(developer.packet_json) as { allowed_write_paths: string[]; context: Record<string, unknown> };

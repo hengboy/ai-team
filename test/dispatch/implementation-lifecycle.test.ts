@@ -107,6 +107,30 @@ test("planned and direct packets freeze TDD contracts and require Developer/Test
   });
 });
 
+test("only task authority git continuations omit frozen TDD evidence", async () => {
+  await withStore((store) => {
+    const contract = {
+      acceptance_criteria: ["AC-001"],
+      acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "npm test", expected_result: "passes" }],
+      task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+      test_commands: ["npm test"],
+    };
+    const runId = createRun(store);
+    const dispatches = new DispatchService(store);
+    const dispatchId = dispatches.create(runId, "git-operator", {
+      ...dispatchPacket(),
+      context: { verification_contract: contract, verification_digest: verificationDigest(contract) },
+    });
+    dispatches.claim(runId, dispatchId, "git-operator");
+    assert.throws(
+      () => dispatches.validateValue(runId, dispatchId, "git-operator", completedResult(runId, dispatchId, "git-operator", {
+        operations: [{ command: "git status", outcome: "clean" }],
+      })),
+      /git-operator TDD evidence digest does not match the frozen contract/,
+    );
+  });
+});
+
 test("failed task, final, and review-repair Tests return through Coding to the original Developer", async () => {
   await withStore(async (store) => {
     const repoId = "repo-review-fixture";

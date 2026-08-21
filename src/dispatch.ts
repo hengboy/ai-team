@@ -267,7 +267,13 @@ export class DispatchService {
 
   private assertVerificationEvidence(role: Role, packet: DispatchPacket, result: ResultEnvelope): void {
     if (result.status !== "completed") return;
-    const context = packet.context as { verification_contract?: PlanVerification | TaskVerification; verification_digest?: string };
+    const context = packet.context as {
+      phase?: string;
+      operation?: string;
+      verification_contract?: PlanVerification | TaskVerification;
+      verification_digest?: string;
+    };
+    if (role === "git-operator" && context.phase === "apply_task_authority" && context.operation === "apply-task-authority") return;
     if (!context.verification_contract || !context.verification_digest) return;
     const payload = result.payload as Record<string, unknown>;
     if (payload.verification_digest !== context.verification_digest) throw new ValidationError(`${role} TDD evidence digest does not match the frozen contract`);
