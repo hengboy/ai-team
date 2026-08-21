@@ -312,7 +312,7 @@ export function assertRevisionDocuments(value: unknown): asserts value is Revisi
       if (JSON.stringify(fileKeys) !== JSON.stringify(metadataKeys)) errors.push({ path: "/taskMetadataFiles", pointer: "/taskMetadataFiles", constraint: "keySet", message: "taskFiles and taskMetadataFiles must have identical TASK-xxx keys", suggestion: "Add or remove matching task Markdown and metadata entries." });
     }
   }
-  if (errors.length) throw new ValidationError("revision documents are invalid", errors);
+  if (errors.length) throw new ValidationError(`revision documents are invalid: ${errors.map((error) => error.message).join("; ")}`, errors);
 }
 
 export const REVISION_RUN_STAGES: Readonly<Record<string, readonly string[]>> = Object.freeze({
