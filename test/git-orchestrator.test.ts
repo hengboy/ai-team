@@ -1325,6 +1325,12 @@ test("claimed planned developer scope recovery supersedes without touching its d
     }, before);
     const legacyPacket = structuredClone(packet) as unknown as { context: Record<string, unknown>; execution_contract: { source: { role: string } } };
     delete legacyPacket.context.operation;
+    delete legacyPacket.context.authority_commit;
+    delete legacyPacket.context.expected_head;
+    delete legacyPacket.context.superseded_developer_dispatch_id;
+    delete (legacyPacket.context.scope_recovery as Record<string, unknown>).allowed_write_paths;
+    legacyPacket.context.phase = "implementation";
+    legacyPacket.context.stage = "coding";
     legacyPacket.execution_contract.source.role = "backend-developer";
     fixture.store.db.prepare("UPDATE dispatches SET role='backend-developer',packet_json=? WHERE dispatch_id=?")
       .run(JSON.stringify(legacyPacket), recovered.dispatch_id);

@@ -1044,11 +1044,20 @@ export class DispatchService {
     }
     const sourceContext = (JSON.parse(source.packet_json) as DispatchPacket).context as Record<string, unknown>;
     const recovery = context.scope_recovery as Record<string, unknown> | undefined;
-    const required = ["task_id", "worktree_id", "worktree_path", "authority_commit", "expected_head", "superseded_developer_dispatch_id"];
-    if (context.phase !== "apply_task_authority" || required.some((key) => typeof context[key] !== "string" || !context[key])
-      || context.superseded_developer_dispatch_id !== row.replacement_for || context.task_id !== sourceContext.task_id
-      || !recovery || recovery.authority_commit !== context.authority_commit || recovery.expected_head !== context.expected_head
-      || stableJson(recovery.allowed_write_paths) !== stableJson(packet.allowed_write_paths)) {
+    const sourceFields = ["task_id", "worktree_id", "worktree_path", "explorer_dispatch_id", "coordinator_dispatch_id", "prepare_git_dispatch_id"];
+    const scopeFields = ["authority_commit", "expected_head"];
+    const originalPaths = recovery?.original_allowed_write_paths;
+    const addedPaths = recovery?.added_write_paths;
+    const recoveredPaths = Array.isArray(originalPaths) && Array.isArray(addedPaths)
+      && [...originalPaths, ...addedPaths].every((path) => typeof path === "string")
+      ? [...new Set([...originalPaths, ...addedPaths] as string[])].sort() : undefined;
+    if (sourceFields.some((key) => typeof sourceContext[key] !== "string" || !sourceContext[key])
+      || scopeFields.some((key) => typeof recovery?.[key] !== "string" || !recovery?.[key])
+      || (context.task_id !== undefined && context.task_id !== sourceContext.task_id)
+      || (context.worktree_id !== undefined && context.worktree_id !== sourceContext.worktree_id)
+      || (context.worktree_path !== undefined && context.worktree_path !== sourceContext.worktree_path)
+      || (context.superseded_developer_dispatch_id !== undefined && context.superseded_developer_dispatch_id !== row.replacement_for)
+      || !recoveredPaths || stableJson(recoveredPaths) !== stableJson([...packet.allowed_write_paths].sort())) {
       throw new ValidationError("legacy task authority replacement is missing frozen recovery lineage");
     }
     const sideEffects = this.store.db.prepare(`SELECT
@@ -1058,6 +1067,9 @@ export class DispatchService {
     const unfrozen = { ...packet };
     delete unfrozen.execution_contract;
     delete unfrozen.execution_request;
+    const lineageContext = { ...context };
+    delete lineageContext.context_owner;
+    delete lineageContext.context_maintenance;
     const corrected = freezeExecutionContract("git-operator", this.freezeVerificationContext(input.runId, "git-operator", validatePacket({
       ...unfrozen,
       objective: `Apply the recorded authority commit for ${context.task_id} without changing its task worktree HEAD or losing its dirty work.`,
@@ -1067,7 +1079,22 @@ export class DispatchService {
         "Preserve the frozen task worktree identity, HEAD, and dirty work",
         "Record only the authority application receipt",
       ],
-      context: { ...context, stage: "git-operator", phase: "apply_task_authority", operation: "apply-task-authority" },
+      context: {
+        ...lineageContext,
+        stage: "git-operator",
+        phase: "apply_task_authority",
+        operation: "apply-task-authority",
+        task_id: sourceContext.task_id,
+        worktree_id: sourceContext.worktree_id,
+        worktree_path: sourceContext.worktree_path,
+        explorer_dispatch_id: sourceContext.explorer_dispatch_id,
+        coordinator_dispatch_id: sourceContext.coordinator_dispatch_id,
+        prepare_git_dispatch_id: sourceContext.prepare_git_dispatch_id,
+        authority_commit: recovery!.authority_commit,
+        expected_head: recovery!.expected_head,
+        superseded_developer_dispatch_id: row.replacement_for,
+        scope_recovery: { ...recovery, allowed_write_paths: [...packet.allowed_write_paths].sort() },
+      },
     }, "git-operator")));
     const packetJson = redact(stableJson(corrected));
     const prompt = redact(promptFor(input.runId, input.dispatchId, "git-operator", corrected));
