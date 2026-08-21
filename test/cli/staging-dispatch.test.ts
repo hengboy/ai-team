@@ -26,7 +26,7 @@ test("CLI advertises the supported claimed task scope recovery authority flags",
   const sandbox = await makeSandbox(t);
   const help = await cli(sandbox, ["dispatch", "recover-claimed-task-scope", "--help"]);
   assert.equal(help.status, 0, help.stderr);
-  for (const option of ["--authority-commit <sha>", "--expected-head <sha>", "--add-write-path <path...>"]) {
+  for (const option of ["--role <role>", "--authority-commit <sha>", "--expected-head <sha>", "--add-write-path <path...>"]) {
     assert.ok(help.stdout.includes(option));
   }
 });
