@@ -68,20 +68,9 @@ export class WorkflowService {
     });
   }
 
-  completePlanningHandoff(
-    planningRunId: string,
-    planId: string,
-    revision: string,
-    planDigest: string,
-    planCommit: string,
-    contract?: { planVerification: PlanVerification; tasks: Array<{ task_id: string; source_path: string; source_digest: string; write_paths: string[]; verification: TaskVerification }> },
-  ): string | undefined {
-    void planningRunId;
-    void planId;
-    void revision;
-    void planDigest;
-    void planCommit;
-    void contract;
+  assertPlanningHandoffAllowed(planningRunId: string): void {
+    const run = this.store.getRun(planningRunId) as { source_run_id?: string };
+    if (!run.source_run_id) return;
     throw new IncompatibleError("Planning cannot resume a prior Coding run", {
       reason_code: "legacy_run_handoff",
       next_action: "start_new_run",

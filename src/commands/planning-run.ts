@@ -45,6 +45,26 @@ const planningCommitBaseKey = (request: PlanningCommitRequest): string => [
   request.dispatch_id,
 ].join(":");
 
+const assertPlanningCommitReconciliationActor = (store: StateStore, request: PlanningCommitRequest, dispatchId: string): void => {
+  const actor = store.db.prepare("SELECT role,state FROM dispatches WHERE run_id=? AND dispatch_id=?")
+    .get(request.run_id, dispatchId) as { role: string; state: string } | undefined;
+  const canonical = store.db.prepare("SELECT role FROM dispatches WHERE run_id=? AND dispatch_id=?")
+    .get(request.run_id, request.dispatch_id) as { role: string } | undefined;
+  if (!actor || actor.role !== "git-operator" || actor.state !== "claimed" || canonical?.role !== "git-operator") {
+    throw new ValidationError("planning commit operation identity does not match run and dispatch");
+  }
+  if (dispatchId === request.dispatch_id) return;
+  const ancestor = store.db.prepare(`WITH RECURSIVE lineage(dispatch_id,replacement_for) AS (
+    SELECT dispatch_id,replacement_for FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'
+    UNION
+    SELECT predecessor.dispatch_id,predecessor.replacement_for FROM dispatches predecessor
+      JOIN lineage ON lineage.replacement_for=predecessor.dispatch_id
+      WHERE predecessor.run_id=? AND predecessor.role='git-operator'
+  ) SELECT 1 FROM lineage WHERE dispatch_id=? LIMIT 1`)
+    .get(request.run_id, dispatchId, request.run_id, request.dispatch_id);
+  if (!ancestor) throw new ValidationError("planning commit operation identity does not match run and dispatch");
+};
+
 export const reconcilePlanningCommit = (
   store: StateStore,
   operation: PlanningCommitOperation,
@@ -55,7 +75,8 @@ export const reconcilePlanningCommit = (
 ): { operation_id: string; state: string; plan_commit?: string; reused: boolean } => {
   if (operation.run_id !== runId) throw new ValidationError("planning commit operation does not belong to run");
   const request = JSON.parse(operation.request_json) as PlanningCommitRequest;
-  if (request.run_id !== runId || request.dispatch_id !== dispatchId) throw new ValidationError("planning commit operation identity does not match run and dispatch");
+  if (request.run_id !== runId) throw new ValidationError("planning commit operation identity does not match run and dispatch");
+  assertPlanningCommitReconciliationActor(store, request, dispatchId);
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) throw new ValidationError("planning commit reconciliation evidence must be an object");
   const supplied = evidence as Record<string, unknown>;
   const planCommit = supplied.plan_commit;
@@ -69,6 +90,7 @@ export const reconcilePlanningCommit = (
     revision: request.revision,
     digest: request.digest,
     dispatch_id: request.dispatch_id,
+    actor_dispatch_id: dispatchId,
   })) {
     if (supplied[field] !== undefined && supplied[field] !== expected) throw new ValidationError(`planning commit reconciliation ${field} does not match operation`);
   }
@@ -103,6 +125,7 @@ export const reconcilePlanningCommit = (
     revision: request.revision,
     digest: request.digest,
     dispatch_id: request.dispatch_id,
+    actor_dispatch_id: dispatchId,
     ...(state === "completed" ? { state: "ready", plan_commit: planCommit } : {}),
     confirmation: supplied,
   };
@@ -248,8 +271,8 @@ export const registerPlanningCommands = (program: Command, dependencies: Plannin
       store.assertPlanningClarificationsResolved(options.runId);
       const row = store.db.prepare("SELECT * FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?").get(repo.repoId, options.planId, options.revision) as { state: string; digest?: string; plan_commit?: string } | undefined;
       if (!row || !["plan_ready", "tasks_preview", "ready"].includes(row.state) || !row.digest) throw new ValidationError("planning revision is not ready to commit");
-      const revisionDigest = row.digest;
       assertRevisionRunStage(row.state, run.stage, "ready");
+      new WorkflowService(store).assertPlanningHandoffAllowed(options.runId);
       const operationRequest: PlanningCommitRequest = {
         repo_id: repo.repoId,
         run_id: options.runId,
@@ -317,17 +340,12 @@ export const registerPlanningCommands = (program: Command, dependencies: Plannin
           operation_id: operation.operationId,
         });
       }
-      const handoff = store.getRun(options.runId) as { source_run_id?: string };
-      const handoffContract = handoff.source_run_id
-        ? await new WorkflowService(store).planningSnapshot(repo.root, options.planId, options.revision, commit)
-        : undefined;
       store.db.transaction(() => {
         store.db.prepare("UPDATE revisions SET state='ready',plan_commit=? WHERE repo_id=? AND plan_id=? AND revision=?").run(commit, repo.repoId, options.planId, options.revision);
         const closedPlanning = store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND role='planning' AND state IN ('pending','claimed','needs_decision')").run(new Date().toISOString(), options.runId).changes;
         store.db.prepare("UPDATE runs SET stage='ready',updated_at=? WHERE run_id=?").run(new Date().toISOString(), options.runId);
         store.event(options.runId, "planning.revision_committed", { planId: options.planId, revision: options.revision, commit });
         if (closedPlanning) store.event(options.runId, "planning.stale_dispatches_closed", { count: closedPlanning, reason: "revision_committed" });
-        new WorkflowService(store).completePlanningHandoff(options.runId, options.planId, options.revision, revisionDigest, commit, handoffContract);
         store.finishOperation(operation.operationId, { state: "ready", plan_commit: commit });
       })();
       return { state: "ready", plan_commit: commit, operation_id: operation.operationId, reused: false };

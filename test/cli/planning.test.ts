@@ -641,6 +641,8 @@ test("completed planning commit reconciliation converges state, validates owners
   const planId = "20260814-reconciled";
   const revision = "001";
   const dispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+  const replacementDispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FB3";
+  const unrelatedDispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FB4";
   const otherDispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FB0";
   const stalePlanningId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FB1";
   const digest = "d".repeat(64);
@@ -652,8 +654,8 @@ test("completed planning commit reconciliation converges state, validates owners
   database.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,created_at) VALUES (?,?,?,?,?,?,?)")
     .run(planId, revision, run.repo_id, "plan_ready", "main", digest, new Date().toISOString());
   const insertDispatch = database.prepare(`INSERT INTO dispatches(
-    dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,claimed_at,created_at
-  ) VALUES (?,?,?,'claimed',?,?,?,?,?,?)`);
+    dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,replacement_for,claimed_at,created_at
+  ) VALUES (?,?,?, ?,?,?,?,?,?,?,?)`);
   const packet = JSON.stringify({
     objective: "Commit this planning revision",
     allowed_read_paths: [`.ai-team/plans/${planId}/revisions/${revision}`],
@@ -661,11 +663,12 @@ test("completed planning commit reconciliation converges state, validates owners
     acceptance_criteria: ["Commit this revision"],
     context: { plan_id: planId, revision },
   });
-  insertDispatch.run(dispatchId, started.run_id, "git-operator", packet, "", "{}", "{}", new Date().toISOString(), new Date().toISOString());
-  insertDispatch.run(otherDispatchId, otherStarted.run_id, "git-operator", packet, "", "{}", "{}", new Date().toISOString(), new Date().toISOString());
-  insertDispatch.run(stalePlanningId, started.run_id, "planning", JSON.stringify({
+  const now = new Date().toISOString();
+  insertDispatch.run(dispatchId, started.run_id, "git-operator", "claimed", packet, "", "{}", "{}", null, now, now);
+  insertDispatch.run(otherDispatchId, otherStarted.run_id, "git-operator", "claimed", packet, "", "{}", "{}", null, now, now);
+  insertDispatch.run(stalePlanningId, started.run_id, "planning", "claimed", JSON.stringify({
     objective: "stale split continuation", allowed_read_paths: ["README.md"], allowed_write_paths: [], acceptance_criteria: ["close on ready"], context: { stage: "plan_ready" },
-  }), "", "{}", "{}", new Date().toISOString(), new Date().toISOString());
+  }), "", "{}", "{}", null, now, now);
   database.close();
 
   const commitArgs = [
@@ -680,11 +683,24 @@ test("completed planning commit reconciliation converges state, validates owners
   const pendingDatabase = new Database(databasePath, { readonly: true });
   const operation = pendingDatabase.prepare("SELECT operation_id FROM operations WHERE run_id=? AND state='pending'").get(started.run_id) as { operation_id: string };
   pendingDatabase.close();
+  const reissuedDatabase = new Database(databasePath);
+  reissuedDatabase.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), dispatchId);
+  reissuedDatabase.prepare(`INSERT INTO dispatches(
+    dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,replacement_for,claimed_at,created_at
+  ) VALUES (?,?,?,'claimed',?,?,?,?,?,?,?)`).run(
+    replacementDispatchId, started.run_id, "git-operator", packet, "", "{}", "{}", dispatchId, now, now,
+  );
+  reissuedDatabase.prepare(`INSERT INTO dispatches(
+    dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,claimed_at,created_at
+  ) VALUES (?,?,?,'claimed',?,?,?,?,?,?)`).run(
+    unrelatedDispatchId, started.run_id, "git-operator", packet, "", "{}", "{}", now, now,
+  );
+  reissuedDatabase.close();
 
   const invalidEvidence = join(sandbox.root, "invalid-completed.json");
   await writeFile(invalidEvidence, JSON.stringify({ plan_commit: "not-a-commit" }));
   const invalid = await cli(sandbox, [
-    "git", "reconcile", "--run-id", started.run_id, "--dispatch-id", dispatchId,
+    "git", "reconcile", "--run-id", started.run_id, "--dispatch-id", replacementDispatchId,
     "--operation-id", operation.operation_id, "--state", "completed", "--evidence-file", invalidEvidence,
   ]);
   assert.equal(invalid.status, 2);
@@ -708,8 +724,23 @@ test("completed planning commit reconciliation converges state, validates owners
   assert.equal((unchangedDatabase.prepare("SELECT state FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?").get(run.repo_id, planId, revision) as { state: string }).state, "plan_ready");
   unchangedDatabase.close();
 
+  const unrelated = await cli(sandbox, [
+    "git", "reconcile", "--run-id", started.run_id, "--dispatch-id", unrelatedDispatchId,
+    "--operation-id", operation.operation_id, "--state", "completed", "--evidence-file", completedEvidence,
+  ]);
+  assert.equal(unrelated.status, 2);
+  assert.match(unrelated.stderr, /identity does not match run and dispatch/);
+  const wrongRole = await cli(sandbox, [
+    "git", "reconcile", "--run-id", started.run_id, "--dispatch-id", stalePlanningId,
+    "--operation-id", operation.operation_id, "--state", "completed", "--evidence-file", completedEvidence,
+  ]);
+  assert.equal(wrongRole.status, 2);
+  const rejectedDatabase = new Database(databasePath, { readonly: true });
+  assert.equal((rejectedDatabase.prepare("SELECT state FROM operations WHERE operation_id=?").get(operation.operation_id) as { state: string }).state, "pending");
+  rejectedDatabase.close();
+
   const reconcileArgs = [
-    "git", "reconcile", "--run-id", started.run_id, "--dispatch-id", dispatchId,
+    "git", "reconcile", "--run-id", started.run_id, "--dispatch-id", replacementDispatchId,
     "--operation-id", operation.operation_id, "--state", "completed", "--evidence-file", completedEvidence,
   ];
   const reconciled = json<{ operation_id: string; state: string; plan_commit: string; reused: boolean }>(await cli(sandbox, reconcileArgs));
@@ -727,17 +758,78 @@ test("completed planning commit reconciliation converges state, validates owners
     convergedDatabase.prepare("SELECT state,plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?").get(run.repo_id, planId, revision),
     { state: "ready", plan_commit: confirmedCommit },
   );
+  assert.deepEqual(
+    JSON.parse((convergedDatabase.prepare("SELECT evidence_json FROM operations WHERE operation_id=?").get(operation.operation_id) as { evidence_json: string }).evidence_json),
+    {
+      reconciliation: "completed",
+      repo_id: run.repo_id,
+      run_id: started.run_id,
+      plan_id: planId,
+      revision,
+      digest,
+      dispatch_id: dispatchId,
+      actor_dispatch_id: replacementDispatchId,
+      state: "ready",
+      plan_commit: confirmedCommit,
+      confirmation: { plan_commit: confirmedCommit, plan_id: planId, revision, digest },
+    },
+  );
   convergedDatabase.close();
 
+});
+
+test("planning revision commit rejects legacy handoff before Git mutation", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const requestFile = join(sandbox.root, "request.md");
+  await writeFile(requestFile, "Reject a legacy planning handoff.\n");
+  const source = json<{ run_id: string }>(await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]));
+  const started = json<{ run_id: string }>(await cli(sandbox, ["planning", "start", "--project", sandbox.repo, "--request-file", requestFile]));
+  const planId = "20260821-legacy-handoff";
+  const revision = "001";
+  const dispatchId = "dispatch_01ARZ3NDEKTSV4RRFFQ69G5FB5";
+  const databasePath = join(sandbox.aiTeamHome, "state", "state.sqlite");
+  const database = new Database(databasePath);
+  const run = database.prepare("SELECT repo_id FROM runs WHERE run_id=?").get(started.run_id) as { repo_id: string };
+  database.prepare("UPDATE runs SET plan_id=?,revision=?,stage='plan_ready',source_run_id=? WHERE run_id=?")
+    .run(planId, revision, source.run_id, started.run_id);
+  database.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,created_at) VALUES (?,?,?,?,?,?,?)")
+    .run(planId, revision, run.repo_id, "plan_ready", "main", "f".repeat(64), new Date().toISOString());
+  database.prepare(`INSERT INTO dispatches(
+    dispatch_id,run_id,role,state,packet_json,prompt,schema_json,template_json,claimed_at,created_at
+  ) VALUES (?,?,?,'claimed',?,?,?,?,?,?)`).run(
+    dispatchId, started.run_id, "git-operator", JSON.stringify({
+      objective: "Commit this planning revision", allowed_read_paths: [`.ai-team/plans/${planId}/revisions/${revision}`], allowed_write_paths: [],
+      acceptance_criteria: ["Commit this revision"], context: { plan_id: planId, revision },
+    }), "", "{}", "{}", new Date().toISOString(), new Date().toISOString(),
+  );
+  database.close();
   const revisionRoot = join(sandbox.repo, ".ai-team", "plans", planId, "revisions", revision);
   await mkdir(revisionRoot, { recursive: true });
   await writeFile(join(sandbox.repo, ".ai-team", "plans", planId, "plan.yaml"), `plan_id: ${planId}\n`);
   await writeFile(join(revisionRoot, "spec.md"), "# Spec\n");
-  const headBeforeRetry = (await git(sandbox, ["rev-parse", "HEAD"])).stdout.trim();
-  const retry = json<{ plan_commit: string; operation_id: string; reused: boolean }>(await cli(sandbox, commitArgs));
-  assert.deepEqual(retry, { plan_commit: confirmedCommit, operation_id: operation.operation_id, reused: true, state: "ready" });
-  assert.equal((await git(sandbox, ["rev-parse", "HEAD"])).stdout.trim(), headBeforeRetry);
-  assert.match((await git(sandbox, ["status", "--porcelain"])).stdout, /\.ai-team/);
+  await writeFile(join(revisionRoot, "plan.md"), "# Plan\n");
+  await writeFile(join(revisionRoot, "plan.metadata.json"), JSON.stringify({
+    extensions: {
+      acceptance_contract: {
+        acceptance_criteria: ["AC-001"],
+        acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "true", expected_result: "passes" }],
+        task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+        test_commands: ["true"],
+      },
+    },
+  }));
+  const headBefore = (await git(sandbox, ["rev-parse", "HEAD"])).stdout.trim();
+
+  const result = await cli(sandbox, [
+    "planning", "revision", "commit", "--project", sandbox.repo, "--plan-id", planId, "--revision", revision,
+    "--run-id", started.run_id, "--dispatch-id", dispatchId,
+  ]);
+  assert.equal(result.status, 4);
+  assert.match(result.stderr, /legacy_run_handoff/);
+  assert.equal((await git(sandbox, ["rev-parse", "HEAD"])).stdout.trim(), headBefore);
+  const finalDatabase = new Database(databasePath, { readonly: true });
+  assert.equal((finalDatabase.prepare("SELECT count(*) AS count FROM operations WHERE run_id=?").get(started.run_id) as { count: number }).count, 0);
+  finalDatabase.close();
 });
 
 
