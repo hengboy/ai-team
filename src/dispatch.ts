@@ -1906,6 +1906,14 @@ export class DispatchService {
         this.ensureRecoveredTaskDeveloperDispatch(runId, result.dispatch_id);
         return;
       }
+      if (run.mode === "planned" && context.phase === "continue_task_authority_conflict") {
+        const authorityDispatchId = typeof (context as { authority_apply_dispatch_id?: unknown }).authority_apply_dispatch_id === "string"
+          ? (context as { authority_apply_dispatch_id: string }).authority_apply_dispatch_id
+          : undefined;
+        if (!authorityDispatchId) throw new ValidationError("authority conflict continuation is missing its authority dispatch");
+        this.ensureRecoveredTaskDeveloperDispatch(runId, authorityDispatchId);
+        return;
+      }
       if (run.mode === "planned" && context.phase === "reconcile_worktree_ownership") {
         if (typeof context.source_dispatch_id !== "string") throw new ValidationError("ownership reconciliation is missing its source merge dispatch");
         const failed = this.store.db.prepare("SELECT dispatch_id,role,packet_json,packet_digest,result_json,replacement_for FROM dispatches WHERE run_id=? AND dispatch_id=?")
@@ -2585,7 +2593,7 @@ export class DispatchService {
   }
 
   private ensureRecoveredTaskDeveloperDispatch(runId: string, authorityDispatchId: string): string | undefined {
-    const authority = this.store.db.prepare(`SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator' AND state='completed'
+    const authority = this.store.db.prepare(`SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator' AND state IN ('completed','failed')
       AND json_extract(packet_json,'$.context.phase')='apply_task_authority'`).get(runId, authorityDispatchId) as { packet_json: string } | undefined;
     if (!authority) return undefined;
     const authorityPacket = JSON.parse(authority.packet_json) as DispatchPacket;

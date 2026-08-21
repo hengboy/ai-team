@@ -1520,13 +1520,21 @@ test("authority content conflict creates a frozen continuation and records its r
     };
 
     const dispatches = new DispatchService(fixture.store);
+    fixture.store.advanceRunTask(runId, "TASK-001", "prepared", { worktree_id: task.worktree_id });
+    const sourceDeveloperDispatchId = dispatches.create(runId, "backend-developer", {
+      objective: "Implement TASK-001 before authority recovery", allowed_read_paths: ["README.md"], allowed_write_paths: ["README.md", "dirty.txt", "authority.txt"],
+      acceptance_criteria: ["Implement TASK-001"],
+      context: { stage: "coding", phase: "implementation", task_id: "TASK-001", worktree_id: task.worktree_id, worktree_path: task.path },
+    });
+    fixture.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?")
+      .run(new Date().toISOString(), sourceDeveloperDispatchId);
     const authorityDispatchId = dispatches.create(runId, "git-operator", {
       objective: "Apply authority", allowed_read_paths: [], allowed_write_paths: ["README.md", "dirty.txt", "authority.txt"],
       acceptance_criteria: ["Apply authority"],
       context: {
         stage: "git-operator", phase: "apply_task_authority", operation: "apply-task-authority", task_id: "TASK-001",
         worktree_id: task.worktree_id, worktree_path: task.path, authority_commit: authorityCommit, expected_head: baseCommit,
-        superseded_developer_dispatch_id: "dispatch_source", scope_recovery: {
+        superseded_developer_dispatch_id: sourceDeveloperDispatchId, scope_recovery: {
           authority_commit: authorityCommit, expected_head: baseCommit, original_allowed_write_paths: ["README.md", "dirty.txt", "authority.txt"],
           added_write_paths: [], allowed_write_paths: ["README.md", "dirty.txt", "authority.txt"], dirty_paths: ["README.md", "dirty.txt"],
         },
@@ -1583,6 +1591,27 @@ test("authority content conflict creates a frozen continuation and records its r
     assert.equal(await rawGit(task.path, ["ls-files", "-u"]), "");
     assert.equal(await readFile(join(task.path, "authority.txt"), "utf8"), "authority-only\n");
     assert.deepEqual((await rawGit(task.path, ["status", "--porcelain=v1"])).split("\n").map((line) => line.slice(3)).sort(), ["README.md", "authority.txt", "dirty.txt"]);
+
+    const receiptResult = {
+      ...createResultTemplate(runId, continuation.dispatch_id, "git-operator"),
+      summary: "Recorded authority continuation receipt",
+      verification: [{ command: "record authority application receipt", outcome: "completed" }],
+      payload: { operations: [{ command: "record authority application receipt", outcome: "completed" }] },
+    };
+    const submitted = await dispatches.submitValue(runId, continuation.dispatch_id, "git-operator", receiptResult);
+    assert.equal((fixture.store.getRun(runId) as { stage: string }).stage, "coding");
+    assert.equal(submitted.continuation.pending_dispatches.length, 1);
+    const replacement = submitted.continuation.pending_dispatches[0];
+    assert.equal(replacement?.role, "backend-developer");
+    assert.equal((fixture.store.db.prepare("SELECT replacement_for FROM dispatches WHERE dispatch_id=?").get(replacement?.dispatch_id) as { replacement_for: string }).replacement_for, sourceDeveloperDispatchId);
+    assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='active_run_recovery'").get(runId) as { count: number }).count, 0);
+
+    const repeated = await dispatches.submitValue(runId, continuation.dispatch_id, "git-operator", receiptResult);
+    assert.equal(repeated.reused, true);
+    const resumed = dispatches.resume(runId);
+    assert.equal(resumed.pending_dispatches.length, 1);
+    assert.equal(resumed.pending_dispatches[0]?.dispatch_id, replacement?.dispatch_id);
+    assert.equal((fixture.store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='active_run_recovery'").get(runId) as { count: number }).count, 0);
   } finally {
     await fixture.dispose();
   }
