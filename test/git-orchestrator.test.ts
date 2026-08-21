@@ -1383,12 +1383,30 @@ test("claimed planned developer scope recovery supersedes without touching its d
       fixture.orchestrator.commit(runId, "worktree_not_authorized", "must not commit", [], recovered.dispatch_id),
       /only authorizes apply-task-authority/,
     );
-    const applied = await fixture.orchestrator.applyTaskAuthority({
+    const applyRequest = {
       runId,
       dispatchId: recovered.dispatch_id,
       worktreeId: prepared.worktree_id,
       authorityCommit,
       expectedHead: baseCommit,
+    };
+    const key = `worktree:apply-authority:${runId}:${recovered.dispatch_id}:${prepared.worktree_id}:${authorityCommit}:${baseCommit}`;
+    const pending = fixture.store.beginOperation("git.task_authority.apply", key, { ...applyRequest, dirty_paths: ["README.md", "dirty.txt"] }, runId);
+    await assert.rejects(fixture.orchestrator.applyTaskAuthority(applyRequest), /unknown side effect; reconcile required/);
+    const failedPacket = structuredClone(packet) as typeof packet & { execution_contract?: unknown };
+    delete failedPacket.execution_contract;
+    const failedDispatchId = dispatches.create(runId, "git-operator", failedPacket);
+    dispatches.claim(runId, failedDispatchId, "git-operator");
+    const failedRequest = { ...applyRequest, dispatchId: failedDispatchId };
+    const failedKey = `worktree:apply-authority:${runId}:${failedDispatchId}:${prepared.worktree_id}:${authorityCommit}:${baseCommit}`;
+    fixture.store.db.prepare("INSERT INTO operations(operation_id,run_id,idempotency_key,kind,state,evidence_json,request_json,created_at,completed_at) VALUES (?,?,?,'git.task_authority.apply','failed',?,?,?,?)")
+      .run("op_authority_failed_without_reconciliation", runId, failedKey, JSON.stringify({ failure: "fixture" }), JSON.stringify(failedRequest), new Date().toISOString(), new Date().toISOString());
+    await assert.rejects(fixture.orchestrator.applyTaskAuthority(failedRequest), /unknown side effect; reconcile required/);
+    fixture.store.reconcileOperation(pending.operationId, "not_applied", { checked: "fixture" });
+    const applied = await fixture.orchestrator.applyTaskAuthority(applyRequest);
+    assert.notEqual(applied.operation_id, pending.operationId);
+    assert.deepEqual(fixture.store.db.prepare("SELECT idempotency_key FROM operations WHERE operation_id=?").get(applied.operation_id), {
+      idempotency_key: `${key}:retry:${pending.operationId}`,
     });
     assert.equal(applied.head, baseCommit);
     assert.deepEqual(applied.dirty_paths, ["README.md", "dirty.txt"]);

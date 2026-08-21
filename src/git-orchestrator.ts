@@ -586,8 +586,28 @@ export class GitOrchestrator {
     if (!allowed || dirtyPaths.some((path) => !pathMatchesScope(path, allowed))) {
       throw new ValidationError("task authority apply dirty work is outside the frozen replacement scope", { dirty_paths: dirtyPaths });
     }
-    const operation = this.store.beginOperation("git.task_authority.apply", key, { ...request, dirty_paths: dirtyPaths }, request.runId);
-    if (operation.reused && operation.state !== "completed") throw new ValidationError("task authority apply has an unknown side effect; reconcile required");
+    let operationKey = key;
+    let operation: { operationId: string; reused: boolean; state: string };
+    while (true) {
+      operation = this.store.beginOperation("git.task_authority.apply", operationKey, { ...request, dirty_paths: dirtyPaths }, request.runId);
+      if (!operation.reused) break;
+      if (operation.state === "completed") {
+        const completed = this.store.db.prepare("SELECT evidence_json FROM operations WHERE operation_id=?")
+          .get(operation.operationId) as { evidence_json: string };
+        return { ...(JSON.parse(completed.evidence_json) as TaskAuthorityApplyReceipt), reused: true };
+      }
+      const failed = operation.state === "failed"
+        ? this.store.db.prepare("SELECT evidence_json FROM operations WHERE operation_id=?")
+          .get(operation.operationId) as { evidence_json: string | null } | undefined
+        : undefined;
+      try {
+        if (JSON.parse(failed?.evidence_json ?? "{}").reconciliation === "not_applied") {
+          operationKey = `${operationKey}:retry:${operation.operationId}`;
+          continue;
+        }
+      } catch { /* malformed reconciliation evidence is not retry authorization */ }
+      throw new ValidationError("task authority apply has an unknown side effect; reconcile required");
+    }
     const stashCommit = await applyAuthorityCommitPreservingDirtyWork(row.path, request.authorityCommit, `ai-team authority ${request.dispatchId}`);
     const receipt: TaskAuthorityApplyReceipt = {
       operation_id: operation.operationId,
