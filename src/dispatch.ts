@@ -1911,7 +1911,7 @@ export class DispatchService {
           ? (context as { authority_apply_dispatch_id: string }).authority_apply_dispatch_id
           : undefined;
         if (!authorityDispatchId) throw new ValidationError("authority conflict continuation is missing its authority dispatch");
-        this.ensureRecoveredTaskDeveloperDispatch(runId, authorityDispatchId);
+        this.ensureRecoveredTaskDeveloperDispatch(runId, authorityDispatchId, true);
         return;
       }
       if (run.mode === "planned" && context.phase === "reconcile_worktree_ownership") {
@@ -2592,7 +2592,11 @@ export class DispatchService {
     return dispatchId;
   }
 
-  private ensureRecoveredTaskDeveloperDispatch(runId: string, authorityDispatchId: string): string | undefined {
+  private ensureRecoveredTaskDeveloperDispatch(
+    runId: string,
+    authorityDispatchId: string,
+    allowReconciledTaskRecovery = false,
+  ): string | undefined {
     const authority = this.store.db.prepare(`SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator' AND state IN ('completed','failed')
       AND json_extract(packet_json,'$.context.phase')='apply_task_authority'`).get(runId, authorityDispatchId) as { packet_json: string } | undefined;
     if (!authority) return undefined;
@@ -2610,7 +2614,13 @@ export class DispatchService {
       .get(runId, sourceId) as { packet_json: string; state: string } | undefined;
     if (!source || source.state !== "failed") throw new ValidationError("authority application source developer was not superseded");
     const task = this.plannedTaskRows(runId).find((candidate) => candidate.task_id === taskId);
-    if (!task || task.state !== "prepared" || task.developer_dispatch_id) throw new ValidationError("authority application task is no longer ready for its replacement developer");
+    const recoveringReconciledTask = allowReconciledTaskRecovery
+      && (task?.state === "prepared" || task?.state === "implemented")
+      && task.developer_dispatch_id === sourceId;
+    const normallyReadyTask = task?.state === "prepared" && !task.developer_dispatch_id;
+    if (!normallyReadyTask && !recoveringReconciledTask) {
+      throw new ValidationError("authority application task is no longer ready for its replacement developer");
+    }
     const worktree = this.store.db.prepare("SELECT path,state FROM worktrees WHERE run_id=? AND worktree_id=?")
       .get(runId, worktreeId) as { path: string; state: string } | undefined;
     if (!worktree || worktree.state !== "active" || worktree.path !== worktreePath) throw new ValidationError("authority application worktree identity changed before developer replacement");
@@ -2633,8 +2643,13 @@ export class DispatchService {
     let replacementId = "";
     this.store.db.transaction(() => {
       replacementId = this.insert(runId, "backend-developer", packet, sourceId);
-      const updated = this.store.db.prepare(`UPDATE run_tasks SET developer_dispatch_id=?,updated_at=?
-        WHERE run_id=? AND task_id=? AND developer_dispatch_id IS NULL AND state='prepared'`).run(replacementId, new Date().toISOString(), runId, taskId);
+      const updated = recoveringReconciledTask
+        ? this.store.db.prepare(`UPDATE run_tasks SET state='prepared',developer_dispatch_id=?,updated_at=?
+          WHERE run_id=? AND task_id=? AND developer_dispatch_id=? AND state IN ('prepared','implemented')`)
+          .run(replacementId, new Date().toISOString(), runId, taskId, sourceId)
+        : this.store.db.prepare(`UPDATE run_tasks SET developer_dispatch_id=?,updated_at=?
+          WHERE run_id=? AND task_id=? AND developer_dispatch_id IS NULL AND state='prepared'`)
+          .run(replacementId, new Date().toISOString(), runId, taskId);
       if (updated.changes !== 1) throw new ValidationError("authority application task ownership changed during developer replacement");
       this.store.event(runId, "coding.developer_dispatch_created", {
         dispatch_id: replacementId,
@@ -3348,7 +3363,7 @@ export class DispatchService {
         this.store.db.prepare("UPDATE runs SET state='active',stage=?,updated_at=? WHERE run_id=?")
           .run(authorityApplyDispatchId ? "coding" : source.role, new Date().toISOString(), runId);
         replacementId = authorityApplyDispatchId
-          ? this.ensureRecoveredTaskDeveloperDispatch(runId, authorityApplyDispatchId) ?? ""
+          ? this.ensureRecoveredTaskDeveloperDispatch(runId, authorityApplyDispatchId, true) ?? ""
           : this.recoveryReplacement(runId, source, resolvedDecision);
         if (!replacementId) throw new ValidationError("completed authority conflict receipt has no recoverable developer continuation");
         const successor = this.store.db.prepare("SELECT packet_digest FROM dispatches WHERE dispatch_id=?").get(replacementId) as { packet_digest?: string };
@@ -3900,7 +3915,7 @@ export class DispatchService {
                 .run(new Date().toISOString(), pendingDispatch.dispatch_id);
               this.store.db.prepare("UPDATE runs SET state='active',stage='coding',updated_at=? WHERE run_id=?")
                 .run(new Date().toISOString(), runId);
-              if (!this.ensureRecoveredTaskDeveloperDispatch(runId, authorityApplyDispatchId)) {
+              if (!this.ensureRecoveredTaskDeveloperDispatch(runId, authorityApplyDispatchId, true)) {
                 throw new ValidationError("completed authority conflict receipt has no recoverable developer continuation");
               }
             })();

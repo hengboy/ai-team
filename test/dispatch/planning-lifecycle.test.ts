@@ -783,8 +783,8 @@ test("active run recovery retries the last durable stage instead of creating an 
   });
 });
 
-test("active run recovery skips a completed authority conflict receipt and restores its developer", () => {
-  return withStore((store) => {
+test("active run recovery skips a completed authority conflict receipt and restores its developer", async () => {
+  await withStore(async (store) => {
     const repoId = "repo-review-fixture";
     store.registerRepository(repoId, join(process.cwd(), "."), process.cwd());
     const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "20260820-authority-recovery", revision: "003" });
@@ -810,6 +810,8 @@ test("active run recovery skips a completed authority conflict receipt and resto
       context: { stage: "coding", phase: "implementation", task_id: taskId, worktree_id: worktreeId, worktree_path: worktreePath },
     });
     store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), developerId);
+    store.db.prepare("UPDATE run_tasks SET state='implemented',developer_dispatch_id=? WHERE run_id=? AND task_id=?")
+      .run(developerId, runId, taskId);
     const authorityId = dispatches.create(runId, "git-operator", {
       ...dispatchPacket(),
       allowed_write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
@@ -824,6 +826,19 @@ test("active run recovery skips a completed authority conflict receipt and resto
         expected_head: "a".repeat(40),
       },
     });
+    store.db.prepare("INSERT INTO operations(operation_id,run_id,idempotency_key,kind,state,request_json,evidence_json,created_at,completed_at) VALUES (?,?,?,'git.task_authority.apply','completed',?,?,?,?)")
+      .run("op_authority_apply", runId, `authority:${runId}:${taskId}`, "{}", JSON.stringify({
+        worktree_id: worktreeId,
+        authority_commit: "b".repeat(40),
+        head: "a".repeat(40),
+      }), new Date().toISOString(), new Date().toISOString());
+    dispatches.claim(runId, authorityId, "git-operator");
+    await assert.rejects(
+      dispatches.submitValue(runId, authorityId, "git-operator", completedResult(runId, authorityId, "git-operator", {
+        operations: [{ command: "apply task authority", outcome: "completed" }],
+      })),
+      /authority application task is no longer ready for its replacement developer/,
+    );
     store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), authorityId);
     const receiptId = dispatches.create(runId, "git-operator", {
       ...dispatchPacket(),
@@ -856,6 +871,10 @@ test("active run recovery skips a completed authority conflict receipt and resto
     const replacement = store.db.prepare("SELECT role,replacement_for,packet_json FROM dispatches WHERE dispatch_id=?").get(replacementId) as { role: string; replacement_for: string; packet_json: string };
     assert.equal(replacement.role, "backend-developer");
     assert.equal(replacement.replacement_for, developerId);
+    assert.deepEqual(store.db.prepare("SELECT state,developer_dispatch_id FROM run_tasks WHERE run_id=? AND task_id=?").get(runId, taskId), {
+      state: "prepared",
+      developer_dispatch_id: replacementId,
+    });
     assert.equal(JSON.parse(replacement.packet_json).context.phase, "implementation");
     assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='git-operator' AND json_extract(packet_json,'$.context.phase')='continue_task_authority_conflict'").get(runId) as { count: number }).count, 1);
     assert.equal((store.db.prepare("SELECT status FROM decisions WHERE decision_id=?").get(decision.decision_id) as { status: string }).status, "resolved");
@@ -896,6 +915,8 @@ test("run resume consumes a claimed completed authority conflict receipt and res
       context: { stage: "coding", phase: "implementation", task_id: taskId, worktree_id: worktreeId, worktree_path: worktreePath },
     });
     store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), developerId);
+    store.db.prepare("UPDATE run_tasks SET state='prepared',developer_dispatch_id=? WHERE run_id=? AND task_id=?")
+      .run(developerId, runId, taskId);
     const authorityId = dispatches.create(runId, "git-operator", {
       ...dispatchPacket(),
       allowed_write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
@@ -943,6 +964,10 @@ test("run resume consumes a claimed completed authority conflict receipt and res
     assert.equal(resumed.pending_dispatches[0]?.dispatch_id, replacement.dispatch_id);
     assert.equal(replacement.role, "backend-developer");
     assert.equal(replacement.replacement_for, developerId);
+    assert.deepEqual(store.db.prepare("SELECT state,developer_dispatch_id FROM run_tasks WHERE run_id=? AND task_id=?").get(runId, taskId), {
+      state: "prepared",
+      developer_dispatch_id: replacement.dispatch_id,
+    });
     assert.equal((store.db.prepare("SELECT state,result_json FROM dispatches WHERE dispatch_id=?").get(receiptId) as { state: string; result_json?: string }).state, "completed");
     assert.equal((store.db.prepare("SELECT state,result_json FROM dispatches WHERE dispatch_id=?").get(receiptId) as { state: string; result_json?: string }).result_json, null);
     assert.equal((store.db.prepare("SELECT stage FROM runs WHERE run_id=?").get(runId) as { stage: string }).stage, "coding");
