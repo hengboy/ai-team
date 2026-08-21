@@ -1365,6 +1365,10 @@ test("claimed planned developer scope recovery supersedes without touching its d
       addedWritePaths: ["src/contracts.ts", "src/commands/planning-run.ts"],
     }), { ...recovered, reused: true });
     dispatches.claim(runId, recovered.dispatch_id, "git-operator");
+    await assert.rejects(
+      fixture.orchestrator.commit(runId, "worktree_not_authorized", "must not commit", [], recovered.dispatch_id),
+      /only authorizes apply-task-authority/,
+    );
     const applied = await fixture.orchestrator.applyTaskAuthority({
       runId,
       dispatchId: recovered.dispatch_id,

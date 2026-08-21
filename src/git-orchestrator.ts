@@ -123,9 +123,15 @@ export class GitOrchestrator {
   /** Every mutating operation can be tied to the claimed git-operator dispatch.
    * The optional argument preserves the programmatic API used by older
    * integrations; CLI callers should always provide it. */
-  private assertGitOperator(runId: string, dispatchId?: string): void {
+  private assertGitOperator(runId: string, dispatchId?: string, operation?: "apply-task-authority"): void {
     if (!dispatchId) return;
     new DispatchService(this.store).assertClaimed(runId, dispatchId, "git-operator");
+    const row = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+      .get(runId, dispatchId) as { packet_json: string } | undefined;
+    const context = row ? (JSON.parse(row.packet_json) as { context?: Record<string, unknown> }).context : undefined;
+    if (context?.phase === "apply_task_authority" && operation !== "apply-task-authority") {
+      throw new ValidationError("task authority dispatch only authorizes apply-task-authority");
+    }
   }
 
   private repositoryForRun(runId: string): { root: string; run: any } {
@@ -549,7 +555,7 @@ export class GitOrchestrator {
   }
 
   async applyTaskAuthority(request: TaskAuthorityApplyRequest): Promise<TaskAuthorityApplyReceipt> {
-    this.assertGitOperator(request.runId, request.dispatchId);
+    this.assertGitOperator(request.runId, request.dispatchId, "apply-task-authority");
     if (!/^[a-f0-9]{40}$/.test(request.authorityCommit) || !/^[a-f0-9]{40}$/.test(request.expectedHead)) {
       throw new ValidationError("task authority apply requires full authority and expected HEAD commit SHAs");
     }
