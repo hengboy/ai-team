@@ -207,13 +207,32 @@ test("failed task, final, and review-repair Tests return through Coding to the o
     }
 
     const taskRepair = created[0]!;
-    dispatches.claim(runId, taskRepair.coding, "coding");
-    await dispatches.submitValue(runId, taskRepair.coding, "coding", completedResult(runId, taskRepair.coding, "coding", { actions: ["repair"] }));
+    const replacement = dispatches.reissue(runId, taskRepair.coding, "coding", "coding", "replace Test repair coordinator");
+    assert.equal(replacement.replacement_for, taskRepair.coding);
+    dispatches.claim(runId, replacement.dispatch_id, "coding");
+    const codingResult = completedResult(runId, replacement.dispatch_id, "coding", { actions: ["repair"] });
+    const staging = await store.createStagingEntry({
+      runId, dispatchId: replacement.dispatch_id, role: "coding", kind: "dispatch-result",
+    });
+    const ready = await store.writeStagingEntry(
+      staging.stagingId, JSON.stringify(codingResult),
+      { runId, dispatchId: replacement.dispatch_id, role: "coding", kind: "dispatch-result" },
+    );
+    const submission = await dispatches.submitStaging(runId, replacement.dispatch_id, "coding", ready.stagingId);
+    assert.equal(submission.staging.state, "consumed");
     const repairDeveloper = (store.db.prepare("SELECT repair_developer_dispatch_id FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(taskRepair.source) as { repair_developer_dispatch_id: string }).repair_developer_dispatch_id;
     const repairPacket = JSON.parse((store.db.prepare("SELECT packet_json,replacement_for FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { packet_json: string; replacement_for: string }).packet_json);
     const failedArtifact = store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE dispatch_id=?").get(taskRepair.source) as { artifact_id: string; sha256: string };
+    const frozenLineage = store.db.prepare("SELECT coding_dispatch_id,original_developer_dispatch_id,worktree_id FROM test_repair_lineage WHERE source_test_dispatch_id=?")
+      .get(taskRepair.source) as { coding_dispatch_id: string; original_developer_dispatch_id: string; worktree_id: string };
+    assert.deepEqual(frozenLineage, {
+      coding_dispatch_id: taskRepair.coding,
+      original_developer_dispatch_id: originalDeveloper,
+      worktree_id: "worktree_repair_loop",
+    });
     assert.equal((store.db.prepare("SELECT replacement_for FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { replacement_for: string }).replacement_for, originalDeveloper);
     assert.equal(repairPacket.context.worktree_id, "worktree_repair_loop");
+    assert.equal(repairPacket.context.coordinator_dispatch_id, replacement.dispatch_id);
     assert.deepEqual(repairPacket.context.predecessor_repair, {
       required: true,
       handled_tests: [{ dispatch_id: taskRepair.source, artifact_id: failedArtifact.artifact_id, digest: failedArtifact.sha256, failed_checks: [{ command: "npm test", outcome: "failed" }] }],

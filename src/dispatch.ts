@@ -378,9 +378,17 @@ export class DispatchService {
   }
 
   private ensureTestRepairDeveloperDispatch(runId: string, codingDispatchId: string): string {
-    const lineage = this.store.db.prepare(`SELECT source_test_dispatch_id,test_scope,task_id,barrier_id,original_developer_dispatch_id,
-      developer_role,worktree_id,repair_developer_dispatch_id FROM test_repair_lineage WHERE run_id=? AND coding_dispatch_id=?`)
-      .get(runId, codingDispatchId) as {
+    const lineage = this.store.db.prepare(`WITH RECURSIVE coding_ancestors(dispatch_id,replacement_for) AS (
+      SELECT dispatch_id,replacement_for FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='coding'
+      UNION ALL
+      SELECT dispatches.dispatch_id,dispatches.replacement_for FROM dispatches
+        JOIN coding_ancestors ON coding_ancestors.replacement_for=dispatches.dispatch_id
+        WHERE dispatches.run_id=? AND dispatches.role='coding'
+    )
+    SELECT source_test_dispatch_id,test_scope,task_id,barrier_id,original_developer_dispatch_id,
+      developer_role,worktree_id,repair_developer_dispatch_id FROM test_repair_lineage
+      WHERE run_id=? AND coding_dispatch_id IN (SELECT dispatch_id FROM coding_ancestors)`)
+      .get(runId, codingDispatchId, runId, runId) as {
         source_test_dispatch_id: string;
         test_scope: string;
         task_id?: string;
@@ -446,8 +454,8 @@ export class DispatchService {
     const frozen = freezeExecutionContract(lineage.developer_role, this.freezeVerificationContext(runId, lineage.developer_role, packet));
     assertExplorerAuthorization(this.store, runId, lineage.developer_role, frozen);
     const dispatchId = this.insert(runId, lineage.developer_role, frozen, lineage.original_developer_dispatch_id);
-    const updated = this.store.db.prepare("UPDATE test_repair_lineage SET repair_developer_dispatch_id=? WHERE run_id=? AND coding_dispatch_id=? AND repair_developer_dispatch_id IS NULL")
-      .run(dispatchId, runId, codingDispatchId);
+    const updated = this.store.db.prepare("UPDATE test_repair_lineage SET repair_developer_dispatch_id=? WHERE run_id=? AND source_test_dispatch_id=? AND repair_developer_dispatch_id IS NULL")
+      .run(dispatchId, runId, lineage.source_test_dispatch_id);
     if (updated.changes !== 1) throw new ValidationError("Test repair Developer continuation was created concurrently");
     this.store.event(runId, "test.repair_developer_dispatch_created", {
       coding_dispatch_id: codingDispatchId,
