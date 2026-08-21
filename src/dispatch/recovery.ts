@@ -10,6 +10,7 @@ export const retryableResultHasNoSideEffects = (resultJson: string | undefined):
 
 export const livenessRecoveryIntent = (profile: string, state: string, stage: string, hasDurableContinuation: boolean) => {
   if (state !== "active" || hasDurableContinuation) return undefined;
+  if (profile === "planning" && stage === "ready") return undefined;
   return {
     packet: {
       objective: `Recover the active ${stage} stage that has no durable continuation.`,

@@ -706,6 +706,45 @@ test("fresh Planning and long-lived continuations share the spec_ready task spli
 
 test("run resume recovers planning idempotently without crossing decisions or operations", async () => {
   await withStore((store) => {
+    const readyRun = createRun(store, "planning", { planId: "20260821-ready", revision: "001" });
+    const readyRepo = store.db.prepare("SELECT repo_id FROM runs WHERE run_id=?").get(readyRun) as { repo_id: string };
+    const readyDigest = "a".repeat(64);
+    store.db.prepare("INSERT INTO revisions(plan_id,revision,repo_id,state,target_branch,digest,plan_commit,created_at) VALUES (?,?,?,?,?,?,?,?)")
+      .run("20260821-ready", "001", readyRepo.repo_id, "ready", "main", readyDigest, "b".repeat(40), new Date().toISOString());
+    store.db.prepare("UPDATE runs SET state='active',stage='ready',plan_digest=? WHERE run_id=?").run(readyDigest, readyRun);
+    store.db.prepare("INSERT INTO operations(operation_id,run_id,idempotency_key,kind,state,request_json,evidence_json,created_at,completed_at) VALUES (?,?,?,'planning.revision.commit','completed',?,?,?,?)")
+      .run("op_ready_planning_commit", readyRun, `planning-commit:${readyRun}`, JSON.stringify({
+        repo_id: readyRepo.repo_id, run_id: readyRun, plan_id: "20260821-ready", revision: "001", digest: readyDigest,
+      }), JSON.stringify({ state: "ready", plan_commit: "b".repeat(40) }), new Date().toISOString(), new Date().toISOString());
+    const readyBefore = store.db.prepare(`SELECT
+      (SELECT COUNT(*) FROM run_events WHERE run_id=?) AS events,
+      (SELECT COUNT(*) FROM decisions WHERE run_id=?) AS decisions,
+      (SELECT COUNT(*) FROM dispatches WHERE run_id=?) AS dispatches`)
+      .get(readyRun, readyRun, readyRun);
+    const dispatches = new DispatchService(store);
+    const readyFirst = dispatches.resume(readyRun);
+    const readyAfterFirst = store.db.prepare(`SELECT
+      (SELECT COUNT(*) FROM run_events WHERE run_id=?) AS events,
+      (SELECT COUNT(*) FROM decisions WHERE run_id=?) AS decisions,
+      (SELECT COUNT(*) FROM dispatches WHERE run_id=?) AS dispatches`)
+      .get(readyRun, readyRun, readyRun);
+    const readySecond = dispatches.resume(readyRun);
+    const readyAfterSecond = store.db.prepare(`SELECT
+      (SELECT COUNT(*) FROM run_events WHERE run_id=?) AS events,
+      (SELECT COUNT(*) FROM decisions WHERE run_id=?) AS decisions,
+      (SELECT COUNT(*) FROM dispatches WHERE run_id=?) AS dispatches`)
+      .get(readyRun, readyRun, readyRun);
+    assert.equal((readyFirst.run as { state: string }).state, "completed");
+    assert.equal((readyFirst.run as { stage: string }).stage, "ready");
+    assert.equal(readyFirst.pending_decision, null);
+    assert.deepEqual(readyFirst.pending_dispatches, []);
+    assert.equal((readySecond.run as { state: string }).state, "completed");
+    assert.equal((readySecond.run as { stage: string }).stage, "ready");
+    assert.equal(readySecond.pending_decision, null);
+    assert.deepEqual(readySecond.pending_dispatches, []);
+    assert.deepEqual(readyAfterFirst, readyBefore);
+    assert.deepEqual(readyAfterSecond, readyAfterFirst);
+
     const recoverRun = createRun(store, "planning");
     store.db.prepare("UPDATE runs SET state='needs_decision',stage='requirements' WHERE run_id=?").run(recoverRun);
     const choices = [
@@ -714,7 +753,6 @@ test("run resume recovers planning idempotently without crossing decisions or op
     ];
     const resolvedId = store.createDecision(recoverRun, "Which target?", choices, "current");
     store.decide(recoverRun, resolvedId, "current");
-    const dispatches = new DispatchService(store);
     const first = dispatches.resume(recoverRun);
     const second = dispatches.resume(recoverRun);
     assert.equal((first.run as { state: string }).state, "active");

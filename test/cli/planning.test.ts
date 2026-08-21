@@ -208,6 +208,19 @@ test("planning revision creation enforces task preview approval and preserves re
   ]);
   assert.notEqual(duplicate.status, 0);
   assert.match(duplicate.stderr, /revisions are immutable/);
+
+  json(await cli(sandbox, [
+    "dispatch", "claim", "--run-id", pendingRun, "--dispatch-id", transitioned.dispatch_id, "--role", "git-operator",
+  ]));
+  const committed = json<{ state: string; plan_commit: string }>(await cli(sandbox, [
+    "planning", "revision", "commit", "--project", sandbox.repo, "--plan-id", pendingPlanId, "--revision", "001",
+    "--run-id", pendingRun, "--dispatch-id", transitioned.dispatch_id,
+  ]));
+  assert.equal(committed.state, "ready");
+  assert.match(committed.plan_commit, /^[a-f0-9]{40}$/);
+  const committedStore = await StateStore.open(sandbox.aiTeamHome);
+  assert.deepEqual(committedStore.db.prepare("SELECT state,stage FROM runs WHERE run_id=?").get(pendingRun), { state: "completed", stage: "ready" });
+  committedStore.close();
 });
 
 test("planning revision create stdin preserves failed preflight staging for retry", async (t) => {
@@ -753,7 +766,7 @@ test("completed planning commit reconciliation converges state, validates owners
   assert.deepEqual(repeated, { ...reconciled, reused: true });
 
   const convergedDatabase = new Database(databasePath, { readonly: true });
-  assert.deepEqual(convergedDatabase.prepare("SELECT state,stage FROM runs WHERE run_id=?").get(started.run_id), { state: "active", stage: "ready" });
+  assert.deepEqual(convergedDatabase.prepare("SELECT state,stage FROM runs WHERE run_id=?").get(started.run_id), { state: "completed", stage: "ready" });
   assert.deepEqual(
     convergedDatabase.prepare("SELECT state,plan_commit FROM revisions WHERE repo_id=? AND plan_id=? AND revision=?").get(run.repo_id, planId, revision),
     { state: "ready", plan_commit: confirmedCommit },

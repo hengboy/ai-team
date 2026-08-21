@@ -135,7 +135,7 @@ export const reconcilePlanningCommit = (
         .run(planCommit, request.repo_id, request.plan_id, request.revision);
       const closedPlanning = store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND role='planning' AND state IN ('pending','claimed','needs_decision')")
         .run(new Date().toISOString(), runId).changes;
-      store.db.prepare("UPDATE runs SET stage='ready',state='active',updated_at=? WHERE run_id=?")
+      store.db.prepare("UPDATE runs SET stage='ready',state=CASE WHEN source_run_id IS NULL THEN 'completed' ELSE 'active' END,updated_at=? WHERE run_id=?")
         .run(new Date().toISOString(), runId);
       store.event(runId, "planning.revision_committed", { planId: request.plan_id, revision: request.revision, commit: planCommit, reconciled: true, operationId: operation.operation_id });
       if (closedPlanning) store.event(runId, "planning.stale_dispatches_closed", { count: closedPlanning, reason: "revision_reconciled" });
@@ -343,7 +343,7 @@ export const registerPlanningCommands = (program: Command, dependencies: Plannin
       store.db.transaction(() => {
         store.db.prepare("UPDATE revisions SET state='ready',plan_commit=? WHERE repo_id=? AND plan_id=? AND revision=?").run(commit, repo.repoId, options.planId, options.revision);
         const closedPlanning = store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE run_id=? AND role='planning' AND state IN ('pending','claimed','needs_decision')").run(new Date().toISOString(), options.runId).changes;
-        store.db.prepare("UPDATE runs SET stage='ready',updated_at=? WHERE run_id=?").run(new Date().toISOString(), options.runId);
+        store.db.prepare("UPDATE runs SET stage='ready',state=CASE WHEN source_run_id IS NULL THEN 'completed' ELSE 'active' END,updated_at=? WHERE run_id=?").run(new Date().toISOString(), options.runId);
         store.event(options.runId, "planning.revision_committed", { planId: options.planId, revision: options.revision, commit });
         if (closedPlanning) store.event(options.runId, "planning.stale_dispatches_closed", { count: closedPlanning, reason: "revision_committed" });
         store.finishOperation(operation.operationId, { state: "ready", plan_commit: commit });

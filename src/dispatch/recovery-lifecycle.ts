@@ -480,9 +480,23 @@ export function ensureActiveLivenessDecision(store: common.StateStore, ops: comm
     store.event(runId, "run.recovery_decision_created", { dispatch_id: dispatchId, stage: run.stage });
   }
 
+function completeReadyStandalonePlanningRun(store: common.StateStore, runId: string): boolean {
+  return store.db.prepare(`UPDATE runs SET state='completed',updated_at=?
+    WHERE run_id=? AND profile='planning' AND state='active' AND stage='ready' AND source_run_id IS NULL
+      AND EXISTS (SELECT 1 FROM revisions
+        WHERE repo_id=runs.repo_id AND plan_id=runs.plan_id AND revision=runs.revision
+          AND state='ready' AND digest=runs.plan_digest
+          AND length(plan_commit)=40 AND plan_commit NOT GLOB '*[^a-f0-9]*')
+      AND NOT EXISTS (SELECT 1 FROM operations WHERE run_id=runs.run_id AND state='pending')
+      AND NOT EXISTS (SELECT 1 FROM decisions WHERE run_id=runs.run_id AND status='pending')
+      AND NOT EXISTS (SELECT 1 FROM dispatches WHERE run_id=runs.run_id AND state IN ('pending','claimed','needs_decision'))`)
+    .run(new Date().toISOString(), runId).changes === 1;
+}
+
 export function resume(store: common.StateStore, ops: common.DispatchOperations, runId: string): common.RunResumeResult {
     store.db.transaction(() => {
       let run = store.getRun(runId) as { profile: string; state: string; stage: string };
+      if (completeReadyStandalonePlanningRun(store, runId)) return;
       const pendingDecision = store.db.prepare("SELECT decision_id,dispatch_id,receipt_json FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; dispatch_id?: string; receipt_json?: string } | undefined;
       const pendingOperation = store.db.prepare("SELECT operation_id,kind,request_json,evidence_json FROM operations WHERE run_id=? AND state='pending' ORDER BY created_at LIMIT 1")
         .get(runId) as { operation_id: string; kind: string; request_json?: string; evidence_json?: string } | undefined;
