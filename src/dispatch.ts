@@ -377,6 +377,90 @@ export class DispatchService {
     return true;
   }
 
+  private ensureTestRepairDeveloperDispatch(runId: string, codingDispatchId: string): string {
+    const lineage = this.store.db.prepare(`SELECT source_test_dispatch_id,test_scope,task_id,barrier_id,original_developer_dispatch_id,
+      developer_role,worktree_id,repair_developer_dispatch_id FROM test_repair_lineage WHERE run_id=? AND coding_dispatch_id=?`)
+      .get(runId, codingDispatchId) as {
+        source_test_dispatch_id: string;
+        test_scope: string;
+        task_id?: string;
+        barrier_id?: string;
+        original_developer_dispatch_id: string;
+        developer_role: Role;
+        worktree_id: string;
+        repair_developer_dispatch_id?: string;
+      } | undefined;
+    if (!lineage) throw new ValidationError("completed Test repair is missing its frozen lineage");
+    if (lineage.repair_developer_dispatch_id) return lineage.repair_developer_dispatch_id;
+
+    const coordinator = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='coding' AND state='completed'")
+      .get(runId, codingDispatchId) as { packet_json: string } | undefined;
+    const developer = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role=? AND state='completed'")
+      .get(runId, lineage.original_developer_dispatch_id, lineage.developer_role) as { packet_json: string } | undefined;
+    const worktree = this.store.db.prepare("SELECT path FROM worktrees WHERE run_id=? AND worktree_id=? AND state='active'")
+      .get(runId, lineage.worktree_id) as { path: string } | undefined;
+    const testArtifact = this.store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'")
+      .get(runId, lineage.source_test_dispatch_id) as { artifact_id: string; sha256: string } | undefined;
+    if (!coordinator || !developer || !worktree || !testArtifact) {
+      throw new ValidationError("completed Test repair cannot create its original Developer continuation");
+    }
+
+    const coordinatorPacket = JSON.parse(coordinator.packet_json) as DispatchPacket;
+    const originalDeveloperPacket = JSON.parse(developer.packet_json) as DispatchPacket;
+    const failedChecks = Array.isArray(coordinatorPacket.context.failed_checks) ? coordinatorPacket.context.failed_checks : undefined;
+    if (!failedChecks) throw new ValidationError("completed Test repair is missing frozen failed checks");
+    if (originalDeveloperPacket.context.worktree_id !== lineage.worktree_id) {
+      throw new ValidationError("Test repair original Developer worktree does not match its frozen lineage");
+    }
+    const requiredCommands = [...new Set(failedChecks.flatMap((check) => check && typeof check === "object" && typeof (check as { command?: unknown }).command === "string"
+      ? [(check as { command: string }).command] : []))];
+    const packet = validatePacket({
+      objective: `Repair frozen ${lineage.test_scope} Test failures in the original ${lineage.developer_role} worktree.`,
+      allowed_read_paths: originalDeveloperPacket.allowed_read_paths,
+      allowed_write_paths: originalDeveloperPacket.allowed_write_paths,
+      acceptance_criteria: ["Resolve the frozen failed Test checks", "Preserve the original Developer worktree and repair evidence"],
+      context: {
+        stage: "coding",
+        phase: "test_repair",
+        test_scope: lineage.test_scope,
+        source_test_dispatch_id: lineage.source_test_dispatch_id,
+        original_developer_dispatch_id: lineage.original_developer_dispatch_id,
+        coordinator_dispatch_id: codingDispatchId,
+        worktree_id: lineage.worktree_id,
+        worktree_path: worktree.path,
+        ...(typeof originalDeveloperPacket.context.explorer_dispatch_id === "string" ? { explorer_dispatch_id: originalDeveloperPacket.context.explorer_dispatch_id } : {}),
+        ...(lineage.task_id ? { task_id: lineage.task_id } : {}),
+        ...(lineage.barrier_id ? { barrier_id: lineage.barrier_id } : {}),
+        predecessor_repair: {
+          required: true,
+          handled_tests: [{
+            dispatch_id: lineage.source_test_dispatch_id,
+            artifact_id: testArtifact.artifact_id,
+            digest: testArtifact.sha256,
+            failed_checks: failedChecks,
+          }],
+          required_commands: requiredCommands,
+        },
+      },
+    }, lineage.developer_role);
+    const frozen = freezeExecutionContract(lineage.developer_role, this.freezeVerificationContext(runId, lineage.developer_role, packet));
+    assertExplorerAuthorization(this.store, runId, lineage.developer_role, frozen);
+    const dispatchId = this.insert(runId, lineage.developer_role, frozen, lineage.original_developer_dispatch_id);
+    const updated = this.store.db.prepare("UPDATE test_repair_lineage SET repair_developer_dispatch_id=? WHERE run_id=? AND coding_dispatch_id=? AND repair_developer_dispatch_id IS NULL")
+      .run(dispatchId, runId, codingDispatchId);
+    if (updated.changes !== 1) throw new ValidationError("Test repair Developer continuation was created concurrently");
+    this.store.event(runId, "test.repair_developer_dispatch_created", {
+      coding_dispatch_id: codingDispatchId,
+      repair_developer_dispatch_id: dispatchId,
+      source_test_dispatch_id: lineage.source_test_dispatch_id,
+      original_developer_dispatch_id: lineage.original_developer_dispatch_id,
+      developer_role: lineage.developer_role,
+      worktree_id: lineage.worktree_id,
+    });
+    this.changeStage(runId, "coding", dispatchId);
+    return dispatchId;
+  }
+
   private createRepairRetest(runId: string, sourceTestDispatchId: string, developerDispatchId: string, commit?: string, changedPaths?: string[]): string {
     const lineage = this.store.db.prepare("SELECT * FROM test_repair_lineage WHERE run_id=? AND source_test_dispatch_id=?")
       .get(runId, sourceTestDispatchId) as { test_scope: string; attempt: number; worktree_id: string; task_id?: string; barrier_id?: string } | undefined;
@@ -1845,6 +1929,14 @@ export class DispatchService {
 
   private advanceRun(runId: string, role: Role, result: ResultEnvelope): void {
     const run = this.store.getRun(runId) as { profile: string; mode?: string };
+    if (role === "coding") {
+      const packetRow = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(result.dispatch_id) as { packet_json: string } | undefined;
+      const packet = packetRow ? JSON.parse(packetRow.packet_json) as DispatchPacket : undefined;
+      if (packet?.context.phase === "test_repair") {
+        this.ensureTestRepairDeveloperDispatch(runId, result.dispatch_id);
+        return;
+      }
+    }
     if (role === "file-explorer") {
       const next = run.profile === "planning" ? "planning" : "coding";
       const existing = this.store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND role=? AND state IN ('pending','claimed')").get(runId, next);

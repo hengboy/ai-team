@@ -208,16 +208,18 @@ test("failed task, final, and review-repair Tests return through Coding to the o
 
     const taskRepair = created[0]!;
     dispatches.claim(runId, taskRepair.coding, "coding");
-    const repairDeveloper = dispatches.create(runId, "backend-developer", {
-      ...dispatchPacket(["src/dispatch.ts"]), allowed_write_paths: ["src/dispatch.ts"],
-      context: {
-        phase: "test_repair", test_scope: "task", source_test_dispatch_id: taskRepair.source,
-        explorer_dispatch_id: explorerId, worktree_id: "worktree_repair_loop", worktree_path: process.cwd(), task_id: "TASK-001",
-        coordinator_dispatch_id: taskRepair.coding,
-      },
-    }, "coding", taskRepair.coding);
-    assert.equal((store.db.prepare("SELECT replacement_for FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { replacement_for: string }).replacement_for, originalDeveloper);
     await dispatches.submitValue(runId, taskRepair.coding, "coding", completedResult(runId, taskRepair.coding, "coding", { actions: ["repair"] }));
+    const repairDeveloper = (store.db.prepare("SELECT repair_developer_dispatch_id FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(taskRepair.source) as { repair_developer_dispatch_id: string }).repair_developer_dispatch_id;
+    const repairPacket = JSON.parse((store.db.prepare("SELECT packet_json,replacement_for FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { packet_json: string; replacement_for: string }).packet_json);
+    const failedArtifact = store.db.prepare("SELECT artifact_id,sha256 FROM artifacts WHERE dispatch_id=?").get(taskRepair.source) as { artifact_id: string; sha256: string };
+    assert.equal((store.db.prepare("SELECT replacement_for FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { replacement_for: string }).replacement_for, originalDeveloper);
+    assert.equal(repairPacket.context.worktree_id, "worktree_repair_loop");
+    assert.deepEqual(repairPacket.context.predecessor_repair, {
+      required: true,
+      handled_tests: [{ dispatch_id: taskRepair.source, artifact_id: failedArtifact.artifact_id, digest: failedArtifact.sha256, failed_checks: [{ command: "npm test", outcome: "failed" }] }],
+      required_commands: ["npm test"],
+    });
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='active_run_recovery'").get(runId) as { count: number }).count, 0);
     dispatches.claim(runId, repairDeveloper, "backend-developer");
     await dispatches.submitValue(runId, repairDeveloper, "backend-developer", completedResult(runId, repairDeveloper, "backend-developer", {
       modified_paths: ["src/dispatch.ts"], self_tests: [{ command: "npm test", outcome: "passed" }],
@@ -235,7 +237,7 @@ test("failed task, final, and review-repair Tests return through Coding to the o
   });
 });
 
-test("resume recreates a failed Test repair as an active Coding continuation", async () => {
+test("resume completes a failed Test repair Coding continuation with its original Developer", async () => {
   await withStore(async (store) => {
     const repoId = "repo-review-fixture";
     store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
@@ -268,6 +270,8 @@ test("resume recreates a failed Test repair as an active Coding continuation", a
     };
     store.db.prepare("UPDATE dispatches SET state='failed',result_json=?,completed_at=? WHERE dispatch_id=?")
       .run(JSON.stringify(failedResult), new Date().toISOString(), failedTest);
+    store.db.prepare("INSERT INTO artifacts(artifact_id,run_id,dispatch_id,kind,path,sha256,redacted,created_at) VALUES (?,?,?,'result',?,?,1,?)")
+      .run("artifact_resume_repair_test", runId, failedTest, "/tmp/resume-repair-test-result.json", "b".repeat(64), new Date().toISOString());
     store.db.prepare("UPDATE runs SET state='failed',stage='test' WHERE run_id=?").run(runId);
 
     const resumed = dispatches.resume(runId);
@@ -275,13 +279,12 @@ test("resume recreates a failed Test repair as an active Coding continuation", a
     const continuation = resumed.pending_dispatches.find(({ role }) => role === "coding")!;
     assert.ok(continuation);
     dispatches.claim(runId, continuation.dispatch_id, "coding");
-    const repairDeveloper = dispatches.create(runId, "backend-developer", {
-      ...dispatchPacket(["src/dispatch.ts"]), allowed_write_paths: ["src/dispatch.ts"],
-      context: {
-        phase: "test_repair", test_scope: "task", source_test_dispatch_id: failedTest, explorer_dispatch_id: explorerId,
-        task_id: "TASK-001", worktree_id: "worktree_resume_repair", worktree_path: process.cwd(), coordinator_dispatch_id: continuation.dispatch_id,
-      },
-    }, "coding", continuation.dispatch_id);
+    await dispatches.submitValue(runId, continuation.dispatch_id, "coding", completedResult(runId, continuation.dispatch_id, "coding", { actions: ["repair"] }));
+    const repairDeveloper = (store.db.prepare("SELECT repair_developer_dispatch_id FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(failedTest) as { repair_developer_dispatch_id: string }).repair_developer_dispatch_id;
+    const afterCodingResume = dispatches.resume(runId);
+    assert.equal((afterCodingResume.run as { state: string }).state, "active");
+    assert.ok(afterCodingResume.pending_dispatches.some(({ dispatch_id, role }) => dispatch_id === repairDeveloper && role === "backend-developer"));
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='active_run_recovery'").get(runId) as { count: number }).count, 0);
     assert.equal((store.db.prepare("SELECT replacement_for FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { replacement_for: string }).replacement_for, originalDeveloper);
     dispatches.claim(runId, repairDeveloper, "backend-developer");
     assert.doesNotThrow(() => dispatches.validateValue(runId, repairDeveloper, "backend-developer", completedResult(runId, repairDeveloper, "backend-developer", {
