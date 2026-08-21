@@ -3885,6 +3885,27 @@ export class DispatchService {
           WHERE run_id=? AND state IN ('pending','claimed') ORDER BY created_at DESC LIMIT 1`).get(runId) as { dispatch_id: string; role: Role; packet_json: string } | undefined;
         if (pendingDispatch && run.profile === "coding") {
           const pendingPacket = JSON.parse(pendingDispatch.packet_json) as DispatchPacket;
+          const recovery = pendingPacket.context.recovery as { completed_verification?: unknown } | undefined;
+          const authorityApplyDispatchId = pendingDispatch.role === "git-operator"
+            && pendingPacket.context.phase === "continue_task_authority_conflict"
+            && pendingPacket.context.operation === "continue-task-authority-conflict"
+            && typeof pendingPacket.context.authority_apply_dispatch_id === "string"
+            && Array.isArray(recovery?.completed_verification)
+            && recovery.completed_verification.length > 0
+            ? pendingPacket.context.authority_apply_dispatch_id
+            : undefined;
+          if (authorityApplyDispatchId) {
+            this.store.db.transaction(() => {
+              this.store.db.prepare("UPDATE dispatches SET state='completed',completed_at=COALESCE(completed_at,?) WHERE dispatch_id=? AND state IN ('pending','claimed')")
+                .run(new Date().toISOString(), pendingDispatch.dispatch_id);
+              this.store.db.prepare("UPDATE runs SET state='active',stage='coding',updated_at=? WHERE run_id=?")
+                .run(new Date().toISOString(), runId);
+              if (!this.ensureRecoveredTaskDeveloperDispatch(runId, authorityApplyDispatchId)) {
+                throw new ValidationError("completed authority conflict receipt has no recoverable developer continuation");
+              }
+            })();
+            return;
+          }
           if (pendingDispatch.role === "git-operator" && pendingPacket.context.phase === "prepare_implementation_worktree"
             && typeof pendingPacket.context.task_id === "string" && this.pendingPlannedTaskRecovery(runId, pendingPacket.context.task_id)) {
             this.ensureNextPlannedTaskPrepare(runId);

@@ -869,6 +869,92 @@ test("active run recovery skips a completed authority conflict receipt and resto
   });
 });
 
+test("run resume consumes a claimed completed authority conflict receipt and restores its developer", () => {
+  return withStore((store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), "."), process.cwd());
+    const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "20260820-authority-recovery", revision: "003" });
+    const dispatches = new DispatchService(store);
+    const taskId = "TASK-001";
+    const worktreeId = "worktree_authority_recovery";
+    const worktreePath = `/tmp/${runId}-task-001`;
+    store.initializeRunTasks(runId, [{
+      task_id: taskId,
+      source_path: ".ai-team/plans/20260820-authority-recovery/revisions/003/tasks/TASK-001.md",
+      source_digest: "a".repeat(64),
+      write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
+    }]);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run(worktreeId, runId, "task/20260820/task-001", worktreePath, "a".repeat(40), new Date().toISOString());
+    store.advanceRunTask(runId, taskId, "prepared", { worktree_id: worktreeId });
+
+    const developerId = dispatches.create(runId, "backend-developer", {
+      objective: "Implement TASK-001 in its frozen prepared task worktree.",
+      allowed_read_paths: ["src/dispatch.ts"],
+      allowed_write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
+      acceptance_criteria: ["Implement only the frozen Task scope"],
+      context: { stage: "coding", phase: "implementation", task_id: taskId, worktree_id: worktreeId, worktree_path: worktreePath },
+    });
+    store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), developerId);
+    const authorityId = dispatches.create(runId, "git-operator", {
+      ...dispatchPacket(),
+      allowed_write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
+      context: {
+        phase: "apply_task_authority",
+        operation: "apply-task-authority",
+        task_id: taskId,
+        superseded_developer_dispatch_id: developerId,
+        worktree_id: worktreeId,
+        worktree_path: worktreePath,
+        authority_commit: "b".repeat(40),
+        expected_head: "a".repeat(40),
+      },
+    });
+    store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), authorityId);
+    const receiptId = dispatches.create(runId, "git-operator", {
+      ...dispatchPacket(),
+      allowed_write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
+      acceptance_criteria: ["Record only the authority application receipt"],
+      context: {
+        phase: "continue_task_authority_conflict",
+        operation: "continue-task-authority-conflict",
+        authority_apply_dispatch_id: authorityId,
+        authority_apply_operation_id: "op_authority_recovery",
+        task_id: taskId,
+        worktree_id: worktreeId,
+        worktree_path: worktreePath,
+        authority_commit: "b".repeat(40),
+        expected_head: "a".repeat(40),
+        stash_commit: "c".repeat(40),
+        dirty_paths: ["src/dispatch.ts"],
+        authority_paths: ["src/dispatch.ts"],
+        conflict_paths: ["src/dispatch.ts"],
+        recovery: { completed_verification: [{ command: "git status", outcome: "clean" }, { command: "git status", outcome: "clean" }] },
+      },
+    });
+    store.db.prepare("UPDATE dispatches SET replacement_for=?,state='claimed',claimed_at=? WHERE dispatch_id=?")
+      .run(authorityId, new Date().toISOString(), receiptId);
+    store.db.prepare("UPDATE runs SET state='active',stage='git-operator' WHERE run_id=?").run(runId);
+
+    const resumed = dispatches.resume(runId);
+    const replacement = store.db.prepare("SELECT dispatch_id,role,replacement_for FROM dispatches WHERE run_id=? AND role='backend-developer' AND replacement_for=?")
+      .get(runId, developerId) as { dispatch_id: string; role: string; replacement_for: string };
+    assert.equal(resumed.pending_dispatches.length, 1);
+    assert.equal(resumed.pending_dispatches[0]?.dispatch_id, replacement.dispatch_id);
+    assert.equal(replacement.role, "backend-developer");
+    assert.equal(replacement.replacement_for, developerId);
+    assert.equal((store.db.prepare("SELECT state,result_json FROM dispatches WHERE dispatch_id=?").get(receiptId) as { state: string; result_json?: string }).state, "completed");
+    assert.equal((store.db.prepare("SELECT state,result_json FROM dispatches WHERE dispatch_id=?").get(receiptId) as { state: string; result_json?: string }).result_json, null);
+    assert.equal((store.db.prepare("SELECT stage FROM runs WHERE run_id=?").get(runId) as { stage: string }).stage, "coding");
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=? AND role='git-operator' AND json_extract(packet_json,'$.context.phase')='continue_task_authority_conflict'").get(runId) as { count: number }).count, 1);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=? AND decision_type='active_run_recovery' AND status='pending'").get(runId) as { count: number }).count, 0);
+
+    dispatches.resume(runId);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM dispatches WHERE run_id=?").get(runId) as { count: number }).count, 4);
+    assert.equal((store.db.prepare("SELECT count(*) AS count FROM decisions WHERE run_id=?").get(runId) as { count: number }).count, 0);
+  });
+});
+
 test("run resume repairs a stale planning retryable failure without crossing blockers or profiles", async () => {
   await withStore(async (store, home) => {
     const dispatches = new DispatchService(store);
