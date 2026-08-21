@@ -13,6 +13,7 @@ import { createResultTemplate } from "../src/contracts.js";
 import { StateStore } from "../src/state.js";
 import { ScopeGate } from "../src/gates.js";
 import { sha256 } from "../src/utils.js";
+import { taskSourceDigest } from "../src/planning.js";
 import { ValidationError } from "../src/errors.js";
 import { resolveMergeTaskWorktree, resolveTaskIdentityWorktree } from "../src/worktree-ownership.js";
 import { stagingFilePath } from "../src/security.js";
@@ -260,6 +261,15 @@ test("planned resume replaces a clean stale next-Task worktree from current plan
     await writeFile(join(taskRoot, "TASK-002.md"), "# TASK-002\n");
     await rawGit(fixture.root, ["add", ".ai-team", "MEMORY.md"]);
     await rawGit(fixture.root, ["commit", "-m", "Freeze stale task fixture"]);
+    const taskPath = `.ai-team/plans/${planId}/revisions/001/tasks/TASK-001.md`;
+    const taskContent = "# TASK-001\n";
+    const taskMetadataPath = taskPath.replace(/\.md$/, ".metadata.json");
+    const taskMetadata = "{}\n";
+    await mkdir(join(fixture.root, ".ai-team", "plans", planId, "revisions", "001", "tasks"), { recursive: true });
+    await writeFile(join(fixture.root, taskPath), taskContent);
+    await writeFile(join(fixture.root, taskMetadataPath), taskMetadata);
+    await rawGit(fixture.root, ["add", ".ai-team"]);
+    await rawGit(fixture.root, ["commit", "-m", "Freeze recovery task"]);
     const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
     const identity = await repositoryIdentity(fixture.root);
     const runId = fixture.store.createRun({
@@ -348,7 +358,10 @@ test("planned single explicit Task reuses the plan worktree and reaches final Te
     await writeFile(join(fixture.root, ".ai-team", "index", "feature-navigation.md"), "# fixture\n");
     await writeFile(join(fixture.root, ".ai-team", "plans", planId, "revisions", revision, "plan.md"), "# plan\n");
     const taskContent = "# TASK-001\n\n- 允许写入路径：`single.txt`\n";
+    const taskMetadataPath = `.ai-team/plans/${planId}/revisions/${revision}/tasks/TASK-001.metadata.json`;
+    const taskMetadata = "{\n  \"extensions\": {\n    \"acceptance_contract\": {}\n  }\n}\n";
     await writeFile(join(taskRoot, "TASK-001.md"), taskContent);
+    await writeFile(join(fixture.root, taskMetadataPath), taskMetadata);
     await writeFile(join(fixture.root, "package.json"), JSON.stringify({ name: "fixture", scripts: { test: "node --test" } }));
     await rawGit(fixture.root, ["add", ".ai-team", "MEMORY.md", "package.json"]);
     await rawGit(fixture.root, ["commit", "-m", "Freeze single task fixture"]);
@@ -360,7 +373,7 @@ test("planned single explicit Task reuses the plan worktree and reaches final Te
     fixture.store.initializeRunTasks(runId, [{
       task_id: "TASK-001",
       source_path: `.ai-team/plans/${planId}/revisions/${revision}/tasks/TASK-001.md`,
-      source_digest: sha256(taskContent),
+      source_digest: taskSourceDigest(`.ai-team/plans/${planId}/revisions/${revision}/tasks/TASK-001.md`, taskContent, taskMetadataPath, taskMetadata),
       write_paths: ["single.txt"],
     }]);
     const plan = await fixture.orchestrator.prepareIntegration(runId);
@@ -1063,6 +1076,15 @@ test("recoverTaskWorktree atomically carries a dirty managed Task into its direc
   try {
     const planId = "20260820-worktree-recovery";
     const identity = await repositoryIdentity(fixture.root);
+    const taskPath = `.ai-team/plans/${planId}/revisions/001/tasks/TASK-001.md`;
+    const taskContent = "# TASK-001\n";
+    const taskMetadataPath = taskPath.replace(/\.md$/, ".metadata.json");
+    const taskMetadata = "{}\n";
+    await mkdir(join(fixture.root, ".ai-team", "plans", planId, "revisions", "001", "tasks"), { recursive: true });
+    await writeFile(join(fixture.root, taskPath), taskContent);
+    await writeFile(join(fixture.root, taskMetadataPath), taskMetadata);
+    await rawGit(fixture.root, ["add", ".ai-team"]);
+    await rawGit(fixture.root, ["commit", "-m", "Freeze recovery task"]);
     const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
     const sourceDigest = "1".repeat(64);
     const targetDigest = "2".repeat(64);
@@ -1072,8 +1094,9 @@ test("recoverTaskWorktree atomically carries a dirty managed Task into its direc
       .run(planId, "002", identity.repoId, targetDigest, baseCommit, "001", new Date().toISOString());
     const sourceRun = fixture.store.createRun({ repoId: identity.repoId, profile: "coding", mode: "planned", planId, revision: "001", baseCommit, targetBranch: "main", planDigest: sourceDigest });
     const targetRun = fixture.store.createRun({ repoId: identity.repoId, profile: "coding", mode: "planned", planId, revision: "002", baseCommit, targetBranch: "main", planDigest: targetDigest });
-    fixture.store.initializeRunTasks(sourceRun, [{ task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "a".repeat(64), write_paths: ["README.md", "untracked.txt"] }]);
-    fixture.store.initializeRunTasks(targetRun, [{ task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "b".repeat(64), write_paths: ["README.md", "test/core.test.ts", "untracked.txt"] }]);
+    const sourceTaskDigest = taskSourceDigest(taskPath, taskContent, taskMetadataPath, taskMetadata);
+    fixture.store.initializeRunTasks(sourceRun, [{ task_id: "TASK-001", source_path: taskPath, source_digest: sourceTaskDigest, write_paths: ["README.md", "untracked.txt"] }]);
+    fixture.store.initializeRunTasks(targetRun, [{ task_id: "TASK-001", source_path: taskPath, source_digest: sourceTaskDigest, write_paths: ["README.md", "test/core.test.ts", "untracked.txt"] }]);
 
     const worktreePath = join(fixture.root, ".worktrees", "tasks", planId, `${planId}-001--task-001`);
     const branch = `task/${planId}/${planId}-001--task-001`;

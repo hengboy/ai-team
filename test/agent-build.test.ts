@@ -61,7 +61,7 @@ test("role manifests reserve revision creation for planning and revision commit 
 
 test("role manifests declare staging ownership separately from project writes", () => {
   const build = loadAgentBuildSync(sourceRoot);
-  assert.equal(build.templateVersion, 6);
+  assert.equal(build.templateVersion, 7);
   assert.deepEqual(build.roles["file-explorer"].staging.owned_entries, ["project-context", "dispatch-result"]);
   assert.deepEqual(build.roles["environment-operator"].staging.owned_entries, []);
   assert.ok(build.roles.planning.commands.includes("staging create"));
@@ -76,6 +76,8 @@ test("planning templates match the workflow structure contract", async () => {
   const spec = await readFile(join(sourceRoot, "templates", "spec.md"), "utf8");
   const plan = await readFile(join(sourceRoot, "templates", "plan.md"), "utf8");
   const task = await readFile(join(sourceRoot, "templates", "task.md"), "utf8");
+  const planMetadata = await readFile(join(sourceRoot, "templates", "plan.metadata.json"), "utf8");
+  const taskMetadata = await readFile(join(sourceRoot, "templates", "task.metadata.json"), "utf8");
   const sectionHeadings = (document: string): string[] =>
     [...document.matchAll(/^## (.+)$/gm)].map((match) => match[1] ?? "");
   const goalSection = spec.match(/## 目标\n\n([\s\S]*?)(?=\n## )/)?.[1] ?? "";
@@ -95,19 +97,17 @@ test("planning templates match the workflow structure contract", async () => {
   assert.match(plan, /^# 实施计划$/m);
   assert.deepEqual(sectionHeadings(plan), [...PLAN_SECTIONS]);
   assert.match(plan, /^### STEP-001：<步骤标题>$/m);
-  assert.equal((plan.match(/^## 方案验收契约$/gm) ?? []).length, 1);
-  assert.match(plan, /"acceptance_criteria"/);
-  assert.match(plan, /"acceptance_steps"/);
-  assert.match(plan, /"task_mapping"/);
-  assert.match(plan, /"test_commands"/);
+  assert.doesNotMatch(plan, /^## 方案验收契约$/m);
+  assert.match(planMetadata, /"acceptance_contract"/);
+  assert.match(planMetadata, /"acceptance_steps"/);
 
   assert.match(task, /^# 任务拆分$/m);
-  assert.deepEqual(sectionHeadings(task), ["任务清单", "依赖关系", "并行批次", "任务验收契约", "风险与阻塞"]);
+  assert.deepEqual(sectionHeadings(task), ["任务清单", "依赖关系", "并行批次", "风险与阻塞"]);
   assert.match(task, /^### TASK-001：<任务标题>$/m);
   assert.doesNotMatch(task, /^### \[[ xX]\] TASK-/m);
   assert.match(task, /^- 允许写入路径：$/m);
   assert.match(task, /revision 冻结后不得修改任务文档/);
   assert.match(task, /完成状态以 AI Team 运行状态和审计证据为准/);
-  assert.equal((task.match(/^## 任务验收契约$/gm) ?? []).length, 1);
-  assert.match(task, /"tdd_cycles"/);
+  assert.doesNotMatch(task, /^## 任务验收契约$/m);
+  assert.match(taskMetadata, /"tdd_cycles"/);
 });

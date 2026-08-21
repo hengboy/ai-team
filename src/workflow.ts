@@ -5,7 +5,7 @@ import { currentBranch, currentHead, git, repositoryIdentity, worktreeStatus } f
 import { frozenTaskWritePathsFromDocument, StateStore } from "./state.js";
 import { DispatchService } from "./dispatch.js";
 import { ValidationError } from "./errors.js";
-import { parsePlanVerification, parseTaskVerification, triageRequest, type PlanVerification, type TaskVerification } from "./planning.js";
+import { parsePlanVerification, parseTaskVerification, taskSourceDigest, triageRequest, type PlanVerification, type TaskVerification } from "./planning.js";
 import { AGENT_BUILD } from "./roles.js";
 import { assertReadablePath } from "./security.js";
 import { GitOrchestrator } from "./git-orchestrator.js";
@@ -168,48 +168,55 @@ export class WorkflowService {
   }> {
     const root = join(".ai-team", "plans", planId);
     const revisionRoot = join(root, "revisions", revision);
-    const paths = [join(root, "plan.yaml"), join(revisionRoot, "spec.md"), join(revisionRoot, "plan.md")];
-    try {
-      await readFile(join(project, revisionRoot, "tasks.md"), "utf8");
-      paths.push(join(revisionRoot, "tasks.md"));
-    } catch { /* an unsplit plan has no tasks.md */ }
-    let taskFiles: string[] = [];
-    if (planCommit) {
-      try {
-        taskFiles = execFileSync("git", ["-C", project, "ls-tree", "-r", "--name-only", planCommit, "--", join(revisionRoot, "tasks")], { encoding: "utf8" })
-          .split("\n").filter((path) => /\/TASK-\d{3}\.md$/.test(path)).sort();
-      } catch { throw new ValidationError("planned TASK metadata could not be read from the frozen plan commit"); }
-    } else {
-      try {
-        taskFiles = (await readdir(join(project, revisionRoot, "tasks"), { withFileTypes: true }))
-          .filter((entry) => entry.isFile() && /^TASK-\d{3}\.md$/.test(entry.name))
-          .map((entry) => join(revisionRoot, "tasks", entry.name))
-          .sort();
-      } catch { /* an unsplit plan has no tasks directory */ }
+    const required = [join(root, "plan.yaml"), join(revisionRoot, "spec.md"), join(revisionRoot, "plan.md"), join(revisionRoot, "plan.metadata.json")];
+    const treePaths = planCommit
+      ? execFileSync("git", ["-C", project, "ls-tree", "-r", "--name-only", planCommit, "--", root], { encoding: "utf8" }).split("\n").filter(Boolean)
+      : await (async () => {
+        const taskNames = await readdir(join(project, revisionRoot, "tasks"), { withFileTypes: true }).catch(() => []);
+        const rootNames = await readdir(join(project, revisionRoot), { withFileTypes: true });
+        return [...rootNames.filter((entry) => entry.isFile()).map((entry) => join(revisionRoot, entry.name)), ...taskNames.filter((entry) => entry.isFile()).map((entry) => join(revisionRoot, "tasks", entry.name))];
+      })();
+    const relevant = treePaths.filter((path) => path === join(root, "plan.yaml") || path === join(revisionRoot, "spec.md") || path === join(revisionRoot, "plan.md") || path === join(revisionRoot, "plan.metadata.json") || path === join(revisionRoot, "tasks.md") || path === join(revisionRoot, "tasks.metadata.json") || /\/tasks\/TASK-\d{3}(?:\.metadata)?\.json$/.test(path) || /\/tasks\/TASK-\d{3}\.md$/.test(path));
+    const paths = [...new Set([...required, ...relevant])].sort();
+    const documentByPath = new Map<string, string>();
+    for (const path of paths) {
+      let content: string;
+      try { content = planCommit ? execFileSync("git", ["-C", project, "show", `${planCommit}:${path}`], { encoding: "utf8" }) : await readFile(join(project, path), "utf8"); }
+      catch { throw new ValidationError(`planned revision is missing required artifact: ${path}`); }
+      let current: string;
+      try { current = await readFile(join(project, path), "utf8"); } catch { throw new ValidationError(`planned working tree is missing artifact: ${path}`); }
+      if (current !== content) throw new ValidationError(`planned artifact differs from frozen plan commit: ${path}`);
+      documentByPath.set(path, content);
     }
-    paths.push(...taskFiles);
-    const documents = await Promise.all(paths.map(async (path) => ({ path, content: await readFile(join(project, path), "utf8") })));
-    const tasks = await Promise.all(taskFiles.map(async (path) => {
-      const content = planCommit
-        ? execFileSync("git", ["-C", project, "show", `${planCommit}:${path}`], { encoding: "utf8" })
-        : await readFile(join(project, path), "utf8");
-      const current = documents.find((document) => document.path === path)?.content;
-      if (current !== content) throw new ValidationError(`planned Task differs from frozen plan commit: ${path}`);
+    const tasksPath = join(revisionRoot, "tasks.md");
+    const tasksMetadataPath = join(revisionRoot, "tasks.metadata.json");
+    if (documentByPath.has(tasksPath) !== documentByPath.has(tasksMetadataPath)) throw new ValidationError("planned revision has unpaired tasks metadata sidecar");
+    const taskFiles = paths.filter((path) => /\/tasks\/TASK-\d{3}\.md$/.test(path));
+    const taskMetadataFiles = paths.filter((path) => /\/tasks\/TASK-\d{3}\.metadata\.json$/.test(path));
+    const taskIds = taskFiles.map((path) => path.slice(path.lastIndexOf("/") + 1, -3)).sort();
+    const metadataIds = taskMetadataFiles.map((path) => path.slice(path.lastIndexOf("/") + 1, -14)).sort();
+    if (JSON.stringify(taskIds) !== JSON.stringify(metadataIds)) throw new ValidationError("planned revision has unpaired task metadata sidecar");
+    const parseMetadata = (path: string): unknown => {
+      try { return JSON.parse(documentByPath.get(path)!); } catch { throw new ValidationError(`planned metadata sidecar contains invalid JSON: ${path}`); }
+    };
+    const tasks = taskFiles.map((path) => {
+      const metadataPath = path.replace(/\.md$/, ".metadata.json");
+      const content = documentByPath.get(path)!;
+      const metadata = documentByPath.get(metadataPath)!;
       return {
         task_id: path.slice(path.lastIndexOf("/") + 1, -3),
         source_path: path,
-        source_digest: sha256(content),
+        source_digest: taskSourceDigest(path, content, metadataPath, metadata),
         write_paths: frozenTaskWritePathsFromDocument(content, path),
-        verification: parseTaskVerification(content),
+        verification: parseTaskVerification(parseMetadata(metadataPath)),
       };
-    }));
-    const planDocument = documents.find(({ path }) => path === join(revisionRoot, "plan.md"));
-    if (!planDocument) throw new ValidationError("planned verification contract could not be read");
+    });
+    const planMetadataPath = join(revisionRoot, "plan.metadata.json");
     return {
       paths,
       tasks,
-      planVerification: parsePlanVerification(planDocument.content),
-      digest: sha256(documents.map(({ path, content }) => `${path}\n${content}`).join("\n")),
+      planVerification: parsePlanVerification(parseMetadata(planMetadataPath)),
+      digest: sha256(paths.map((path) => `${path}\n${documentByPath.get(path)!}`).join("\n")),
     };
   }
 

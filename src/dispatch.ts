@@ -8,7 +8,7 @@ import { IncompatibleError, ValidationError, validationCause } from "./errors.js
 import { ROLE_MANIFEST, ROLE_MANIFEST_DIGEST } from "./roles.js";
 import { assertReadablePath, pathMatchesScope } from "./security.js";
 import { assertExplicitTaskWritePaths, StateStore } from "./state.js";
-import { assertRevisionRunStage, verificationDigest, type PlanVerification, type TaskVerification } from "./planning.js";
+import { assertRevisionRunStage, taskSourceDigest, verificationDigest, type PlanVerification, type TaskVerification } from "./planning.js";
 import { makeId, readJson, redact, sha256, stableJson, writeJson } from "./utils.js";
 import type { ReviewFinding, ReviewResult } from "./review.js";
 import { plannedWorktreeSnapshot, ScopeGate } from "./gates.js";
@@ -3259,7 +3259,15 @@ export class DispatchService {
       : execFileSync("git", ["-C", repository.project_path, "diff", "--name-only", baseCommit, revisionSha], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
     const changedPaths = [...new Set(gitChangedPaths)];
     if (!changedPaths.length || !committedDiff.trim()) return undefined;
-    const planningPaths = run.plan_id && run.revision ? ["spec.md", "plan.md", "tasks.md"].map((name) => `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/${name}`) : [];
+    const planningPaths = run.plan_id && run.revision ? [
+      "spec.md", "plan.md", "plan.metadata.json", "tasks.md", "tasks.metadata.json",
+    ].map((name) => `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/${name}`) : [];
+    if (run.plan_id && run.revision) {
+      const taskRoot = `.ai-team/plans/${run.plan_id}/revisions/${run.revision}/tasks`;
+      const taskPaths = execFileSync("git", ["-C", repository.project_path, "ls-tree", "-r", "--name-only", revisionSha, "--", taskRoot], { encoding: "utf8" })
+        .split("\n").filter((path) => /\/TASK-\d{3}(?:\.metadata)?\.(?:md|json)$/.test(path));
+      planningPaths.push(...taskPaths);
+    }
     const existingPlanningPaths = planningPaths.filter((path) => {
       try { execFileSync("git", ["-C", repository.project_path, "cat-file", "-e", `${revisionSha}:${path}`], { stdio: "ignore" }); return true; }
       catch { return false; }
@@ -3959,14 +3967,17 @@ export class DispatchService {
             frozenPaths = task.write_paths_json
               ? assertExplicitTaskWritePaths(JSON.parse(task.write_paths_json) as string[], task.source_path)
               : scopePaths;
-            if (task.write_paths_json) sourceValid = true;
-            else {
-              const source = recoveryRevision?.plan_commit && recoveryRepository
-                ? execFileSync("git", ["-C", recoveryRepository.project_path, "show", `${recoveryRevision.plan_commit}:${task.source_path}`], { encoding: "utf8" })
-                : "";
-              sourceValid = Boolean(recoveryRevision?.digest && recoveryRevision.digest === recoveryRun.plan_digest
-                && /^[a-f0-9]{40}$/.test(recoveryRevision.plan_commit ?? "") && sha256(source) === task.source_digest);
-            }
+            const metadataPath = task.source_path.replace(/\.md$/, ".metadata.json");
+            if (metadataPath === task.source_path) throw new Error("invalid task source path");
+            const source = recoveryRevision?.plan_commit && recoveryRepository
+              ? execFileSync("git", ["-C", recoveryRepository.project_path, "show", `${recoveryRevision.plan_commit}:${task.source_path}`], { encoding: "utf8" })
+              : "";
+            const metadata = recoveryRevision?.plan_commit && recoveryRepository
+              ? execFileSync("git", ["-C", recoveryRepository.project_path, "show", `${recoveryRevision.plan_commit}:${metadataPath}`], { encoding: "utf8" })
+              : "";
+            sourceValid = Boolean(recoveryRevision?.digest && recoveryRevision.digest === recoveryRun.plan_digest
+              && /^[a-f0-9]{40}$/.test(recoveryRevision.plan_commit ?? "")
+              && taskSourceDigest(task.source_path, source, metadataPath, metadata) === task.source_digest);
           } catch { sourceValid = false; }
           const taskEvidenceValid = Boolean(task.developer_dispatch_id && task.worktree_id && packet
             && packet.context.task_id === task.task_id && packet.context.worktree_id === task.worktree_id

@@ -10,7 +10,7 @@ import { ROLES } from "../src/constants.js";
 import { COMMAND_CONTRACT_BASE, COMMAND_PARAMETER_TYPES, COMMAND_SYNTAX, commandContractFor } from "../src/command-contract.js";
 import { DispatchService, dispatchPacketSchema, dispatchPacketTemplate, type DispatchPacket } from "../src/dispatch.js";
 import { IncompatibleError, ValidationError } from "../src/errors.js";
-import { assertCoverage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, parsePlanVerification, parseTaskVerification, preflightRevision, triage, validateCoverage, verificationDigest } from "../src/planning.js";
+import { assertCoverage, assertRevisionCreateRunStage, assertRevisionDocuments, assertRevisionRunStage, extractRequirementIds, nextPlanState, parsePlanVerification, parseTaskVerification, preflightRevision, serializeDocumentMetadata, taskSourceDigest, triage, validateCoverage, verificationDigest } from "../src/planning.js";
 import { StateStore } from "../src/state.js";
 import { legacyStagingFilePath, pathMatchesScope, stagingFilePath } from "../src/security.js";
 import { makePlanId, sha256 } from "../src/utils.js";
@@ -424,7 +424,10 @@ test("migration 009 renames legacy staging files and continues their run sequenc
 
     const planningDocuments = await store.createStagingEntry({ runId, role: "planning", kind: "planning-documents" });
     assert.equal((await stat(stagingFilePath(store.paths.staging, runId, 2, "planning-documents", "planning"))).mode & 0o777, 0o600);
-    assert.deepEqual((await store.inspectStagingEntry(planningDocuments.stagingId)).value, { spec: "", plan: "" });
+    const stagingValue = (await store.inspectStagingEntry(planningDocuments.stagingId)).value as { spec: string; plan: string; planMetadata: { extensions: { acceptance_contract: { acceptance_criteria: string[] } } } };
+    assert.equal(stagingValue.spec, "");
+    assert.equal(stagingValue.plan, "");
+    assert.deepEqual(stagingValue.planMetadata.extensions.acceptance_contract.acceptance_criteria, ["AC-001"]);
   } finally {
     store?.close();
     await rm(home, { recursive: true, force: true });
@@ -1097,18 +1100,20 @@ test("revision documents reject missing, unknown, and non-string fields with JSO
       assert.deepEqual(details.map(({ path, message }) => ({ path, message })), [
         { path: "/spec", message: "must be a string" },
         { path: "/plan", message: "must be a string" },
+        { path: "/planMetadata", message: "is required" },
       ]);
-      return details.every(({ path, pointer, constraint, suggestion }) => pointer === path && constraint === "type" && suggestion.length > 0);
+      return details.every(({ path, pointer, constraint, suggestion }) => pointer === path && ["type", "required"].includes(constraint) && suggestion.length > 0);
     },
   );
   assert.throws(
-    () => assertRevisionDocuments({ spec: "spec", plan: "plan", extra: true, taskFiles: { "TASK-001.md": 1 } }),
+    () => assertRevisionDocuments({ spec: "spec", plan: "plan", planMetadata: { extensions: { acceptance_contract: planVerification } }, extra: true, taskFiles: { "TASK-001.md": 1 } }),
     (error: unknown) => {
       if (!(error instanceof ValidationError)) return false;
       const details = error.details as Array<{ path: string; pointer: string; constraint: string; message: string; suggestion: string }>;
       assert.deepEqual(details.map(({ path, message }) => ({ path, message })), [
         { path: "/extra", message: "unknown field" },
         { path: "/taskFiles/TASK-001.md", message: "must be a string" },
+        { path: "/taskMetadataFiles", message: "taskFiles and taskMetadataFiles must appear together" },
       ]);
       return details.every(({ path, pointer, constraint, suggestion }) => pointer === path && constraint.length > 0 && suggestion.length > 0);
     },
@@ -1140,7 +1145,7 @@ const tddSpecDocument = [
   "## 功能需求", "### REQ-001：需求", "- 对应验收：AC-001",
   "## 验收标准", "### AC-001：验收", "- Given：前置", "- When：操作", "- Then：结果",
   "- 覆盖需求：REQ-001", "- RED 判定：实现前命令失败", "- 可观察结果：退出码非零",
-  "- 边界反例：缺少输入", "- 建议测试层级：unit",
+  "- 边界反例：缺少输入", "- 建议测试层级：unit", "- 验证命令或证据路径：npm test",
   "## 数据与接口", "无", "## 兼容约束", "无", "## 安全约束", "无", "## 错误与边界", "无",
   "## 迁移发布回滚", "无", "## 已确认偏好", "无", "## 默认取舍", "无", "## 已关闭问题", "无", "## 未决问题", "无",
 ].join("\n");
@@ -1163,42 +1168,46 @@ const taskVerification = {
   }],
 };
 
-const contractSection = (heading: string, value: unknown): string => `## ${heading}\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
+const planMetadata = { extensions: { acceptance_contract: planVerification } };
+const taskMetadata = { extensions: { acceptance_contract: taskVerification } };
 const tddPlanDocument = [
   "# Plan", "## 方案摘要", "摘要", "## 实施步骤", "STEP-001 REQ-001 AC-001 TASK-001", "## 需求覆盖", "REQ-001 AC-001 TASK-001",
-  "## 验证", "npm test", contractSection("方案验收契约", planVerification), "## 发布与回滚", "无",
+  "## 验证", "npm test", "## 发布与回滚", "无",
 ].join("\n");
 const tddTaskDocument = [
-  "# Task", "TASK-001 REQ-001 AC-001", contractSection("任务验收契约", taskVerification),
+  "# Task", "TASK-001 REQ-001 AC-001",
 ].join("\n");
 
 test("planning verification contracts parse strictly and produce canonical digests", () => {
-  assert.deepEqual(parsePlanVerification(tddPlanDocument), planVerification);
-  assert.deepEqual(parseTaskVerification(tddTaskDocument), taskVerification);
+  assert.deepEqual(parsePlanVerification(planMetadata), planVerification);
+  assert.deepEqual(parseTaskVerification(taskMetadata), taskVerification);
   assert.equal(verificationDigest({ b: 2, a: 1 }), verificationDigest({ a: 1, b: 2 }));
 
-  assert.throws(() => parsePlanVerification(`${tddPlanDocument}\n${contractSection("方案验收契约", planVerification)}`), /exactly one/);
-  assert.throws(() => parsePlanVerification(tddPlanDocument.replace('"test_commands"', '"unknown"')), /unknown field/);
-  assert.throws(() => parsePlanVerification(contractSection("方案验收契约", { ...planVerification, acceptance_criteria: ["AC-invalid"] })), /invalid acceptance criterion id/);
-  assert.throws(() => parseTaskVerification(tddTaskDocument.replace('"red":', '"missing_red":')), /unknown field|red/);
-  assert.throws(() => parseTaskVerification(tddTaskDocument.replace('"green":', '"missing_green":')), /unknown field|green/);
-  assert.throws(() => parseTaskVerification(tddTaskDocument.replace('"refactor":', '"missing_refactor":')), /unknown field|refactor/);
+  assert.throws(() => parsePlanVerification({ extensions: { acceptance_contract: planVerification }, extra: true }), /unknown field/);
+  assert.throws(() => parsePlanVerification({ extensions: { acceptance_contract: { ...planVerification, acceptance_criteria: ["AC-invalid"] } } }), /invalid acceptance criterion id/);
+  assert.throws(() => parseTaskVerification({ extensions: { acceptance_contract: { ...taskVerification, tdd_cycles: [{ ...taskVerification.tdd_cycles[0], missing_red: {} }] } } }), /unknown field|red/);
+  assert.throws(() => parseTaskVerification({ extensions: { acceptance_contract: { ...taskVerification, tdd_cycles: [{ ...taskVerification.tdd_cycles[0], green: { missing_green: true } }] } } }), /unknown field|green/);
+  assert.throws(() => parseTaskVerification({ extensions: { acceptance_contract: { ...taskVerification, tdd_cycles: [{ ...taskVerification.tdd_cycles[0], refactor: { missing_refactor: true } }] } } }), /unknown field|refactor/);
 });
 
 test("planning preflight rejects incomplete TDD and inconsistent AC/task mappings", async () => {
   const project = await temporaryHome();
   try {
     const legacyPlan = ["# Plan", "## 方案摘要", "摘要", "## 实施步骤", "REQ-001", "## 需求覆盖", "REQ-001 AC-001", "## 验证", "npm test", "## 方案验收契约", "missing", "## 发布与回滚", "无"].join("\n");
-    await assert.rejects(() => preflightRevision(project, "20260820-tdd", "001", { spec: tddSpecDocument, plan: legacyPlan }), /JSON contract/);
+    await assert.rejects(() => preflightRevision(project, "20260820-tdd", "001", { spec: tddSpecDocument, plan: legacyPlan, planMetadata }), /legacy acceptance contract/);
     await assert.rejects(() => preflightRevision(project, "20260820-tdd", "001", {
       spec: tddSpecDocument,
       plan: tddPlanDocument,
+      planMetadata,
       taskFiles: { "TASK-001": tddTaskDocument.replaceAll("AC-001", "AC-002") },
+      taskMetadataFiles: { "TASK-001": taskMetadata },
     }), /unknown|mapping|coverage/i);
     await assert.doesNotReject(() => preflightRevision(project, "20260820-tdd", "001", {
       spec: tddSpecDocument,
       plan: tddPlanDocument,
+      planMetadata,
       taskFiles: { "TASK-001": tddTaskDocument },
+      taskMetadataFiles: { "TASK-001": taskMetadata },
     }));
   } finally {
     await rm(project, { recursive: true, force: true });
@@ -1211,8 +1220,31 @@ test("planning preflight accepts single-character non-empty TDD field values", a
     await assert.doesNotReject(() => preflightRevision(project, "20260820-tdd-short", "001", {
       spec: tddSpecDocument.replace("- 边界反例：缺少输入", "- 边界反例：无"),
       plan: tddPlanDocument,
+      planMetadata,
       taskFiles: { "TASK-001": tddTaskDocument },
+      taskMetadataFiles: { "TASK-001": taskMetadata },
     }));
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+test("sidecar metadata enforces pairing, preserves all task forms, and has stable bytes", async () => {
+  const project = await temporaryHome();
+  const base = { spec: tddSpecDocument, plan: tddPlanDocument, planMetadata };
+  try {
+    await assert.doesNotReject(() => preflightRevision(project, "20260821-sidecar-none", "001", base));
+    await assert.doesNotReject(() => preflightRevision(project, "20260821-sidecar-tasks", "001", { ...base, tasks: tddTaskDocument, tasksMetadata: taskMetadata }));
+    await assert.doesNotReject(() => preflightRevision(project, "20260821-sidecar-files", "001", { ...base, taskFiles: { "TASK-001": tddTaskDocument }, taskMetadataFiles: { "TASK-001": taskMetadata } }));
+    await assert.doesNotReject(() => preflightRevision(project, "20260821-sidecar-both", "001", { ...base, tasks: tddTaskDocument, tasksMetadata: taskMetadata, taskFiles: { "TASK-001": tddTaskDocument }, taskMetadataFiles: { "TASK-001": taskMetadata } }));
+    assert.doesNotThrow(() => assertRevisionCreateRunStage({ ...base, taskFiles: {}, taskMetadataFiles: {} }, "tasks_preview"));
+    assert.throws(() => assertRevisionCreateRunStage({ ...base, taskFiles: {}, taskMetadataFiles: {} }, "plan_ready"), /requires run stage tasks_preview/);
+    assert.throws(() => assertRevisionDocuments({ ...base, taskFiles: { "TASK-001": tddTaskDocument }, taskMetadataFiles: {} }), /identical TASK-xxx keys/);
+    assert.throws(() => parsePlanVerification({ extensions: { acceptance_contract: planVerification, other: true } }), /unknown field/);
+    const serialized = serializeDocumentMetadata({ extensions: { acceptance_contract: { ...planVerification, test_commands: ["npm test"] } } });
+    assert.equal(serialized.endsWith("\n"), true);
+    assert.equal(serialized, serializeDocumentMetadata({ extensions: { acceptance_contract: { test_commands: ["npm test"], task_mapping: planVerification.task_mapping, acceptance_steps: planVerification.acceptance_steps, acceptance_criteria: planVerification.acceptance_criteria } } }));
+    assert.notEqual(taskSourceDigest("tasks/TASK-001.md", "markdown", "tasks/TASK-001.metadata.json", serialized), taskSourceDigest("tasks/TASK-001.md", "markdown", "tasks/TASK-001.metadata.json", `${serialized} `));
   } finally {
     await rm(project, { recursive: true, force: true });
   }
