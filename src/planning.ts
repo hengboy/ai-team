@@ -9,7 +9,7 @@ import { canonicalizeInside } from "./security.js";
 const ID_RE = /\b(?:REQ|AC)-\d{3}\b/g;
 
 export const SPEC_SECTIONS = ["背景", "目标", "非目标", "用户场景", "功能需求", "验收标准", "数据与接口", "兼容约束", "安全约束", "错误与边界", "迁移发布回滚", "已确认偏好", "默认取舍", "已关闭问题", "未决问题"] as const;
-export const PLAN_SECTIONS = ["方案摘要", "实施步骤", "需求覆盖", "验证", "方案验收契约", "发布与回滚"] as const;
+export const PLAN_SECTIONS = ["方案摘要", "实施步骤", "需求覆盖", "验证", "发布与回滚"] as const;
 
 const ACCEPTANCE_ID_RE = /^AC-\d{3}$/;
 const REQUIREMENT_ID_RE = /^REQ-\d{3}$/;
@@ -47,6 +47,12 @@ export interface TaskVerification extends PlanVerification {
   tdd_cycles: TddCycle[];
 }
 
+export interface DocumentMetadata<T> {
+  extensions: {
+    acceptance_contract: T;
+  };
+}
+
 const contractObject = (value: unknown, path: string): Record<string, unknown> => {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new ValidationError(`${path} must be an object`);
   return value as Record<string, unknown>;
@@ -74,22 +80,6 @@ const stringList = (value: unknown, path: string, pattern?: RegExp, idName?: str
     if (invalid.length) throw new ValidationError(`${path} contains invalid ${idName ?? "id"}`, { invalid });
   }
   return result;
-};
-
-const parseContractBlock = (markdown: string, heading: string): unknown => {
-  const headings = [...markdown.matchAll(new RegExp(`^## ${heading}$`, "gm"))];
-  if (headings.length !== 1) throw new ValidationError(`${heading} must contain exactly one JSON contract block`);
-  const start = headings[0]!.index! + headings[0]![0].length;
-  const remainder = markdown.slice(start);
-  const nextHeading = remainder.search(/^##\s+/m);
-  const section = (nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder).trim();
-  const match = section.match(/^```json\s*\n([\s\S]*?)\n```$/);
-  if (!match) throw new ValidationError(`${heading} must contain exactly one fenced JSON contract`);
-  try {
-    return JSON.parse(match[1]!);
-  } catch (error) {
-    throw new ValidationError(`${heading} contains invalid JSON`, { cause: error instanceof Error ? error.message : String(error) });
-  }
 };
 
 const parseAcceptanceStep = (value: unknown, path: string): AcceptanceStep => {
@@ -146,14 +136,24 @@ const parsePlanVerificationValue = (value: unknown, task = false): PlanVerificat
   };
 };
 
-export const parsePlanVerification = (markdown: string): PlanVerification =>
-  parsePlanVerificationValue(parseContractBlock(markdown, "方案验收契约"));
+const parseDocumentMetadata = <T>(value: unknown, path: string, parse: (contract: unknown) => T): DocumentMetadata<T> => {
+  const metadata = contractObject(value, path);
+  exactFields(metadata, ["extensions"], path);
+  const extensions = contractObject(metadata.extensions, `${path}/extensions`);
+  exactFields(extensions, ["acceptance_contract"], `${path}/extensions`);
+  return { extensions: { acceptance_contract: parse(extensions.acceptance_contract) } };
+};
 
-export const parseTaskVerification = (markdown: string): TaskVerification => {
-  const value = contractObject(parseContractBlock(markdown, "任务验收契约"), "task verification");
-  const verification = parsePlanVerificationValue(value, true);
-  if (!Array.isArray(value.tdd_cycles) || value.tdd_cycles.length === 0) throw new ValidationError("/tdd_cycles must be a non-empty array");
-  const tddCycles = value.tdd_cycles.map((entry, index): TddCycle => {
+export const parsePlanMetadata = (value: unknown): DocumentMetadata<PlanVerification> =>
+  parseDocumentMetadata(value, "plan metadata", (contract) => parsePlanVerificationValue(contract));
+
+export const parseTaskMetadata = (input: unknown): DocumentMetadata<TaskVerification> => {
+  const valueObject = contractObject(input, "task metadata");
+  const metadata = parseDocumentMetadata(valueObject, "task metadata", (contract) => parsePlanVerificationValue(contract, true));
+  const contract = contractObject(valueObject.extensions && contractObject(valueObject.extensions, "task metadata/extensions").acceptance_contract, "task verification");
+  const verification = metadata.extensions.acceptance_contract as TaskVerification;
+  if (!Array.isArray(contract.tdd_cycles) || contract.tdd_cycles.length === 0) throw new ValidationError("/tdd_cycles must be a non-empty array");
+  const tddCycles = contract.tdd_cycles.map((entry, index): TddCycle => {
     const path = `/tdd_cycles/${index}`;
     const cycle = contractObject(entry, path);
     exactFields(cycle, ["acceptance_criterion", "test_path", "red", "green", "refactor"], path);
@@ -182,7 +182,25 @@ export const parseTaskVerification = (markdown: string): TaskVerification => {
     };
   });
   assertMappedExactly(verification.acceptance_criteria, tddCycles.map(({ acceptance_criterion }) => [acceptance_criterion]), "/tdd_cycles");
-  return { ...verification, tdd_cycles: tddCycles };
+  return { extensions: { acceptance_contract: { ...verification, tdd_cycles: tddCycles } } };
+};
+
+export const parsePlanVerification = (metadata: unknown): PlanVerification => parsePlanMetadata(metadata).extensions.acceptance_contract;
+
+export const parseTaskVerification = (metadata: unknown): TaskVerification => parseTaskMetadata(metadata).extensions.acceptance_contract;
+
+export const serializeDocumentMetadata = (metadata: DocumentMetadata<PlanVerification> | DocumentMetadata<TaskVerification>): string =>
+  `${JSON.stringify(JSON.parse(stableJson(metadata)), null, 2)}\n`;
+
+export const taskSourceDigest = (markdownPath: string, markdown: string, metadataPath: string, metadata: string): string =>
+  sha256(`${markdownPath}\n${markdown}\n${metadataPath}\n${metadata}`);
+
+const legacyContractHeadings = (markdown: string): string[] =>
+  [...markdown.matchAll(/^##\s+(方案验收契约|任务验收契约)\s*$/gm)].map((match) => match[1]!);
+
+export const assertNoLegacyContractHeadings = (markdown: string, name: string): void => {
+  const headings = legacyContractHeadings(markdown);
+  if (headings.length) throw new ValidationError(`${name} contains legacy acceptance contract heading; use metadata sidecar instead`, { headings });
 };
 
 export const verificationDigest = (verification: PlanVerification | TaskVerification | unknown): string =>
@@ -230,8 +248,11 @@ export const nextPlanState = (current: string, target: string): string => {
 export interface RevisionDocuments {
   spec: string;
   plan: string;
+  planMetadata: DocumentMetadata<PlanVerification>;
   tasks?: string;
+  tasksMetadata?: DocumentMetadata<TaskVerification>;
   taskFiles?: Record<string, string>;
+  taskMetadataFiles?: Record<string, DocumentMetadata<TaskVerification>>;
 }
 
 export const hasTaskDocuments = (docs: RevisionDocuments): boolean =>
@@ -244,7 +265,7 @@ export function assertRevisionDocuments(value: unknown): asserts value is Revisi
     throw new ValidationError("revision documents are invalid", [{ path: "/", message: "must be an object" }]);
   }
   const documents = value as Record<string, unknown>;
-  const allowed = new Set(["spec", "plan", "tasks", "taskFiles"]);
+  const allowed = new Set(["spec", "plan", "planMetadata", "tasks", "tasksMetadata", "taskFiles", "taskMetadataFiles"]);
   const errors: Array<{ path: string; pointer?: string; constraint?: string; message: string; suggestion?: string }> = Object.keys(documents)
     .filter((key) => !allowed.has(key))
     .map((key) => ({ path: `/${pointer(key)}`, pointer: `/${pointer(key)}`, constraint: "additionalProperties", message: "unknown field", suggestion: "Use the planning-documents fields spec, plan, tasks, and taskFiles." }));
@@ -253,6 +274,16 @@ export function assertRevisionDocuments(value: unknown): asserts value is Revisi
   }
   if (documents.tasks !== undefined && typeof documents.tasks !== "string") {
     errors.push({ path: "/tasks", pointer: "/tasks", constraint: "type", message: "must be a string", suggestion: "Set tasks to the complete tasks.md Markdown document." });
+  }
+  if (documents.planMetadata === undefined) {
+    errors.push({ path: "/planMetadata", pointer: "/planMetadata", constraint: "required", message: "is required", suggestion: "Set planMetadata.extensions.acceptance_contract to the plan verification contract." });
+  } else {
+    try { parsePlanMetadata(documents.planMetadata); } catch (error) { errors.push({ path: "/planMetadata", pointer: "/planMetadata", constraint: "contract", message: error instanceof Error ? error.message : String(error), suggestion: "Use only extensions.acceptance_contract with a valid plan verification contract." }); }
+  }
+  if ((documents.tasks === undefined) !== (documents.tasksMetadata === undefined)) {
+    errors.push({ path: "/tasksMetadata", pointer: "/tasksMetadata", constraint: "paired", message: "tasks and tasksMetadata must appear together", suggestion: "Provide both tasks and tasksMetadata, or omit both." });
+  } else if (documents.tasksMetadata !== undefined) {
+    try { parseTaskMetadata(documents.tasksMetadata); } catch (error) { errors.push({ path: "/tasksMetadata", pointer: "/tasksMetadata", constraint: "contract", message: error instanceof Error ? error.message : String(error), suggestion: "Use a valid task metadata sidecar." }); }
   }
   if (documents.taskFiles !== undefined) {
     if (!documents.taskFiles || typeof documents.taskFiles !== "object" || Array.isArray(documents.taskFiles)) {
@@ -264,6 +295,21 @@ export function assertRevisionDocuments(value: unknown): asserts value is Revisi
           errors.push({ path, pointer: path, constraint: "type", message: "must be a string", suggestion: "Set each taskFiles value to a complete task Markdown document." });
         }
       }
+    }
+  }
+  if ((documents.taskFiles === undefined) !== (documents.taskMetadataFiles === undefined)) {
+    errors.push({ path: "/taskMetadataFiles", pointer: "/taskMetadataFiles", constraint: "paired", message: "taskFiles and taskMetadataFiles must appear together", suggestion: "Provide both taskFiles and taskMetadataFiles, or omit both." });
+  } else if (documents.taskMetadataFiles !== undefined) {
+    if (!documents.taskMetadataFiles || typeof documents.taskMetadataFiles !== "object" || Array.isArray(documents.taskMetadataFiles)) {
+      errors.push({ path: "/taskMetadataFiles", message: "must be an object" });
+    } else {
+      for (const [name, metadata] of Object.entries(documents.taskMetadataFiles)) {
+        const path = `/taskMetadataFiles/${pointer(name)}`;
+        try { parseTaskMetadata(metadata); } catch (error) { errors.push({ path, pointer: path, constraint: "contract", message: error instanceof Error ? error.message : String(error), suggestion: "Use a valid task metadata sidecar." }); }
+      }
+      const fileKeys = Object.keys(documents.taskFiles ?? {}).sort();
+      const metadataKeys = Object.keys(documents.taskMetadataFiles).sort();
+      if (JSON.stringify(fileKeys) !== JSON.stringify(metadataKeys)) errors.push({ path: "/taskMetadataFiles", pointer: "/taskMetadataFiles", constraint: "keySet", message: "taskFiles and taskMetadataFiles must have identical TASK-xxx keys", suggestion: "Add or remove matching task Markdown and metadata entries." });
     }
   }
   if (errors.length) throw new ValidationError("revision documents are invalid", errors);
@@ -338,14 +384,14 @@ const assertSpecTddContract = (spec: string): string[] => {
 const assertVerificationMappings = (docs: RevisionDocuments, specCriteria: string[], planVerification: PlanVerification): void => {
   exactIdSet(specCriteria, planVerification.acceptance_criteria, "plan verification acceptance criteria do not match spec.md");
   const taskDocuments = [
-    ...(docs.tasks === undefined ? [] : [{ name: "tasks", document: docs.tasks }]),
-    ...Object.entries(docs.taskFiles ?? {}).map(([name, document]) => ({ name, document })),
+    ...(docs.tasksMetadata === undefined ? [] : [{ name: "tasks", metadata: docs.tasksMetadata }]),
+    ...Object.entries(docs.taskMetadataFiles ?? {}).map(([name, metadata]) => ({ name, metadata })),
   ];
   if (!taskDocuments.length) return;
   const taskMappings = new Map<string, string[]>();
   const hasIndividualTasks = Object.keys(docs.taskFiles ?? {}).length > 0;
-  for (const { name, document } of taskDocuments) {
-    const verification = parseTaskVerification(document);
+  for (const { name, metadata } of taskDocuments) {
+    const verification = parseTaskVerification(metadata);
     exactIdSet(verification.acceptance_criteria, verification.tdd_cycles.map(({ acceptance_criterion }) => acceptance_criterion), `${name} TDD cycles do not match its acceptance criteria`);
     if (name === "tasks") {
       exactIdSet(planVerification.acceptance_criteria, verification.acceptance_criteria, "tasks verification acceptance criteria do not match plan verification");
@@ -379,8 +425,11 @@ export const preflightRevision = async (project: string, planId: string, revisio
   try { await stat(revisionPath); throw new ValidationError("planning revisions are immutable; create a new revision"); } catch (error) { if (error instanceof ValidationError) throw error; }
   assertSections(docs.spec, SPEC_SECTIONS, "spec.md");
   assertSections(docs.plan, PLAN_SECTIONS, "plan.md");
+  assertNoLegacyContractHeadings(docs.plan, "plan.md");
+  if (docs.tasks !== undefined) assertNoLegacyContractHeadings(docs.tasks, "tasks.md");
+  for (const [taskId, document] of Object.entries(docs.taskFiles ?? {})) assertNoLegacyContractHeadings(document, `${taskId}.md`);
   const specCriteria = assertSpecTddContract(docs.spec);
-  const planVerification = parsePlanVerification(docs.plan);
+  const planVerification = parsePlanVerification(docs.planMetadata);
   assertVerificationMappings(docs, specCriteria, planVerification);
   assertCoverage(docs.spec, [docs.plan, docs.tasks ?? "", ...Object.values(docs.taskFiles ?? {})]);
   for (const taskId of Object.keys(docs.taskFiles ?? {})) {
@@ -388,7 +437,7 @@ export const preflightRevision = async (project: string, planId: string, revisio
   }
   return {
     path: revisionPath,
-    digest: sha256([docs.spec, docs.plan, docs.tasks ?? "", ...Object.values(docs.taskFiles ?? {})].join("\n")),
+    digest: sha256(stableJson(docs)),
   };
 };
 
@@ -403,11 +452,16 @@ export const writeRevision = async (project: string, planId: string, revision: s
     const wrap = (body: string): string => `---\n${frontmatter}---\n\n${body.trim()}\n`;
     await writeFile(join(revisionPath, "spec.md"), wrap(docs.spec));
     await writeFile(join(revisionPath, "plan.md"), wrap(docs.plan));
-    if (docs.tasks) await writeFile(join(revisionPath, "tasks.md"), wrap(docs.tasks));
+    await writeFile(join(revisionPath, "plan.metadata.json"), serializeDocumentMetadata(parsePlanMetadata(docs.planMetadata)));
+    if (docs.tasks !== undefined) {
+      await writeFile(join(revisionPath, "tasks.md"), wrap(docs.tasks));
+      await writeFile(join(revisionPath, "tasks.metadata.json"), serializeDocumentMetadata(parseTaskMetadata(docs.tasksMetadata!)));
+    }
     if (docs.taskFiles) {
       await mkdir(join(revisionPath, "tasks"));
       for (const [taskId, content] of Object.entries(docs.taskFiles)) {
         await writeFile(join(revisionPath, "tasks", `${taskId}.md`), wrap(content));
+        await writeFile(join(revisionPath, "tasks", `${taskId}.metadata.json`), serializeDocumentMetadata(parseTaskMetadata(docs.taskMetadataFiles![taskId])));
       }
     }
     try { await readFile(join(planRoot, "plan.yaml")); } catch { await writeFile(join(planRoot, "plan.yaml"), YAML.stringify({ plan_id: planId, active_revision: revision })); createdPlanMetadata = true; }

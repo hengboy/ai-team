@@ -20,14 +20,14 @@ export interface AgentBuildManifest { schema_version: number; template_version: 
 export interface AgentBuildRole { id: Role; purpose: string; writes: string[]; staging: { owned_entries: StagingKind[] }; delegates: Role[]; commands: string[]; discovery: boolean; enforcement: Record<string, Enforcement>; execution: RoleExecutionPolicy; body: string; }
 export interface EnvironmentFile { name: string; platforms: AgentBuildPlatform[]; defaults: Record<string, Record<string, unknown>>; overrides?: Record<string, Record<string, Record<string, unknown>>>; }
 export interface AgentBuild { root: string; manifest: AgentBuildManifest; roles: Record<Role, AgentBuildRole>; environments: Record<string, EnvironmentFile>; templates: Record<string, string>; instructions: string; digest: string; templateVersion: number; }
-export interface RenderContext { role: Role; purpose: string; allowed_commands: string; delegates: string; discovery: string; stop_conditions: string; platform: AgentBuildPlatform; environment: string; contract_digest: string; role_manifest_digest: string; template_version: number; spec_template: string; plan_template: string; task_template: string; }
+export interface RenderContext { role: Role; purpose: string; allowed_commands: string; delegates: string; discovery: string; stop_conditions: string; platform: AgentBuildPlatform; environment: string; contract_digest: string; role_manifest_digest: string; template_version: number; spec_template: string; plan_template: string; task_template: string; plan_metadata_template: string; task_metadata_template: string; }
 
 const supportedPlatforms: AgentBuildPlatform[] = ["codex", "claude", "opencode"];
 const reasoningValues = new Set(["low", "medium", "high", "xhigh"]);
 const effortValues = new Set(["low", "medium", "high"]);
 const variantValues = new Set(["low", "medium", "high"]);
 const supportedCommandPrefixes = ["planning start", "planning revision ", "planning tasks ", "coding start", "context ", "dispatch ", "decision create", "staging ", "scope check", "run ", "review ", "research ", "git ", "install", "env ", "backup restore", "uninstall"];
-const allowedVariables = new Set(["role", "purpose", "allowed_commands", "delegates", "discovery", "stop_conditions", "platform", "environment", "contract_digest", "role_manifest_digest", "template_version", "spec_template", "plan_template", "task_template"]);
+const allowedVariables = new Set(["role", "purpose", "allowed_commands", "delegates", "discovery", "stop_conditions", "platform", "environment", "contract_digest", "role_manifest_digest", "template_version", "spec_template", "plan_template", "task_template", "plan_metadata_template", "task_metadata_template"]);
 const packageRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const expectedSchemas = ["manifest-v1.json", "role-v1.json", "environment-v1.json"] as const;
 
@@ -179,9 +179,13 @@ function parseAndValidate(root: string): AgentBuild {
   if (!Object.keys(environments).length) fail("agent-build has no environments");
   const templateDir = assertSafe(root, manifest.template_directory);
   if (!existsSync(templateDir) || !lstatSync(templateDir).isDirectory()) fail("agent-build template directory is missing");
-  const expectedTemplates = new Set(["spec.md", "plan.md", "task.md"]);
+  const expectedTemplates = new Set(["spec.md", "plan.md", "task.md", "plan.metadata.json", "task.metadata.json"]);
   const templates: Record<string, string> = {};
-  for (const file of readdirSync(templateDir)) { if (!expectedTemplates.has(file)) fail(`unexpected agent-build template resource: ${file}`); templates[file.slice(0, -3)] = readText(root, join(manifest.template_directory, file)); }
+  for (const file of readdirSync(templateDir)) {
+    if (!expectedTemplates.has(file)) fail(`unexpected agent-build template resource: ${file}`);
+    const key = file === "plan.metadata.json" ? "planMetadata" : file === "task.metadata.json" ? "taskMetadata" : file.slice(0, -3);
+    templates[key] = readText(root, join(manifest.template_directory, file));
+  }
   for (const file of expectedTemplates) if (!existsSync(join(templateDir, file))) fail(`agent-build template is missing: ${file}`);
   const declaredFiles = new Set(["manifest.yaml", manifest.instructions]);
   for (const role of ROLES) { declaredFiles.add(join(manifest.role_directory, `${role}.yaml`)); declaredFiles.add(join(manifest.role_directory, `${role}.md`)); }

@@ -54,6 +54,28 @@ ai-team install
 .ai-team/plans/<plan-id>/revisions/<revision>/
 ```
 
+每个 revision 至少包含 `spec.md`、`plan.md` 和 `plan.metadata.json`。验收契约只保存在
+sidecar JSON：`plan.metadata.json`、`tasks.metadata.json` 以及
+`tasks/TASK-xxx.metadata.json`；任务 Markdown 仍是任务的 `source_path`。metadata 根对象
+只能是 `extensions`，其中当前只允许 `acceptance_contract`。
+
+`planning revision create` 与 `validate` 的 documents 输入使用以下字段：
+
+```json
+{
+  "spec": "...",
+  "plan": "...",
+  "planMetadata": { "extensions": { "acceptance_contract": { "acceptance_criteria": ["AC-001"], "acceptance_steps": [{ "id": "VERIFY-001", "acceptance_criteria": ["AC-001"], "command": "npm test", "expected_result": "passes" }], "task_mapping": [{ "task_id": "TASK-001", "acceptance_criteria": ["AC-001"] }], "test_commands": ["npm test"] } },
+  "taskFiles": { "TASK-001": "..." },
+  "taskMetadataFiles": { "TASK-001": { "extensions": { "acceptance_contract": { "...": "task verification" } } }
+}
+```
+
+支持四种任务组合：不提供任务文档、仅 `tasks` 与 `tasksMetadata`、仅 `taskFiles` 与
+`taskMetadataFiles`、以及两者同时提供。每对字段必须同时出现；独立任务两张 map 的
+`TASK-xxx` 键集合必须完全一致。空的两张 map 仍表示任务预览输入并要求 `tasks_preview`，
+不会转换成 no-split；no-split 的 plan 契约可预声明尚未生成文档的任务。
+
 只有 `ready` 修订可以进入计划内编码。编码始终记录当前目标分支的 HEAD 作为
 实现基线；目标 worktree 不干净时会被阻止，并使用 `.worktrees/` 下受管理的
 worktree。计划内编码启动时会创建一个由运行拥有、名为
@@ -218,6 +240,10 @@ SIGTERM 分别返回 130 和 143。`--human` 对 status、resolved environment�
 
 重新生成或安装代理前，请升级兼容的 CLI。AI Team 不会扫描、迁移或删除历史
 `$TMPDIR/opencode` 文件。
+
+验收契约 sidecar 是不兼容格式变更：旧 Markdown 的 `方案验收契约` 或 `任务验收契约`
+H2 会被拒绝，旧 revision 或 run 缺少所需 sidecar、或保存旧式 task source digest 时会
+明确失败。系统不会补写、迁移历史 revision/run，也不会回退读取 Markdown 内嵌契约。
 
 ## 开发
 

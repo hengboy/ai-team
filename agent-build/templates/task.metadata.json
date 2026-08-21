@@ -1,0 +1,31 @@
+{
+  "extensions": {
+    "acceptance_contract": {
+      "acceptance_criteria": ["AC-001"],
+      "acceptance_steps": [
+        {
+          "id": "VERIFY-001",
+          "acceptance_criteria": ["AC-001"],
+          "command": "<任务验收命令>",
+          "expected_result": "<可观察的通过结果>"
+        }
+      ],
+      "task_mapping": [
+        {
+          "task_id": "TASK-001",
+          "acceptance_criteria": ["AC-001"]
+        }
+      ],
+      "test_commands": ["<任务完整测试命令>"],
+      "tdd_cycles": [
+        {
+          "acceptance_criterion": "AC-001",
+          "test_path": "<冻结的测试路径>",
+          "red": { "command": "<实施前命令>", "expected_failure": "<预期失败断言或退出状态>" },
+          "green": { "implementation_steps": ["<最小实现步骤>"], "command": "<实施后命令>", "expected_result": "<预期通过结果>" },
+          "refactor": { "scope": "<允许的整理范围；无则明确写无>", "command": "<重构后命令>", "expected_result": "<行为保持通过的结果>" }
+        }
+      ]
+    }
+  }
+}

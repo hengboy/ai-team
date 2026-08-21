@@ -214,7 +214,20 @@ export class StagingStore {
     const runDirectory = stagingRunDirectory(this.paths.staging, input.runId);
     await ensureManagedDirectory(this.paths.staging, runDirectory);
     const path = stagingFilePath(this.paths.staging, input.runId, sequence.sequence_no, input.kind, input.role);
-    const defaultJson = input.kind === "planning-documents" ? '{"spec":"","plan":""}' : "null";
+  const defaultJson = input.kind === "planning-documents" ? JSON.stringify({
+    spec: "",
+    plan: "",
+    planMetadata: {
+      extensions: {
+        acceptance_contract: {
+          acceptance_criteria: ["AC-001"],
+          acceptance_steps: [{ id: "VERIFY-001", acceptance_criteria: ["AC-001"], command: "<自动化验收命令>", expected_result: "<可观察的通过结果>" }],
+          task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
+          test_commands: ["<完整方案测试命令>"],
+        },
+      },
+    },
+  }) : "null";
     const content = await writeManagedJsonFile(this.paths.staging, path, input.initialJson ?? defaultJson);
     const timestamp = now.toISOString();
     const expiresAt = new Date(now.getTime() + retentionHours * 60 * 60 * 1000).toISOString();

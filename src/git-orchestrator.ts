@@ -1,4 +1,5 @@
 import { mkdir, readdir, realpath, stat } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { dirname, join, relative } from "node:path";
 import { ValidationError } from "./errors.js";
 import { applyAuthorityCommitPreservingDirtyWork, applyAuthorityPaths, AuthorityApplyConflictError, commitPaths, createWorktree, currentBranch, currentHead, git, mergeNoFastForward, worktreeStatus } from "./git.js";
@@ -7,6 +8,7 @@ import { StateStore } from "./state.js";
 import { sha256, stableJson, toPosix } from "./utils.js";
 import { ScopeGate } from "./gates.js";
 import { DispatchService } from "./dispatch.js";
+import { taskSourceDigest } from "./planning.js";
 import {
   completedMergeOwnershipPartialEffect,
   resolveMergeIntegrationWorktree,
@@ -445,6 +447,20 @@ export class GitOrchestrator {
     if (head !== request.expectedHead) throw new ValidationError("worktree HEAD does not match expected HEAD", { expected: request.expectedHead, actual: head });
     const branch = await currentBranch(canonical);
     if (branch !== row.branch) throw new ValidationError("worktree branch does not match its managed registration");
+    const metadataPath = String(sourceTask.source_path).replace(/\.md$/, ".metadata.json");
+    if (metadataPath === sourceTask.source_path || !/^[a-f0-9]{40}$/.test(sourceRevision.plan_commit ?? "")) {
+      throw new ValidationError("source task has no valid frozen sidecar metadata");
+    }
+    try {
+      const source = execFileSync("git", ["-C", target.root, "show", `${sourceRevision.plan_commit}:${sourceTask.source_path}`], { encoding: "utf8" });
+      const metadata = execFileSync("git", ["-C", target.root, "show", `${sourceRevision.plan_commit}:${metadataPath}`], { encoding: "utf8" });
+      if (taskSourceDigest(sourceTask.source_path, source, metadataPath, metadata) !== sourceTask.source_digest) {
+        throw new ValidationError("source task digest does not match frozen Markdown and sidecar metadata");
+      }
+    } catch (error) {
+      if (error instanceof ValidationError) throw error;
+      throw new ValidationError("source task sidecar metadata could not be read from the frozen plan commit");
+    }
     const statusEntries = (await git(canonical, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout.split("\0").filter(Boolean);
     const dirty = new Set<string>();
     for (let index = 0; index < statusEntries.length; index += 1) {

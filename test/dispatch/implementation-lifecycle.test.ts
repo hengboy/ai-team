@@ -11,6 +11,7 @@ import { GitOrchestrator } from "../../src/git-orchestrator.js";
 import { ReviewService } from "../../src/review.js";
 import { verificationDigest } from "../../src/planning.js";
 import { sha256 } from "../../src/utils.js";
+import { taskSourceDigest } from "../../src/planning.js";
 import { completedResult, createRun, dispatchPacket, projectContext, temporaryDirectory, withStore } from "../helpers/dispatch.js";
 import { REVIEW_COMMON_DIR, REVIEW_HEAD } from "../helpers/git.js";
 
@@ -1042,6 +1043,7 @@ test("planned resume supersedes a side-effect-free prepare claim with frozen tas
         await writeFile(join(repository, ".ai-team", "plans", "task-recovery", "revisions", revision, "plan.md"), "# plan\n");
         for (const [taskId, content] of taskContents) {
           await writeFile(join(repository, ".ai-team", "plans", "task-recovery", "revisions", revision, "tasks", `${taskId}.md`), content);
+          await writeFile(join(repository, ".ai-team", "plans", "task-recovery", "revisions", revision, "tasks", `${taskId}.metadata.json`), "{}\n");
         }
       }
       await writeFile(join(repository, "MEMORY.md"), "# fixture\n");
@@ -1062,12 +1064,15 @@ test("planned resume supersedes a side-effect-free prepare claim with frozen tas
         .run(planId, "003", repoId, targetDigest, baseCommit, "002", new Date().toISOString());
       const sourceRunId = store.createRun({ repoId, profile: "coding", mode: "planned", planId, revision: "002", baseCommit, targetBranch: "main", planDigest: sourceDigest });
       const targetRunId = store.createRun({ repoId, profile: "coding", mode: "planned", planId, revision: "003", baseCommit, targetBranch: "main", planDigest: targetDigest });
-      const tasks = [...taskContents].map(([taskId, content]) => ({
+      const tasks = [...taskContents].map(([taskId, content]) => {
+        const sourcePath = `.ai-team/plans/${planId}/revisions/003/tasks/${taskId}.md`;
+        const metadataPath = sourcePath.replace(/\.md$/, ".metadata.json");
+        return {
         task_id: taskId,
-        source_path: `.ai-team/plans/${planId}/revisions/003/tasks/${taskId}.md`,
-        source_digest: sha256(content),
+        source_path: sourcePath,
+        source_digest: taskSourceDigest(sourcePath, content, metadataPath, "{}\n"),
         write_paths: taskId === "TASK-001" ? ["README.md", "src/recovery.ts", "untracked.txt"] : ["src/task-two.ts"],
-      }));
+      }; });
       store.initializeRunTasks(sourceRunId, tasks);
       store.initializeRunTasks(targetRunId, tasks);
       const sourcePath = join(repository, ".worktrees", "tasks", planId, "task-001");
@@ -1159,11 +1164,14 @@ test("planned Test submit binds pre_commit to developer modified_paths instead o
       await mkdir(join(repository, "test"), { recursive: true });
       await mkdir(join(repository, ".ai-team", "index"), { recursive: true });
       const taskPath = ".ai-team/plans/modified-subset/revisions/001/tasks/TASK-001.md";
+      const taskMetadataPath = taskPath.replace(/\.md$/, ".metadata.json");
       const taskContent = "# TASK-001\n\n- 允许写入路径：planning/coding角色文件 及相关测试，`test/**`\n";
+      const taskMetadata = "{}\n";
       await mkdir(join(repository, ".ai-team", "plans", "modified-subset", "revisions", "001", "tasks"), { recursive: true });
       await writeFile(join(repository, "MEMORY.md"), "# fixture\n");
       await writeFile(join(repository, ".ai-team", "index", "feature-navigation.md"), "# fixture\n");
       await writeFile(join(repository, taskPath), taskContent);
+      await writeFile(join(repository, taskMetadataPath), taskMetadata);
       await writeFile(join(repository, ".ai-team", "plans", "modified-subset", "revisions", "001", "plan.md"), "# plan\n");
       await writeFile(join(repository, "src", "actual.ts"), "export const value = 1;\n");
       await writeFile(join(repository, "test", "allowed.test.ts"), "export {};\n");
@@ -1178,7 +1186,7 @@ test("planned Test submit binds pre_commit to developer modified_paths instead o
         .run("modified-subset", "001", repoId, "main", planDigest, baseCommit, new Date().toISOString());
       const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "modified-subset", revision: "001", planDigest });
       store.initializeRunTasks(runId, [{
-        task_id: "TASK-001", source_path: taskPath, source_digest: sha256(taskContent),
+        task_id: "TASK-001", source_path: taskPath, source_digest: taskSourceDigest(taskPath, taskContent, taskMetadataPath, taskMetadata),
         write_paths: ["src/actual.ts", "test/allowed.test.ts"],
       }]);
       const worktreeId = "worktree_modified_subset";

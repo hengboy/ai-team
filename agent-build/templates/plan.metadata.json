@@ -1,0 +1,22 @@
+{
+  "extensions": {
+    "acceptance_contract": {
+      "acceptance_criteria": ["AC-001"],
+      "acceptance_steps": [
+        {
+          "id": "VERIFY-001",
+          "acceptance_criteria": ["AC-001"],
+          "command": "<自动化验收命令>",
+          "expected_result": "<可观察的通过结果>"
+        }
+      ],
+      "task_mapping": [
+        {
+          "task_id": "TASK-001",
+          "acceptance_criteria": ["AC-001"]
+        }
+      ],
+      "test_commands": ["<完整方案测试命令>"]
+    }
+  }
+}

@@ -57,14 +57,16 @@ const commitPlanRevision = async (repository: { directory: string; head: string 
   await mkdir(path.join(revisionRoot, "tasks"), { recursive: true });
   await writeFile(path.join(planRoot, "plan.yaml"), `plan_id: ${planId}\nactive_revision: ${revision}\n`);
   await writeFile(path.join(revisionRoot, "spec.md"), `# ${planId} ${revision} spec\n`);
-  await writeFile(path.join(revisionRoot, "plan.md"), `# ${planId} ${revision} plan\n\n## 方案验收契约\n\n\`\`\`json\n${JSON.stringify(planVerification, null, 2)}\n\`\`\`\n`);
+  await writeFile(path.join(revisionRoot, "plan.md"), `# ${planId} ${revision} plan\n\n## 验证\n\nnpm test\n`);
+  await writeFile(path.join(revisionRoot, "plan.metadata.json"), `${JSON.stringify({ extensions: { acceptance_contract: planVerification } }, null, 2)}\n`);
   for (const taskId of taskIds) {
     const taskVerification = {
       ...planVerification,
       task_mapping: [{ task_id: taskId, acceptance_criteria: ["AC-001"] }],
       tdd_cycles: [{ acceptance_criterion: "AC-001", test_path: `test/${taskId.toLowerCase()}.test.ts`, red: { command: "npm test", expected_failure: "fails" }, green: { implementation_steps: ["implement"], command: "npm test", expected_result: "passes" }, refactor: { scope: "none", command: "npm test", expected_result: "passes" } }],
     };
-    await writeFile(path.join(revisionRoot, "tasks", `${taskId}.md`), `# ${taskId}\n\n- Allowed write paths: \`src/${taskId.toLowerCase()}.ts\`\n\n## 任务验收契约\n\n\`\`\`json\n${JSON.stringify(taskVerification, null, 2)}\n\`\`\`\n`);
+    await writeFile(path.join(revisionRoot, "tasks", `${taskId}.md`), `# ${taskId}\n\n- Allowed write paths: \`src/${taskId.toLowerCase()}.ts\`\n`);
+    await writeFile(path.join(revisionRoot, "tasks", `${taskId}.metadata.json`), `${JSON.stringify({ extensions: { acceptance_contract: taskVerification } }, null, 2)}\n`);
   }
   await git(repository.directory, "add", "--", path.relative(repository.directory, planRoot));
   await git(repository.directory, "commit", "-m", `freeze ${planId} ${revision}`);
@@ -713,9 +715,10 @@ test("revision preflight accepts legacy and canonical TDD acceptance field label
     task_mapping: [{ task_id: "TASK-001", acceptance_criteria: ["AC-001"] }],
     test_commands: ["npm test"],
   };
+  const planMetadata = { extensions: { acceptance_contract: planContract } };
   const plan = [
     "# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", "REQ-001 AC-001",
-    "## 验证", "验证", "## 方案验收契约", "```json", JSON.stringify(planContract), "```", "## 发布与回滚", "回滚",
+    "## 验证", "验证", "## 发布与回滚", "回滚",
   ].join("\n");
   const canonicalAcceptance = legacyAcceptance
     .replace("- RED：", "- RED 判定：")
@@ -723,10 +726,10 @@ test("revision preflight accepts legacy and canonical TDD acceptance field label
     .replace("- 验证命令或证据：", "- 验证命令或证据路径：");
 
   try {
-    await assert.doesNotReject(() => preflightRevision(project, "20260820-legacy-ac", "002", { spec: spec(legacyAcceptance), plan }, "001"));
-    await assert.doesNotReject(() => preflightRevision(project, "20260820-canonical-ac", "001", { spec: spec(canonicalAcceptance), plan }));
+    await assert.doesNotReject(() => preflightRevision(project, "20260820-legacy-ac", "002", { spec: spec(legacyAcceptance), plan, planMetadata }, "001"));
+    await assert.doesNotReject(() => preflightRevision(project, "20260820-canonical-ac", "001", { spec: spec(canonicalAcceptance), plan, planMetadata }));
     await assert.rejects(
-      () => preflightRevision(project, "20260820-missing-coverage", "001", { spec: spec(legacyAcceptance), plan: plan.replace("REQ-001 AC-001", "AC-001") }),
+      () => preflightRevision(project, "20260820-missing-coverage", "001", { spec: spec(legacyAcceptance), plan: plan.replace("REQ-001 AC-001", "AC-001"), planMetadata }),
       /planning coverage is incomplete/,
     );
 
@@ -744,7 +747,7 @@ test("revision preflight accepts legacy and canonical TDD acceptance field label
       const omitted = legacyAcceptance.split("\n").filter((candidate) => candidate !== line).join("\n");
       for (const acceptance of [omitted, legacyAcceptance.replace(line, `${line.slice(0, line.indexOf("：") + 1)}   `)]) {
         await assert.rejects(
-          () => preflightRevision(project, "20260820-invalid-ac", "001", { spec: spec(acceptance), plan }),
+          () => preflightRevision(project, "20260820-invalid-ac", "001", { spec: spec(acceptance), plan, planMetadata }),
           (error: unknown) => error instanceof ValidationError
             && (error.details as { missing: string[] }).missing.includes(field),
           `${field} must be present and non-empty`,
@@ -755,6 +758,7 @@ test("revision preflight accepts legacy and canonical TDD acceptance field label
       () => preflightRevision(project, "20260820-keyword-collision", "001", {
         spec: spec(`${legacyAcceptance.split("\n").filter((line) => !line.startsWith("- 验证命令或证据：")).join("\n")}\n正文提到验证命令或证据但不是字段。`),
         plan,
+        planMetadata,
       }),
       (error: unknown) => error instanceof ValidationError
         && (error.details as { missing: string[] }).missing.includes("验证命令"),
@@ -778,8 +782,10 @@ test("revision writing enforces coverage, frontmatter, and immutability", async 
     ...planContract,
     tdd_cycles: [{ acceptance_criterion: "AC-001", test_path: "test/example.test.ts", red: { command: "npm test", expected_failure: "fails" }, green: { implementation_steps: ["implement"], command: "npm test", expected_result: "passes" }, refactor: { scope: "none", command: "npm test", expected_result: "passes" } }],
   };
-  const planDocument = ["# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", "REQ-001 AC-001", "## 验证", "验证", "## 方案验收契约", "```json", JSON.stringify(planContract), "```", "## 发布与回滚", "回滚"].join("\n");
-  const taskDocument = ["# Tasks", "REQ-001 AC-001 TASK-001", "## 任务验收契约", "```json", JSON.stringify(taskContract), "```"].join("\n");
+  const planMetadata = { extensions: { acceptance_contract: planContract } };
+  const taskMetadata = { extensions: { acceptance_contract: taskContract } };
+  const planDocument = ["# Plan", "## 方案摘要", "摘要", "## 实施步骤", "步骤", "## 需求覆盖", "REQ-001 AC-001", "## 验证", "验证", "## 发布与回滚", "回滚"].join("\n");
+  const taskDocument = ["# Tasks", "REQ-001 AC-001 TASK-001"].join("\n");
   try {
     assert.deepEqual(validateCoverage("REQ-001 AC-001", ["REQ-001 REQ-999"]), {
       requirements: ["AC-001", "REQ-001"],
@@ -793,21 +799,24 @@ test("revision writing enforces coverage, frontmatter, and immutability", async 
         && assert.deepEqual((error.details as Array<{ path: string; message: string }>).map(({ path, message }) => ({ path, message })), [
           { path: "/spec", message: "must be a string" },
           { path: "/plan", message: "must be a string" },
+          { path: "/planMetadata", message: "is required" },
         ]) === undefined,
     );
     await assert.rejects(
-      () => writeRevision(project, planId, "001", "main", { spec: "REQ-001 AC-001", plan: "REQ-001 AC-001" }),
+      () => writeRevision(project, planId, "001", "main", { spec: "REQ-001 AC-001", plan: "REQ-001 AC-001", planMetadata }),
       /missing required sections/,
     );
     await assert.rejects(
-      () => writeRevision(project, planId, "001", "main", { spec: specDocument, plan: planDocument.replace("REQ-001 AC-001", "AC-001") }),
+      () => writeRevision(project, planId, "001", "main", { spec: specDocument, plan: planDocument.replace("REQ-001 AC-001", "AC-001"), planMetadata }),
       /coverage is incomplete/,
     );
 
     const written = await writeRevision(project, planId, "001", "main", {
       spec: specDocument,
       plan: planDocument,
+      planMetadata,
       tasks: taskDocument,
+      tasksMetadata: taskMetadata,
     }, "000");
     const spec = await readFile(path.join(written.path, "spec.md"), "utf8");
     assert.match(spec, /^---\nplan_id: 20260813-workflow\nrevision: "001"\ntarget_branch: main\nsupersedes: "000"\n---\n\n# Spec/);
@@ -817,13 +826,15 @@ test("revision writing enforces coverage, frontmatter, and immutability", async 
       () => writeRevision(project, "20260813-workflow-abcd", "002", "main", {
         spec: specDocument,
         plan: planDocument,
+        planMetadata,
         tasks: taskDocument,
+        tasksMetadata: taskMetadata,
       }),
       /invalid plan id/,
     );
 
     await assert.rejects(
-      () => writeRevision(project, planId, "001", "main", { spec: "REQ-002", plan: "REQ-002" }),
+      () => writeRevision(project, planId, "001", "main", { spec: "REQ-002", plan: "REQ-002", planMetadata }),
       /revisions are immutable/,
     );
     assert.equal(await readFile(path.join(written.path, "spec.md"), "utf8"), spec);
