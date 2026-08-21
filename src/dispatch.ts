@@ -1878,7 +1878,28 @@ export class DispatchService {
         const repairDispatchId = repairableTest
           ? this.createTestRepair(runId, dispatchId, JSON.parse(row.packet_json) as DispatchPacket, result)
           : undefined;
-        if (!repairDispatchId) this.store.db.prepare("UPDATE runs SET state=?,updated_at=? WHERE run_id=?")
+        const packet = JSON.parse(row.packet_json) as DispatchPacket;
+        const blockedTestRepair = (role === "frontend-developer" || role === "backend-developer")
+          && packet.context.phase === "test_repair"
+          && result.status === "failed"
+          && result.failure_class === "allowed_path_blocked"
+          && result.side_effect_state === "completed";
+        if (blockedTestRepair) {
+          const decisionId = this.store.createDecision(
+            runId,
+            "Frozen Test repair is blocked by a path outside the Developer packet scope.",
+            [
+              { id: "retry", label: "Retry recovery", impact: "Preserve the frozen scope and retry through the supported recovery path." },
+              { id: "abort", label: "Abort run", impact: "Stop this run while preserving its recorded repair evidence." },
+            ],
+            "retry",
+            "active_run_recovery",
+            dispatchId,
+          );
+          this.store.db.prepare("UPDATE runs SET state='needs_decision',stage='coding',updated_at=? WHERE run_id=?")
+            .run(new Date().toISOString(), runId);
+          this.store.event(runId, "test.repair_scope_blocked", { dispatch_id: dispatchId, decision_id: decisionId, failure_class: result.failure_class });
+        } else if (!repairDispatchId) this.store.db.prepare("UPDATE runs SET state=?,updated_at=? WHERE run_id=?")
           .run(result.status === "needs_decision" || result.status === "retryable_failure" && result.decisions_needed.length === 1 ? "needs_decision" : result.status === "retryable_failure" ? "retryable_failure" : "failed", new Date().toISOString(), runId);
       }
     });

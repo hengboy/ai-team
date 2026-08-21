@@ -312,6 +312,74 @@ test("resume completes a failed Test repair Coding continuation with its origina
   });
 });
 
+test("blocked frozen Test repair preserves evidence and creates an explicit recovery decision", async () => {
+  await withStore(async (store) => {
+    const repoId = "repo-review-fixture";
+    store.registerRepository(repoId, join(process.cwd(), REVIEW_COMMON_DIR), process.cwd());
+    const runId = store.createRun({ repoId, profile: "coding", mode: "planned", planId: "blocked-repair", revision: "001" });
+    store.initializeRunTasks(runId, [{ task_id: "TASK-001", source_path: "tasks/TASK-001.md", source_digest: "a".repeat(64), write_paths: ["src/dispatch.ts"] }]);
+    store.db.prepare("INSERT INTO worktrees(worktree_id,run_id,branch,path,base_commit,state,created_at) VALUES (?,?,?,?,?,'active',?)")
+      .run("worktree_blocked_repair", runId, "plan/blocked-repair/blocked-repair-001", process.cwd(), REVIEW_HEAD, new Date().toISOString());
+    const dispatches = new DispatchService(store);
+    const explorerId = dispatches.create(runId, "file-explorer", dispatchPacket(["."]));
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(fileExplorerResult(runId, explorerId)), new Date().toISOString(), explorerId);
+    const originalDeveloper = dispatches.create(runId, "backend-developer", {
+      ...dispatchPacket(["src/dispatch.ts"]), allowed_write_paths: ["src/dispatch.ts"],
+      context: { explorer_dispatch_id: explorerId, task_id: "TASK-001", worktree_id: "worktree_blocked_repair" },
+    }, "coding");
+    store.db.prepare("UPDATE dispatches SET state='completed',result_json=?,completed_at=? WHERE dispatch_id=?")
+      .run(JSON.stringify(completedResult(runId, originalDeveloper, "backend-developer", { modified_paths: ["src/dispatch.ts"] })), new Date().toISOString(), originalDeveloper);
+
+    const failedTest = dispatches.create(runId, "test", {
+      ...dispatchPacket(["src/dispatch.ts"]),
+      context: {
+        stage: "test", phase: "task_test", task_id: "TASK-001", explorer_dispatch_id: explorerId,
+        worktree_id: "worktree_blocked_repair", worktree_path: process.cwd(), implementation_dispatch_id: originalDeveloper,
+      },
+    });
+    dispatches.claim(runId, failedTest, "test");
+    await dispatches.submitValue(runId, failedTest, "test", {
+      ...completedResult(runId, failedTest, "test", { checks: [{ command: "npm run lint", outcome: "src/review.ts:107:46 _formal is declared but never used" }] }),
+      status: "failed",
+      failure_class: "test_failure",
+      side_effect_state: "none",
+    });
+    const repairCoordinator = (store.db.prepare("SELECT coding_dispatch_id FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(failedTest) as { coding_dispatch_id: string }).coding_dispatch_id;
+    dispatches.claim(runId, repairCoordinator, "coding");
+    await dispatches.submitValue(runId, repairCoordinator, "coding", completedResult(runId, repairCoordinator, "coding", { actions: ["repair"] }));
+    const repairDeveloper = (store.db.prepare("SELECT repair_developer_dispatch_id FROM test_repair_lineage WHERE source_test_dispatch_id=?").get(failedTest) as { repair_developer_dispatch_id: string }).repair_developer_dispatch_id;
+    const repairPacket = JSON.parse((store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { packet_json: string }).packet_json);
+    assert.deepEqual(repairPacket.allowed_write_paths, ["src/dispatch.ts"]);
+
+    dispatches.claim(runId, repairDeveloper, "backend-developer");
+    const staging = await store.createStagingEntry({ runId, dispatchId: repairDeveloper, role: "backend-developer", kind: "dispatch-result" });
+    const failedRepair = {
+      ...completedResult(runId, repairDeveloper, "backend-developer", { modified_paths: ["src/dispatch.ts"], blocked_path: "src/review.ts" }),
+      status: "failed" as const,
+      failure_class: "allowed_path_blocked" as const,
+      side_effect_state: "completed" as const,
+    };
+    const ready = await store.writeStagingEntry(staging.stagingId, JSON.stringify(failedRepair), {
+      runId, dispatchId: repairDeveloper, role: "backend-developer", kind: "dispatch-result",
+    });
+    const submission = await dispatches.submitStaging(runId, repairDeveloper, "backend-developer", ready.stagingId);
+
+    assert.equal(submission.staging.state, "consumed");
+    assert.equal((store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(repairDeveloper) as { state: string }).state, "failed");
+    assert.ok(store.db.prepare("SELECT 1 FROM artifacts WHERE run_id=? AND dispatch_id=? AND kind='result'").get(runId, repairDeveloper));
+    const decision = store.db.prepare("SELECT decision_id,decision_type,dispatch_id FROM decisions WHERE run_id=? AND status='pending'").get(runId) as { decision_id: string; decision_type: string; dispatch_id: string };
+    assert.deepEqual({ decision_type: decision.decision_type, dispatch_id: decision.dispatch_id }, { decision_type: "active_run_recovery", dispatch_id: repairDeveloper });
+    const continuation = dispatches.continuation(runId);
+    assert.equal(continuation.run_state, "needs_decision");
+    assert.equal(continuation.pending_decision?.decision_type, "active_run_recovery");
+    assert.equal(continuation.pending_dispatches.length, 0);
+    const successor = dispatches.resolveDecision(runId, decision.decision_id, "retry");
+    assert.ok(store.db.prepare("SELECT 1 FROM dispatches WHERE run_id=? AND dispatch_id=? AND state IN ('pending','claimed')").get(runId, successor));
+    assert.equal((store.getRun(runId) as { state: string }).state, "active");
+  });
+});
+
 test("direct Git prepare phases require registered run-owned worktrees and defer the task until pre_write", async () => {
   await withStore(async (store) => {
     const runId = createRun(store);
