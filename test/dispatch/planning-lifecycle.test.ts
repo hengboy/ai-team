@@ -832,6 +832,8 @@ test("active run recovery skips a completed authority conflict receipt and resto
         authority_commit: "b".repeat(40),
         head: "a".repeat(40),
       }), new Date().toISOString(), new Date().toISOString());
+    store.db.prepare("UPDATE run_tasks SET developer_dispatch_id=? WHERE run_id=? AND task_id=?")
+      .run(authorityId, runId, taskId);
     dispatches.claim(runId, authorityId, "git-operator");
     await assert.rejects(
       dispatches.submitValue(runId, authorityId, "git-operator", completedResult(runId, authorityId, "git-operator", {
@@ -840,6 +842,8 @@ test("active run recovery skips a completed authority conflict receipt and resto
       /authority application task is no longer ready for its replacement developer/,
     );
     store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), authorityId);
+    store.db.prepare("UPDATE run_tasks SET developer_dispatch_id=? WHERE run_id=? AND task_id=?")
+      .run(developerId, runId, taskId);
     const receiptId = dispatches.create(runId, "git-operator", {
       ...dispatchPacket(),
       allowed_write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],
@@ -932,6 +936,8 @@ test("run resume consumes a claimed completed authority conflict receipt and res
       },
     });
     store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=?").run(new Date().toISOString(), authorityId);
+    store.db.prepare("UPDATE run_tasks SET developer_dispatch_id=? WHERE run_id=? AND task_id=?")
+      .run(authorityId, runId, taskId);
     const receiptId = dispatches.create(runId, "git-operator", {
       ...dispatchPacket(),
       allowed_write_paths: ["src/dispatch.ts", "test/dispatch/planning-lifecycle.test.ts"],

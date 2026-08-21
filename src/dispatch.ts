@@ -2614,9 +2614,11 @@ export class DispatchService {
       .get(runId, sourceId) as { packet_json: string; state: string } | undefined;
     if (!source || source.state !== "failed") throw new ValidationError("authority application source developer was not superseded");
     const task = this.plannedTaskRows(runId).find((candidate) => candidate.task_id === taskId);
+    const isReconciledTaskOwner = task?.developer_dispatch_id === sourceId
+      || task?.developer_dispatch_id === authorityDispatchId;
     const recoveringReconciledTask = allowReconciledTaskRecovery
       && (task?.state === "prepared" || task?.state === "implemented")
-      && task.developer_dispatch_id === sourceId;
+      && isReconciledTaskOwner;
     const normallyReadyTask = task?.state === "prepared" && !task.developer_dispatch_id;
     if (!normallyReadyTask && !recoveringReconciledTask) {
       throw new ValidationError("authority application task is no longer ready for its replacement developer");
@@ -2645,8 +2647,8 @@ export class DispatchService {
       replacementId = this.insert(runId, "backend-developer", packet, sourceId);
       const updated = recoveringReconciledTask
         ? this.store.db.prepare(`UPDATE run_tasks SET state='prepared',developer_dispatch_id=?,updated_at=?
-          WHERE run_id=? AND task_id=? AND developer_dispatch_id=? AND state IN ('prepared','implemented')`)
-          .run(replacementId, new Date().toISOString(), runId, taskId, sourceId)
+          WHERE run_id=? AND task_id=? AND developer_dispatch_id IN (?,?) AND state IN ('prepared','implemented')`)
+          .run(replacementId, new Date().toISOString(), runId, taskId, sourceId, authorityDispatchId)
         : this.store.db.prepare(`UPDATE run_tasks SET developer_dispatch_id=?,updated_at=?
           WHERE run_id=? AND task_id=? AND developer_dispatch_id IS NULL AND state='prepared'`)
           .run(replacementId, new Date().toISOString(), runId, taskId);
