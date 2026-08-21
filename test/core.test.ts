@@ -873,6 +873,35 @@ test("legacy claim bundles remain byte-preserving and manifest mismatch blocks r
   });
 });
 
+test("authority conflict continuations preserve only a frozen git-operator manifest contract", async () => {
+  const { freezeAuthorityConflictContinuationExecutionContract, freezeExecutionContract } = await import("../src/execution-contract.js");
+  const source = freezeExecutionContract("git-operator", {
+    allowed_write_paths: ["README.md"],
+    context: { phase: "apply_task_authority", operation: "apply-task-authority", worktree_id: "worktree_authority" },
+  });
+  source.execution_contract.source.role_manifest_digest = "legacy-git-operator-manifest";
+  const continuation = freezeAuthorityConflictContinuationExecutionContract({
+    allowed_write_paths: ["README.md"],
+    context: { phase: "continue_task_authority_conflict", operation: "continue-task-authority-conflict", worktree_id: "worktree_authority" },
+  }, source);
+  assert.equal(continuation.execution_contract.source.role_manifest_digest, "legacy-git-operator-manifest");
+
+  assert.throws(() => freezeAuthorityConflictContinuationExecutionContract({
+    allowed_write_paths: ["README.md"],
+    context: { phase: "continue_task_authority_conflict", operation: "continue-task-authority-conflict", worktree_id: "worktree_authority" },
+  }, {
+    ...source,
+    execution_contract: { ...source.execution_contract, source: { ...source.execution_contract.source, role: "backend-developer" } },
+  }), /frozen git-operator authority contract/);
+  assert.throws(() => freezeAuthorityConflictContinuationExecutionContract({
+    allowed_write_paths: ["README.md"],
+    context: { phase: "continue_task_authority_conflict", operation: "continue-task-authority-conflict", worktree_id: "worktree_authority" },
+  }, {
+    ...source,
+    context: { phase: "integration", operation: "merge-task" },
+  }), /frozen git-operator authority contract/);
+});
+
 test("command lifecycle is terminal once and recovery actions are stable and blocked by priority", async () => {
   await withStore((store) => {
     const runId = createRun(store);

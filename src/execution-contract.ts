@@ -76,12 +76,13 @@ const validateRequest = (request: ExecutionRequest, role: Role): void => {
   }
 };
 
-export const freezeExecutionContract = <T extends ExecutionPacketFields>(role: Role, packet: T, source?: ExecutionContract): Omit<T, "execution_request" | "execution_contract"> & { execution_contract: ExecutionContract } => {
+const freezeExecutionContractWithCompatibleSource = <T extends ExecutionPacketFields>(role: Role, packet: T, source?: ExecutionContract, compatibleSourceManifestDigest?: string): Omit<T, "execution_request" | "execution_contract"> & { execution_contract: ExecutionContract } => {
   if (packet.execution_contract && !source) throw new ValidationError("execution_contract is server-generated", ["/execution_contract"]);
   const request = packet.execution_request;
   if (request) validateRequest(request, role);
   const policy = ROLE_MANIFEST[role].execution;
-  const sourceContract = source?.source.role_manifest_digest === ROLE_MANIFEST_DIGEST ? source : undefined;
+  const sourceContract = source && (source.source.role_manifest_digest === ROLE_MANIFEST_DIGEST
+    || source.source.role_manifest_digest === compatibleSourceManifestDigest) ? source : undefined;
   if (source && !sourceContract) throw new ValidationError("source dispatch role manifest does not match the current role manifest", {
     reason_code: "role_manifest_mismatch",
     next_action: "start_new_run",
@@ -127,10 +128,26 @@ export const freezeExecutionContract = <T extends ExecutionPacketFields>(role: R
       source: {
         kind: sourceContract ? "source_contract" : request ? "dispatch_request" : "role_default",
         role,
-        role_manifest_digest: ROLE_MANIFEST_DIGEST,
+        role_manifest_digest: sourceContract?.source.role_manifest_digest ?? ROLE_MANIFEST_DIGEST,
       },
     },
   } as Omit<T, "execution_request" | "execution_contract"> & { execution_contract: ExecutionContract };
+};
+
+export const freezeExecutionContract = <T extends ExecutionPacketFields>(role: Role, packet: T, source?: ExecutionContract): Omit<T, "execution_request" | "execution_contract"> & { execution_contract: ExecutionContract } =>
+  freezeExecutionContractWithCompatibleSource(role, packet, source);
+
+export const freezeAuthorityConflictContinuationExecutionContract = <T extends ExecutionPacketFields>(
+  packet: T,
+  source: ExecutionPacketFields & { execution_contract?: ExecutionContract },
+): Omit<T, "execution_request" | "execution_contract"> & { execution_contract: ExecutionContract } => {
+  const sourceContract = source.execution_contract;
+  if (!sourceContract || sourceContract.source.role !== "git-operator"
+    || source.context.phase !== "apply_task_authority" || source.context.operation !== "apply-task-authority"
+    || packet.context.phase !== "continue_task_authority_conflict" || packet.context.operation !== "continue-task-authority-conflict") {
+    throw new ValidationError("authority conflict continuation requires the frozen git-operator authority contract");
+  }
+  return freezeExecutionContractWithCompatibleSource("git-operator", packet, sourceContract, sourceContract.source.role_manifest_digest);
 };
 
 export const executionEnforcement = (contract?: ExecutionContract): Record<string, unknown> => contract ? {

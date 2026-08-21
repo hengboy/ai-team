@@ -1533,6 +1533,9 @@ test("authority content conflict creates a frozen continuation and records its r
       },
     });
     dispatches.claim(runId, authorityDispatchId, "git-operator");
+    const legacyAuthorityPacket = JSON.parse((fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(authorityDispatchId) as { packet_json: string }).packet_json) as { execution_contract: { source: { role_manifest_digest: string } } };
+    legacyAuthorityPacket.execution_contract.source.role_manifest_digest = "legacy-git-operator-manifest";
+    fixture.store.db.prepare("UPDATE dispatches SET packet_json=? WHERE dispatch_id=?").run(JSON.stringify(legacyAuthorityPacket), authorityDispatchId);
     await assert.rejects(
       fixture.orchestrator.applyTaskAuthority({ runId, dispatchId: authorityDispatchId, worktreeId: task.worktree_id, authorityCommit, expectedHead: baseCommit }),
       /requires Git conflict reconciliation/,
@@ -1552,10 +1555,11 @@ test("authority content conflict creates a frozen continuation and records its r
     }, { ...before, unmerged: "" });
     const continuation = fixture.store.db.prepare("SELECT dispatch_id,state,packet_json,replacement_for FROM dispatches WHERE run_id=? AND replacement_for=?")
       .get(runId, authorityDispatchId) as { dispatch_id: string; state: string; packet_json: string; replacement_for: string };
-    const packet = JSON.parse(continuation.packet_json) as { allowed_write_paths: string[]; context: Record<string, unknown> };
+    const packet = JSON.parse(continuation.packet_json) as { allowed_write_paths: string[]; context: Record<string, unknown>; execution_contract: { source: { role_manifest_digest: string } } };
     assert.equal(continuation.state, "pending");
     assert.equal(continuation.replacement_for, authorityDispatchId);
     assert.deepEqual(packet.allowed_write_paths, ["README.md", "dirty.txt", "authority.txt"]);
+    assert.equal(packet.execution_contract.source.role_manifest_digest, "legacy-git-operator-manifest");
     assert.deepEqual({
       phase: packet.context.phase, operation: packet.context.operation, authority_apply_operation_id: packet.context.authority_apply_operation_id,
       authority_apply_dispatch_id: packet.context.authority_apply_dispatch_id, worktree_id: packet.context.worktree_id,

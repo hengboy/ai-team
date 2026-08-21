@@ -29,7 +29,7 @@ import {
 import { buildContinueTestingPacket, buildReviewPacket as assembleReviewPacket, buildTestPacket } from "./dispatch/implementation.js";
 import { assertPlanningSubmissionTransition, planningContinuationPacket, planningSubmissionIntent, requirementClarificationMappings } from "./dispatch/planning.js";
 import { isManagedPlannedRecovery, livenessRecoveryIntent, managedCleanupPacket, reconciliationIntent, reissuePacket, retryableResultHasNoSideEffects } from "./dispatch/recovery.js";
-import { executionEnforcement, freezeExecutionContract, type ExecutionContract, type ExecutionRequest } from "./execution-contract.js";
+import { executionEnforcement, freezeAuthorityConflictContinuationExecutionContract, freezeExecutionContract, type ExecutionContract, type ExecutionRequest } from "./execution-contract.js";
 import { recoveryProjection, type NextAction, type TimelineEntry } from "./run-recovery.js";
 
 export interface DispatchPacket {
@@ -1417,7 +1417,7 @@ export class DispatchService {
       stash_commit: input.stashCommit,
       allowed_write_paths: [...sourcePacket.allowed_write_paths].sort(),
     };
-    const packet = freezeExecutionContract("git-operator", validatePacket({
+    const packet = freezeAuthorityConflictContinuationExecutionContract(validatePacket({
       objective: `Resolve the recorded authority content conflict for ${String(context.task_id)} without changing its frozen task worktree HEAD or losing its dirty work.`,
       allowed_read_paths: [],
       allowed_write_paths: [...sourcePacket.allowed_write_paths],
@@ -1427,7 +1427,7 @@ export class DispatchService {
         "Record only the authority application receipt",
       ],
       context: continuationContext,
-    }, "git-operator"), sourcePacket.execution_contract);
+    }, "git-operator"), sourcePacket);
     const packetJson = redact(stableJson(packet));
     const existing = this.store.db.prepare("SELECT dispatch_id,packet_json FROM dispatches WHERE run_id=? AND replacement_for=? ORDER BY created_at LIMIT 1")
       .get(input.runId, input.authorityDispatchId) as { dispatch_id: string; packet_json: string } | undefined;
