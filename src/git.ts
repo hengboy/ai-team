@@ -53,14 +53,24 @@ export const applyAuthorityCommitPreservingDirtyWork = async (cwd: string, autho
       throw new GitGateError(`task authority apply failed: ${detail.stderr?.trim() || detail.message}`);
     }
   };
+  const status = await run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  const untrackedPaths = status.stdout.split("\0").filter((entry) => entry.startsWith("?? ")).map((entry) => entry.slice(3));
   await run(["stash", "push", "--include-untracked", "--message", label]);
   const stashCommit = (await run(["rev-parse", "refs/stash"])).stdout;
   try {
-    await run(["stash", "apply", "--index", stashCommit]);
     await run(["cherry-pick", "--no-commit", authorityCommit]);
+    await run(["reset", "HEAD"]);
+    await run(["stash", "apply", "--index", stashCommit]);
     return stashCommit;
   } catch (error) {
-    throw new GitGateError(`task authority apply requires Git conflict reconciliation; dirty-work stash retained at ${stashCommit}: ${error instanceof Error ? error.message : String(error)}`);
+    try {
+      await run(["reset", "--hard", "HEAD"]);
+      if (untrackedPaths.length) await run(["clean", "-fd", "--", ...untrackedPaths]);
+      await run(["stash", "apply", "--index", stashCommit]);
+    } catch (cleanupError) {
+      throw new GitGateError(`task authority apply failed and cleanup could not restore dirty work; dirty-work stash retained at ${stashCommit}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+    }
+    throw new GitGateError(`task authority apply requires Git conflict reconciliation; original dirty work restored and dirty-work stash retained at ${stashCommit}: ${error instanceof Error ? error.message : String(error)}`);
   }
 };
 

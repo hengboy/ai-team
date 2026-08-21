@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { git, repositoryIdentity } from "../src/git.js";
+import { applyAuthorityCommitPreservingDirtyWork, git, repositoryIdentity } from "../src/git.js";
 import { GitOrchestrator } from "../src/git-orchestrator.js";
 import { DispatchService } from "../src/dispatch.js";
 import { ReviewService } from "../src/review.js";
@@ -1398,6 +1398,8 @@ test("claimed planned developer scope recovery supersedes without touching its d
       unstaged: await rawGit(prepared.path, ["diff", "--binary", "--", "README.md"]),
       untracked: await readFile(join(prepared.path, "dirty.txt"), "utf8"),
     }, { head: baseCommit, staged: before.staged, unstaged: before.unstaged, untracked: "untracked\n" });
+    assert.equal(await readFile(join(prepared.path, "src", "contracts.ts"), "utf8"), "export {};\n");
+    assert.equal(await readFile(join(prepared.path, "src", "commands", "planning-run.ts"), "utf8"), "export {};\n");
     const authorityReceipt = {
       ...createResultTemplate(runId, recovered.dispatch_id, "git-operator"),
       summary: "Applied the recorded task authority commit",
@@ -1415,6 +1417,45 @@ test("claimed planned developer scope recovery supersedes without touching its d
     assert.equal(developerPacket.context.coordinator_dispatch_id, "dispatch_coordinator");
     assert.equal(developerPacket.context.prepare_git_dispatch_id, "dispatch_prepare");
     assert.deepEqual(fixture.store.db.prepare("SELECT developer_dispatch_id FROM run_tasks WHERE run_id=? AND task_id='TASK-001'").get(runId), { developer_dispatch_id: developer.dispatch_id });
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("authority application restores dirty work after a content conflict", async () => {
+  const fixture = await createFixture();
+  try {
+    const baseCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    await writeFile(join(fixture.root, "README.md"), "authority\n");
+    await rawGit(fixture.root, ["add", "README.md"]);
+    await rawGit(fixture.root, ["commit", "-m", "Authority changes README"]);
+    const authorityCommit = await rawGit(fixture.root, ["rev-parse", "HEAD"]);
+    await rawGit(fixture.root, ["reset", "--hard", baseCommit]);
+
+    await writeFile(join(fixture.root, "README.md"), "staged\n");
+    await rawGit(fixture.root, ["add", "README.md"]);
+    await writeFile(join(fixture.root, "README.md"), "staged\nunstaged\n");
+    await writeFile(join(fixture.root, "dirty.txt"), "untracked\n");
+    const before = {
+      head: await rawGit(fixture.root, ["rev-parse", "HEAD"]),
+      status: await rawGit(fixture.root, ["status", "--porcelain=v1"]),
+      staged: await rawGit(fixture.root, ["diff", "--cached", "--binary"]),
+      unstaged: await rawGit(fixture.root, ["diff", "--binary"]),
+      untracked: await readFile(join(fixture.root, "dirty.txt"), "utf8"),
+    };
+
+    await assert.rejects(
+      applyAuthorityCommitPreservingDirtyWork(fixture.root, authorityCommit, "authority-conflict"),
+      /original dirty work restored and dirty-work stash retained at [a-f0-9]{40}/,
+    );
+    assert.deepEqual({
+      head: await rawGit(fixture.root, ["rev-parse", "HEAD"]),
+      status: await rawGit(fixture.root, ["status", "--porcelain=v1"]),
+      staged: await rawGit(fixture.root, ["diff", "--cached", "--binary"]),
+      unstaged: await rawGit(fixture.root, ["diff", "--binary"]),
+      untracked: await readFile(join(fixture.root, "dirty.txt"), "utf8"),
+      unmerged: await rawGit(fixture.root, ["ls-files", "-u"]),
+    }, { ...before, unmerged: "" });
   } finally {
     await fixture.dispose();
   }
