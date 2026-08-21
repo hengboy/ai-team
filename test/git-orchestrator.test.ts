@@ -1293,22 +1293,25 @@ test("claimed planned developer scope recovery supersedes without touching its d
     assert.deepEqual(recovered.allowed_write_paths, ["README.md", "dirty.txt", "src/commands/planning-run.ts", "src/contracts.ts"]);
     assert.deepEqual(recovered.dirty_paths, ["README.md", "dirty.txt"]);
     assert.deepEqual(fixture.store.db.prepare("SELECT state FROM dispatches WHERE dispatch_id=?").get(sourceId), { state: "failed" });
-    assert.deepEqual(fixture.store.db.prepare("SELECT state,replacement_for FROM dispatches WHERE dispatch_id=?").get(recovered.dispatch_id), { state: "pending", replacement_for: sourceId });
+    assert.deepEqual(fixture.store.db.prepare("SELECT role,state,replacement_for FROM dispatches WHERE dispatch_id=?").get(recovered.dispatch_id), { role: "git-operator", state: "pending", replacement_for: sourceId });
     const replacement = fixture.store.db.prepare("SELECT packet_json FROM dispatches WHERE dispatch_id=?").get(recovered.dispatch_id) as { packet_json: string };
     const packet = JSON.parse(replacement.packet_json) as { allowed_write_paths: string[]; context: Record<string, unknown> };
     assert.deepEqual(packet.allowed_write_paths, recovered.allowed_write_paths);
+    assert.equal(packet.context.phase, "apply_task_authority");
+    assert.equal(packet.context.superseded_developer_dispatch_id, sourceId);
     assert.deepEqual(packet.context.scope_recovery, {
       authority_commit: authorityCommit,
       expected_head: baseCommit,
       original_allowed_write_paths: ["README.md", "dirty.txt"],
       added_write_paths: ["src/commands/planning-run.ts", "src/contracts.ts"],
+      allowed_write_paths: ["README.md", "dirty.txt", "src/commands/planning-run.ts", "src/contracts.ts"],
       dirty_paths: ["README.md", "dirty.txt"],
     });
     assert.equal(packet.context.explorer_dispatch_id, explorerId);
     assert.equal(packet.context.coordinator_dispatch_id, "dispatch_coordinator");
     assert.equal(packet.context.prepare_git_dispatch_id, "dispatch_prepare");
     assert.deepEqual(fixture.store.db.prepare("SELECT developer_dispatch_id,write_paths_json FROM run_tasks WHERE run_id=? AND task_id='TASK-001'").get(runId), {
-      developer_dispatch_id: recovered.dispatch_id,
+      developer_dispatch_id: null,
       write_paths_json: JSON.stringify(recovered.allowed_write_paths),
     });
     assert.deepEqual({
@@ -1321,6 +1324,37 @@ test("claimed planned developer scope recovery supersedes without touching its d
       runId, dispatchId: sourceId, authorityCommit, expectedHead: baseCommit,
       addedWritePaths: ["src/contracts.ts", "src/commands/planning-run.ts"],
     }), { ...recovered, reused: true });
+    dispatches.claim(runId, recovered.dispatch_id, "git-operator");
+    const applied = await fixture.orchestrator.applyTaskAuthority({
+      runId,
+      dispatchId: recovered.dispatch_id,
+      worktreeId: prepared.worktree_id,
+      authorityCommit,
+      expectedHead: baseCommit,
+    });
+    assert.equal(applied.head, baseCommit);
+    assert.deepEqual(applied.dirty_paths, ["README.md", "dirty.txt"]);
+    assert.deepEqual({
+      head: await rawGit(prepared.path, ["rev-parse", "HEAD"]),
+      staged: await rawGit(prepared.path, ["diff", "--cached", "--binary", "--", "README.md"]),
+      unstaged: await rawGit(prepared.path, ["diff", "--binary", "--", "README.md"]),
+      untracked: await readFile(join(prepared.path, "dirty.txt"), "utf8"),
+    }, { head: baseCommit, staged: before.staged, unstaged: before.unstaged, untracked: "untracked\n" });
+    await dispatches.submitValue(runId, recovered.dispatch_id, "git-operator", {
+      ...createResultTemplate(runId, recovered.dispatch_id, "git-operator"),
+      summary: "Applied the recorded task authority commit",
+      verification: [{ command: "ai-team git apply-task-authority", outcome: "passed" }],
+      payload: { operations: [{ command: "ai-team git apply-task-authority", outcome: applied.operation_id }] },
+    });
+    const developer = fixture.store.db.prepare("SELECT dispatch_id,replacement_for,packet_json FROM dispatches WHERE run_id=? AND role='backend-developer' AND replacement_for=?")
+      .get(runId, sourceId) as { dispatch_id: string; replacement_for: string; packet_json: string };
+    const developerPacket = JSON.parse(developer.packet_json) as { allowed_write_paths: string[]; context: Record<string, unknown> };
+    assert.deepEqual(developerPacket.allowed_write_paths, recovered.allowed_write_paths);
+    assert.equal(developerPacket.context.authority_apply_git_dispatch_id, recovered.dispatch_id);
+    assert.equal(developerPacket.context.explorer_dispatch_id, explorerId);
+    assert.equal(developerPacket.context.coordinator_dispatch_id, "dispatch_coordinator");
+    assert.equal(developerPacket.context.prepare_git_dispatch_id, "dispatch_prepare");
+    assert.deepEqual(fixture.store.db.prepare("SELECT developer_dispatch_id FROM run_tasks WHERE run_id=? AND task_id='TASK-001'").get(runId), { developer_dispatch_id: developer.dispatch_id });
   } finally {
     await fixture.dispose();
   }

@@ -40,6 +40,30 @@ export const git = async (cwd: string, args: readonly string[]): Promise<GitResu
   }
 };
 
+/** Applies one verified authority commit without advancing HEAD. This is intentionally
+ * not exposed through the general Git wrapper because it temporarily snapshots dirty work. */
+export const applyAuthorityCommitPreservingDirtyWork = async (cwd: string, authorityCommit: string, label: string): Promise<string> => {
+  if (!/^[a-f0-9]{40}$/.test(authorityCommit)) throw new GitGateError("authority commit must be a full commit SHA");
+  const run = async (args: string[]): Promise<GitResult> => {
+    try {
+      const result = await execFileForInvocation("git", args, { cwd, maxBuffer: 10 * 1024 * 1024 });
+      return { stdout: result.stdout.replace(/[\r\n]+$/, ""), stderr: result.stderr.replace(/[\r\n]+$/, "") };
+    } catch (error) {
+      const detail = error as { stderr?: string; message?: string };
+      throw new GitGateError(`task authority apply failed: ${detail.stderr?.trim() || detail.message}`);
+    }
+  };
+  await run(["stash", "push", "--include-untracked", "--message", label]);
+  const stashCommit = (await run(["rev-parse", "refs/stash"])).stdout;
+  try {
+    await run(["stash", "apply", "--index", stashCommit]);
+    await run(["cherry-pick", "--no-commit", authorityCommit]);
+    return stashCommit;
+  } catch (error) {
+    throw new GitGateError(`task authority apply requires Git conflict reconciliation; dirty-work stash retained at ${stashCommit}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+};
+
 export const repositoryIdentity = async (project: string): Promise<{ root: string; commonDir: string; repoId: string }> => {
   const root = await realpath((await git(project, ["rev-parse", "--show-toplevel"])).stdout);
   const common = (await git(root, ["rev-parse", "--git-common-dir"])).stdout;

@@ -1,7 +1,7 @@
 import { mkdir, readdir, realpath, stat } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { ValidationError } from "./errors.js";
-import { commitPaths, createWorktree, currentBranch, currentHead, git, mergeNoFastForward, worktreeStatus } from "./git.js";
+import { applyAuthorityCommitPreservingDirtyWork, commitPaths, createWorktree, currentBranch, currentHead, git, mergeNoFastForward, worktreeStatus } from "./git.js";
 import { assertWritablePath, canonicalizeInside, pathMatchesScope } from "./security.js";
 import { StateStore } from "./state.js";
 import { sha256, stableJson, toPosix } from "./utils.js";
@@ -61,6 +61,24 @@ export interface TaskWorktreeRecoveryReceipt {
     after_state: "canceled";
     operation_id: string;
   };
+  reused: boolean;
+}
+
+export interface TaskAuthorityApplyRequest {
+  runId: string;
+  dispatchId: string;
+  worktreeId: string;
+  authorityCommit: string;
+  expectedHead: string;
+}
+
+export interface TaskAuthorityApplyReceipt {
+  operation_id: string;
+  worktree_id: string;
+  authority_commit: string;
+  head: string;
+  dirty_paths: string[];
+  stash_commit: string;
   reused: boolean;
 }
 
@@ -528,6 +546,55 @@ export class GitOrchestrator {
       this.store.event(request.toRunId, "worktree.recovered", { ...operationRequest, operation_id: operationId, receipt: evidence });
     })();
     return evidence;
+  }
+
+  async applyTaskAuthority(request: TaskAuthorityApplyRequest): Promise<TaskAuthorityApplyReceipt> {
+    this.assertGitOperator(request.runId, request.dispatchId);
+    if (!/^[a-f0-9]{40}$/.test(request.authorityCommit) || !/^[a-f0-9]{40}$/.test(request.expectedHead)) {
+      throw new ValidationError("task authority apply requires full authority and expected HEAD commit SHAs");
+    }
+    const { run } = this.repositoryForRun(request.runId);
+    if (!isPlannedRun(run)) throw new ValidationError("task authority apply requires a planned Coding run");
+    const dispatch = this.store.db.prepare("SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator'")
+      .get(request.runId, request.dispatchId) as { packet_json: string } | undefined;
+    const context = dispatch ? (JSON.parse(dispatch.packet_json) as { context: Record<string, unknown> }).context : undefined;
+    if (!context || context.phase !== "apply_task_authority" || context.worktree_id !== request.worktreeId
+      || context.authority_commit !== request.authorityCommit || context.expected_head !== request.expectedHead) {
+      throw new ValidationError("Git Operator dispatch is not bound to this task authority recovery");
+    }
+    const row = this.store.db.prepare("SELECT path,state FROM worktrees WHERE run_id=? AND worktree_id=?")
+      .get(request.runId, request.worktreeId) as { path: string; state: string } | undefined;
+    if (!row || row.state !== "active") throw new ValidationError("task authority apply requires its active frozen worktree");
+    const key = `worktree:apply-authority:${request.runId}:${request.dispatchId}:${request.worktreeId}:${request.authorityCommit}:${request.expectedHead}`;
+    const completed = this.store.db.prepare("SELECT evidence_json FROM operations WHERE idempotency_key=? AND kind='git.task_authority.apply' AND state='completed'")
+      .get(key) as { evidence_json: string } | undefined;
+    if (completed) return { ...(JSON.parse(completed.evidence_json) as TaskAuthorityApplyReceipt), reused: true };
+    const head = await currentHead(row.path);
+    if (head !== request.expectedHead) throw new ValidationError("task authority apply worktree HEAD does not match expected HEAD", { expected: request.expectedHead, actual: head });
+    const status = await git(row.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const dirtyPaths = status.stdout.split("\0").filter(Boolean).map((entry) => entry.slice(3)).sort();
+    if (!dirtyPaths.length) throw new ValidationError("task authority apply requires the recorded dirty task work");
+    const allowed = Array.isArray(context.scope_recovery && (context.scope_recovery as Record<string, unknown>).allowed_write_paths)
+      ? (context.scope_recovery as { allowed_write_paths: string[] }).allowed_write_paths
+      : undefined;
+    if (!allowed || dirtyPaths.some((path) => !pathMatchesScope(path, allowed))) {
+      throw new ValidationError("task authority apply dirty work is outside the frozen replacement scope", { dirty_paths: dirtyPaths });
+    }
+    const operation = this.store.beginOperation("git.task_authority.apply", key, { ...request, dirty_paths: dirtyPaths }, request.runId);
+    if (operation.reused && operation.state !== "completed") throw new ValidationError("task authority apply has an unknown side effect; reconcile required");
+    const stashCommit = await applyAuthorityCommitPreservingDirtyWork(row.path, request.authorityCommit, `ai-team authority ${request.dispatchId}`);
+    const receipt: TaskAuthorityApplyReceipt = {
+      operation_id: operation.operationId,
+      worktree_id: request.worktreeId,
+      authority_commit: request.authorityCommit,
+      head: await currentHead(row.path),
+      dirty_paths: dirtyPaths,
+      stash_commit: stashCommit,
+      reused: false,
+    };
+    this.store.finishOperation(operation.operationId, receipt);
+    this.store.event(request.runId, "worktree.task_authority_applied", receipt);
+    return receipt;
   }
 
   async prepareIntegration(runId: string, dispatchId?: string): Promise<PreparedWorktree> {

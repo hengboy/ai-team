@@ -86,6 +86,14 @@ export const registerGitCommands = (program: Command, dependencies: GitDependenc
       dispatchId: options.dispatchId,
       replacesStagingId: options.replacesStagingId,
     }))));
+  gitCommand.command("apply-task-authority").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--worktree-id <id>").requiredOption("--authority-commit <sha>").requiredOption("--expected-head <sha>")
+    .action(async (options) => output(await withStore((store) => new GitOrchestrator(store).applyTaskAuthority({
+      runId: options.runId,
+      dispatchId: options.dispatchId,
+      worktreeId: options.worktreeId,
+      authorityCommit: options.authorityCommit,
+      expectedHead: options.expectedHead,
+    }))));
   gitCommand.command("commit").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--worktree-id <id>").requiredOption("--message <message>").requiredOption("--scope <paths>", "comma-separated repository-relative scopes").action(async (options) => output(await withStore((store) => new GitOrchestrator(store).commit(options.runId, options.worktreeId, options.message, options.scope.split(","), options.dispatchId))));
   gitCommand.command("merge-task").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--task-id <id>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).mergeTask(options.runId, options.integrationId, options.taskId, options.dispatchId)) }));
   gitCommand.command("continue-conflict").requiredOption("--run-id <id>").requiredOption("--dispatch-id <id>").requiredOption("--integration-id <id>").requiredOption("--scope <paths>").action(async (options) => output({ commit: await withStore((store) => new GitOrchestrator(store).continueConflict(options.runId, options.integrationId, options.scope.split(","), options.dispatchId)) }));

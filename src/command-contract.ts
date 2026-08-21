@@ -74,6 +74,8 @@ export const COMMAND_SYNTAX: Readonly<Record<string, readonly string[]>> = Objec
   "dispatch reissue": ["ai-team dispatch reissue --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text>"],
   "dispatch reconcile": ["ai-team dispatch reconcile --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text> [--staging-id <staging-id>]"],
   "dispatch supersede": ["ai-team dispatch supersede --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text> (--packet-file <json> | --staging-id <staging-id> | --input-stdin)"],
+  "dispatch recover-claimed-task-scope": ["ai-team dispatch recover-claimed-task-scope --run-id <run-id> --dispatch-id <dispatch-id> --authority-commit <sha> --expected-head <sha> --add-write-path <path...>"],
+  "git apply-task-authority": ["ai-team git apply-task-authority --run-id <run-id> --dispatch-id <dispatch-id> --worktree-id <id> --authority-commit <sha> --expected-head <sha>"],
   "dispatch prompt": ["ai-team dispatch prompt --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
   "dispatch schema": ["ai-team dispatch schema --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
   "dispatch template": ["ai-team dispatch template --run-id <run-id> --dispatch-id <dispatch-id> --role <role>"],
@@ -140,6 +142,7 @@ const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>
   "dispatch create": ["ai-team dispatch create --run-id <run-id> --role <role> --actor-role <role> [--actor-dispatch-id <dispatch-id>] --input-stdin"],
   "dispatch claim": ["ai-team dispatch claim --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --bundle"],
   "dispatch supersede": ["ai-team dispatch supersede --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --actor-role <role> --reason <text> --input-stdin"],
+  "dispatch recover-claimed-task-scope": ["ai-team dispatch recover-claimed-task-scope --run-id <run-id> --dispatch-id <dispatch-id> --authority-commit <sha> --expected-head <sha> --add-write-path <path...>"],
   "dispatch validate": ["ai-team dispatch validate --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --staging-id <staging-id>"],
   "dispatch submit": ["ai-team dispatch submit --run-id <run-id> --dispatch-id <dispatch-id> --role <role> --staging-id <staging-id>"],
   "decision create": ["ai-team decision create --run-id <run-id> --dispatch-id <dispatch-id> --input-stdin"],
@@ -150,7 +153,7 @@ const AGENT_COMMAND_SYNTAX_OVERRIDES: Readonly<Record<string, readonly string[]>
 });
 
 const PUBLIC_COMMANDS = ["init", "install", "status", "contract", "context update", "context validate", "planning start", "coding start", "run show", "run resume", "run handoff-to-planning", "run cancel", "run decide", "env list", "env show", "env validate", "env explain", "env diff", "env edit", "env generate", "env switch", "env status", "env doctor", "backup restore", "uninstall"] as const;
-const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch packet-schema", "dispatch packet-template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git recover-task-worktree", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolution-schema", "review resolution-template", "review resolve", "review status"] as const;
+const AGENT_COMMANDS = ["context update", "context validate", "planning revision validate", "planning revision create", "planning revision transition", "planning revision commit", "planning tasks validate", "dispatch create", "dispatch claim", "dispatch cancel", "dispatch reissue", "dispatch reconcile", "dispatch supersede", "dispatch recover-claimed-task-scope", "dispatch prompt", "dispatch schema", "dispatch template", "dispatch packet-schema", "dispatch packet-template", "dispatch validate", "dispatch submit", "decision create", "decision schema", "decision template", "staging create", "staging write", "staging show", "staging cleanup", "scope check", "git status", "git prepare", "git adopt", "git transfer", "git recover-task-worktree", "git apply-task-authority", "git commit", "git merge-task", "git integrate", "git reconcile", "git cleanup", "research archive", "review create", "review submit", "review resolution-schema", "review resolution-template", "review resolve", "review status"] as const;
 
 /** Runtime guards for commands whose values are consumed as an identity. */
 export const COMMAND_VALIDATORS: Readonly<Record<string, CommandSpec>> = Object.freeze({

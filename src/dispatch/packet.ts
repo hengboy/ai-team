@@ -53,6 +53,9 @@ const packetContextRequirements = (role: Role, phase?: unknown, taskId?: unknown
   if (phase === "recover_task_worktree") {
     return ["phase", "task_id", "worktree_id"];
   }
+  if (phase === "apply_task_authority") {
+    return ["phase", "task_id", "worktree_id", "worktree_path", "authority_commit", "expected_head", "superseded_developer_dispatch_id"];
+  }
   if (role === "frontend-developer" || role === "backend-developer") return ["explorer_dispatch_id", "worktree_id"];
   return [];
 };

@@ -962,24 +962,36 @@ export class DispatchService {
     if (outOfScope.length) throw new ValidationError("scope recovery would not preserve dirty paths within the replacement scope", { dirty_paths: outOfScope });
     const packet = validatePacket({
       ...sourcePacket,
+      objective: `Apply the recorded authority commit for ${taskId} without changing its task worktree HEAD or losing its dirty work.`,
       allowed_write_paths: allowedWritePaths,
+      acceptance_criteria: [
+        "Apply only the recorded authority commit into the frozen task worktree",
+        "Preserve the frozen task worktree identity, HEAD, and dirty work",
+        "Leave the replacement developer packet to continue the frozen Task scope",
+      ],
       context: {
         ...sourcePacket.context,
+        stage: "git-operator",
+        phase: "apply_task_authority",
+        authority_commit: authority,
+        expected_head: input.expectedHead,
+        superseded_developer_dispatch_id: input.dispatchId,
         scope_recovery: {
           authority_commit: authority,
           expected_head: input.expectedHead,
           original_allowed_write_paths: originalPaths,
           added_write_paths: normalizedAddedPaths,
+          allowed_write_paths: allowedWritePaths,
           dirty_paths: dirtyPaths,
         },
       },
-    }, "backend-developer");
+    }, "git-operator");
     let replacementId = "";
     this.store.db.transaction(() => {
       this.store.db.prepare("UPDATE dispatches SET state='failed',completed_at=? WHERE dispatch_id=? AND state='claimed'").run(new Date().toISOString(), input.dispatchId);
-      replacementId = this.insert(input.runId, "backend-developer", packet, input.dispatchId);
+      replacementId = this.insert(input.runId, "git-operator", packet, input.dispatchId);
       const updated = this.store.db.prepare(`UPDATE run_tasks SET write_paths_json=?,developer_dispatch_id=?,updated_at=?
-        WHERE run_id=? AND task_id=? AND (developer_dispatch_id=? OR developer_dispatch_id IS NULL) AND state!='integrated'`).run(stableJson(allowedWritePaths), replacementId, new Date().toISOString(), input.runId, taskId, input.dispatchId);
+        WHERE run_id=? AND task_id=? AND (developer_dispatch_id=? OR developer_dispatch_id IS NULL) AND state!='integrated'`).run(stableJson(allowedWritePaths), null, new Date().toISOString(), input.runId, taskId, input.dispatchId);
       if (updated.changes !== 1) throw new ValidationError("task ownership changed during claimed scope recovery");
       this.store.event(input.runId, "dispatch.superseded", { dispatchId: input.dispatchId, replacement_dispatch_id: replacementId, role: "backend-developer", actor_role: "coding", reason: "frozen task scope expanded by explicit authority commit" });
       this.store.event(input.runId, "task.scope_recovered", { task_id: taskId, worktree_id: worktreeId, authority_commit: authority, expected_head: input.expectedHead, original_allowed_write_paths: originalPaths, allowed_write_paths: allowedWritePaths, dirty_paths: dirtyPaths, superseded_dispatch_id: input.dispatchId, replacement_dispatch_id: replacementId });
@@ -1682,6 +1694,10 @@ export class DispatchService {
         this.ensurePlannedTaskContinuation(runId, result.dispatch_id);
         return;
       }
+      if (run.mode === "planned" && context.phase === "apply_task_authority") {
+        this.ensureRecoveredTaskDeveloperDispatch(runId, result.dispatch_id);
+        return;
+      }
       if (run.mode === "planned" && context.phase === "reconcile_worktree_ownership") {
         if (typeof context.source_dispatch_id !== "string") throw new ValidationError("ownership reconciliation is missing its source merge dispatch");
         const failed = this.store.db.prepare("SELECT dispatch_id,role,packet_json,packet_digest,result_json,replacement_for FROM dispatches WHERE run_id=? AND dispatch_id=?")
@@ -2360,6 +2376,62 @@ export class DispatchService {
     return dispatchId;
   }
 
+  private ensureRecoveredTaskDeveloperDispatch(runId: string, authorityDispatchId: string): string | undefined {
+    const authority = this.store.db.prepare(`SELECT packet_json FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='git-operator' AND state='completed'
+      AND json_extract(packet_json,'$.context.phase')='apply_task_authority'`).get(runId, authorityDispatchId) as { packet_json: string } | undefined;
+    if (!authority) return undefined;
+    const authorityPacket = JSON.parse(authority.packet_json) as DispatchPacket;
+    const context = authorityPacket.context as Record<string, unknown>;
+    const taskId = typeof context.task_id === "string" ? context.task_id : undefined;
+    const sourceId = typeof context.superseded_developer_dispatch_id === "string" ? context.superseded_developer_dispatch_id : undefined;
+    const worktreeId = typeof context.worktree_id === "string" ? context.worktree_id : undefined;
+    const worktreePath = typeof context.worktree_path === "string" ? context.worktree_path : undefined;
+    if (!taskId || !sourceId || !worktreeId || !worktreePath) throw new ValidationError("authority application continuation lacks frozen developer lineage");
+    const existing = this.store.db.prepare("SELECT dispatch_id FROM dispatches WHERE run_id=? AND replacement_for=? AND role='backend-developer' ORDER BY created_at LIMIT 1")
+      .get(runId, sourceId) as { dispatch_id: string } | undefined;
+    if (existing) return existing.dispatch_id;
+    const source = this.store.db.prepare("SELECT packet_json,state FROM dispatches WHERE run_id=? AND dispatch_id=? AND role='backend-developer'")
+      .get(runId, sourceId) as { packet_json: string; state: string } | undefined;
+    if (!source || source.state !== "failed") throw new ValidationError("authority application source developer was not superseded");
+    const task = this.plannedTaskRows(runId).find((candidate) => candidate.task_id === taskId);
+    if (!task || task.state !== "prepared" || task.developer_dispatch_id) throw new ValidationError("authority application task is no longer ready for its replacement developer");
+    const worktree = this.store.db.prepare("SELECT path,state FROM worktrees WHERE run_id=? AND worktree_id=?")
+      .get(runId, worktreeId) as { path: string; state: string } | undefined;
+    if (!worktree || worktree.state !== "active" || worktree.path !== worktreePath) throw new ValidationError("authority application worktree identity changed before developer replacement");
+    const sourcePacket = JSON.parse(source.packet_json) as DispatchPacket;
+    const { execution_contract: _executionContract, ...unfrozenSource } = sourcePacket;
+    const packet = validatePacket({
+      ...unfrozenSource,
+      allowed_write_paths: authorityPacket.allowed_write_paths,
+      context: {
+        ...sourcePacket.context,
+        phase: "implementation",
+        authority_apply_git_dispatch_id: authorityDispatchId,
+        scope_recovery: {
+          ...(context.scope_recovery as Record<string, unknown>),
+          authority_apply_git_dispatch_id: authorityDispatchId,
+        },
+      },
+    }, "backend-developer");
+    let replacementId = "";
+    this.store.db.transaction(() => {
+      replacementId = this.insert(runId, "backend-developer", packet, sourceId);
+      const updated = this.store.db.prepare(`UPDATE run_tasks SET developer_dispatch_id=?,updated_at=?
+        WHERE run_id=? AND task_id=? AND developer_dispatch_id IS NULL AND state='prepared'`).run(replacementId, new Date().toISOString(), runId, taskId);
+      if (updated.changes !== 1) throw new ValidationError("authority application task ownership changed during developer replacement");
+      this.store.event(runId, "coding.developer_dispatch_created", {
+        dispatch_id: replacementId,
+        source: "scope_recovery",
+        task_id: taskId,
+        worktree_id: worktreeId,
+        superseded_developer_dispatch_id: sourceId,
+        authority_apply_git_dispatch_id: authorityDispatchId,
+      });
+    })();
+    this.changeStage(runId, "coding", replacementId);
+    return replacementId;
+  }
+
   private ensurePlannedTaskDeveloperDispatch(
     runId: string,
     continuationDispatchId?: string,
@@ -2463,7 +2535,7 @@ export class DispatchService {
   }
 
   private assertGitPrepareResult(runId: string, packet: DispatchPacket): void {
-    const context = packet.context as { phase?: unknown; task_id?: unknown; worktree_id?: unknown; worktree_ids?: unknown; operation?: unknown };
+    const context = packet.context as { phase?: unknown; task_id?: unknown; worktree_id?: unknown; worktree_ids?: unknown; operation?: unknown; authority_commit?: unknown; expected_head?: unknown };
     if (context.phase === "prepare_worktrees") {
       const worktree = this.activeIntegrationWorktree(runId);
       if (!worktree) throw new ValidationError("prepare_worktrees requires a registered active integration worktree or plan worktree owned by this run");
@@ -2487,6 +2559,15 @@ export class DispatchService {
       const recovered = this.store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.worktree.recover' AND state='completed'
         AND json_extract(evidence_json,'$.worktree_id')=? AND json_extract(evidence_json,'$.task_id')=? LIMIT 1`).get(runId, worktreeId, taskId);
       if (!recovered) throw new ValidationError("recover_task_worktree requires its completed recovery receipt");
+    }
+    if (context.phase === "apply_task_authority") {
+      const worktreeId = typeof context.worktree_id === "string" ? context.worktree_id : "";
+      const authorityCommit = typeof context.authority_commit === "string" ? context.authority_commit : "";
+      const expectedHead = typeof context.expected_head === "string" ? context.expected_head : "";
+      const applied = this.store.db.prepare(`SELECT 1 FROM operations WHERE run_id=? AND kind='git.task_authority.apply' AND state='completed'
+        AND json_extract(evidence_json,'$.worktree_id')=? AND json_extract(evidence_json,'$.authority_commit')=?
+        AND json_extract(evidence_json,'$.head')=? LIMIT 1`).get(runId, worktreeId, authorityCommit, expectedHead);
+      if (!applied) throw new ValidationError("apply_task_authority requires its completed authority application receipt");
     }
     if (context.phase === "reconcile_worktree_ownership") {
       if (!Array.isArray(context.worktree_ids) || !context.worktree_ids.length || context.worktree_ids.some((id) => typeof id !== "string")) {
