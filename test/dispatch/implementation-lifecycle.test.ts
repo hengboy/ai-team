@@ -107,7 +107,7 @@ test("planned and direct packets freeze TDD contracts and require Developer/Test
   });
 });
 
-test("only task authority git continuations omit frozen TDD evidence", async () => {
+test("only task authority receipt git continuations omit frozen TDD evidence", async () => {
   await withStore((store) => {
     const contract = {
       acceptance_criteria: ["AC-001"],
@@ -117,6 +117,31 @@ test("only task authority git continuations omit frozen TDD evidence", async () 
     };
     const runId = createRun(store);
     const dispatches = new DispatchService(store);
+    const continuationId = dispatches.create(runId, "git-operator", {
+      ...dispatchPacket(),
+      context: {
+        phase: "continue_task_authority_conflict",
+        operation: "continue-task-authority-conflict",
+        task_id: "TASK-001",
+        worktree_id: "worktree_authority_receipt",
+        worktree_path: process.cwd(),
+        authority_commit: REVIEW_HEAD,
+        expected_head: REVIEW_HEAD,
+        authority_apply_operation_id: "op_6b734efd6cf935d9dd0b8f185a",
+        authority_apply_dispatch_id: "dispatch_01M0F97XZ57WAJ05NG7EKQG54Q",
+        stash_commit: REVIEW_HEAD,
+        dirty_paths: ["src/dispatch.ts"],
+        authority_paths: ["src/dispatch.ts"],
+        conflict_paths: ["src/dispatch.ts"],
+        verification_contract: contract,
+        verification_digest: verificationDigest(contract),
+      },
+    });
+    dispatches.claim(runId, continuationId, "git-operator");
+    assert.doesNotThrow(() => dispatches.validateValue(runId, continuationId, "git-operator", completedResult(runId, continuationId, "git-operator", {
+      operations: [{ command: "record authority application receipt", outcome: "completed" }],
+    })));
+
     const dispatchId = dispatches.create(runId, "git-operator", {
       ...dispatchPacket(),
       context: { verification_contract: contract, verification_digest: verificationDigest(contract) },

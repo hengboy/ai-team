@@ -273,7 +273,11 @@ export class DispatchService {
       verification_contract?: PlanVerification | TaskVerification;
       verification_digest?: string;
     };
-    if (role === "git-operator" && context.phase === "apply_task_authority" && context.operation === "apply-task-authority") return;
+    const authorityReceipt = role === "git-operator" && (
+      (context.phase === "apply_task_authority" && context.operation === "apply-task-authority")
+      || (context.phase === "continue_task_authority_conflict" && context.operation === "continue-task-authority-conflict")
+    );
+    if (authorityReceipt) return;
     if (!context.verification_contract || !context.verification_digest) return;
     const payload = result.payload as Record<string, unknown>;
     if (payload.verification_digest !== context.verification_digest) throw new ValidationError(`${role} TDD evidence digest does not match the frozen contract`);
